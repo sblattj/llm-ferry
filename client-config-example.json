@@ -1,0 +1,45 @@
+{
+  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP, and the model id with whatever the host is serving.",
+
+  "opencode": {
+    "provider": {
+      "llm-ferry": {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": "LLM-Ferry (host)",
+        "options": {
+          "baseURL": "http://your-mac.local:8090/v1",
+          "apiKey": "local"
+        },
+        "models": {
+          "gemini/gemini-3.7-flash": {
+            "name": "Gemini 3.7 Flash (LLM-Ferry)"
+          }
+        }
+      }
+    },
+    "model": "llm-ferry/gemini/gemini-3.7-flash"
+  },
+
+  "continue_dev_vscode_or_jetbrains": {
+    "models": [
+      {
+        "title": "LLM-Ferry",
+        "provider": "openai",
+        "model": "gemini/gemini-3.7-flash",
+        "apiBase": "http://your-mac.local:8090/v1",
+        "apiKey": "local"
+      }
+    ]
+  },
+
+  "cursor_ide": {
+    "section": "Settings -> Models -> OpenAI-Compatible",
+    "override_baseURL": "http://your-mac.local:8090/v1",
+    "apiKey": "local",
+    "model_name_to_add": "gemini/gemini-3.7-flash"
+  },
+
+  "generic_openai_sdk_python": {
+    "code": "from openai import OpenAI\n\nclient = OpenAI(\n    base_url='http://your-mac.local:8090/v1',\n    api_key='local'\n)\n\nresponse = client.chat.completions.create(\n    model='gemini/gemini-3.7-flash',\n    messages=[{'role': 'user', 'content': 'Tell me a joke.'}]\n)\nprint(response.choices[0].message.content)"
+  }
+}

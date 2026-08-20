@@ -1,0 +1,12 @@
+# Ignore macOS system files
+.DS_Store
+
+# Ignore Python caches
+__pycache__/
+*.pyc
+
+# Ignore local log files
+*.log
+
+# Ignore inbound client HQ telemetry (runtime data, written by `ferry share` /hq endpoint)
+client_logs.txt

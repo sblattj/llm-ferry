@@ -1,0 +1,1209 @@
+#!/bin/zsh
+# ferry — Unified LAN AI Relay and Proxy Manager for Apple Silicon Macs.
+# Consolidates local GPU model execution, cloud API proxies, and LAN sharing.
+# Supports both Host Mode (on the Mac) and Client Mode (on connecting laptops).
+#
+# Usage:
+#   ferry install                # Provision dependencies, models, and global link
+#   ferry up [options]           # [Host] Start local GPU server or cloud proxy (Gemini)
+#   ferry down                   # [Host] Stop all relay servers, proxies, and shares
+#   ferry status                 # [Dual] View active status, LAN IPs, and test connections
+#   ferry share                  # [Host] Expose client-bootstrap.sh over LAN
+#   ferry msg <text>             # [Client] Send a direct text message to host's client_logs.txt
+#   ferry log                    # [Client] Pipe stdin log stream directly back to host
+#   ferry offer <path>...        # [Host] Offer files/dirs for clients to fetch over the LAN
+#   ferry pull <model-id>        # [Client] Pull a model from the host cache (http|hf|nc transports)
+#   ferry get <name>             # [Client] Fetch an offered file/dir from the host
+#   ferry send <path> <client>   # [Host] Push a file/dir to a listening client via netcat
+#   ferry receive                # [Client] Listen for and receive a netcat tar stream
+#   ferry serve-hf               # [Host] Start an EXPERIMENTAL HuggingFace pass-through proxy
+#   ferry serve-proxy            # [Host] Start a general HTTP(S) forward proxy for client downloads
+#   ferry env                    # [Client] Emit shell exports so this laptop downloads via the host proxy
+
+set -eu
+
+APP_DIR="$(dirname "${0:A}")"
+PORT="8090"
+SHARE_PORT="8095"
+HF_PORT="8096"
+PROXY_PORT="8097"
+LOCAL_MODEL="mlx-community/Qwen3.8-27B-nvfp4"
+LOCAL_DRAFT="mlx-community/Qwen3.8-27B-MTP-8bit"
+MDNS_NAME="$(scutil --get LocalHostName 2>/dev/null | tr 'A-Z' 'a-z').local"
+
+# Default cloud model associations
+DEFAULT_GEMINI="gemini/gemini-3.7-flash"
+
+# Robust local IP discovery prioritizing standard RFC 1918 Private LAN ranges
+get_lan_ip() {
+  # Parse all active non-loopback IPv4 addresses directly from ifconfig (bypasses macOS ipconfig getifaddr quirks)
+  local ip_list=($(ifconfig 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}'))
+  if [[ ${#ip_list[@]} -gt 0 ]]; then
+    # 1. Prefer standard RFC 1918 private subnets (192.168.x.x, 10.x.x.x, 172.16-31.x)
+    for ip in "${ip_list[@]}"; do
+      if [[ "$ip" == 192.168.* || "$ip" == 10.* || "$ip" == 172.1[6-9].* || "$ip" == 172.2[0-9].* || "$ip" == 172.3[0-1].* ]]; then
+        echo "$ip"
+        return
+      fi
+    done
+    # 2. Next, prefer any IP that isn't Tailscale (starts with 100.)
+    for ip in "${ip_list[@]}"; do
+      if [[ "$ip" != 100.* ]]; then
+        echo "$ip"
+        return
+      fi
+    done
+    # 3. Fall back to first IP found (which could be Tailscale)
+    echo "${ip_list[1]}"
+    return
+  fi
+  echo "Unknown-IP"
+}
+LAN_IP=$(get_lan_ip)
+
+# Dual-Mode Configuration: Detect if running on a Client laptop
+CLIENT_MODE=0
+CLIENT_HOST=""
+CLIENT_PORT="8090"
+CLIENT_SHARE_PORT="8095"
+
+CLIENT_CONF="$HOME/.config/ferry/client.json"
+if [[ -f "$CLIENT_CONF" ]]; then
+  CLIENT_MODE=1
+  CLIENT_HOST=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('host', ''))" 2>/dev/null || echo "")
+  CLIENT_PORT=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('port', '8090'))" 2>/dev/null || echo "8090")
+  CLIENT_SHARE_PORT=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('share_port', '8095'))" 2>/dev/null || echo "8095")
+fi
+
+# Logging locations (Host Mode only)
+LOG_DIR="${TMPDIR:-/tmp}/ferry-logs"
+mkdir -p "$LOG_DIR"
+LOCAL_LOG="$LOG_DIR/local-gpu-$PORT.log"
+CLOUD_LOG="$LOG_DIR/cloud-proxy-$PORT.log"
+SHARE_LOG="$LOG_DIR/share-$SHARE_PORT.log"
+
+# Load local secrets if present (e.g. GEMINI_API_KEY). Export the variable in your
+# shell, or drop it in ~/.config/ferry/secrets.env — never commit real API keys.
+if [[ -f "$HOME/.config/ferry/secrets.env" ]]; then
+  source "$HOME/.config/ferry/secrets.env" >/dev/null 2>&1 || true
+fi
+
+# Banner Help
+usage() {
+  cat <<EOF
+LLM-Ferry CLI (ferry) — Decoupled Local AI LAN sharing & Cloud proxying.
+
+Usage:
+  ferry <command> [options]
+
+Commands:
+  install            Install uv, mlx-vlm, litellm, models, and link globally
+  up                 [Host] Start local GPU server or cloud API proxy (boots Catalog by default)
+  down               [Host] Stop all running servers (local, cloud, sharing)
+  status             [Dual] Show server listeners, active models, and client test commands
+  share              [Host] Expose client-bootstrap.sh over LAN for other laptops to curl
+  msg <text>         [Client] Send a direct text message to host's client_logs.txt
+  log                [Client] Pipe stdin log stream directly back to host
+  env                [Client] Emit shell exports so downloads route via the host proxy
+                       eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
+
+Ferrying models & files across the LAN:
+  offer <path>...    [Host] Record files/dirs in ~/.config/ferry/offered.json for clients to fetch
+  pull <model-id>    [Client] Pull a model from the host's local HF cache
+                       [--host H] [--port P] [--transport http|hf|nc] [--to DIR]
+                       http (default): stream+untar from the share server
+                       hf:  download THROUGH the host's 'ferry serve-hf' proxy (EXPERIMENTAL)
+                       nc:  listen for a netcat push (then run 'ferry send' on the host)
+  get <name>         [Client] Fetch an offered file/dir  [--host H] [--port P] [--to DIR]
+  receive            [Client] Listen for a netcat tar stream  [--port P] [--to DIR]
+  send <path> <cli>  [Host] Push a file/dir to a listening client  [--port P]
+  serve-hf           [Host] Start EXPERIMENTAL HuggingFace pass-through proxy [--port P] (default $HF_PORT)
+  serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
+
+Options for 'up':
+  -l, --local        Launch local GPU model ($LOCAL_MODEL)
+  -c, --cloud        Proxy to default cloud model ($DEFAULT_GEMINI)
+  -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
+  -i, --interactive  Force launch the interactive model selection catalog
+  -p, --port <port>  Override listening port [default: $PORT]
+
+Examples:
+  ferry up             # Starts in interactive mode to query Gemini's active catalog
+  ferry status         # View connection health diagnostics
+  ferry msg "hello"    # Sends telemetry message back to the host Mac
+  cat err.log | ferry log  # Stream errors back to host Mac
+EOF
+  exit 0
+}
+
+# ----------------- COMMANDS -----------------
+
+cmd_install() {
+  echo "================================================================="
+  echo "               PROVISIONING LLM-FERRY SYSTEM HOST"
+  echo "================================================================="
+  
+  # Ensure uv is installed
+  if ! command -v uv >/dev/null 2>&1; then
+    echo ">>> Installing 'uv'..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+  else
+    echo ">>> 'uv' is already installed."
+  fi
+
+  # Install mlx-vlm
+  echo ">>> Installing 'mlx-vlm' via uv..."
+  uv tool install mlx-vlm --with jinja2 --force
+
+  # Install litellm for cloud proxying
+  # Pin litellm + fastapi as a matched, tested set. litellm 1.97.0's proxy imports
+  # fastapi.dependencies.utils.get_flat_dependant, which FastAPI removed after
+  # 0.136.3. Left unpinned, uv resolves fastapi 0.141+ and the proxy dies at
+  # startup with a misleading "ModuleNotFoundError: No module named 'proxy_server'".
+  # The [proxy] extra is what pulls fastapi/uvicorn in the first place.
+  echo ">>> Installing 'litellm' via uv..."
+  uv tool install 'litellm[proxy]==1.97.0' --with 'fastapi==0.136.3' --force
+
+  # Download models
+  echo ">>> Downloading default local models..."
+  download_model() {
+    local model_id=$1
+    if command -v hf >/dev/null 2>&1; then
+      echo "    [hf] Downloading $model_id..."
+      hf download "$model_id"
+    else
+      echo "    [huggingface-cli] Downloading $model_id..."
+      uv run huggingface-cli download "$model_id"
+    fi
+  }
+  download_model "$LOCAL_MODEL"
+  download_model "$LOCAL_DRAFT"
+
+  # Link globally to ~/.local/bin/ferry
+  echo ">>> Creating global symlink in ~/.local/bin/ferry..."
+  mkdir -p "$HOME/.local/bin"
+  ln -sfn "${0:A}" "$HOME/.local/bin/ferry"
+  
+  echo "================================================================="
+  echo ">>> SUCCESS! 'ferry' CLI has been linked globally."
+  echo "    Ensure ~/.local/bin is in your PATH. Run: ferry --help"
+  echo "================================================================="
+}
+
+# Dynamic interactive catalog selector querying Gemini API live list
+select_model_from_catalog() {
+  echo "================================================================="
+  echo "               FETCHING LIVE GEMINI MODELS LIST..."
+  echo "================================================================="
+
+  # Ensure API key is present
+  if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+    echo "Error: GEMINI_API_KEY is not set in your environment or ~/.config/ferry/secrets.env."
+    echo "Please set GEMINI_API_KEY to access cloud models dynamically."
+    echo "Fallback: Launching Local GPU model instead."
+    LAUNCH_MODE="local"
+    return
+  fi
+
+  # Call Gemini REST endpoint to grab the active model list
+  local raw_models
+  if ! raw_models=$(curl -fsS -m 5 "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}" 2>/dev/null); then
+    echo "WARNING: Could not connect to Gemini's server to retrieve live list."
+    echo "Fallback: Launching Local GPU model instead."
+    LAUNCH_MODE="local"
+    return
+  fi
+
+  # Run Python script to parse, filter for generateContent, sort newest models first, and display a menu
+  local chosen_model
+  chosen_model=$(python3 - "$raw_models" <<'PYEOF'
+import json, sys, re
+
+# Read API response
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    print("__ERROR:Failed to parse response JSON__")
+    sys.exit(0)
+
+models_list = data.get("models", [])
+
+# Filter for text/generation models
+chat_models = []
+for m in models_list:
+    name = m.get("name", "")
+    # Remove prefix "models/"
+    short_name = name.split("/")[-1] if "/" in name else name
+    
+    # Filter out embedding, semantic, translation, or legacy models
+    methods = m.get("supportedGenerationMethods", [])
+    if "generateContent" in methods and "embedContent" not in name and "text-embedding" not in name:
+        # Match version strings for sorting
+        # Prioritize 3.7, 2.0, 1.5, in descending order
+        version_weight = 0.0
+        if "3.7" in short_name:
+            version_weight += 300.0
+        elif "2.0" in short_name:
+            version_weight += 200.0
+        elif "1.5" in short_name:
+            version_weight += 100.0
+            
+        # Give higher priority to flash/pro over experimental/older
+        if "pro" in short_name:
+            version_weight += 10.0
+        elif "flash" in short_name:
+            version_weight += 5.0
+            
+        # Push preview/thinking/experimental variants slightly down relative to stable versions
+        if "thinking" in short_name or "preview" in short_name or "experimental" in short_name:
+            version_weight -= 2.0
+            
+        chat_models.append((version_weight, short_name, m.get("displayName", short_name)))
+
+# Sort descending (newest versions first)
+chat_models.sort(key=lambda x: x[0], reverse=True)
+
+# Generate list of options
+options = []
+# Option 1 is ALWAYS the local Apple Silicon GPU Qwen model
+options.append(("local", "Local GPU Qwen 3.8-27B (APC + Speculative MTP)"))
+
+for _, m_id, m_desc in chat_models:
+    options.append((f"gemini/{m_id}", f"[Cloud] {m_desc} (gemini/{m_id})"))
+
+# Prompt the user via stderr to keep stdout clean for capturing the output model selection
+sys.stderr.write("=================================================================\n")
+sys.stderr.write("             LLM-FERRY ACTIVE MODEL CATALOG (NEWEST FIRST)\n")
+sys.stderr.write("=================================================================\n")
+for idx, (m_id, label) in enumerate(options, 1):
+    sys.stderr.write(f"  {idx}) {label}\n")
+sys.stderr.write("=================================================================\n")
+sys.stderr.write(f"Select a model to launch (1-{len(options)}) [Default: 2]: ")
+sys.stderr.flush()
+
+try:
+    # Read response directly from /dev/tty
+    with open("/dev/tty", "r") as tty:
+        choice_str = tty.readline().strip()
+    choice = int(choice_str) if choice_str else 2
+except Exception:
+    choice = 2
+
+if choice < 1 or choice > len(options):
+    choice = 2
+
+selected_id = options[choice - 1][0]
+print(selected_id)
+PYEOF
+)
+
+  if [[ "$chosen_model" == "local" ]]; then
+    LAUNCH_MODE="local"
+  elif [[ "$chosen_model" == "__ERROR:"* ]]; then
+    echo "Error parsing live models. Falling back to Local GPU model."
+    LAUNCH_MODE="local"
+  else
+    LAUNCH_MODE="cloud"
+    CLOUD_PROVIDER="gemini"
+    CLOUD_MODEL="$chosen_model"
+  fi
+}
+
+cmd_up() {
+  if (( CLIENT_MODE )); then
+    echo "Error: Command 'ferry up' is only available on the LLM-Ferry Host Mac."
+    exit 1
+  fi
+
+  local LAUNCH_MODE="local" # Default if arguments parsed override it
+  local CLOUD_PROVIDER=""
+  local CLOUD_MODEL=""
+  local target_port="$PORT"
+  local skip_catalog=0
+
+  # If no arguments passed, launch the interactive model catalog!
+  if [[ $# -eq 0 ]]; then
+    select_model_from_catalog
+    skip_catalog=1
+  fi
+  
+  if (( ! skip_catalog )); then
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -l|--local)
+          LAUNCH_MODE="local"
+          skip_catalog=1
+          shift
+          ;;
+        -i|--interactive)
+          select_model_from_catalog
+          skip_catalog=1
+          shift
+          ;;
+        -c|--cloud)
+          LAUNCH_MODE="cloud"
+          CLOUD_PROVIDER="gemini"
+          CLOUD_MODEL="$DEFAULT_GEMINI"
+          skip_catalog=1
+          shift
+          ;;
+        -m|--model)
+          LAUNCH_MODE="cloud"
+          CLOUD_MODEL="$2"
+          skip_catalog=1
+          if [[ "$CLOUD_MODEL" == gemini/* ]]; then
+            CLOUD_PROVIDER="gemini"
+          else
+            CLOUD_PROVIDER="generic"
+          fi
+          shift 2
+          ;;
+        -p|--port)
+          target_port="$2"
+          shift 2
+          ;;
+        *)
+          echo "Unknown option: $1"
+          usage
+          ;;
+      esac
+    done
+  fi
+
+  # Stop any conflicting server on the target port first
+  if lsof -nP -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> Port $target_port is already in use. Stopping conflicting server..."
+    lsof -ti tcp:"$target_port" | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+
+  if [[ "$LAUNCH_MODE" == "local" ]]; then
+    # Start local GPU server
+    if ! command -v mlx_vlm.server >/dev/null 2>&1; then
+      echo "Error: 'mlx_vlm.server' is missing. Run: ferry install"
+      exit 1
+    fi
+    
+    export APC_ENABLED=1
+    echo ">>> Launching local GPU model server with APC and MTP..."
+    echo "    Model: $LOCAL_MODEL"
+    echo "    Port:  $target_port"
+    
+    nohup mlx_vlm.server \
+      --model "$LOCAL_MODEL" \
+      --draft-model "$LOCAL_DRAFT" \
+      --host 0.0.0.0 \
+      --port "$target_port" > "$LOCAL_LOG" 2>&1 & disown
+      
+    echo ">>> Running in background. Log: $LOCAL_LOG"
+    
+  elif [[ "$LAUNCH_MODE" == "cloud" ]]; then
+    # Start cloud API proxy
+    if ! command -v litellm >/dev/null 2>&1; then
+      echo "Error: 'litellm' is missing. Run: ferry install"
+      exit 1
+    fi
+
+    # Verify key is present
+    if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+      echo "Error: GEMINI_API_KEY is not set in your environment or ~/.config/ferry/secrets.env."
+      exit 1
+    fi
+
+    echo ">>> Proxying to Cloud Model: \033[1;32m$CLOUD_MODEL\033[0m"
+    echo "    Port: $target_port"
+    
+    # Launch LiteLLM proxy
+    nohup litellm \
+      --model "$CLOUD_MODEL" \
+      --port "$target_port" \
+      --host 0.0.0.0 > "$CLOUD_LOG" 2>&1 & disown
+      
+    echo ">>> Cloud proxy running in background. Log: $CLOUD_LOG"
+  fi
+}
+
+cmd_down() {
+  if (( CLIENT_MODE )); then
+    echo "Error: Command 'ferry down' is only available on the LLM-Ferry Host Mac."
+    exit 1
+  fi
+
+  echo ">>> Stopping all LLM-Ferry servers, cloud proxies, and share servers..."
+  
+  # Terminate local model servers
+  pkill -f mlx_vlm.server || true
+  
+  # Terminate LiteLLM proxies
+  pkill -f "litellm --model" || true
+  
+  # Terminate sharing Python servers. They run as `python3 - <port> <dir> ferry-share-marker`
+  # with the script fed on stdin via heredoc, so "DynamicHandler" lives in stdin and never
+  # appears in argv — `pkill -f DynamicHandler` could never match them and leaked a server
+  # every session. We tag them with a stable sentinel arg and match that instead.
+  pkill -f "ferry-share-marker" || true
+  pkill -f "host-share.sh" || true
+
+  # Terminate the experimental HuggingFace pass-through proxy (tagged with its sentinel arg).
+  pkill -f "ferry-hf-marker" || true
+
+  # Terminate the general HTTP(S) download forward proxy (tagged with its sentinel arg).
+  pkill -f "ferry-proxy-marker" || true
+
+  echo ">>> Success: All servers stopped."
+}
+
+cmd_status() {
+  if (( CLIENT_MODE )); then
+    echo "================================================================="
+    echo "                 LLM-FERRY CLIENT DIAGNOSTICS"
+    echo "================================================================="
+    echo "Config Profile:      $CLIENT_CONF"
+    echo "Host Target Server:  http://$CLIENT_HOST:$CLIENT_PORT"
+    echo "Host Telemetry Port: http://$CLIENT_HOST:$CLIENT_SHARE_PORT"
+    echo "================================================================="
+    
+    echo ">>> Probing network connectivity to Host Mac..."
+    if curl -fsS -m 3 "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" >/dev/null 2>&1; then
+      echo ">>> Connection Health: \033[1;32mONLINE\033[0m"
+      
+      # Query active model
+      local models=$(curl -fsS -m 2 "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" 2>/dev/null || echo "")
+      if [[ -n "$models" ]]; then
+        local active=$(echo "$models" | python3 -c "import json,sys; d=json.load(sys.stdin).get('data',[]); print(d[0]['id'] if d else 'None')")
+        echo "    Currently active model on Host: \033[1;32m$active\033[0m"
+      fi
+    else
+      echo ">>> Connection Health: \033[1;31mOFFLINE\033[0m (Check Wi-Fi/cable or network status)"
+    fi
+    echo "================================================================="
+    return
+  fi
+
+  # Host status
+  echo "================================================================="
+  echo "                 LLM-FERRY SYSTEM ACTIVE LISTENERS"
+  echo "================================================================="
+  echo "Host mDNS Domain:    http://$MDNS_NAME"
+  echo "Host active LAN IP:  http://$LAN_IP"
+  echo "================================================================="
+
+  # Check active ports
+  for p in 8090 8095; do
+    if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+      local pid=$(lsof -t -iTCP:"$p" -sTCP:LISTEN)
+      local cmd=$(ps -p "$pid" -o comm= 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
+      echo ">>> Port $p is \033[1;32mONLINE\033[0m (PID: $pid, Command: $cmd)"
+      
+      # If port is our model server, query the active model
+      if [[ "$cmd" == "Python" || "$cmd" == "python3" || "$cmd" == "litellm" || "$p" == "8090" ]]; then
+        local models=$(curl -fsS -m 2 "http://127.0.0.1:$p/v1/models" 2>/dev/null || echo "")
+        if [[ -n "$models" ]]; then
+          local active=$(echo "$models" | python3 -c "import json,sys; d=json.load(sys.stdin).get('data',[]); print(d[0]['id'] if d else 'None')")
+          echo "    Active Model loaded: \033[1;32m$active\033[0m"
+          echo "    Test with: curl -fsS -H \"Content-Type: application/json\" -d '{\"model\":\"$active\",\"messages\":[{\"role\":\"user\",\"content\":\"Say Hello!\"}],\"max_tokens\":10}' http://$MDNS_NAME:$p/v1/chat/completions"
+        fi
+      fi
+    else
+      echo ">>> Port $p is \033[1;31mOFFLINE\033[0m"
+    fi
+  done
+
+  # Experimental HuggingFace pass-through proxy (only reported when running).
+  if lsof -nP -iTCP:"$HF_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    local hf_pid=$(lsof -t -iTCP:"$HF_PORT" -sTCP:LISTEN)
+    echo ">>> Port $HF_PORT is \033[1;32mONLINE\033[0m (HF pass-through proxy, PID: $hf_pid)"
+  fi
+
+  # General HTTP(S) download forward proxy (only reported when running).
+  if lsof -nP -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> HTTP download proxy is \033[1;32mONLINE\033[0m (port $PROXY_PORT)"
+  fi
+
+  # Offered files manifest (from `ferry offer`).
+  local offered_file="$HOME/.config/ferry/offered.json"
+  if [[ -f "$offered_file" ]]; then
+    local offered_count=$(python3 -c "import json; print(len(json.load(open('$offered_file'))))" 2>/dev/null || echo "?")
+    echo ">>> Offered files: $offered_count  ($offered_file)"
+  fi
+  echo "================================================================="
+}
+
+cmd_share() {
+  if (( CLIENT_MODE )); then
+    echo "Error: Command 'ferry share' is only available on the LLM-Ferry Host Mac."
+    exit 1
+  fi
+
+  local target_port="$SHARE_PORT"
+  
+  # Scan upwards to find an available port
+  while lsof -nP -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1; do
+    echo ">>> Share port $target_port is already in use. Checking next port..."
+    target_port=$((target_port + 1))
+  done
+
+  echo "================================================================="
+  echo "                SHARING LLM-FERRY CLIENT BOOTSTRAPPER"
+  echo "================================================================="
+  echo "Serving directory: $APP_DIR"
+  echo "Port bound:        $target_port"
+  echo "================================================================="
+  echo ">>> COMMAND TO RUN ON ANY CLIENT LAPTOP ON THE SAME LAN:"
+  echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-bootstrap.sh | zsh\033[0m"
+  echo "    (or: curl -fsSL http://$LAN_IP:$target_port/client-bootstrap.sh | zsh)"
+  echo "================================================================="
+  echo ">>> Starting Dynamic Python HTTP share server in background..."
+
+  # Launch the dynamic share server in background (log to share log)
+  # The trailing "ferry-share-marker" arg is a stable kill sentinel for `ferry down` (see cmd_down);
+  # the heredoc script only reads argv[1]/argv[2], so the extra arg is ignored at runtime.
+  nohup python3 - "$target_port" "$APP_DIR" "ferry-share-marker" <<'PYEOF' > "$SHARE_LOG" 2>&1 & disown
+import sys, os, socket, subprocess, json, tarfile, glob
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+port = int(sys.argv[1])
+directory = sys.argv[2]
+
+mdns_name = subprocess.getoutput("scutil --get LocalHostName 2>/dev/null").strip().lower() + ".local"
+if not mdns_name or mdns_name == ".local":
+    mdns_name = socket.gethostname().lower()
+
+# Ferry transfer locations: the host's HuggingFace cache and the offered-files manifest.
+HF_HUB = os.path.expanduser("~/.cache/huggingface/hub")
+OFFERED = os.path.expanduser("~/.config/ferry/offered.json")
+
+class DynamicHandler(SimpleHTTPRequestHandler):
+    def _tar_stream(self, root, arcname):
+        # Stream a tar of `root` back to the client. dereference=True resolves the
+        # HuggingFace cache's snapshot symlinks (which point into ../../blobs) into
+        # real file content, so the pulled model is self-contained on the client.
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-tar")
+        self.end_headers()
+        with tarfile.open(fileobj=self.wfile, mode="w|", dereference=True) as tar:
+            tar.add(root, arcname=arcname)
+
+    def do_GET(self):
+        if self.path == "/client-bootstrap.sh" or self.path.endswith("/client-bootstrap.sh"):
+            file_path = os.path.join(self.directory, "client-bootstrap.sh")
+            if os.path.exists(file_path):
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                    content = content.replace("HOST_MDNS_PLACEHOLDER", mdns_name)
+                    content = content.replace("SHARE_PORT_PLACEHOLDER", str(port))
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-sh")
+                    self.send_header("Content-Length", str(len(content)))
+                    self.end_headers()
+                    self.wfile.write(content.encode("utf-8"))
+                    return
+                except Exception as e:
+                    print(f"Error performing dynamic replacement: {e}")
+
+        # /pull/<model-id> — tar-stream a model from the host's local HuggingFace cache.
+        if self.path.startswith("/pull/"):
+            model_id = self.path[len("/pull/"):].strip("/")
+            base = os.path.join(HF_HUB, "models--" + model_id.replace("/", "--"))
+            snaps = sorted(glob.glob(os.path.join(base, "snapshots", "*")))
+            if not snaps:
+                self.send_response(404); self.end_headers()
+                self.wfile.write(b"model not in host cache\n"); return
+            self._tar_stream(snaps[-1], model_id.split("/")[-1]); return
+
+        # /file/<name> — tar-stream a previously offered file/dir (see `ferry offer`).
+        if self.path.startswith("/file/"):
+            name = self.path[len("/file/"):].strip("/")
+            offered = json.load(open(OFFERED)) if os.path.exists(OFFERED) else {}
+            p = offered.get(name)
+            if not p or not os.path.exists(p):
+                self.send_response(404); self.end_headers()
+                self.wfile.write(b"not offered\n"); return
+            self._tar_stream(p, os.path.basename(p.rstrip("/"))); return
+
+        # /manifest — list the models in the host cache and the offered files.
+        if self.path == "/manifest" or self.path.endswith("/manifest"):
+            models = [os.path.basename(d)[len("models--"):].replace("--", "/")
+                      for d in glob.glob(os.path.join(HF_HUB, "models--*"))]
+            offered = json.load(open(OFFERED)) if os.path.exists(OFFERED) else {}
+            body = json.dumps({"models": sorted(models), "files": sorted(offered.keys())}, indent=2).encode()
+            self.send_response(200); self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body))); self.end_headers()
+            self.wfile.write(body); return
+
+        super().do_GET()
+
+    def do_POST(self):
+        if self.path == "/hq" or self.path.endswith("/hq"):
+            try:
+                content_length = int(self.headers.get('Content-Length', 0))
+                post_data = self.rfile.read(content_length).decode('utf-8')
+                
+                # Append client logs to host workspace
+                log_file_path = os.path.join(self.directory, "client_logs.txt")
+                with open(log_file_path, "a", encoding="utf-8") as lf:
+                    lf.write(f"=== CLIENT LOG ENTRY ===\n{post_data}\n\n")
+                
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"Logged successfully at HQ!\n")
+                return
+            except Exception as e:
+                print(f"Error handling HQ log: {e}")
+                self.send_response(500)
+                self.end_headers()
+                return
+        self.send_response(444)
+        self.end_headers()
+
+handler = lambda *a, **kw: DynamicHandler(*a, directory=directory, **kw)
+ThreadingHTTPServer(('0.0.0.0', port), handler).serve_forever()
+PYEOF
+
+  echo ">>> Sharing server running in background. Log: $SHARE_LOG"
+}
+
+cmd_msg() {
+  if (( ! CLIENT_MODE )); then
+    echo "Error: Command 'ferry msg' is only available in Client Mode."
+    exit 1
+  fi
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: ferry msg <your text message here>"
+    exit 1
+  fi
+  local text="$*"
+  echo ">>> Streaming direct text telemetry to Host HQ..."
+  curl -sS -X POST --data-binary "$text" "http://$CLIENT_HOST:$CLIENT_SHARE_PORT/hq"
+}
+
+cmd_log() {
+  if (( ! CLIENT_MODE )); then
+    echo "Error: Command 'ferry log' is only available in Client Mode."
+    exit 1
+  fi
+  echo ">>> Streaming stdin log stream directly back to Host HQ..."
+  curl -sS -X POST --data-binary @- "http://$CLIENT_HOST:$CLIENT_SHARE_PORT/hq"
+}
+
+# ----------------- FERRY TRANSFER COMMANDS -----------------
+
+# Resolve the LAN host to talk to for client-side pull/get:
+#   --host flag (already captured into $1) > $CLIENT_HOST (client mode) > error.
+resolve_ferry_host() {
+  local h="$1"
+  if [[ -n "$h" ]]; then echo "$h"; return 0; fi
+  if [[ -n "${CLIENT_HOST:-}" ]]; then echo "$CLIENT_HOST"; return 0; fi
+  return 1
+}
+
+# Resolve the share-server port for client-side pull/get:
+#   --port flag ($1) > $CLIENT_SHARE_PORT > $SHARE_PORT > 8095.
+resolve_ferry_port() {
+  local p="$1"
+  if [[ -n "$p" ]]; then echo "$p"; return; fi
+  if [[ -n "${CLIENT_SHARE_PORT:-}" ]]; then echo "$CLIENT_SHARE_PORT"; return; fi
+  if [[ -n "${SHARE_PORT:-}" ]]; then echo "$SHARE_PORT"; return; fi
+  echo "8095"
+}
+
+cmd_offer() {
+  if (( CLIENT_MODE )); then
+    echo "Error: Command 'ferry offer' is only available on the LLM-Ferry Host Mac."
+    exit 1
+  fi
+  if [[ $# -lt 1 ]]; then
+    echo "Usage: ferry offer <path>..."
+    exit 1
+  fi
+  local cfg_dir="$HOME/.config/ferry"
+  local offered="$cfg_dir/offered.json"
+  mkdir -p "$cfg_dir"
+
+  # Merge the given paths (basename -> absolute path) into offered.json via python for safe JSON.
+  python3 - "$offered" "$@" <<'PYEOF'
+import json, os, sys
+offered_path = sys.argv[1]
+paths = sys.argv[2:]
+data = {}
+if os.path.exists(offered_path):
+    try:
+        data = json.load(open(offered_path))
+    except Exception:
+        data = {}
+for p in paths:
+    ap = os.path.abspath(os.path.expanduser(p))
+    if not os.path.exists(ap):
+        print(f"    WARNING: path not found, skipping: {p}")
+        continue
+    name = os.path.basename(ap.rstrip("/"))
+    data[name] = ap
+    print(f"    Offered: {name}  ->  {ap}")
+json.dump(data, open(offered_path, "w"), indent=2)
+print(f">>> Offered manifest saved: {offered_path}")
+PYEOF
+}
+
+cmd_pull() {
+  if [[ $# -lt 1 || "$1" == --* ]]; then
+    echo "Usage: ferry pull <model-id> [--host H] [--port P] [--transport http|hf|nc] [--to DIR]"
+    exit 1
+  fi
+  local model_id="$1"; shift
+  local host="" port="" transport="http" to=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host)      host="$2"; shift 2 ;;
+      --port)      port="$2"; shift 2 ;;
+      --transport) transport="$2"; shift 2 ;;
+      --to)        to="$2"; shift 2 ;;
+      *)           echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+
+  case "$transport" in
+    http)
+      local h; h=$(resolve_ferry_host "$host") || {
+        echo "Error: no host resolved. Pass --host <hostname-or-ip> (or run on a configured client)."; exit 1; }
+      local p; p=$(resolve_ferry_port "$port")
+      local dest="${to:-$HOME/.cache/ferry/models/$model_id}"
+      mkdir -p "$dest"
+      echo ">>> Pulling model '$model_id' from http://$h:$p over HTTP (tar stream)..."
+      if curl -fsS "http://$h:$p/pull/$model_id" | tar -x -C "$dest"; then
+        echo ">>> Model landed at: $dest"
+      else
+        echo "Error: pull failed. Is the model in the host's HF cache, and is 'ferry share' running?"
+        exit 1
+      fi
+      ;;
+    hf)
+      local h; h=$(resolve_ferry_host "$host") || {
+        echo "Error: no host resolved. Pass --host <hostname-or-ip>."; exit 1; }
+      local hfp="${port:-$HF_PORT}"
+      echo ">>> [EXPERIMENTAL] Pulling '$model_id' THROUGH host HF proxy at http://$h:$hfp ..."
+      echo "    (Requires the host to be running: ferry serve-hf)"
+      if command -v hf >/dev/null 2>&1; then
+        HF_ENDPOINT="http://$h:$hfp" hf download "$model_id"
+      else
+        echo "    'hf' not found; falling back to 'uv run huggingface-cli'..."
+        HF_ENDPOINT="http://$h:$hfp" uv run huggingface-cli download "$model_id"
+      fi
+      ;;
+    nc)
+      echo ">>> Pull via netcat: this laptop will LISTEN and receive a tar stream."
+      echo "    On the HOST, run:  ferry send <path-to-model-dir> <this-laptop-host-or-ip> --port ${port:-9099}"
+      local recv_args=()
+      [[ -n "$port" ]] && recv_args+=(--port "$port")
+      [[ -n "$to" ]]   && recv_args+=(--to "$to")
+      cmd_receive "${recv_args[@]}"
+      ;;
+    *)
+      echo "Unknown transport: $transport (use http|hf|nc)"
+      exit 1
+      ;;
+  esac
+}
+
+cmd_get() {
+  if [[ $# -lt 1 || "$1" == --* ]]; then
+    echo "Usage: ferry get <name> [--host H] [--port P] [--to DIR]"
+    exit 1
+  fi
+  local name="$1"; shift
+  local host="" port="" to=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host) host="$2"; shift 2 ;;
+      --port) port="$2"; shift 2 ;;
+      --to)   to="$2"; shift 2 ;;
+      *)      echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  local h; h=$(resolve_ferry_host "$host") || {
+    echo "Error: no host resolved. Pass --host <hostname-or-ip>."; exit 1; }
+  local p; p=$(resolve_ferry_port "$port")
+  local dest="${to:-.}"
+  mkdir -p "$dest"
+  echo ">>> Fetching offered file '$name' from http://$h:$p into $dest ..."
+  if curl -fsS "http://$h:$p/file/$name" | tar -x -C "$dest"; then
+    echo ">>> Landed under: $dest"
+    ls -la "$dest"
+  else
+    echo "Error: fetch failed. Is '$name' offered on the host (see 'ferry offer')?"
+    exit 1
+  fi
+}
+
+cmd_receive() {
+  local port="" to=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      --to)   to="$2"; shift 2 ;;
+      *)      echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  local rcv_port="${port:-9099}"
+  local dest="${to:-.}"
+  mkdir -p "$dest"
+  echo ">>> Receiving: listening on port $rcv_port; extracting into $dest"
+  echo "    On the HOST run:  ferry send <file|dir> <this-laptop-host-or-ip> --port $rcv_port"
+  # BSD/macOS netcat: `nc -l PORT` listens; the stream is piped straight into tar.
+  # `-d` stops nc from reading stdin — without it, a backgrounded listener whose
+  # stdin has already reached EOF tears the connection down before the tar payload
+  # finishes transferring (Apple nc reads stdin and closes the socket on its EOF).
+  nc -d -l "$rcv_port" | tar -x -C "$dest"
+  echo ">>> Receive complete. Files are in: $dest"
+}
+
+cmd_send() {
+  if (( CLIENT_MODE )); then
+    echo "Error: Command 'ferry send' is only available on the LLM-Ferry Host Mac."
+    exit 1
+  fi
+  if [[ $# -lt 2 || "$1" == --* || "$2" == --* ]]; then
+    echo "Usage: ferry send <file|dir> <client-host> [--port P]"
+    exit 1
+  fi
+  local src="$1"; local client_host="$2"; shift 2
+  local port=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      *)      echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  local send_port="${port:-9099}"
+  if [[ ! -e "$src" ]]; then
+    echo "Error: path not found: $src"
+    exit 1
+  fi
+  # zsh modifiers: :A = absolute path, :h = head (dirname), :t = tail (basename).
+  # Using them avoids forking dirname/basename and works for relative paths too.
+  # NB: do NOT name this var 'path' — in zsh that is the array tied to $PATH.
+  local parent base
+  parent="${src:A:h}"
+  base="${src:t}"
+  echo ">>> Sending '$base' to $client_host:$send_port via netcat (tar stream)..."
+  echo "    (The client must already be running: ferry receive --port $send_port)"
+  tar -c -C "$parent" "$base" | nc "$client_host" "$send_port"
+  echo ">>> Sent: $base"
+}
+
+cmd_serve_hf() {
+  if (( CLIENT_MODE )); then
+    echo "Error: Command 'ferry serve-hf' is only available on the LLM-Ferry Host Mac."
+    exit 1
+  fi
+  local port=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      *)      echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  local hf_port="${port:-$HF_PORT}"
+  local hf_log="$LOG_DIR/ferry-hf-$hf_port.log"
+
+  # Free the port if something is already bound there.
+  if lsof -nP -iTCP:"$hf_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> Port $hf_port already in use. Stopping conflicting listener..."
+    lsof -ti tcp:"$hf_port" | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+
+  echo "================================================================="
+  echo "     STARTING HUGGINGFACE PASS-THROUGH PROXY (EXPERIMENTAL)"
+  echo "================================================================="
+  echo "Proxy port:  $hf_port"
+  echo "Clients set: HF_ENDPOINT=http://$MDNS_NAME:$hf_port  (or http://$LAN_IP:$hf_port)"
+  echo "Log:         $hf_log"
+  echo "================================================================="
+
+  # The trailing "ferry-hf-marker" arg is a stable kill sentinel for `ferry down`;
+  # the heredoc only reads argv[1] (the port), so the extra arg is ignored at runtime.
+  nohup python3 - "$hf_port" "ferry-hf-marker" <<'PYEOF' > "$hf_log" 2>&1 & disown
+import sys, urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+port = int(sys.argv[1])
+UPSTREAM = "https://huggingface.co"
+
+class HFProxyHandler(BaseHTTPRequestHandler):
+    def _proxy(self, method):
+        url = UPSTREAM + self.path
+        try:
+            req = urllib.request.Request(url, method=method)
+            # Forward the headers that matter for auth and ranged/LFS downloads.
+            for h in ("Authorization", "User-Agent", "Range", "Accept"):
+                v = self.headers.get(h)
+                if v:
+                    req.add_header(h, v)
+            # urllib follows redirects by default — HF redirects LFS blobs to a CDN.
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                self.send_response(resp.status)
+                for k, v in resp.headers.items():
+                    if k.lower() in ("transfer-encoding", "connection"):
+                        continue
+                    self.send_header(k, v)
+                self.end_headers()
+                if method != "HEAD":
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+        except urllib.error.HTTPError as e:
+            self.send_response(e.code)
+            self.end_headers()
+            try:
+                if method != "HEAD":
+                    self.wfile.write(e.read())
+            except Exception:
+                pass
+        except Exception as e:
+            self.send_response(502)
+            self.end_headers()
+            try:
+                self.wfile.write(("proxy error: %s\n" % e).encode())
+            except Exception:
+                pass
+
+    def do_GET(self):
+        self._proxy("GET")
+
+    def do_HEAD(self):
+        self._proxy("HEAD")
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("[ferry-hf] " + (fmt % args) + "\n")
+
+ThreadingHTTPServer(('0.0.0.0', port), HFProxyHandler).serve_forever()
+PYEOF
+
+  sleep 1
+  if lsof -nP -iTCP:"$hf_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> HF proxy is listening on port $hf_port. Stop it with: ferry down"
+  else
+    echo "WARNING: HF proxy did not come up; check the log: $hf_log"
+  fi
+}
+
+cmd_serve_proxy() {
+  if (( CLIENT_MODE )); then
+    echo "Error: Command 'ferry serve-proxy' is only available on the LLM-Ferry Host Mac."
+    exit 1
+  fi
+  local port=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="$2"; shift 2 ;;
+      *)      echo "Unknown option: $1"; exit 1 ;;
+    esac
+  done
+  local proxy_port="${port:-$PROXY_PORT}"
+  local proxy_log="$LOG_DIR/ferry-proxy-$proxy_port.log"
+
+  # Free the port if something is already bound there.
+  if lsof -nP -iTCP:"$proxy_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> Port $proxy_port already in use. Stopping conflicting listener..."
+    lsof -ti tcp:"$proxy_port" | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+
+  echo "================================================================="
+  echo "           STARTING HTTP(S) DOWNLOAD FORWARD PROXY"
+  echo "================================================================="
+  echo "Proxy port:  $proxy_port"
+  echo "Routes:      uv/PyPI, huggingface_hub, sherpa-onnx/GitHub, git, curl — anything honoring proxy env vars"
+  echo "Log:         $proxy_log"
+  echo "================================================================="
+
+  # A general forward proxy: CONNECT tunneling for HTTPS, plain-HTTP forwarding for GET.
+  # The trailing "ferry-proxy-marker" arg is a stable kill sentinel for `ferry down`;
+  # the heredoc only reads argv[1] (the port), so the extra arg is ignored at runtime.
+  nohup python3 - "$proxy_port" "ferry-proxy-marker" <<'PYEOF' > "$proxy_log" 2>&1 & disown
+import sys, select, socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+PORT = int(sys.argv[1])   # sys.argv[2] == "ferry-proxy-marker" (kill sentinel, unused)
+
+
+class Proxy(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_CONNECT(self):
+        # Establish a raw TCP tunnel to the requested host:port, then pump bytes
+        # both ways until either side closes. This is what HTTPS clients use.
+        try:
+            host, _, port = self.path.partition(":")
+            upstream = socket.create_connection((host, int(port or 443)), timeout=30)
+        except Exception:
+            self.send_error(502)
+            return
+        self.send_response(200, "Connection established")
+        self.end_headers()
+        client = self.connection
+        client.setblocking(0)
+        upstream.setblocking(0)
+        try:
+            while True:
+                r, _, _ = select.select([client, upstream], [], [], 60)
+                if not r:
+                    break
+                for s in r:
+                    data = s.recv(65536)
+                    if not data:
+                        return
+                    (upstream if s is client else client).sendall(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    def do_GET(self):
+        # Plain-HTTP forwarding: fetch the absolute URL and relay the response.
+        import urllib.request
+        try:
+            req = urllib.request.Request(self.path, headers=dict(self.headers))
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                self.send_response(resp.status)
+                for k, v in resp.headers.items():
+                    if k.lower() not in ("transfer-encoding", "connection", "content-length"):
+                        self.send_header(k, v)
+                body = resp.read()
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        except Exception:
+            self.send_error(502)
+
+    def log_message(self, *a):
+        pass
+
+
+ThreadingHTTPServer(("0.0.0.0", PORT), Proxy).serve_forever()
+PYEOF
+
+  sleep 1
+  if lsof -nP -iTCP:"$proxy_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> HTTP download proxy is listening on port $proxy_port. Stop it with: ferry down"
+    echo ">>> On a client run:  eval \"\$(ferry env --host $MDNS_NAME)\""
+  else
+    echo "WARNING: HTTP proxy did not come up; check the log: $proxy_log"
+  fi
+}
+
+cmd_env() {
+  # Emit shell 'export' lines so a client routes its downloads through the host's
+  # forward proxy (see 'ferry serve-proxy'). Designed for:  eval "$(ferry env ...)".
+  # stdout stays PURELY eval-able; any human hint goes to stderr.
+  local host="" proxy_port="" hf_port="" do_write=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host)       host="$2"; shift 2 ;;
+      --proxy-port) proxy_port="$2"; shift 2 ;;
+      --hf-port)    hf_port="$2"; shift 2 ;;
+      --write)      do_write=1; shift ;;
+      *)            echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  # Resolve the host: --host wins, else the client profile's CLIENT_HOST.
+  local H="${host:-$CLIENT_HOST}"
+  if [[ -z "$H" ]]; then
+    echo "Error: no host given. Pass --host H, or configure ~/.config/ferry/client.json first." >&2
+    exit 1
+  fi
+  local PP="${proxy_port:-$PROXY_PORT}"
+  local HFP="${hf_port:-$HF_PORT}"
+
+  # The export block. Built with an expanding heredoc so $H/$PP/$HFP interpolate.
+  local block
+  block=$(cat <<EOF
+export HTTP_PROXY="http://$H:$PP"
+export HTTPS_PROXY="http://$H:$PP"
+export http_proxy="http://$H:$PP"
+export https_proxy="http://$H:$PP"
+export ALL_PROXY="http://$H:$PP"
+export HF_ENDPOINT="http://$H:$HFP"
+export NO_PROXY="localhost,127.0.0.1,::1,$H"
+export no_proxy="localhost,127.0.0.1,::1,$H"
+EOF
+)
+
+  if (( do_write )); then
+    local rc="$HOME/.zshrc"
+    local start="# >>> ferry env >>>"
+    local end="# <<< ferry env <<<"
+    touch "$rc"
+    # Strip any existing ferry env block (inclusive of its markers) before re-adding.
+    python3 - "$rc" "$start" "$end" <<'PYEOF'
+import sys
+rc, start, end = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(rc) as f:
+    lines = f.readlines()
+out, skip = [], False
+for ln in lines:
+    s = ln.rstrip("\n")
+    if s == start:
+        skip = True
+        continue
+    if s == end:
+        skip = False
+        continue
+    if not skip:
+        out.append(ln)
+while out and out[-1].strip() == "":
+    out.pop()
+with open(rc, "w") as f:
+    f.writelines(out)
+    if out:
+        f.write("\n")
+PYEOF
+    {
+      echo "$start"
+      echo "$block"
+      echo "$end"
+    } >> "$rc"
+    echo ">>> Appended ferry env block to $rc (host $H). Run: source $rc"
+  else
+    print -r -- "$block"
+    echo "# eval \"\$(ferry env)\" then run your uv/hf tool (downloads route via $H)" >&2
+  fi
+}
+
+# ----------------- PARSER -----------------
+
+if [[ $# -lt 1 ]]; then
+  usage
+fi
+
+COMMAND="$1"
+shift
+
+case "$COMMAND" in
+  install)       cmd_install ;;
+  up)            cmd_up "$@" ;;
+  down)          cmd_down ;;
+  status)        cmd_status ;;
+  share)         cmd_share ;;
+  msg)           cmd_msg "$@" ;;
+  log)           cmd_log ;;
+  offer)         cmd_offer "$@" ;;
+  pull)          cmd_pull "$@" ;;
+  get)           cmd_get "$@" ;;
+  receive)       cmd_receive "$@" ;;
+  send)          cmd_send "$@" ;;
+  serve-hf)      cmd_serve_hf "$@" ;;
+  serve-proxy)   cmd_serve_proxy "$@" ;;
+  env)           cmd_env "$@" ;;
+  --help|-h)     usage ;;
+  *)             echo "Unknown command: $COMMAND"; usage ;;
+esac

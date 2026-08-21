@@ -82,7 +82,7 @@ some-command 2>&1 | ferry log    # stream logs/errors back to the host
 ferry up --route     # serve orchestrator + gemini-3.7-flash from ~/.config/ferry/litellm.yaml
 ```
 
-The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and stops so you can edit it — set your model ids and export the keys it references (`KIMI_API_KEY`, `GEMINI_API_KEY`, `GEMINI_API_KEY_2`, in your shell or `~/.config/ferry/secrets.env`) — then re-run. The two-key failover is simply **two identical `gemini-3.7-flash` deployments** in the yaml: LiteLLM's router load-balances them and, on a `429`, cools the dead key out and rolls traffic to the second.
+The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and stops so you can edit it — set your model ids and export the keys it references (`KIMI_API_KEY`, `GEMINI_API_KEY`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`, in your shell or `~/.config/ferry/secrets.env`) — then re-run. The worker failover is simply **several identical `gemini-3.7-flash` deployments** in the yaml: `usage-based-routing-v2` sends each call to the least-used key (proactive even split), and on a `429` it cools the dead key out and rolls traffic to another. **Gemini quota is per-GCP-project, not per-key** — so each key only adds real headroom if it lives in its own Google Cloud project.
 
 Note that LiteLLM only **routes and fails over** — the "orchestrator delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to `orchestrator` and the subagent model to `gemini-3.7-flash`.
 

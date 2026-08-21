@@ -19,6 +19,7 @@
 #   ferry serve-hf               # [Host] Start an EXPERIMENTAL HuggingFace pass-through proxy
 #   ferry serve-proxy            # [Host] Start a general HTTP(S) forward proxy for client downloads
 #   ferry env                    # [Client] Emit shell exports so this laptop downloads via the host proxy
+#   ferry opencode               # [Client] Auto-wire opencode to route through the host (detects served models)
 
 set -eu
 
@@ -33,6 +34,10 @@ MDNS_NAME="$(scutil --get LocalHostName 2>/dev/null | tr 'A-Z' 'a-z').local"
 
 # Default cloud model associations
 DEFAULT_GEMINI="gemini/gemini-3.7-flash"
+
+# Route mode: serve multiple models (orchestrator + failover workers) from a litellm config
+DEFAULT_ROUTE_CONFIG="$HOME/.config/ferry/litellm.yaml"
+ROUTE_TEMPLATE="$APP_DIR/litellm-route-example.yaml"
 
 # Robust local IP discovery prioritizing standard RFC 1918 Private LAN ranges
 get_lan_ip() {
@@ -106,6 +111,8 @@ Commands:
   log                [Client] Pipe stdin log stream directly back to host
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
+  opencode           [Client] Auto-wire opencode to route through the host (detects served models)
+                       ferry opencode [--host H] [--port P] [--config PATH] [--model M] [--small-model SM] [--no-default]
 
 Ferrying models & files across the LAN:
   offer <path>...    [Host] Record files/dirs in ~/.config/ferry/offered.json for clients to fetch
@@ -124,11 +131,14 @@ Options for 'up':
   -l, --local        Launch local GPU model ($LOCAL_MODEL)
   -c, --cloud        Proxy to default cloud model ($DEFAULT_GEMINI)
   -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
+  -r, --route        Serve MULTIPLE models from a litellm config (orchestrator + key failover)
+                       Uses ~/.config/ferry/litellm.yaml (seeded from template on first run)
   -i, --interactive  Force launch the interactive model selection catalog
   -p, --port <port>  Override listening port [default: $PORT]
 
 Examples:
   ferry up             # Starts in interactive mode to query Gemini's active catalog
+  ferry up --route     # Serve orchestrator + Gemini key-failover from litellm.yaml
   ferry status         # View connection health diagnostics
   ferry msg "hello"    # Sends telemetry message back to the host Mac
   cat err.log | ferry log  # Stream errors back to host Mac
@@ -348,6 +358,11 @@ cmd_up() {
           skip_catalog=1
           shift
           ;;
+        -r|--route)
+          LAUNCH_MODE="route"
+          skip_catalog=1
+          shift
+          ;;
         -m|--model)
           LAUNCH_MODE="cloud"
           CLOUD_MODEL="$2"
@@ -377,6 +392,9 @@ cmd_up() {
     lsof -ti tcp:"$target_port" | xargs kill -9 2>/dev/null || true
     sleep 1
   fi
+
+  # Port-accurate cloud/route log name (the global CLOUD_LOG is pinned to the default port).
+  local cloud_log="$LOG_DIR/cloud-proxy-$target_port.log"
 
   if [[ "$LAUNCH_MODE" == "local" ]]; then
     # Start local GPU server
@@ -418,9 +436,59 @@ cmd_up() {
     nohup litellm \
       --model "$CLOUD_MODEL" \
       --port "$target_port" \
-      --host 0.0.0.0 > "$CLOUD_LOG" 2>&1 & disown
-      
-    echo ">>> Cloud proxy running in background. Log: $CLOUD_LOG"
+      --host 0.0.0.0 > "$cloud_log" 2>&1 & disown
+
+    echo ">>> Cloud proxy running in background. Log: $cloud_log"
+  elif [[ "$LAUNCH_MODE" == "route" ]]; then
+    # Multi-model routing via a litellm config: an orchestrator model plus
+    # worker model(s) with automatic key failover (two same-named deployments).
+    if ! command -v litellm >/dev/null 2>&1; then
+      echo "Error: 'litellm' is missing. Run: ferry install"
+      exit 1
+    fi
+
+    local route_config="$DEFAULT_ROUTE_CONFIG"
+
+    # First run: seed the config from the shipped template, then STOP so the
+    # user can set their model ids / keys before we launch anything.
+    if [[ ! -f "$route_config" ]]; then
+      mkdir -p "$(dirname "$route_config")"
+      if [[ -f "$ROUTE_TEMPLATE" ]]; then
+        cp "$ROUTE_TEMPLATE" "$route_config"
+        echo ">>> Seeded route config from template:"
+        echo "    $route_config"
+        echo "    Edit it (set your model ids), export the keys it references"
+        echo "    (e.g. KIMI_API_KEY, GEMINI_API_KEY, GEMINI_API_KEY_2), then"
+        echo "    re-run 'ferry up --route'."
+        exit 0
+      else
+        echo "Error: No route config at $route_config and no template at $ROUTE_TEMPLATE."
+        exit 1
+      fi
+    fi
+
+    # Warn (don't hard-fail) on unset keys the default template expects.
+    local missing=()
+    [[ -z "${KIMI_API_KEY:-}" ]]     && missing+=("KIMI_API_KEY")
+    [[ -z "${GEMINI_API_KEY:-}" ]]   && missing+=("GEMINI_API_KEY")
+    [[ -z "${GEMINI_API_KEY_2:-}" ]] && missing+=("GEMINI_API_KEY_2 (failover)")
+    if (( ${#missing[@]} > 0 )); then
+      echo ">>> WARNING: these env vars are unset; models that need them will 401:"
+      for m in "${missing[@]}"; do echo "      - $m"; done
+      echo "    Export them in your shell or ~/.config/ferry/secrets.env."
+    fi
+
+    echo ">>> Serving MULTIPLE models via litellm route config:"
+    echo "    Config: $route_config"
+    echo "    Port:   $target_port"
+
+    nohup litellm \
+      --config "$route_config" \
+      --port "$target_port" \
+      --host 0.0.0.0 > "$cloud_log" 2>&1 & disown
+
+    echo ">>> Route proxy running in background. Log: $cloud_log"
+    echo "    Served models:  curl -s http://127.0.0.1:$target_port/v1/models"
   fi
 }
 
@@ -437,7 +505,10 @@ cmd_down() {
   
   # Terminate LiteLLM proxies
   pkill -f "litellm --model" || true
-  
+
+  # Route mode runs `litellm --config …`, which the --model matcher above misses.
+  pkill -f "litellm --config" || true
+
   # Terminate sharing Python servers. They run as `python3 - <port> <dir> ferry-share-marker`
   # with the script fed on stdin via heredoc, so "DynamicHandler" lives in stdin and never
   # appears in argv — `pkill -f DynamicHandler` could never match them and leaked a server
@@ -1179,6 +1250,105 @@ PYEOF
   fi
 }
 
+cmd_opencode() {
+  # [Client] Wire this laptop's opencode config to route through the host's ferry endpoint.
+  # Auto-detects the host's served models: if the host serves `orchestrator` + a worker
+  # (e.g. gemini-3.7-flash), it sets up the orchestrator/worker split; otherwise it wires
+  # whatever single model the host serves. Non-destructive: backs up and merges.
+  local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
+  local oc_config="$HOME/.config/opencode/opencode.json"
+  local force_model="" force_small="" set_default=1
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host)         oc_host="$2"; shift 2 ;;
+      --port)         oc_port="$2"; shift 2 ;;
+      --config)       oc_config="$2"; shift 2 ;;
+      --model)        force_model="$2"; shift 2 ;;
+      --small-model)  force_small="$2"; shift 2 ;;
+      --no-default)   set_default=0; shift ;;
+      *) echo "Unknown option for 'ferry opencode': $1"; exit 1 ;;
+    esac
+  done
+
+  if [[ -z "$oc_host" ]]; then
+    echo "Error: no host known. Pass --host <mdns-or-ip> (or run this on a bootstrapped"
+    echo "client where ~/.config/ferry/client.json exists)."
+    exit 1
+  fi
+
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" <<'PYEOF'
+import json, os, re, sys, shutil, urllib.request
+
+host, port, cfg_path, force_model, force_small = sys.argv[1:6]
+set_default = sys.argv[6] == "1"
+cfg_path = os.path.expanduser(cfg_path)
+base = f"http://{host}:{port}/v1"
+
+# --- Discover what the host is serving ---
+served = []
+try:
+    with urllib.request.urlopen(f"{base}/models", timeout=4) as r:
+        served = [m.get("id") for m in json.load(r).get("data", []) if m.get("id")]
+except Exception as e:
+    print(f"    (Could not query {base}/models: {e}; wiring from flags/defaults)")
+
+# --- Decide main + worker models ---
+main = force_model or ("orchestrator" if "orchestrator" in served else (served[0] if served else "orchestrator"))
+small = force_small or ("gemini-3.7-flash" if "gemini-3.7-flash" in served else "")
+
+model_ids = list(dict.fromkeys(served + [main] + ([small] if small else [])))
+models = {mid: {} for mid in model_ids}
+
+# --- Load existing opencode config (JSONC-tolerant; back up + reset if unparseable) ---
+cfg = None
+if os.path.exists(cfg_path):
+    raw = open(cfg_path).read()
+    try:
+        cfg = json.loads(raw)
+    except json.JSONDecodeError:
+        stripped = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/',
+                          lambda m: m.group(1) or '', raw, flags=re.S)
+        stripped = re.sub(r',\s*([}\]])', r'\1', stripped)
+        try:
+            cfg = json.loads(stripped)
+            print("    (Existing opencode config had JSONC comments; parsed tolerantly)")
+        except json.JSONDecodeError as e:
+            shutil.copy(cfg_path, cfg_path + ".bak")
+            print(f"    WARNING: existing config unparseable ({e}); backed up to {cfg_path}.bak")
+            cfg = None
+
+if cfg is None:
+    cfg = {"$schema": "https://opencode.ai/config.json"}
+elif os.path.exists(cfg_path):
+    shutil.copy(cfg_path, cfg_path + ".bak")   # keep a backup before we rewrite
+
+# --- Merge the ferry provider (preserving everything else) ---
+prov = cfg.setdefault("provider", {})
+prov["ferry"] = {
+    "npm": "@ai-sdk/openai-compatible",
+    "name": f"Ferry ({host})",
+    "options": {"baseURL": base, "apiKey": "local"},
+    "models": models,
+}
+
+if set_default:
+    cfg["model"] = f"ferry/{main}"
+    if small:
+        cfg["small_model"] = f"ferry/{small}"
+
+os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+json.dump(cfg, open(cfg_path, "w"), indent=2)
+
+print(f"    Wired opencode -> {base}")
+print(f"    Provider: ferry   Served models: {', '.join(served) if served else '(none detected)'}")
+print(f"    Default model:       ferry/{main}")
+if set_default and small:
+    print(f"    Default small_model: ferry/{small}")
+print(f"    Config written: {cfg_path}")
+PYEOF
+}
+
 # ----------------- PARSER -----------------
 
 if [[ $# -lt 1 ]]; then
@@ -1204,6 +1374,7 @@ case "$COMMAND" in
   serve-hf)      cmd_serve_hf "$@" ;;
   serve-proxy)   cmd_serve_proxy "$@" ;;
   env)           cmd_env "$@" ;;
+  opencode)      cmd_opencode "$@" ;;
   --help|-h)     usage ;;
   *)             echo "Unknown command: $COMMAND"; usage ;;
 esac

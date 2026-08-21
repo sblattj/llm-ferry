@@ -1,33 +1,29 @@
 {
-  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP, and the model id with whatever the host is serving.",
+  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP. In route mode the host serves an 'orchestrator' plus a 'gemini-3.7-flash' worker from one endpoint; point the main model at 'orchestrator' and the worker/subagent model at 'gemini-3.7-flash'. Easiest of all: just run `ferry opencode` on the client to write the opencode block below automatically (it detects whatever the host is serving).",
 
   "opencode": {
     "provider": {
-      "llm-ferry": {
+      "ferry": {
         "npm": "@ai-sdk/openai-compatible",
-        "name": "LLM-Ferry (host)",
-        "options": {
-          "baseURL": "http://your-mac.local:8090/v1",
-          "apiKey": "local"
-        },
-        "models": {
-          "gemini/gemini-3.7-flash": {
-            "name": "Gemini 3.7 Flash (LLM-Ferry)"
-          }
-        }
+        "name": "Ferry (host)",
+        "options": { "baseURL": "http://your-mac.local:8090/v1", "apiKey": "local" },
+        "models": { "orchestrator": {}, "gemini-3.7-flash": {} }
       }
     },
-    "model": "llm-ferry/gemini/gemini-3.7-flash"
+    "model": "ferry/orchestrator",
+    "small_model": "ferry/gemini-3.7-flash",
+    "_tip": "Or just run `ferry opencode` on the client to write this automatically."
   },
 
   "continue_dev_vscode_or_jetbrains": {
     "models": [
       {
-        "title": "LLM-Ferry",
+        "title": "Ferry (orchestrator)",
         "provider": "openai",
-        "model": "gemini/gemini-3.7-flash",
+        "model": "orchestrator",
         "apiBase": "http://your-mac.local:8090/v1",
-        "apiKey": "local"
+        "apiKey": "local",
+        "_note": "In route mode 'gemini-3.7-flash' is the cheaper worker model the host also serves."
       }
     ]
   },
@@ -36,10 +32,12 @@
     "section": "Settings -> Models -> OpenAI-Compatible",
     "override_baseURL": "http://your-mac.local:8090/v1",
     "apiKey": "local",
-    "model_name_to_add": "gemini/gemini-3.7-flash"
+    "model_name_to_add": "orchestrator",
+    "_note": "In route mode 'gemini-3.7-flash' is the cheaper worker model the host also serves."
   },
 
   "generic_openai_sdk_python": {
-    "code": "from openai import OpenAI\n\nclient = OpenAI(\n    base_url='http://your-mac.local:8090/v1',\n    api_key='local'\n)\n\nresponse = client.chat.completions.create(\n    model='gemini/gemini-3.7-flash',\n    messages=[{'role': 'user', 'content': 'Tell me a joke.'}]\n)\nprint(response.choices[0].message.content)"
+    "code": "from openai import OpenAI\n\nclient = OpenAI(\n    base_url='http://your-mac.local:8090/v1',\n    api_key='local'\n)\n\nresponse = client.chat.completions.create(\n    model='orchestrator',\n    messages=[{'role': 'user', 'content': 'Tell me a joke.'}]\n)\nprint(response.choices[0].message.content)",
+    "_note": "In route mode 'gemini-3.7-flash' is the cheaper worker model the host also serves."
   }
 }

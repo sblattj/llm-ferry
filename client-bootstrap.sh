@@ -89,7 +89,7 @@ echo "    Successfully saved profile: ~/.config/ferry/client.json"
 # 3. Interactive Selection Menu: Choose favorite tools
 echo ""
 echo ">>> Which developer tools would you like to configure for LLM-Ferry?"
-echo "  1) opencode CLI  (recommended; full auto-integration)"
+echo "  1) opencode CLI  (recommended; full auto-integration, auto-detects the host's served models)"
 echo "  2) VS Code Continue Extension (config.json generator)"
 echo "  3) Cursor IDE"
 echo "  4) Set up ALL integrations"
@@ -138,67 +138,22 @@ esac
 # 5. Perform Automatic opencode configuration
 if (( SETUP_OPENCODE )); then
   echo ""
-  echo ">>> Automatically setting up 'opencode' config to proxy through host..."
-  
-  python3 - "$HOST_NAME" "$HOST_PORT" "$SELECTED_MODEL" <<'PYEOF'
-import json, os, re, sys
-
-host_name, host_port, model_id = sys.argv[1], sys.argv[2], sys.argv[3]
-cfg_path = os.path.expanduser("~/.config/opencode/opencode.json")
-cfg = None
-
-if os.path.exists(cfg_path):
-    raw = open(cfg_path).read()
-    try:
-        cfg = json.loads(raw)
-    except json.JSONDecodeError:
-        # Strip JSONC comments & trailing commas
-        stripped = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/',
-                          lambda m: m.group(1) or '', raw, flags=re.S)
-        stripped = re.sub(r',\s*([}\]])', r'\1', stripped)
-        try:
-            cfg = json.loads(stripped)
-            print("    (Existing opencode config had JSONC comments; parsed tolerantly)")
-        except json.JSONDecodeError as e:
-            backup = cfg_path + ".bak"
-            import shutil
-            shutil.copy(cfg_path, backup)
-            print(f"    WARNING: Existing config unparseable ({e}); backed up to {backup}")
-            cfg = None
-
-if cfg is None:
-    cfg = {"$schema": "https://opencode.ai/config.json"}
-
-# Add or update the LLM-Ferry provider block pointing to the host
-providers = cfg.setdefault("provider", {})
-providers["llm-ferry"] = {
-    "npm": "@ai-sdk/openai-compatible",
-    "name": f"LLM-Ferry ({host_name})",
-    "options": {
-        "baseURL": f"http://{host_name}:{host_port}/v1",
-        "apiKey": "local"
-    },
-    "models": {
-        model_id: {"name": f"Model: {model_id} (LLM-Ferry)"}
-    }
-}
-
-# Set as default active model for next launch
-cfg["model"] = f"llm-ferry/{model_id}"
-
-os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
-json.dump(cfg, open(cfg_path, "w"), indent=2)
-print(f"    Successfully configured 'llm-ferry' pointing to {model_id}!")
-print("    The next time you start opencode, it will automatically call the host proxy.")
-PYEOF
+  echo ">>> Auto-configuring 'opencode' to route through the host (detects served models)..."
+  if "$HOME/.local/bin/ferry" opencode --host "$HOST_NAME" --port "$HOST_PORT"; then
+    :
+  else
+    echo "    WARNING: 'ferry opencode' failed. Wire opencode manually: add an openai-compatible"
+    echo "    provider with baseURL=http://$HOST_NAME:$HOST_PORT/v1, apiKey=local, and a model from"
+    echo "    http://$HOST_NAME:$HOST_PORT/v1/models."
+  fi
 
   # Setup shell alias in .zshrc
   echo ">>> Configuring terminal 'host-code' shortcut in ~/.zshrc..."
   ZSHRC="$HOME/.zshrc"
-  ALIAS_LINE="alias host-code='opencode -m \"llm-ferry/$SELECTED_MODEL\"'"
+  ALIAS_LINE="alias host-code='opencode'"
 
   if [[ -f "$ZSHRC" ]]; then
-    if grep -q "llm-ferry" "$ZSHRC" 2>/dev/null; then
+    if grep -q "^alias host-code=" "$ZSHRC" 2>/dev/null; then
       # Update existing alias
       sed -i '' "s|^alias host-code=.*|$ALIAS_LINE|" "$ZSHRC" 2>/dev/null || \
         sed -i "s|^alias host-code=.*|$ALIAS_LINE|" "$ZSHRC"
@@ -246,10 +201,10 @@ echo "    - Stream terminal logs:      \033[1;32mopencode run \"...\" 2>&1 | fer
 echo ""
 
 if (( SETUP_OPENCODE )); then
-  echo ">>> OPENVCODE CLI INSTANT ACCESS:"
+  echo ">>> OPENCODE CLI INSTANT ACCESS:"
   echo "    You can now call the host model using standard commands:"
   echo "    \033[1;32mhost-code run \"Build a snake game in Python\"\033[0m"
-  echo "    (Or run bare 'opencode' commands — default model is now set to 'llm-ferry')"
+  echo "    (Or run bare 'opencode' commands — default model is now set to 'ferry')"
   echo ""
 fi
 

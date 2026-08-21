@@ -1,7 +1,9 @@
-#!/bin/zsh
-# ferry — Unified LAN AI Relay and Proxy Manager for Apple Silicon Macs.
-# Consolidates local GPU model execution, cloud API proxies, and LAN sharing.
-# Supports both Host Mode (on the Mac) and Client Mode (on connecting laptops).
+#!/usr/bin/env zsh
+# ferry — Unified LAN AI Relay and Proxy Manager (macOS + Linux).
+# Consolidates local GPU model execution (macOS / Apple Silicon only), cloud API
+# proxies, and LAN sharing. On Linux the cloud/route/client/dash/share/transfer
+# features all work; local GPU serving is macOS-only (use --route/--cloud/--model).
+# Supports both Host Mode and Client Mode (on connecting laptops).
 #
 # Usage:
 #   ferry install                # Provision dependencies, models, and global link
@@ -24,13 +26,75 @@
 set -eu
 
 APP_DIR="$(dirname "${0:A}")"
+
+# ---- OS detection & portable host helpers (macOS + Linux) ----
+case "$(uname -s)" in
+  Darwin) IS_MAC=1 ;;
+  *)      IS_MAC=0 ;;
+esac
+
+# detect_lan_ip — echo one primary, non-loopback IPv4 address for this host.
+#   macOS: parse ifconfig directly (bypasses macOS ipconfig getifaddr quirks),
+#          preferring RFC 1918 private subnets, then any non-Tailscale IP, then
+#          the first address found.
+#   Linux: ifconfig is often absent on Ubuntu — use iproute2 (`ip`), then
+#          `hostname -I`, then ifconfig as a last resort.
+detect_lan_ip() {
+  if (( IS_MAC )); then
+    # Parse all active non-loopback IPv4 addresses directly from ifconfig.
+    local ip_list=($(ifconfig 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}'))
+    if [[ ${#ip_list[@]} -gt 0 ]]; then
+      # 1. Prefer standard RFC 1918 private subnets (192.168.x.x, 10.x.x.x, 172.16-31.x)
+      for ip in "${ip_list[@]}"; do
+        if [[ "$ip" == 192.168.* || "$ip" == 10.* || "$ip" == 172.1[6-9].* || "$ip" == 172.2[0-9].* || "$ip" == 172.3[0-1].* ]]; then
+          echo "$ip"
+          return
+        fi
+      done
+      # 2. Next, prefer any IP that isn't Tailscale (starts with 100.)
+      for ip in "${ip_list[@]}"; do
+        if [[ "$ip" != 100.* ]]; then
+          echo "$ip"
+          return
+        fi
+      done
+      # 3. Fall back to first IP found (which could be Tailscale)
+      echo "${ip_list[1]}"
+      return
+    fi
+    echo "Unknown-IP"
+  else
+    # Linux: iproute2 first, then hostname -I, then ifconfig.
+    local ip
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    [[ -z "$ip" ]] && ip=$(ifconfig 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | head -1)
+    [[ -n "$ip" ]] && echo "$ip" || echo "Unknown-IP"
+  fi
+}
+
+# detect_mdns_name — this host's advertised .local name, lowercased.
+#   macOS: scutil --get LocalHostName + ".local".
+#   Linux: <hostname -s> + ".local" (avahi advertises <hostname>.local).
+#   Falls back to "localhost.local" if the short name can't be resolved.
+detect_mdns_name() {
+  local base=""
+  if (( IS_MAC )); then
+    base="$(scutil --get LocalHostName 2>/dev/null | tr 'A-Z' 'a-z')"
+  else
+    base="$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')"
+  fi
+  [[ -z "$base" ]] && base="localhost"
+  echo "${base}.local"
+}
+
 PORT="8090"
 SHARE_PORT="8095"
 HF_PORT="8096"
 PROXY_PORT="8097"
 LOCAL_MODEL="mlx-community/Qwen3.8-27B-nvfp4"
 LOCAL_DRAFT="mlx-community/Qwen3.8-27B-MTP-8bit"
-MDNS_NAME="$(scutil --get LocalHostName 2>/dev/null | tr 'A-Z' 'a-z').local"
+MDNS_NAME="$(detect_mdns_name)"
 
 # Default cloud model associations
 DEFAULT_GEMINI="gemini/gemini-3.7-flash"
@@ -39,30 +103,11 @@ DEFAULT_GEMINI="gemini/gemini-3.7-flash"
 DEFAULT_ROUTE_CONFIG="$HOME/.config/ferry/litellm.yaml"
 ROUTE_TEMPLATE="$APP_DIR/litellm-route-example.yaml"
 
-# Robust local IP discovery prioritizing standard RFC 1918 Private LAN ranges
+# Robust local IP discovery (OS-aware; see detect_lan_ip near the top of this
+# script). macOS keeps the RFC-1918-prioritizing ifconfig parse; Linux uses the
+# iproute2 path since ifconfig is often absent on Ubuntu.
 get_lan_ip() {
-  # Parse all active non-loopback IPv4 addresses directly from ifconfig (bypasses macOS ipconfig getifaddr quirks)
-  local ip_list=($(ifconfig 2>/dev/null | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}'))
-  if [[ ${#ip_list[@]} -gt 0 ]]; then
-    # 1. Prefer standard RFC 1918 private subnets (192.168.x.x, 10.x.x.x, 172.16-31.x)
-    for ip in "${ip_list[@]}"; do
-      if [[ "$ip" == 192.168.* || "$ip" == 10.* || "$ip" == 172.1[6-9].* || "$ip" == 172.2[0-9].* || "$ip" == 172.3[0-1].* ]]; then
-        echo "$ip"
-        return
-      fi
-    done
-    # 2. Next, prefer any IP that isn't Tailscale (starts with 100.)
-    for ip in "${ip_list[@]}"; do
-      if [[ "$ip" != 100.* ]]; then
-        echo "$ip"
-        return
-      fi
-    done
-    # 3. Fall back to first IP found (which could be Tailscale)
-    echo "${ip_list[1]}"
-    return
-  fi
-  echo "Unknown-IP"
+  detect_lan_ip
 }
 LAN_IP=$(get_lan_ip)
 
@@ -102,10 +147,12 @@ Usage:
   ferry <command> [options]
 
 Commands:
-  install            Install uv, mlx-vlm, litellm, models, and link globally
+  install            Install uv, litellm, and link globally (+ mlx-vlm & models on macOS)
   up                 [Host] Start local GPU server or cloud API proxy (boots Catalog by default)
   down               [Host] Stop all running servers (local, cloud, sharing)
   status             [Dual] Show server listeners, active models, and client test commands
+  dash               [Host] Live local web dashboard for the route proxy (localhost:8091)
+                       ferry dash [--open] [--port P] [--ferry URL]
   share              [Host] Expose client-bootstrap.sh over LAN for other laptops to curl
   msg <text>         [Client] Send a direct text message to host's client_logs.txt
   log                [Client] Pipe stdin log stream directly back to host
@@ -128,7 +175,7 @@ Ferrying models & files across the LAN:
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
 
 Options for 'up':
-  -l, --local        Launch local GPU model ($LOCAL_MODEL)
+  -l, --local        Launch local GPU model ($LOCAL_MODEL) [macOS / Apple Silicon only]
   -c, --cloud        Proxy to default cloud model ($DEFAULT_GEMINI)
   -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
   -r, --route        Serve MULTIPLE models from a litellm config (orchestrator + key failover)
@@ -139,6 +186,7 @@ Options for 'up':
 Examples:
   ferry up             # Starts in interactive mode to query Gemini's active catalog
   ferry up --route     # Serve orchestrator + Gemini key-failover from litellm.yaml
+  ferry dash --open    # Open the live route-proxy dashboard in your browser
   ferry status         # View connection health diagnostics
   ferry msg "hello"    # Sends telemetry message back to the host Mac
   cat err.log | ferry log  # Stream errors back to host Mac
@@ -162,9 +210,11 @@ cmd_install() {
     echo ">>> 'uv' is already installed."
   fi
 
-  # Install mlx-vlm
-  echo ">>> Installing 'mlx-vlm' via uv..."
-  uv tool install mlx-vlm --with jinja2 --force
+  # Install mlx-vlm (macOS / Apple Silicon only — this is the local GPU serving path).
+  if (( IS_MAC )); then
+    echo ">>> Installing 'mlx-vlm' via uv..."
+    uv tool install mlx-vlm --with jinja2 --force
+  fi
 
   # Install litellm for cloud proxying
   # Pin litellm + fastapi as a matched, tested set. litellm 1.97.0's proxy imports
@@ -175,28 +225,50 @@ cmd_install() {
   echo ">>> Installing 'litellm' via uv..."
   uv tool install 'litellm[proxy]==1.97.0' --with 'fastapi==0.136.3' --force
 
-  # Download models
-  echo ">>> Downloading default local models..."
-  download_model() {
-    local model_id=$1
-    if command -v hf >/dev/null 2>&1; then
-      echo "    [hf] Downloading $model_id..."
-      hf download "$model_id"
-    else
-      echo "    [huggingface-cli] Downloading $model_id..."
-      uv run huggingface-cli download "$model_id"
+  # Download default local models (macOS only — Linux has no local MLX serving).
+  if (( IS_MAC )); then
+    echo ">>> Downloading default local models..."
+    download_model() {
+      local model_id=$1
+      if command -v hf >/dev/null 2>&1; then
+        echo "    [hf] Downloading $model_id..."
+        hf download "$model_id"
+      else
+        echo "    [huggingface-cli] Downloading $model_id..."
+        uv run huggingface-cli download "$model_id"
+      fi
+    }
+    download_model "$LOCAL_MODEL"
+    download_model "$LOCAL_DRAFT"
+  else
+    echo ">>> Linux detected: skipping mlx-vlm and local model downloads."
+    echo "    Local GPU serving is macOS / Apple Silicon only. On Linux, serve via"
+    echo "    'ferry up --route' / '--cloud' / '--model <id>' against a cloud endpoint."
+    if ! command -v zsh >/dev/null 2>&1; then
+      echo ">>> NOTE: 'zsh' is not installed (ferry is a zsh script). Install it with:"
+      echo "      sudo apt install zsh"
     fi
-  }
-  download_model "$LOCAL_MODEL"
-  download_model "$LOCAL_DRAFT"
+    echo ">>> Recommended: 'avahi-daemon' so '.local' mDNS names resolve across the LAN:"
+    echo "      sudo apt install avahi-daemon"
+    echo "    'iproute2' provides the 'ip' command used for LAN IP detection:"
+    echo "      sudo apt install iproute2"
+  fi
 
-  # Link globally to ~/.local/bin/ferry
-  echo ">>> Creating global symlink in ~/.local/bin/ferry..."
+  # Link globally to ~/.local/bin/ferry (+ the ferry-dash companion)
+  echo ">>> Creating global symlinks in ~/.local/bin (ferry, ferry-dash)..."
   mkdir -p "$HOME/.local/bin"
   ln -sfn "${0:A}" "$HOME/.local/bin/ferry"
-  
+  [[ -f "$APP_DIR/ferry-dash" ]] && ln -sfn "$APP_DIR/ferry-dash" "$HOME/.local/bin/ferry-dash"
+
   echo "================================================================="
-  echo ">>> SUCCESS! 'ferry' CLI has been linked globally."
+  if (( IS_MAC )); then
+    echo ">>> SUCCESS! 'ferry' CLI has been linked globally (macOS / Apple Silicon)."
+    echo "    Local GPU serving, cloud proxy, route, dash, and LAN share are all available."
+  else
+    echo ">>> SUCCESS! 'ferry' CLI has been linked globally (Linux)."
+    echo "    Available: cloud proxy, route, dash, client wiring, LAN share/transfer."
+    echo "    Local GPU serving (--local) is macOS-only; use --route / --cloud / --model."
+  fi
   echo "    Ensure ~/.local/bin is in your PATH. Run: ferry --help"
   echo "================================================================="
 }
@@ -397,6 +469,18 @@ cmd_up() {
   local cloud_log="$LOG_DIR/cloud-proxy-$target_port.log"
 
   if [[ "$LAUNCH_MODE" == "local" ]]; then
+    # Local GPU serving is Apple MLX — macOS / Apple Silicon only. Guard every
+    # path that lands here (explicit --local, the interactive catalog, and its
+    # key-missing/offline fallbacks) so Linux never tries to exec mlx_vlm.server.
+    if (( ! IS_MAC )); then
+      echo "Error: local GPU serving uses Apple MLX (macOS / Apple Silicon only)."
+      echo "       On Linux, serve a cloud / OpenAI-compatible endpoint instead:"
+      echo "         ferry up --route        # multiple models from litellm.yaml"
+      echo "         ferry up --cloud        # default Gemini model"
+      echo "         ferry up --model <id>   # any LiteLLM model string"
+      exit 1
+    fi
+
     # Start local GPU server
     if ! command -v mlx_vlm.server >/dev/null 2>&1; then
       echo "Error: 'mlx_vlm.server' is missing. Run: ferry install"
@@ -637,9 +721,13 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 port = int(sys.argv[1])
 directory = sys.argv[2]
 
-mdns_name = subprocess.getoutput("scutil --get LocalHostName 2>/dev/null").strip().lower() + ".local"
-if not mdns_name or mdns_name == ".local":
-    mdns_name = socket.gethostname().lower()
+# macOS advertises scutil's LocalHostName; other OSes (Linux/avahi) advertise the
+# short hostname as <hostname>.local. Try scutil first, then fall back to the hostname.
+mdns_name = subprocess.getoutput("scutil --get LocalHostName 2>/dev/null").strip().lower()
+if mdns_name:
+    mdns_name += ".local"
+else:
+    mdns_name = socket.gethostname().split(".")[0].lower() + ".local"
 
 # Ferry transfer locations: the host's HuggingFace cache and the offered-files manifest.
 HF_HUB = os.path.expanduser("~/.cache/huggingface/hub")
@@ -926,7 +1014,15 @@ cmd_receive() {
   # `-d` stops nc from reading stdin — without it, a backgrounded listener whose
   # stdin has already reached EOF tears the connection down before the tar payload
   # finishes transferring (Apple nc reads stdin and closes the socket on its EOF).
-  nc -d -l "$rcv_port" | tar -x -C "$dest"
+  # openbsd-nc (the Ubuntu default) has no `-d` flag; plain `nc -l` is correct there,
+  # and ncat (nmap) is preferred when present for cross-platform consistency.
+  if (( IS_MAC )); then
+    nc -d -l "$rcv_port" | tar -x -C "$dest"
+  elif command -v ncat >/dev/null 2>&1; then
+    ncat -l "$rcv_port" | tar -x -C "$dest"
+  else
+    nc -l "$rcv_port" | tar -x -C "$dest"
+  fi
   echo ">>> Receive complete. Files are in: $dest"
 }
 
@@ -960,7 +1056,14 @@ cmd_send() {
   base="${src:t}"
   echo ">>> Sending '$base' to $client_host:$send_port via netcat (tar stream)..."
   echo "    (The client must already be running: ferry receive --port $send_port)"
-  tar -c -C "$parent" "$base" | nc "$client_host" "$send_port"
+  # macOS/BSD nc closes on its own once stdin (the tar) ends. openbsd-nc (Ubuntu)
+  # keeps the socket half-open on stdin EOF, so add `-N` to half-close and let the
+  # receiver's tar finish.
+  if (( IS_MAC )); then
+    tar -c -C "$parent" "$base" | nc "$client_host" "$send_port"
+  else
+    tar -c -C "$parent" "$base" | nc -N "$client_host" "$send_port"
+  fi
   echo ">>> Sent: $base"
 }
 
@@ -1360,6 +1463,23 @@ print(f"    Config written: {cfg_path}")
 PYEOF
 }
 
+cmd_dash() {
+  # Live local web dashboard for the route proxy (`ferry up --route`). Delegates
+  # to the sibling `ferry-dash` python script (stdlib only — runs under any
+  # python3, no venv). Pass-through args: --open, --port, --ferry, --config, --log.
+  local dash="$APP_DIR/ferry-dash"
+  [[ -f "$dash" ]] || dash="$(command -v ferry-dash || true)"
+  if [[ -z "$dash" || ! -f "$dash" ]]; then
+    echo "Error: 'ferry-dash' not found next to 'ferry' or on PATH. Re-run: ferry install"
+    exit 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: 'ferry dash' needs python3 (any version — stdlib only)."
+    exit 1
+  fi
+  exec python3 "$dash" "$@"
+}
+
 # ----------------- PARSER -----------------
 
 if [[ $# -lt 1 ]]; then
@@ -1386,6 +1506,7 @@ case "$COMMAND" in
   serve-proxy)   cmd_serve_proxy "$@" ;;
   env)           cmd_env "$@" ;;
   opencode)      cmd_opencode "$@" ;;
+  dash)          cmd_dash "$@" ;;
   --help|-h)     usage ;;
   *)             echo "Unknown command: $COMMAND"; usage ;;
 esac

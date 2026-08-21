@@ -4,8 +4,11 @@
 # clients (or localhost) get an orchestrator model plus cheaper worker models
 # with automatic key failover — all API keys staying on the host.
 #
-#   orchestrator      -> a "big" planning/driving model (example: Kimi K3)
-#   gemini-3.7-flash  -> worker model, pooled across MULTIPLE API keys
+#   orchestrator          -> a "big" planning/driving model (example: Kimi K3)
+#   orchestrator-fallback -> an INDEPENDENT model litellm reroutes to when the
+#                            orchestrator fails; chain several for depth (example:
+#                            Fireworks DeepSeek V4 Pro first, GLM 5.2 last)
+#   gemini-3.7-flash      -> worker model, pooled across MULTIPLE API keys
 #
 # Multi-key pool: the identical `gemini-3.7-flash` deployments below form one
 # pool. `usage-based-routing-v2` sends each call to the least-used key
@@ -16,6 +19,15 @@
 # adds real headroom if it lives in its OWN Google Cloud project. Two keys in
 # one project share the same quota. Add or remove deployments to match how many
 # independent-project keys you actually have.
+#
+# Orchestrator fallback (strict failover): the `orchestrator-fallback` deployment
+# is a SEPARATE model_name, reached ONLY via router_settings.fallbacks when the
+# orchestrator errors — a 429, a 5xx, or a hard quota 403. Pick a fallback whose
+# capacity is INDEPENDENT of the primary: a different provider or account.
+# (Lesson from the field: a fallback that shares a rate-limit bucket with your
+# primary — or with your own interactive use of that same account — will 429
+# exactly when you need it. A pay-per-token API like Fireworks has its own
+# capacity and only bills when the fallback actually fires.)
 #
 # First run of `ferry up --route` copies this file to ~/.config/ferry/litellm.yaml.
 # Edit THAT copy, then export the API keys it references (in your shell or
@@ -36,6 +48,23 @@ model_list:
       api_base: https://api.kimi.com/coding      # -> https://api.kimi.com/coding/v1/messages
       timeout: 600
 
+  # -- Orchestrator FALLBACK chain (example: Fireworks DeepSeek V4 Pro, GLM 5.2) --
+  # Separate model_names, NOT in any pool — reached only via the `fallbacks:`
+  # mapping below when `orchestrator` fails, in the order listed there. Fireworks
+  # is a pay-per-token API with its OWN capacity, so it never contends with the
+  # primary; billed only when a hop fires. Chain as many as you like, FAST model
+  # first and a slower/cheaper one last. Swap for any independent provider/account.
+  - model_name: orchestrator-fallback        # 1st fallback: fast
+    litellm_params:
+      model: fireworks_ai/accounts/fireworks/models/deepseek-v4-pro-0813
+      api_key: os.environ/FIREWORKS_API_KEY
+      timeout: 600
+  - model_name: orchestrator-fallback-2      # last resort: slower/cheaper
+    litellm_params:
+      model: fireworks_ai/accounts/fireworks/models/glm-5p2
+      api_key: os.environ/FIREWORKS_API_KEY
+      timeout: 600
+
   # -- Worker pool: Gemini 3.7 Flash across N keys (each in its OWN project) --
   - model_name: gemini-3.7-flash
     litellm_params:
@@ -47,12 +76,25 @@ model_list:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_2      # project #2
 
-  # Add more keys (each in its own project) for more headroom, or delete this
-  # third deployment if you only have two independent-project keys.
   - model_name: gemini-3.7-flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_3      # project #3
+  - model_name: gemini-3.7-flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+      api_key: os.environ/GEMINI_API_KEY_4      # project #4
+  - model_name: gemini-3.7-flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+      api_key: os.environ/GEMINI_API_KEY_5      # project #5
+  # Scale the pool to however many independent-project keys you have — add or
+  # delete deployments to match. Each key MUST live in its own Google Cloud
+  # project to add real headroom (Gemini quota is per-project, not per-key).
+  - model_name: gemini-3.7-flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+      api_key: os.environ/GEMINI_API_KEY_6      # project #6
 
 litellm_settings:
   num_retries: 3
@@ -60,6 +102,20 @@ litellm_settings:
 
 router_settings:
   routing_strategy: usage-based-routing-v2   # route to the least-used key (even split)
-  allowed_fails: 1                           # 1 failure (e.g. 429) cools a key out...
-  cooldown_time: 60                          # ...for 60s, so traffic rolls to another key
-  num_retries: 3
+  allowed_fails: 3                           # tolerate a few 429s before cooling a
+                                             # deployment out — matters for a SOLE fallback
+                                             # that has no sibling to roll to
+  cooldown_time: 5                           # short cooldown so a cooled deployment (a pool
+                                             # key OR the fallback) recovers fast; one 429
+                                             # can't lock out the only path for a full minute
+  num_retries: 1                             # retry a failed call once, THEN fall back.
+                                             # Keep low: if a hard-down primary returns an
+                                             # error litellm maps to a retryable class (e.g.
+                                             # a quota 403 -> APIConnectionError), a high
+                                             # num_retries adds retry-backoff latency before
+                                             # the fallback fires. 1 keeps a worker pool
+                                             # resilient to a blip without that penalty.
+  # Strict failover chain: a failed `orchestrator` reroutes to the fallback list in
+  # order (fast model first, last resort last). Only orchestrator has a fallback;
+  # the gemini-3.7-flash pool is untouched.
+  fallbacks: [{"orchestrator": ["orchestrator-fallback", "orchestrator-fallback-2"]}]

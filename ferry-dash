@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""ferry-dash — a live local dashboard for the ferry LAN AI relay.
+
+Serves an auto-refreshing web page (default http://localhost:8091) for the
+litellm route proxy that `ferry up --route` runs. It shows:
+
+  * ferry UP/DOWN + host/port + served model groups
+  * the orchestrator topology (primary + strict fallback chain) from litellm.yaml
+  * the gemini worker pool
+  * recent request activity parsed from the proxy log (rate, status, clients)
+  * an on-demand "Test backends" probe (the ONLY thing that spends tokens)
+
+Auto-refresh costs nothing: it reads the local proxy log plus litellm's
+/health/liveliness and /v1/models (no model calls). Standard library only, so
+it runs under any python3 on macOS and Linux — no venv, no pip.
+
+Usage:
+  ferry-dash                 # serve on http://localhost:8091
+  ferry-dash --open          # ...and open it in your browser
+  ferry-dash --port 9000 --ferry http://127.0.0.1:8090
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import socket
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CFG = {}                    # populated in main()
+_TOPO_CACHE = {}            # (path -> (mtime, parsed)) so we re-parse only on change
+
+
+# ── HTTP helper (talks to the ferry/litellm proxy) ─────────────────────────
+def http_json(url, key, method="GET", body=None, timeout=8):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", "Bearer %s" % key)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw, code, hdrs = r.read(), r.status, r.headers
+    except urllib.error.HTTPError as e:
+        raw, code, hdrs = e.read(), e.code, e.headers
+    except Exception as e:
+        return {"ok": False, "status": 0, "ms": int((time.monotonic() - t0) * 1000),
+                "error": str(e), "headers": {}}
+    out = {"ok": 200 <= code < 300, "status": code,
+           "ms": int((time.monotonic() - t0) * 1000),
+           "headers": {k.lower(): v for k, v in dict(hdrs).items()}}
+    try:
+        out["json"] = json.loads(raw)
+    except Exception:
+        out["text"] = raw.decode("utf-8", "replace")[:400]
+    return out
+
+
+def _short_err(r):
+    j = r.get("json") or {}
+    if isinstance(j, dict) and isinstance(j.get("error"), dict):
+        msg = j["error"].get("message", "")
+        return msg[:160] if msg else None
+    if r.get("error"):
+        return str(r["error"])[:160]
+    if r.get("text"):
+        return r["text"][:160]
+    return None
+
+
+# ── litellm.yaml topology (tiny purpose-built parser, no PyYAML dep) ────────
+def load_topology(path):
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception as e:
+        return {"error": "config unreadable: %s" % e, "groups": {}, "order": [],
+                "fallbacks": {}, "routing": {}}
+    cached = _TOPO_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    topo = {"error": None, "groups": {}, "order": [], "fallbacks": {}, "routing": {}}
+    section = None      # "models" | "router" | None
+    cur = None
+    for ln in open(path, errors="replace").read().splitlines():
+        if re.match(r"^model_list:", ln):
+            section = "models"; continue
+        if re.match(r"^router_settings:", ln):
+            section = "router"; continue
+        if re.match(r"^\w", ln):            # any other top-level key ends the section
+            section = None; continue
+        if section == "models":
+            m = re.match(r"^\s*-\s*model_name:\s*(\S+)", ln)
+            if m:
+                cur = m.group(1)
+                g = topo["groups"].setdefault(cur, {"count": 0, "models": []})
+                g["count"] += 1
+                if cur not in topo["order"]:
+                    topo["order"].append(cur)
+                continue
+            m = re.match(r"^\s*model:\s*(\S+)", ln)
+            if m and cur:
+                topo["groups"][cur]["models"].append(m.group(1))
+        elif section == "router":
+            m = re.match(r"^\s*fallbacks:\s*(.+)$", ln)
+            if m:
+                try:
+                    for d in json.loads(m.group(1)):
+                        topo["fallbacks"].update(d)
+                except Exception:
+                    pass
+                continue
+            m = re.match(r"^\s*(routing_strategy|allowed_fails|cooldown_time|num_retries):\s*(\S+)", ln)
+            if m:
+                topo["routing"][m.group(1)] = m.group(2)
+    _TOPO_CACHE[path] = (mtime, topo)
+    return topo
+
+
+# ── proxy-log activity tail ────────────────────────────────────────────────
+class Activity:
+    # uvicorn access line: `INFO: 1.2.3.4:5678 - "POST /v1/chat/completions HTTP/1.1" 200 OK`
+    ACCESS = re.compile(r'(\d+\.\d+\.\d+\.\d+):\d+ - "(\w+) (\S+) [^"]*" (\d+)')
+
+    def __init__(self, logpath):
+        self.logpath = logpath
+        self.lock = threading.Lock()
+        self.total = 0
+        self.by_status = {}
+        self.by_client = {}
+        self.buckets = []           # per-poll counts -> sparkline of req/interval
+        self.last_event = None
+        self.started = time.time()
+        try:                        # start at EOF: measure activity from dash launch
+            self.offset = os.path.getsize(logpath) if logpath else 0
+        except Exception:
+            self.offset = 0
+
+    def poll(self):
+        if not self.logpath or not os.path.exists(self.logpath):
+            return
+        try:
+            size = os.path.getsize(self.logpath)
+            if size < self.offset:          # log truncated/rotated (ferry restart)
+                self.offset = 0
+            with open(self.logpath, "r", errors="replace") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+                self.offset = f.tell()
+        except Exception:
+            return
+        new = 0
+        with self.lock:
+            for line in chunk.splitlines():
+                m = self.ACCESS.search(line)
+                if m:
+                    ip, _method, path, status = m.groups()
+                    # count only real inference; skip the dash's own /models + /health polls
+                    if path.startswith("/v1/chat/completions"):
+                        self.total += 1
+                        new += 1
+                        self.by_status[status] = self.by_status.get(status, 0) + 1
+                        self.by_client[ip] = self.by_client.get(ip, 0) + 1
+                low = line.lower()
+                if "permission_error" in low and "usage limit" in low:
+                    self.last_event = {"kind": "kimi_quota",
+                                       "text": "Kimi K3 quota exhausted (403) — falling back",
+                                       "t": time.time()}
+                elif "rate_limit" in low or "ratelimiterror" in low:
+                    self.last_event = {"kind": "rate_limit",
+                                       "text": "a backend returned 429 (rate limit)",
+                                       "t": time.time()}
+            self.buckets.append(new)
+            self.buckets = self.buckets[-40:]
+
+    def snapshot(self):
+        with self.lock:
+            clients = sorted(self.by_client.items(), key=lambda kv: -kv[1])[:6]
+            return {
+                "total": self.total,
+                "by_status": dict(self.by_status),
+                "by_client": clients,
+                "spark": self.buckets[-30:],
+                "last_event": self.last_event,
+                "since": self.started,
+                "log": self.logpath,
+            }
+
+
+# ── status assembly (all cheap: readiness + models + local log) ────────────
+def get_status():
+    ferry, key = CFG["ferry"], CFG["key"]
+    live = http_json(ferry + "/health/liveliness", key, timeout=4)
+    up = live.get("ok", False)
+    models = []
+    if up:
+        m = http_json(ferry + "/v1/models", key, timeout=4)
+        if m.get("ok"):
+            models = [x["id"] for x in m.get("json", {}).get("data", [])]
+    CFG["activity"].poll()
+    return {
+        "ts": time.time(),
+        "ferry": {"up": up, "base": ferry, "host": CFG["host"], "port": CFG["ferry_port"]},
+        "models": models,
+        "topology": load_topology(CFG["config_path"]),
+        "activity": CFG["activity"].snapshot(),
+        "config_path": CFG["config_path"],
+    }
+
+
+def probe_backends():
+    ferry, key = CFG["ferry"], CFG["key"]
+    out = {}
+    for label, model in (("orchestrator", "orchestrator"), ("gemini-3.7-flash", "gemini-3.7-flash")):
+        r = http_json(ferry + "/v1/chat/completions", key, "POST",
+                      {"model": model, "messages": [{"role": "user", "content": "ping"}],
+                       "max_tokens": 4}, timeout=60)
+        out[label] = {
+            "ok": r.get("ok"), "status": r.get("status"), "ms": r.get("ms"),
+            "served_by": (r.get("headers", {}) or {}).get("x-litellm-model-name"),
+            "error": None if r.get("ok") else _short_err(r),
+        }
+    return out
+
+
+# ── HTTP server ────────────────────────────────────────────────────────────
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, body, ctype):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        if self.path.split("?")[0] == "/":
+            self._send(200, PAGE, "text/html; charset=utf-8")
+        elif self.path.startswith("/status"):
+            self._send(200, json.dumps(get_status()), "application/json")
+        elif self.path.startswith("/probe"):
+            self._send(200, json.dumps(probe_backends()), "application/json")
+        else:
+            self._send(404, "not found", "text/plain")
+
+    def log_message(self, *a):        # silence per-request stderr spam
+        pass
+
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ferry dash</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
+    --green:#3fb950; --red:#f85149; --amber:#d29922; --blue:#58a6ff; --accent:#1f6feb;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f6f8fa; --panel:#fff; --line:#d0d7de; --fg:#1f2328; --dim:#656d76;
+           --green:#1a7f37; --red:#cf222e; --amber:#9a6700; --blue:#0969da; --accent:#0969da; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+         padding:14px 20px;border-bottom:1px solid var(--line);background:var(--panel)}
+  header h1{font-size:16px;letter-spacing:.14em;margin:0;font-weight:700}
+  .pill{padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700}
+  .pill.up{background:color-mix(in srgb,var(--green) 22%,transparent);color:var(--green)}
+  .pill.down{background:color-mix(in srgb,var(--red) 22%,transparent);color:var(--red)}
+  .muted{color:var(--dim)}
+  .grow{flex:1}
+  main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px 20px;max-width:1080px}
+  @media (max-width:760px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card h2{margin:0 0 10px;font-size:11px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
+  .row{display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px dashed var(--line)}
+  .row:first-of-type{border-top:0}
+  .dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--dim)}
+  .dot.green{background:var(--green)} .dot.red{background:var(--red)}
+  .dot.amber{background:var(--amber)} .dot.blue{background:var(--blue)}
+  .name{font-weight:600}
+  .sub{color:var(--dim);font-size:12px}
+  .tag{margin-left:auto;font-size:11px;color:var(--dim);white-space:nowrap}
+  .tag.active{color:var(--green);font-weight:700}
+  .tag.bad{color:var(--red);font-weight:700}
+  .step{color:var(--dim);width:16px;text-align:right;flex:none}
+  .stats{display:flex;gap:18px;flex-wrap:wrap;margin-bottom:8px}
+  .stat b{font-size:20px;font-weight:700} .stat span{color:var(--dim);font-size:11px;display:block}
+  .spark{display:flex;align-items:flex-end;gap:2px;height:34px;margin:8px 0}
+  .spark i{flex:1;background:var(--blue);min-height:2px;border-radius:1px;opacity:.85}
+  .codes{display:flex;gap:6px;flex-wrap:wrap}
+  .code{padding:1px 8px;border-radius:6px;font-size:12px;border:1px solid var(--line)}
+  .code.ok{color:var(--green)} .code.warn{color:var(--amber)} .code.err{color:var(--red)}
+  .event{margin-top:10px;padding:8px 10px;border-radius:8px;font-size:12px;
+         background:color-mix(in srgb,var(--amber) 16%,transparent);color:var(--amber)}
+  button{font:inherit;cursor:pointer;background:var(--accent);color:#fff;border:0;
+         border-radius:8px;padding:7px 14px;font-weight:700}
+  button:disabled{opacity:.55;cursor:progress}
+  .full{grid-column:1/-1}
+  footer{padding:6px 20px 22px;color:var(--dim);font-size:11px}
+  a{color:var(--blue)}
+</style></head><body>
+<header>
+  <h1>FERRY</h1>
+  <span id="host" class="muted"></span>
+  <span id="uppill" class="pill down">…</span>
+  <span class="grow"></span>
+  <span id="updated" class="muted"></span>
+</header>
+<main>
+  <section class="card" id="orch"><h2>Orchestrator</h2><div id="orchbody" class="muted">loading…</div></section>
+  <section class="card" id="work"><h2>Workers</h2><div id="workbody" class="muted">loading…</div></section>
+  <section class="card full" id="act"><h2>Recent activity <span class="muted" id="since"></span></h2>
+    <div class="stats" id="stats"></div>
+    <div class="spark" id="spark"></div>
+    <div class="codes" id="codes"></div>
+    <div id="clients" class="sub" style="margin-top:8px"></div>
+    <div id="event"></div>
+  </section>
+  <section class="card full" id="probe">
+    <h2>Backends</h2>
+    <button id="testbtn">Test backends</button>
+    <span class="muted" style="margin-left:10px">actively calls each backend (spends a few tokens)</span>
+    <div id="probebody" style="margin-top:10px"></div>
+  </section>
+</main>
+<footer id="foot"></footer>
+<script>
+const $=s=>document.querySelector(s);
+const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;};
+const shortModel=m=>m?String(m).split('/').pop():'—';
+let PROBE={};
+
+function dotFor(state){return {up:'green',down:'red',active:'green',standby:'amber',bad:'red'}[state]||'';}
+
+function renderOrch(st){
+  const t=st.topology||{}, groups=t.groups||{}, fb=(t.fallbacks||{}).orchestrator||[];
+  const ev=(st.activity||{}).last_event;
+  const box=$('#orchbody'); box.innerHTML=''; box.className='';
+  // primary
+  const pg=groups.orchestrator||{models:[]};
+  let pstate='blue', ptag='primary';
+  if(ev && ev.kind==='kimi_quota'){pstate='red';ptag='quota-exhausted (403)';}
+  const pr=PROBE.orchestrator;
+  if(pr && pr.served_by){ const served=shortModel(pr.served_by);
+    if((pg.models[0]||'').includes(served)){pstate='green';ptag='serving ('+pr.ms+'ms)';}
+    else{pstate='red';ptag='down → '+served;} }
+  box.appendChild(mkRow('', 'Kimi K3  ·  '+shortModel(pg.models[0]||'orchestrator'), 'primary', pstate, ptag));
+  // fallback chain
+  fb.forEach((g,i)=>{
+    const gg=groups[g]||{models:[]}; const served=pr&&pr.served_by?shortModel(pr.served_by):null;
+    let state='amber', tag=(i===fb.length-1?'last resort':'standby');
+    if(served && (gg.models[0]||'').includes(served)){state='green';tag='ACTIVE · serving ('+pr.ms+'ms)';}
+    box.appendChild(mkRow(String(i+1), shortModel(gg.models[0]||g), g, state, tag));
+  });
+  if(t.error) box.appendChild(el('div','sub',t.error));
+}
+function mkRow(step,name,sub,state,tag){
+  const r=el('div','row');
+  r.appendChild(el('span','step',step||''));
+  r.appendChild(el('span','dot '+dotFor(state)));
+  const c=el('div'); c.appendChild(el('div','name',name)); if(sub)c.appendChild(el('div','sub',sub)); r.appendChild(c);
+  r.appendChild(el('span','tag'+(state==='green'?' active':state==='red'?' bad':''),tag||''));
+  return r;
+}
+function renderWork(st){
+  const t=st.topology||{}, groups=t.groups||{};
+  const box=$('#workbody'); box.innerHTML=''; box.className='';
+  Object.keys(groups).filter(g=>!g.startsWith('orchestrator')).forEach(g=>{
+    const gg=groups[g]; const pr=PROBE[g];
+    let state='blue', tag=gg.count>1?gg.count+' keys · pool':'1 key';
+    if(pr){ state=pr.ok?'green':'red'; tag=(pr.ok?'healthy ('+pr.ms+'ms)':'error '+(pr.status||''))+' · '+(gg.count+' keys'); }
+    box.appendChild(mkRow('', g, shortModel(gg.models[0]||''), state, tag));
+    if(gg.count>1){ const d=el('div','sub'); d.style.marginLeft='35px';
+      d.textContent='● '.repeat(gg.count).trim()+'  ('+t.routing.routing_strategy+', cooldown '+t.routing.cooldown_time+'s)'; box.appendChild(d); }
+  });
+}
+function renderAct(st){
+  const a=st.activity||{};
+  $('#since').textContent='· since dash start';
+  const s=$('#stats'); s.innerHTML='';
+  const mk=(b,l)=>{const d=el('div','stat');d.appendChild(el('b',null,b));d.appendChild(el('span',null,l));return d;};
+  const codes=a.by_status||{}; const tot=a.total||0;
+  const ok=Object.entries(codes).filter(([k])=>k[0]==='2').reduce((n,[,v])=>n+v,0);
+  s.appendChild(mk(String(tot),'inference requests'));
+  s.appendChild(mk(tot?Math.round(100*ok/tot)+'%':'—','success (2xx)'));
+  s.appendChild(mk(String((a.by_client||[]).length),'clients'));
+  const spark=$('#spark'); spark.innerHTML='';
+  const arr=a.spark||[], mx=Math.max(1,...arr);
+  (arr.length?arr:[0]).forEach(v=>{const i=el('i');i.style.height=(6+94*v/mx)+'%';i.title=v+' req/5s';spark.appendChild(i);});
+  const cc=$('#codes'); cc.innerHTML='';
+  Object.entries(codes).sort().forEach(([k,v])=>{
+    const cls=k[0]==='2'?'ok':k[0]==='4'?'warn':'err';
+    cc.appendChild(el('span','code '+cls,k+': '+v));
+  });
+  if(!Object.keys(codes).length) cc.appendChild(el('span','sub','no inference requests since dash start'));
+  const cl=$('#clients');
+  cl.textContent=(a.by_client||[]).length? 'clients — '+a.by_client.map(([ip,n])=>ip+' ('+n+')').join('   ') : '';
+  const eb=$('#event'); eb.innerHTML='';
+  if(a.last_event){ const secs=Math.round(Date.now()/1000-a.last_event.t);
+    eb.appendChild(el('div','event','⚠ '+a.last_event.text+'  ·  '+secs+'s ago')); }
+}
+async function tick(){
+  try{
+    const st=await (await fetch('/status')).json();
+    const f=st.ferry;
+    $('#host').innerHTML='<span class="muted">'+f.host+':'+f.port+'</span> &nbsp; '+
+      '<span class="muted">groups:</span> '+(st.models||[]).map(m=>'<code>'+m+'</code>').join(' ');
+    const pill=$('#uppill'); pill.className='pill '+(f.up?'up':'down'); pill.textContent=f.up?'● UP':'● DOWN';
+    $('#updated').textContent='updated '+new Date(st.ts*1000).toLocaleTimeString();
+    $('#foot').innerHTML='config <code>'+st.config_path+'</code> &nbsp;·&nbsp; log <code>'+((st.activity||{}).log||'—')+'</code> &nbsp;·&nbsp; auto-refresh 5s (no tokens)';
+    renderOrch(st); renderWork(st); renderAct(st);
+  }catch(e){ $('#uppill').className='pill down'; $('#uppill').textContent='● dash error'; }
+}
+$('#testbtn').onclick=async()=>{
+  const b=$('#testbtn'); b.disabled=true; b.textContent='probing…';
+  const pb=$('#probebody'); pb.innerHTML='';
+  try{
+    PROBE=await (await fetch('/probe')).json();
+    Object.entries(PROBE).forEach(([k,v])=>{
+      const line=el('div','row');
+      line.appendChild(el('span','dot '+(v.ok?'green':'red')));
+      const c=el('div'); c.appendChild(el('div','name',k));
+      c.appendChild(el('div','sub', v.ok? ('→ '+shortModel(v.served_by)+' · '+v.ms+'ms · HTTP '+v.status)
+                                        : ('HTTP '+v.status+' · '+(v.error||'failed')) ));
+      line.appendChild(c); pb.appendChild(line);
+    });
+    tick();  // re-render topology with the fresh per-hop truth
+  }catch(e){ pb.textContent='probe failed: '+e; }
+  b.disabled=false; b.textContent='Test backends';
+};
+tick(); setInterval(tick, 5000);
+</script>
+</body></html>
+"""
+
+
+def find_log(port):
+    tmp = tempfile.gettempdir()
+    cands = [os.path.join(tmp, "ferry-logs", "cloud-proxy-%s.log" % port)]
+    # Linux: TMPDIR is usually unset, so ferry writes to /tmp/ferry-logs.
+    cands.append(os.path.join("/tmp", "ferry-logs", "cloud-proxy-%s.log" % port))
+    # macOS: ferry's $TMPDIR lives under /var/folders/.../T.
+    cands += glob.glob("/var/folders/*/*/T/ferry-logs/cloud-proxy-%s.log" % port)
+    cands += glob.glob(os.path.join(tmp, "ferry-logs", "cloud-proxy-*.log"))
+    cands += glob.glob("/tmp/ferry-logs/cloud-proxy-*.log")
+    existing = [c for c in cands if os.path.exists(c)]
+    return max(existing, key=os.path.getmtime) if existing else None
+
+
+def lan_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Live local dashboard for the ferry route proxy.")
+    ap.add_argument("--port", type=int, default=8091, help="dashboard port (default 8091)")
+    ap.add_argument("--ferry", default="http://127.0.0.1:8090", help="ferry/litellm base URL")
+    ap.add_argument("--config", default=os.path.expanduser("~/.config/ferry/litellm.yaml"))
+    ap.add_argument("--log", default=None, help="proxy log path (auto-discovered if omitted)")
+    ap.add_argument("--key", default="local", help="proxy auth bearer (default 'local')")
+    ap.add_argument("--open", action="store_true", help="open the dashboard in a browser")
+    args = ap.parse_args()
+
+    ferry_port = args.ferry.rsplit(":", 1)[-1].split("/")[0]
+    logpath = args.log or find_log(ferry_port)
+    CFG.update(ferry=args.ferry.rstrip("/"), key=args.key, config_path=args.config,
+               host=lan_ip(), ferry_port=ferry_port, activity=Activity(logpath))
+
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError as e:
+        raise SystemExit("ferry-dash: cannot bind 127.0.0.1:%d (%s). Try --port." % (args.port, e))
+    url = "http://localhost:%d" % args.port
+    print("ferry-dash → %s   (ferry %s, log %s)" % (url, CFG["ferry"], logpath or "not found"))
+    print("Ctrl-C to stop.")
+    if args.open:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nferry-dash stopped.")
+
+
+if __name__ == "__main__":
+    main()

@@ -29,6 +29,17 @@
 
 This table is about **focus**, not "better." Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a great cloud gateway. `llm-ferry` is the glue for a specific job: **sharing one Mac's local + cloud models across a LAN**, plus the client-onboarding and file/model ferrying that job needs.
 
+## Platform support
+
+`ferry` and `ferry-dash` run on **macOS and Linux/Ubuntu**.
+
+| Platform | Local MLX serving | Cloud proxy · route · dash · client wiring · LAN share/transfer |
+|---|:---:|:---:|
+| **macOS (Apple Silicon)** | ✓ | ✓ |
+| **Linux / Ubuntu** | — (macOS only) | ✓ |
+
+**Local GPU serving (`ferry up --local`) uses Apple MLX and is macOS / Apple Silicon only.** On Linux, serve models with `--route`, `--cloud`, or `--model <id>` against a cloud / OpenAI-compatible endpoint instead. `ferry install` on Ubuntu skips MLX and the model downloads — it installs `uv` + `litellm` and links the CLI — and may prompt you to `apt install zsh` (ferry is a zsh script), and recommends `avahi-daemon` (so `.local` mDNS names resolve) and `iproute2` (for the `ip` command used in LAN IP detection).
+
 ## Quickstart
 
 ### Host (your Apple Silicon Mac)
@@ -74,25 +85,36 @@ ferry msg "note"                 # send a quick note to the host's log
 some-command 2>&1 | ferry log    # stream logs/errors back to the host
 ```
 
-### Route mode — one orchestrator + worker failover
+### Route mode — orchestrator (+ fallback) + worker failover
 
-`ferry up -c/-l/-m` serves **one** model. `ferry up --route` serves **multiple** models from one endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs): a big **orchestrator** model plus cheaper **worker** models, with automatic **key failover** on the worker — all API keys staying on the host.
+`ferry up -c/-l/-m` serves **one** model. `ferry up --route` serves **multiple** models from one endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs): a big **orchestrator** model (with a strict **fallback** to an independent model) plus cheaper **worker** models (with automatic **key failover**) — all API keys staying on the host.
 
 ```bash
 ferry up --route     # serve orchestrator + gemini-3.7-flash from ~/.config/ferry/litellm.yaml
 ```
 
-The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and stops so you can edit it — set your model ids and export the keys it references (`KIMI_API_KEY`, `GEMINI_API_KEY`, `GEMINI_API_KEY_2`, `GEMINI_API_KEY_3`, in your shell or `~/.config/ferry/secrets.env`) — then re-run. The worker failover is simply **several identical `gemini-3.7-flash` deployments** in the yaml: `usage-based-routing-v2` sends each call to the least-used key (proactive even split), and on a `429` it cools the dead key out and rolls traffic to another. **Gemini quota is per-GCP-project, not per-key** — so each key only adds real headroom if it lives in its own Google Cloud project.
+The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and stops so you can edit it — set your model ids and export the keys it references (`KIMI_API_KEY`, `GEMINI_API_KEY`, `GEMINI_API_KEY_2` … `GEMINI_API_KEY_6`, `FIREWORKS_API_KEY`, in your shell or `~/.config/ferry/secrets.env`) — then re-run. The worker failover is simply **several identical `gemini-3.7-flash` deployments** in the yaml: `usage-based-routing-v2` sends each call to the least-used key (proactive even split), and on a `429` it cools the dead key out and rolls traffic to another. **Gemini quota is per-GCP-project, not per-key** — so each key only adds real headroom if it lives in its own Google Cloud project.
+
+The **orchestrator** gets a *strict* fallback **chain** the same way: `orchestrator-fallback` deployments (example: **Fireworks DeepSeek V4 Pro** first, **GLM 5.2** as last resort, via `FIREWORKS_API_KEY`) that `router_settings.fallbacks` reroutes to **in order, only** when the orchestrator errors — a `429`, a `5xx`, or a hard quota `403`. Choose fallbacks whose capacity is **independent** of the primary (a different provider or account): one that shares a rate-limit bucket with your primary — or with your own interactive use of that same account — will `429` exactly when you need it. A pay-per-token API like Fireworks has its own capacity and bills only when a hop actually fires. Put the fast model first, and keep `num_retries` low so a hard-down primary falls through quickly instead of burning retry-backoff first.
 
 Note that LiteLLM only **routes and fails over** — the "orchestrator delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to `orchestrator` and the subagent model to `gemini-3.7-flash`.
 
 On a client, `ferry opencode` auto-wires opencode to the host — it detects the served models (setting up the `orchestrator` + `gemini-3.7-flash` split when both are present), merges non-destructively into your existing config, and backs up the old one first. `ferry opencode` also pins opencode's built-in agents — `build`/`plan` to the orchestrator, and the `general`/`explore`/`scout` subagents to the worker model — so the fan-out actually uses the cheap lane.
+
+### Dashboard — `ferry dash`
+
+```bash
+ferry dash --open        # live web dashboard at http://localhost:8091
+```
+
+A live local dashboard for the route proxy — no browser polling of the LAN, it runs on the host. It shows ferry up/down, the served model groups, the **orchestrator topology read from your `litellm.yaml`** (primary → the `fallbacks` chain), the worker pool, and **recent request activity parsed from the proxy log** (rate, status breakdown, per-client, a sparkline). **Auto-refresh costs nothing** — it only reads the local log plus `/health/liveliness` and `/v1/models`. A **"Test backends"** button is the only thing that spends tokens: it actively pings each backend and reports *which fallback hop actually served* + latency. Pure Python **standard library**, so it runs under any `python3` — no venv, no pip. (Also available standalone as `ferry-dash`.)
 
 ## Ports
 
 | Port | Purpose | Started by |
 |---|---|---|
 | **8090** | Inference / completions (local model **or** cloud proxy) | `ferry up` |
+| **8091** | Live route-proxy dashboard (localhost only) | `ferry dash` |
 | **8095** | LAN share server — serves the client bootstrap, model/file ferry routes, and receives client telemetry | `ferry share` |
 | **8096** | HuggingFace pass-through proxy (experimental) | `ferry serve-hf` |
 | **8097** | General HTTP(S) download forward proxy | `ferry serve-proxy` |

@@ -10,3 +10,9 @@ __pycache__/
 
 # Ignore inbound client HQ telemetry (runtime data, written by `ferry share` /hq endpoint)
 client_logs.txt
+
+# Ignore local route config (personal model ids/endpoints); use litellm-route-example.yaml as the template
+litellm.yaml
+
+# Ignore editor/agent scratch + worktrees
+.claude/

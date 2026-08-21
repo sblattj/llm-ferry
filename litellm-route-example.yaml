@@ -1,0 +1,53 @@
+# litellm-route-example.yaml — template for `ferry up --route`
+# ---------------------------------------------------------------------------
+# Serves MULTIPLE models on one OpenAI/Anthropic-compatible endpoint so LAN
+# clients (or localhost) get an orchestrator model plus cheaper worker models
+# with automatic key failover — all API keys staying on the host.
+#
+#   orchestrator      -> a "big" planning/driving model (example: Kimi K3)
+#   gemini-3.7-flash  -> worker model, AUTO-FAILOVER across two API keys
+#
+# The two-key failover is just the two identical `gemini-3.7-flash` deployments
+# below: litellm's router load-balances them and, on a 429/error, cools the
+# dead key out for `cooldown_time` and routes to the other. No client logic.
+#
+# First run of `ferry up --route` copies this file to ~/.config/ferry/litellm.yaml.
+# Edit THAT copy, then export the API keys it references (in your shell or
+# ~/.config/ferry/secrets.env). Never commit real keys.
+#
+# Launch:  ferry up --route            # uses ~/.config/ferry/litellm.yaml
+# ---------------------------------------------------------------------------
+
+model_list:
+  # -- Orchestrator (example: Kimi K3, an Anthropic-compatible endpoint) -----
+  # Swap for any provider. For an Anthropic-format base, litellm appends
+  # /v1/messages to api_base. For a plain OpenAI provider, drop api_base and use
+  # e.g. `model: openai/<id>` with api_key: os.environ/OPENAI_API_KEY.
+  - model_name: orchestrator
+    litellm_params:
+      model: anthropic/k3-256k
+      api_key: os.environ/KIMI_API_KEY
+      api_base: https://api.kimi.com/coding      # -> https://api.kimi.com/coding/v1/messages
+      timeout: 600
+
+  # -- Worker: Gemini 3.7 Flash -- PRIMARY key ------------------------------
+  - model_name: gemini-3.7-flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # -- Worker: Gemini 3.7 Flash -- SECOND key (automatic failover) ----------
+  - model_name: gemini-3.7-flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+      api_key: os.environ/GEMINI_API_KEY_2
+
+litellm_settings:
+  num_retries: 3
+  request_timeout: 600
+
+router_settings:
+  routing_strategy: simple-shuffle   # spread load across both worker keys
+  allowed_fails: 1                   # 1 failure (e.g. 429) cools a key out...
+  cooldown_time: 60                  # ...for 60s, so traffic rolls to the other
+  num_retries: 3

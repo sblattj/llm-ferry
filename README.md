@@ -74,6 +74,20 @@ ferry msg "note"                 # send a quick note to the host's log
 some-command 2>&1 | ferry log    # stream logs/errors back to the host
 ```
 
+### Route mode — one orchestrator + worker failover
+
+`ferry up -c/-l/-m` serves **one** model. `ferry up --route` serves **multiple** models from one endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs): a big **orchestrator** model plus cheaper **worker** models, with automatic **key failover** on the worker — all API keys staying on the host.
+
+```bash
+ferry up --route     # serve orchestrator + gemini-3.7-flash from ~/.config/ferry/litellm.yaml
+```
+
+The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and stops so you can edit it — set your model ids and export the keys it references (`KIMI_API_KEY`, `GEMINI_API_KEY`, `GEMINI_API_KEY_2`, in your shell or `~/.config/ferry/secrets.env`) — then re-run. The two-key failover is simply **two identical `gemini-3.7-flash` deployments** in the yaml: LiteLLM's router load-balances them and, on a `429`, cools the dead key out and rolls traffic to the second.
+
+Note that LiteLLM only **routes and fails over** — the "orchestrator delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to `orchestrator` and the subagent model to `gemini-3.7-flash`.
+
+On a client, `ferry opencode` auto-wires opencode to the host — it detects the served models (setting up the `orchestrator` + `gemini-3.7-flash` split when both are present), merges non-destructively into your existing config, and backs up the old one first.
+
 ## Ports
 
 | Port | Purpose | Started by |
@@ -171,7 +185,7 @@ Local mode serves an MLX model via `mlx-vlm`. The default (`mlx-community/Qwen3.
 | Command | Mode | What it does |
 |---|---|---|
 | `install` | host | Install `uv`, `mlx-vlm`, `litellm`, download default models, link `ferry` globally |
-| `up [-l\|-c\|-m <id>\|-i] [-p <port>]` | host | Start the local GPU server or cloud proxy on `8090` (no args → interactive catalog) |
+| `up [-l\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | Start the local GPU server, cloud proxy, or multi-model route config on `8090` (no args → interactive catalog; `-r`/`--route` → route mode) |
 | `down` | host | Stop all servers, cloud proxies, and share/proxy servers |
 | `status` | both | Host: listeners + active model. Client: connection health + host's active model |
 | `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`) |

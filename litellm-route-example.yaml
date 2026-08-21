@@ -5,11 +5,17 @@
 # with automatic key failover — all API keys staying on the host.
 #
 #   orchestrator      -> a "big" planning/driving model (example: Kimi K3)
-#   gemini-3.7-flash  -> worker model, AUTO-FAILOVER across two API keys
+#   gemini-3.7-flash  -> worker model, pooled across MULTIPLE API keys
 #
-# The two-key failover is just the two identical `gemini-3.7-flash` deployments
-# below: litellm's router load-balances them and, on a 429/error, cools the
-# dead key out for `cooldown_time` and routes to the other. No client logic.
+# Multi-key pool: the identical `gemini-3.7-flash` deployments below form one
+# pool. `usage-based-routing-v2` sends each call to the least-used key
+# (proactive even split); on a 429/error litellm retries on another key and
+# cools the failed one out for `cooldown_time`.
+#
+# IMPORTANT: Gemini quota is per-GCP-PROJECT, not per-key — so each key only
+# adds real headroom if it lives in its OWN Google Cloud project. Two keys in
+# one project share the same quota. Add or remove deployments to match how many
+# independent-project keys you actually have.
 #
 # First run of `ferry up --route` copies this file to ~/.config/ferry/litellm.yaml.
 # Edit THAT copy, then export the API keys it references (in your shell or
@@ -30,24 +36,30 @@ model_list:
       api_base: https://api.kimi.com/coding      # -> https://api.kimi.com/coding/v1/messages
       timeout: 600
 
-  # -- Worker: Gemini 3.7 Flash -- PRIMARY key ------------------------------
+  # -- Worker pool: Gemini 3.7 Flash across N keys (each in its OWN project) --
   - model_name: gemini-3.7-flash
     litellm_params:
       model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY
+      api_key: os.environ/GEMINI_API_KEY        # project #1
 
-  # -- Worker: Gemini 3.7 Flash -- SECOND key (automatic failover) ----------
   - model_name: gemini-3.7-flash
     litellm_params:
       model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY_2
+      api_key: os.environ/GEMINI_API_KEY_2      # project #2
+
+  # Add more keys (each in its own project) for more headroom, or delete this
+  # third deployment if you only have two independent-project keys.
+  - model_name: gemini-3.7-flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+      api_key: os.environ/GEMINI_API_KEY_3      # project #3
 
 litellm_settings:
   num_retries: 3
   request_timeout: 600
 
 router_settings:
-  routing_strategy: simple-shuffle   # spread load across both worker keys
-  allowed_fails: 1                   # 1 failure (e.g. 429) cools a key out...
-  cooldown_time: 60                  # ...for 60s, so traffic rolls to the other
+  routing_strategy: usage-based-routing-v2   # route to the least-used key (even split)
+  allowed_fails: 1                           # 1 failure (e.g. 429) cools a key out...
+  cooldown_time: 60                          # ...for 60s, so traffic rolls to another key
   num_retries: 3

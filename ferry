@@ -1336,6 +1336,15 @@ if set_default:
     cfg["model"] = f"ferry/{main}"
     if small:
         cfg["small_model"] = f"ferry/{small}"
+    # Pin opencode's built-in agents so the fan-out uses the cheap worker:
+    #   primary build/plan -> orchestrator (main); subagents general/explore/scout -> worker (small).
+    # setdefault preserves any existing per-agent prompt/permissions; we only set model.
+    agents = cfg.setdefault("agent", {})
+    for a in ("build", "plan"):
+        agents.setdefault(a, {})["model"] = f"ferry/{main}"
+    if small:
+        for a in ("general", "explore", "scout"):
+            agents.setdefault(a, {})["model"] = f"ferry/{small}"
 
 os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
 json.dump(cfg, open(cfg_path, "w"), indent=2)
@@ -1345,6 +1354,8 @@ print(f"    Provider: ferry   Served models: {', '.join(served) if served else '
 print(f"    Default model:       ferry/{main}")
 if set_default and small:
     print(f"    Default small_model: ferry/{small}")
+if set_default:
+    print(f"    Pinned agents:       build/plan -> ferry/{main}" + (f"; general/explore/scout -> ferry/{small}" if small else ""))
 print(f"    Config written: {cfg_path}")
 PYEOF
 }

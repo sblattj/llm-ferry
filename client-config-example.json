@@ -12,6 +12,13 @@
     },
     "model": "ferry/orchestrator",
     "small_model": "ferry/gemini-3.7-flash",
+    "agent": {
+      "build":   { "model": "ferry/orchestrator" },
+      "plan":    { "model": "ferry/orchestrator" },
+      "general": { "model": "ferry/gemini-3.7-flash" },
+      "explore": { "model": "ferry/gemini-3.7-flash" },
+      "scout":   { "model": "ferry/gemini-3.7-flash" }
+    },
     "_tip": "Or just run `ferry opencode` on the client to write this automatically."
   },
 

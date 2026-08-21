@@ -14,5 +14,6 @@ client_logs.txt
 # Ignore local route config (personal model ids/endpoints); use litellm-route-example.yaml as the template
 litellm.yaml
 
-# Ignore editor/agent scratch + worktrees
-.claude/
+# Ignore editor/agent scratch + worktrees, but DO ship the bundled Claude Code skills
+.claude/*
+!.claude/skills/

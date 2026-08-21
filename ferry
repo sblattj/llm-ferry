@@ -1,4 +1,8 @@
 #!/usr/bin/env zsh
+# ============================================================================
+# GENERATED FILE — DO NOT EDIT. Assembled from lib/ferry-*.zsh by build.zsh.
+# Edit the modules under lib/ and run ./build.zsh to regenerate this file.
+# ============================================================================
 # ferry — Unified LAN AI Relay and Proxy Manager (macOS + Linux).
 # Consolidates local GPU model execution (macOS / Apple Silicon only), cloud API
 # proxies, and LAN sharing. On Linux the cloud/route/client/dash/share/transfer

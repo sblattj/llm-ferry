@@ -97,6 +97,8 @@ The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.
 
 The **orchestrator** gets a *strict* fallback **chain** the same way: `orchestrator-fallback` deployments (example: **Fireworks DeepSeek V4 Pro** first, **GLM 5.2** as last resort, via `FIREWORKS_API_KEY`) that `router_settings.fallbacks` reroutes to **in order, only** when the orchestrator errors — a `429`, a `5xx`, or a hard quota `403`. Choose fallbacks whose capacity is **independent** of the primary (a different provider or account): one that shares a rate-limit bucket with your primary — or with your own interactive use of that same account — will `429` exactly when you need it. A pay-per-token API like Fireworks has its own capacity and bills only when a hop actually fires. Put the fast model first, and keep `num_retries` low so a hard-down primary falls through quickly instead of burning retry-backoff first.
 
+**Adding models with Claude Code:** this repo bundles two skills — [`add-fallback-orchestrator`](.claude/skills/add-fallback-orchestrator/SKILL.md) and [`add-worker-model`](.claude/skills/add-worker-model/SKILL.md) — that walk Claude through editing your `litellm.yaml` correctly: the strict-failover-chain vs. load-balanced-pool distinction, the independent-capacity rule for fallbacks, and the per-project-quota gotcha for worker keys. In this repo, just ask Claude Code to "add a fallback orchestrator" or "add another Gemini worker key."
+
 Note that LiteLLM only **routes and fails over** — the "orchestrator delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to `orchestrator` and the subagent model to `gemini-3.7-flash`.
 
 On a client, `ferry opencode` auto-wires opencode to the host — it detects the served models (setting up the `orchestrator` + `gemini-3.7-flash` split when both are present), merges non-destructively into your existing config, and backs up the old one first. `ferry opencode` also pins opencode's built-in agents — `build`/`plan` to the orchestrator, and the `general`/`explore`/`scout` subagents to the worker model — so the fan-out actually uses the cheap lane.
@@ -210,6 +212,7 @@ Local mode serves an MLX model via `mlx-vlm`. The default (`mlx-community/Qwen3.
 | `up [-l\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | Start the local GPU server, cloud proxy, or multi-model route config on `8090` (no args → interactive catalog; `-r`/`--route` → route mode) |
 | `down` | host | Stop all servers, cloud proxies, and share/proxy servers |
 | `status` | both | Host: listeners + active model. Client: connection health + host's active model |
+| `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (also standalone `ferry-dash`) |
 | `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`) |
 | `msg <text>` | client | Send a text note to the host's `client_logs.txt` |
 | `log` | client | Pipe stdin straight to the host's `client_logs.txt` |
@@ -221,8 +224,20 @@ Local mode serves an MLX model via `mlx-vlm`. The default (`mlx-community/Qwen3.
 | `serve-hf [--port P]` | host | Start the experimental HuggingFace pass-through proxy (default `8096`) |
 | `serve-proxy [--port P]` | host | Start the general HTTP(S) download forward proxy (default `8097`) |
 | `env [--host H] [--proxy-port P] [--hf-port P2] [--write]` | client | Emit shell exports so this laptop routes downloads via the host proxy |
+| `opencode [--host H] [--port P] [--model M] [--small-model SM] [--config PATH] [--no-default]` | client | Auto-wire opencode to the host endpoint (detects served models; pins agent lanes) |
 
 Run `ferry --help` for the built-in usage banner.
+
+## Development
+
+`ferry` is assembled from per-domain modules so the ~1500-line CLI isn't one file to reason about. Source lives in [`lib/`](lib/): `ferry-core` (bootstrap, LAN/mDNS discovery, config, secrets), `ferry-usage`, `ferry-install`, `ferry-serve` (up/down/status/catalog), `ferry-share`, `ferry-transfer` (pull/get/send/receive/offer), `ferry-proxy` (serve-hf/serve-proxy), `ferry-integrate` (env/opencode), `ferry-dash`, and `ferry-main` (dispatch). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules and regenerate:
+
+```bash
+./build.zsh            # regenerate ./ferry from lib/ferry-*.zsh
+./build.zsh --check    # CI / pre-commit: fails if ferry has drifted from lib/
+```
+
+Commit both `lib/` and the regenerated `ferry`; don't hand-edit `ferry` (the sync guard will flag it).
 
 ## License
 

@@ -1,6 +1,6 @@
 # ferry observability stack
 
-A local, on-demand **Grafana OSS + VictoriaMetrics** dashboard stack for **llm-ferry**
+A local, on-demand **Grafana OSS + VictoriaMetrics + VictoriaLogs** dashboard stack for **llm-ferry**
 (the LAN LLM relay). $0 (all OSS), localhost-only, up/down on demand. It coexists with the
 g0vs1g desk stack on the same Mac by using distinct ports and a distinct data dir.
 
@@ -8,8 +8,9 @@ g0vs1g desk stack on the same Mac by using distinct ports and a distinct data di
 |---|---|---|
 | ferry-metrics-exporter | **9092** | `/metrics` + `/healthz` (python3 stdlib, nohup daemon) |
 | VictoriaMetrics (ferry) | **8429** | TSDB + promscrape; `/health`, `/api/v1/query` |
+| VictoriaLogs (ferry) | **9428** | log storage + LogsQL; python3 stdlib shipper tails the proxy log |
 | Grafana (ferry) | **3001** | UI; login `admin` / `ferry-observ` |
-| litellm proxy (existing) | 8090 | native `/metrics` scraped **opt-in** (off by default) |
+| litellm proxy (existing) | 8090 | native `/metrics` scraped **on by default** (see "Enable litellm-native metrics") |
 
 ## Architecture
 
@@ -18,16 +19,22 @@ g0vs1g desk stack on the same Mac by using distinct ports and a distinct data di
   (cloud-proxy-8090) │
   litellm /health/liveliness ─┤
   litellm /v1/models          ├──▶ ferry-metrics-exporter :9092 ──▶ VictoriaMetrics :8429 ──▶ Grafana :3001
-  ~/.config/ferry/litellm.yaml ┘         (emits ferry_* series)          (TSDB, 15s scrape)      (3 dashboards)
+  ~/.config/ferry/litellm.yaml ┘         (emits ferry_* series)          (TSDB, 15s scrape)      (5 dashboards)
                                                                               ▲
                               litellm :8090/metrics ─────────────────────────┘
-                              (OPT-IN; off by default — see "Enable litellm-native metrics")
+                              (ON by default — see "Enable litellm-native metrics")
+
+  proxy access log ──▶ ferry-log-shipper ──▶ VictoriaLogs :9428 ──▶ Grafana :3001
+  (cloud-proxy-8090)    (python3 stdlib,        (LogsQL)              (victoriametrics-logs-datasource)
+                          tails + ships)
 ```
 
 The exporter derives every `ferry_*` series from three zero-disruption sources: the proxy
 access log (traffic counters), litellm `/health/liveliness` + `/v1/models` (health/serving),
 and `~/.config/ferry/litellm.yaml` (topology). It does **not** depend on litellm's native
-`/metrics` (404 until you opt in).
+`/metrics`. Separately, ferry-log-shipper tails the same proxy access log and ships raw log
+lines to VictoriaLogs so Grafana can search/filter per-model request logs and surface errors
+and fallback events — independent of both the exporter and litellm's `/metrics`.
 
 ## Quickstart
 
@@ -49,7 +56,9 @@ e.g. `tailscale serve --bg --https=3443 http://127.0.0.1:3001`, or launch Grafan
 |---|---|
 | **ferry-overview** | Up/serving status, models served, health-check latency, request rate, error rate — the at-a-glance page. |
 | **ferry-traffic** | Per-client-IP × HTTP-status request volume, RPS, error rate, backend events (kimi_quota / rate_limit). |
-| **ferry-backends** | Topology (worker-pool size, deployments, fallback-chain length, config mtime) + an OPT-IN "LLM internals" row fed by litellm-native metrics. |
+| **ferry-backends** | Topology (worker-pool size, deployments, fallback-chain length, config mtime) + an "LLM internals" row fed by litellm-native metrics + a **"Failures & Fallbacks"** row (failures by model/reason, cooldowns, fallbacks fired). |
+| **ferry-models** | Per-model request rate, tokens, spend, latency, success/failure — from litellm-native metrics. |
+| **ferry-logs** | Searchable per-model proxy logs from VictoriaLogs; errors & fallbacks view. |
 
 ## Halt
 
@@ -88,27 +97,41 @@ traffic counters (`ferry_requests_total`, `ferry_backend_events_total`, …), an
 `ferry_route_config_mtime_seconds`). CONTRACT.md is the single source of truth for the exact
 names, labels, and semantics that dashboards and alerts consume.
 
-## Enable litellm-native metrics (optional)
+## Enable litellm-native metrics (on by default)
 
-The **ferry-backends** dashboard's "LLM internals" row shows request-latency histograms,
-token counts, per-deployment success/failure, and spend — sourced directly from litellm's
-own `/metrics` endpoint, **not** from our exporter. It is off by default (litellm's
-`/metrics` returns 404 until the prometheus callback is enabled). To light it up:
+The **ferry-backends** "LLM internals"/"Failures & Fallbacks" rows and the **ferry-models**
+dashboard show request-latency histograms, token counts, per-deployment success/failure,
+spend, and fallback events — sourced directly from litellm's own `/metrics` endpoint, **not**
+from our exporter. `litellm-route-example.yaml` ships with the prometheus callback already
+set, and `ferry install` bundles the `prometheus_client` dep it needs, so this works
+**out of the box** for any route config seeded from the template:
 
-1. Add the prometheus callback under `litellm_settings:` in `~/.config/ferry/litellm.yaml`:
-   ```yaml
-   litellm_settings:
-     callbacks: ["prometheus"]
-   ```
-2. Restart the proxy so it picks up the config:
-   ```bash
-   ferry down && ferry up --route
-   ```
+```yaml
+litellm_settings:
+  callbacks: ["prometheus"]
+```
 
-VictoriaMetrics already scrapes `127.0.0.1:8090/metrics` (the `litellm` job in
-`observ/victoriametrics/scrape.yml`), so once the callback is on, the LLM-internals panels
-begin populating on the next 15s scrape — no observ-stack restart needed.
+VictoriaMetrics scrapes `127.0.0.1:8090/metrics` (the `litellm` job in
+`observ/victoriametrics/scrape.yml`), so the LLM-internals and ferry-models panels populate
+on the next 15s scrape — no observ-stack restart needed.
+
+To **disable** it (e.g. to shed the extra `/metrics` overhead), remove the `callbacks` line
+from `~/.config/ferry/litellm.yaml` and restart the proxy:
+
+```bash
+ferry down && ferry up --route
+```
+
+With it off, `litellm:8090/metrics` 404s again and the `litellm_*`-fed panels go blank; the
+`ferry_*` panels never depend on any of this — they keep working regardless.
 
 > Note: some litellm builds gate parts of the prometheus exporter behind their enterprise
-> tier, so a subset of `litellm_*` metrics may still be absent. The `ferry_*` panels never
-> depend on any of this — they keep working regardless.
+> tier, so a subset of `litellm_*` metrics may still be absent.
+
+## Log search — VictoriaLogs
+
+The **ferry-logs** dashboard and the logs panel in **ferry-backends** are backed by
+**VictoriaLogs** (`:9428`), populated by a small python3-stdlib shipper (`ferry-log-shipper`)
+that tails the proxy access log and ships each line. Grafana reaches it via the
+**`victoriametrics-logs-datasource`** plugin, auto-installed at bringup through
+`GF_INSTALL_PLUGINS` — no manual plugin install step required.

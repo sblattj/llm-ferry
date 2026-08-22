@@ -1,0 +1,31 @@
+# ferry observability stack — Grafana datasource provisioning (apiVersion 1)
+# Grafana 13.2.0. This file is COMMITTED and materialized AS-IS (no envsubst token) into a
+# runtime copy by observ/bringup.sh (-> ~/.config/ferry/observ/grafana-provisioning/). See
+# "url" below for why this one carries a literal URL instead of a ${TOKEN}, unlike ferry-vm.yml.
+apiVersion: 1
+
+# Re-provisioning idempotency: delete any prior "Ferry Logs" datasource (by name) before the
+# `datasources` list below is (re)applied, so repeated bringup runs never accumulate duplicates.
+deleteDatasources:
+  - name: Ferry Logs
+    orgId: 1
+
+datasources:
+  - name: Ferry Logs
+    # Requires the victoriametrics-logs-datasource Grafana plugin (installed at boot via
+    # GF_INSTALL_PLUGINS — see observ/bringup.sh's VictoriaLogs section).
+    type: victoriametrics-logs-datasource
+    # Fixed contract, same idea as ferry-vm's "ferry-vm" uid: every logs panel targets
+    # {"type":"victoriametrics-logs-datasource","uid":"ferry-vlogs"}. This uid MUST NOT change.
+    uid: ferry-vlogs
+    access: proxy
+    # VictoriaLogs' port (9428) is fixed by contract (observ/CONTRACT.md / observ/bringup.sh's
+    # port map) and isn't expected to move host-to-host the way VM_URL can, so this is a literal
+    # URL rather than an envsubst token: bringup.sh's envsubst pass today only expands
+    # ${VM_URL} ${FERRY_ALERT_WEBHOOK} ${GF_SECURITY_ADMIN_USER}, and adding a ${VLOGS_URL}
+    # token would require a bringup.sh change outside this file's ownership.
+    url: http://127.0.0.1:9428
+    orgId: 1
+    isDefault: false
+    editable: true
+    jsonData: {}

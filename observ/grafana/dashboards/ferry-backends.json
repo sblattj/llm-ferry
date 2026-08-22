@@ -26,7 +26,7 @@
       "gridPos": { "x": 0, "y": 0, "w": 24, "h": 3 },
       "options": {
         "mode": "markdown",
-        "content": "## Ferry Backends & Keys\nLitellm proxy topology (`~/.config/ferry/litellm.yaml`) and the Gemini key pool — deployments, fallback chain, config freshness — from `ferry-metrics-exporter`, scraped by VictoriaMetrics every ~15s. **The LLM-internals row below requires litellm's native prometheus callback** (`callbacks: [\"prometheus\"]` in litellm.yaml, off by default) and shows No data until it's enabled — see `observ/README.md`."
+        "content": "## Ferry Backends & Keys\nLitellm proxy topology (`~/.config/ferry/litellm.yaml`) and the Gemini key pool — deployments, fallback chain, config freshness — from `ferry-metrics-exporter`, scraped by VictoriaMetrics every ~15s. The **LLM internals** and **Failures & Fallbacks** rows below read litellm's own `/metrics` (`litellm_*`): the prometheus callback is **on by default now**, so they populate within one scrape of the first request — see `observ/README.md`. Per-model usage lives on the **Ferry — Models** dashboard."
       }
     },
     {
@@ -238,7 +238,7 @@
     {
       "id": 6,
       "type": "row",
-      "title": "LLM internals — requires litellm prometheus (see observ/README.md)",
+      "title": "LLM internals — litellm-native (prometheus callback, on by default)",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "collapsed": false,
       "gridPos": { "x": 0, "y": 19, "w": 24, "h": 1 },
@@ -252,14 +252,14 @@
       "gridPos": { "x": 0, "y": 20, "w": 24, "h": 3 },
       "options": {
         "mode": "markdown",
-        "content": "**Opt-in — off by default.** The four panels below read litellm's own `/metrics` endpoint (`http://127.0.0.1:8090/metrics`), which is **404 until litellm's prometheus callback is enabled**. They will show **No data** until you set `callbacks: [\"prometheus\"]` in `~/.config/ferry/litellm.yaml` and restart (`ferry down && ferry up --route`). Metric names below are best-effort for litellm 1.97.0 and may need adjustment for the version actually running — see `observ/README.md`."
+        "content": "**On by default.** The four panels below read litellm's own `/metrics` endpoint (`http://127.0.0.1:8090/metrics`), which ferry now enables out of the box (`callbacks: [\"prometheus\"]` in `~/.config/ferry/litellm.yaml`). Metric names are verified against **litellm 1.97.0** — counters carry the `_total` suffix. **No data** here means either no traffic in the selected range, or the callback was removed from litellm.yaml (re-add it and `ferry down && ferry up --route`) — see `observ/README.md`."
       }
     },
     {
       "id": 8,
       "type": "timeseries",
       "title": "Request latency p50/p95",
-      "description": "OPT-IN (litellm-native, requires callbacks:[\"prometheus\"]). histogram_quantile over litellm_request_total_latency_metric_bucket — this exact bucket-metric name is best-effort for litellm 1.97.0 and may need adjustment per the litellm version actually running.",
+      "description": "litellm-native. histogram_quantile over litellm_request_total_latency_metric_bucket, aggregated across all models. Per-model p50/p95 is on the Ferry — Models dashboard.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 0, "y": 23, "w": 12, "h": 8 },
       "fieldConfig": {
@@ -325,7 +325,7 @@
       "id": 9,
       "type": "timeseries",
       "title": "Tokens/min",
-      "description": "OPT-IN (litellm-native, requires callbacks:[\"prometheus\"]). litellm_total_tokens_metric is best-effort for litellm 1.97.0 — the closest token-count metric may differ per the version actually running.",
+      "description": "litellm-native. sum(rate(litellm_total_tokens_metric_total[1m])) * 60 — total tokens/min across all models. Per-model token throughput is on the Ferry — Models dashboard.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 12, "y": 23, "w": 12, "h": 8 },
       "fieldConfig": {
@@ -367,7 +367,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum(rate(litellm_total_tokens_metric[1m])) * 60",
+          "expr": "sum(rate(litellm_total_tokens_metric_total[1m])) * 60",
           "legendFormat": "Tokens/min",
           "instant": false
         }
@@ -377,7 +377,7 @@
       "id": 10,
       "type": "table",
       "title": "Per-deployment success/failure",
-      "description": "OPT-IN (litellm-native, requires callbacks:[\"prometheus\"]). litellm_deployment_success_responses + litellm_deployment_failure_responses, joined by deployment label.",
+      "description": "litellm-native. increase(litellm_deployment_success_responses_total[$__range]) and the matching failure counter, summed by litellm_model_name and joined into one row per deployment over the selected range.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 0, "y": 31, "w": 16, "h": 8 },
       "fieldConfig": {
@@ -444,30 +444,45 @@
         "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" }
       },
       "transformations": [
-        { "id": "labelsToFields", "options": {} },
         { "id": "merge", "options": {} },
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "Time 1": true },
-            "renameByName": { "Successes": "Successes", "Failures": "Failures" }
+            "excludeByName": {
+              "Time": true,
+              "Time 1": true,
+              "__name__": true,
+              "__name__ 1": true,
+              "instance": true,
+              "instance 1": true,
+              "job": true,
+              "job 1": true
+            },
+            "indexByName": { "litellm_model_name": 0, "Value": 1, "Value 1": 2 },
+            "renameByName": { "litellm_model_name": "Model", "Value": "Successes", "Value 1": "Failures" }
           }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "Failures", "desc": true }] }
         }
       ],
       "targets": [
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "litellm_deployment_success_responses",
-          "legendFormat": "Successes",
-          "instant": true
+          "expr": "sum by (litellm_model_name) (increase(litellm_deployment_success_responses_total[$__range]))",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
         },
         {
           "refId": "B",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "litellm_deployment_failure_responses",
-          "legendFormat": "Failures",
-          "instant": true
+          "expr": "sum by (litellm_model_name) (increase(litellm_deployment_failure_responses_total[$__range]))",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
         }
       ]
     },
@@ -475,7 +490,7 @@
       "id": 11,
       "type": "stat",
       "title": "Spend",
-      "description": "OPT-IN (litellm-native, requires callbacks:[\"prometheus\"]). litellm_spend_metric.",
+      "description": "litellm-native. sum(litellm_spend_metric_total) — cumulative USD spend litellm has attributed since the proxy started. Per-model spend over a chosen range is on the Ferry — Models dashboard.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 16, "y": 31, "w": 8, "h": 8 },
       "fieldConfig": {
@@ -502,9 +517,384 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "litellm_spend_metric",
+          "expr": "sum(litellm_spend_metric_total)",
           "legendFormat": "Spend",
           "instant": true
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "row",
+      "title": "Failures & Fallbacks — litellm-native (prometheus callback, on by default)",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 39, "w": 24, "h": 1 },
+      "panels": []
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "Failures by model + reason (selected range)",
+      "description": "sum by (litellm_model_name, exception_class, exception_status)(increase(litellm_deployment_failure_responses_total[$__range])) — which deployment failed, with the litellm exception class and HTTP status that caused it (e.g. RateLimitError / 429).",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 40, "w": 14, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#d03b3b", "value": null }]
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Failures" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "#0ca30c", "value": null },
+                    { "color": "#fab219", "value": 1 },
+                    { "color": "#d03b3b", "value": 5 }
+                  ]
+                }
+              },
+              { "id": "custom.width", "value": 110 }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "HTTP status" },
+            "properties": [{ "id": "custom.width", "value": 120 }]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": true, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
+            "indexByName": { "litellm_model_name": 0, "exception_class": 1, "exception_status": 2, "Value": 3 },
+            "renameByName": {
+              "litellm_model_name": "Model",
+              "exception_class": "Exception",
+              "exception_status": "HTTP status",
+              "Value": "Failures"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "Failures", "desc": true }] }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (litellm_model_name, exception_class, exception_status) (increase(litellm_deployment_failure_responses_total[$__range]))",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Failure rate by model",
+      "description": "sum by (litellm_model_name)(rate(litellm_deployment_failure_responses_total[$__rate_interval])) — when each deployment started erroring. Flat zero is healthy; a step up is the moment a backend went bad and fallbacks began firing (see the fallback tables below).",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 14, "y": 40, "w": 10, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "decimals": 3,
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 20,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": { "mode": "none", "group": "A" },
+            "axisPlacement": "auto",
+            "axisLabel": "failures/s",
+            "scaleDistribution": { "type": "linear" },
+            "hideFrom": { "tooltip": false, "viz": false, "legend": false },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#d03b3b", "value": null }]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (litellm_model_name) (rate(litellm_deployment_failure_responses_total[$__rate_interval]))",
+          "legendFormat": "{{litellm_model_name}}",
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "type": "table",
+      "title": "Deployment cooldowns (selected range)",
+      "description": "sum by (litellm_model_name, exception_status)(increase(litellm_deployment_cooled_down_total[$__range])) — how many times litellm's router pulled a deployment out of rotation, and the status that tripped it (429 = quota/rate limit).",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 49, "w": 8, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#eb6834", "value": null }]
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Cooldowns" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "#0ca30c", "value": null },
+                    { "color": "#fab219", "value": 1 },
+                    { "color": "#eb6834", "value": 5 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": true, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
+            "indexByName": { "litellm_model_name": 0, "exception_status": 1, "Value": 2 },
+            "renameByName": {
+              "litellm_model_name": "Model",
+              "exception_status": "HTTP status",
+              "Value": "Cooldowns"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "Cooldowns", "desc": true }] }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (litellm_model_name, exception_status) (increase(litellm_deployment_cooled_down_total[$__range]))",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Fallbacks fired — successful (selected range)",
+      "description": "THE \"watch fallbacks kick in\" panel. sum by (requested_model, fallback_model, exception_class)(increase(litellm_deployment_successful_fallbacks_total[$__range])) — the client asked for `requested_model` (e.g. orchestrator), the primary threw `exception_class`, and `fallback_model` served the call successfully. Rows here mean the chain saved the request. Empty is normal: litellm only creates this counter the first time a fallback actually fires.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 8, "y": 49, "w": 8, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#0ca30c", "value": null }]
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Fallbacks" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [{ "color": "#0ca30c", "value": null }]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": true, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
+            "indexByName": { "requested_model": 0, "fallback_model": 1, "exception_class": 2, "Value": 3 },
+            "renameByName": {
+              "requested_model": "Requested",
+              "fallback_model": "Fell back to",
+              "exception_class": "Trigger",
+              "Value": "Fallbacks"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "Fallbacks", "desc": true }] }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (requested_model, fallback_model, exception_class) (increase(litellm_deployment_successful_fallbacks_total[$__range]))",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "table",
+      "title": "Fallbacks fired — failed (selected range)",
+      "description": "sum by (requested_model, fallback_model, exception_class)(increase(litellm_deployment_failed_fallbacks_total[$__range])) — the fallback hop itself failed, so the client saw an error. Any row here is a real outage for that request; empty is the healthy state (litellm only creates this counter the first time a fallback hop fails).",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 16, "y": 49, "w": 8, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#d03b3b", "value": null }]
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Failed fallbacks" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "#0ca30c", "value": null },
+                    { "color": "#d03b3b", "value": 1 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": true, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
+            "indexByName": { "requested_model": 0, "fallback_model": 1, "exception_class": 2, "Value": 3 },
+            "renameByName": {
+              "requested_model": "Requested",
+              "fallback_model": "Fell back to",
+              "exception_class": "Trigger",
+              "Value": "Failed fallbacks"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "Failed fallbacks", "desc": true }] }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (requested_model, fallback_model, exception_class) (increase(litellm_deployment_failed_fallbacks_total[$__range]))",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
         }
       ]
     }

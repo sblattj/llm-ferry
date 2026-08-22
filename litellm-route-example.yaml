@@ -65,6 +65,21 @@ model_list:
       api_key: os.environ/FIREWORKS_API_KEY
       timeout: 600
 
+  # -- Alternative fallback: a ChatGPT SUBSCRIPTION (not pay-per-token) ---------
+  # litellm's native `chatgpt/` provider routes to chatgpt.com/backend-api/codex
+  # via a device-code login at ~/.config/litellm/chatgpt/auth.json (NOT
+  # OPENAI_API_KEY, which is pay-per-token). The `responses/` segment scopes the
+  # chat->responses bridge. NOTE (litellm 1.97.0): STREAMING-ONLY — a streamed
+  # /v1/chat/completions works (opencode streams), but a non-streamed call 500s
+  # with "Unknown items in responses API response: []" and just rolls to the next
+  # fallback. gpt-5.6-sol / gpt-5.4 work; codex-* ids are rejected for ChatGPT accounts.
+  # - model_name: orchestrator-fallback
+  #   litellm_params:
+  #     model: chatgpt/responses/gpt-5.6-sol
+  #     api_key: "chatgpt-oauth"     # placeholder; provider reads auth.json
+  #     reasoning_effort: max
+  #     timeout: 600
+
   # -- Worker pool: Gemini 3.7 Flash across N keys (each in its OWN project) --
   - model_name: gemini-3.7-flash
     litellm_params:
@@ -97,6 +112,10 @@ model_list:
       api_key: os.environ/GEMINI_API_KEY_6      # project #6
 
 litellm_settings:
+  # Exposes litellm-native /metrics on :8090 (per-model usage, per-deployment
+  # success/failure, fallback events) for the Grafana stack. Requires the
+  # `prometheus_client` dep (bundled by `ferry install`).
+  callbacks: ["prometheus"]
   num_retries: 3
   request_timeout: 600
 

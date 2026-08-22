@@ -1,0 +1,235 @@
+{
+  "title": "Ferry — Logs",
+  "uid": "ferry-logs",
+  "tags": ["llm-ferry", "logs"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 0,
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "templating": {
+    "list": [
+      {
+        "name": "model",
+        "label": "Model",
+        "description": "Backend model the proxy actually dispatched to (the `model` log field). Multi-select; All matches every log line via LogsQL `in(*)`.",
+        "type": "custom",
+        "query": "glm-5.3,gemini-3.7-flash,deepseek-v4-pro-0813,glm-5p2,gpt-5.6-sol,k3-256k",
+        "options": [
+          { "selected": false, "text": "glm-5.3", "value": "glm-5.3" },
+          { "selected": false, "text": "gemini-3.7-flash", "value": "gemini-3.7-flash" },
+          { "selected": false, "text": "deepseek-v4-pro-0813", "value": "deepseek-v4-pro-0813" },
+          { "selected": false, "text": "glm-5p2", "value": "glm-5p2" },
+          { "selected": false, "text": "gpt-5.6-sol", "value": "gpt-5.6-sol" },
+          { "selected": false, "text": "k3-256k", "value": "k3-256k" }
+        ],
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "hide": 0,
+        "skipUrlSync": false
+      },
+      {
+        "name": "level",
+        "label": "Level",
+        "description": "Log level shipped by ferry-log-shipper (`level` field). Multi-select; All matches every log line via LogsQL `in(*)`.",
+        "type": "custom",
+        "query": "info,warn,error",
+        "options": [
+          { "selected": false, "text": "info", "value": "info" },
+          { "selected": false, "text": "warn", "value": "warn" },
+          { "selected": false, "text": "error", "value": "error" }
+        ],
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "hide": 0,
+        "skipUrlSync": false
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "links": [],
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "### Ferry — Logs\nPer-model proxy logs for the **llm-ferry** LAN LLM relay — filter the live tail by backend `model` and `level`, and watch errors/fallbacks land in real time. Logs from VictoriaLogs via `ferry-log-shipper`; adjust LogsQL filters as needed.\n\nFields: `_msg` `_time` `source` `level` `status` `model` `requested_model` `client_ip`. Query language: **LogsQL**. Datasource: `victoriametrics-logs-datasource` (uid `ferry-vlogs`, VictoriaLogs :9428)."
+      },
+      "transparent": true
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Log volume by level",
+      "description": "LogsQL stats over the panel range: `source:proxy | stats by (level) count() as logs`. Uses the plugin's `Range` query type (/select/logsql/stats_query_range).",
+      "gridPos": { "h": 6, "w": 18, "x": 0, "y": 3 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+      "targets": [
+        {
+          "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+          "refId": "A",
+          "editorMode": "code",
+          "queryType": "statsRange",
+          "expr": "source:proxy | stats by (level) count() as logs",
+          "legendFormat": "{{level}}",
+          "step": "$__interval"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 5,
+            "gradientMode": "none",
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#2a78d6", "value": null }]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*error.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#d03b3b" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*warn.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#fab219" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*info.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#2a78d6" } }]
+          }
+        ]
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Errors in window",
+      "description": "LogsQL instant stats: `level:error | stats count() as errors`. Uses the plugin's `Instant` query type (/select/logsql/stats_query).",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 3 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+      "targets": [
+        {
+          "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+          "refId": "A",
+          "editorMode": "code",
+          "queryType": "stats",
+          "expr": "level:error | stats count() as errors"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#0ca30c", "value": null },
+              { "color": "#fab219", "value": 1 },
+              { "color": "#d03b3b", "value": 10 }
+            ]
+          },
+          "color": { "mode": "thresholds" },
+          "noValue": "0"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "logs",
+      "title": "Proxy logs — model: $model · level: $level",
+      "description": "Live tail of the litellm proxy log, filtered by the Model and Level variables. LogsQL: `source:proxy AND model:in($model) AND level:in($level)` — the plugin expands a multi-value variable to `in(\"a\",\"b\")` and the All option to `in(*)`, which matches every log line.",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 9 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+      "targets": [
+        {
+          "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+          "refId": "A",
+          "editorMode": "code",
+          "queryType": "instant",
+          "expr": "source:proxy AND model:in($model) AND level:in($level)",
+          "direction": "desc",
+          "maxLines": 1000
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "logs",
+      "title": "Errors & fallbacks",
+      "description": "Unfiltered by the Model/Level variables on purpose — every error line plus any fallback hop or Gemini RESOURCE_EXHAUSTED quota trip, from any source. LogsQL: `level:error OR _msg:~\"[Ff]allback\" OR _msg:~\"RESOURCE_EXHAUSTED\"`.",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 21 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+      "targets": [
+        {
+          "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+          "refId": "A",
+          "editorMode": "code",
+          "queryType": "instant",
+          "expr": "level:error OR _msg:~\"[Ff]allback\" OR _msg:~\"RESOURCE_EXHAUSTED\"",
+          "direction": "desc",
+          "maxLines": 500
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "showLabels": false,
+        "showCommonLabels": false,
+        "wrapLogMessage": true,
+        "prettifyLogMessage": false,
+        "enableLogDetails": true,
+        "dedupStrategy": "none",
+        "sortOrder": "Descending"
+      },
+      "fieldConfig": { "defaults": {}, "overrides": [] }
+    }
+  ]
+}

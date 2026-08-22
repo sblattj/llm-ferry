@@ -85,6 +85,33 @@ router_settings:
   fallbacks: [{"orchestrator": ["orchestrator-fallback", "orchestrator-fallback-2"]}]
 ```
 
+## ChatGPT subscription as a fallback (litellm `chatgpt/` provider)
+
+Unlike a Claude subscription token (Anthropic gates those to Claude Code — see step 1), a
+**ChatGPT Plus/Pro subscription** CAN back a fallback, via litellm's native `chatgpt/`
+provider (it talks to `chatgpt.com/backend-api/codex`, the Responses API Codex uses).
+
+1. **Log in once (device code).** litellm ships a ChatGPT authenticator that writes a token
+   to `~/.config/litellm/chatgpt/auth.json`. Auth is THAT file, NOT `OPENAI_API_KEY` (which
+   is pay-per-token OpenAI billing on a different bucket). The deployment's `api_key` is a
+   required-but-ignored placeholder.
+2. **Deployment shape** — the `responses/` segment scopes litellm's chat→responses bridge:
+   ```yaml
+     - model_name: orchestrator-chatgpt
+       litellm_params:
+         model: chatgpt/responses/gpt-5.6-sol   # gpt-5.6-sol / gpt-5.4 work; codex-* ids are rejected
+         api_key: "chatgpt-oauth"               # placeholder; provider reads auth.json
+         reasoning_effort: max                  # backend accepts "max"
+         timeout: 600
+   ```
+3. **STREAMING-ONLY (litellm 1.97.0).** The Codex backend always streams and litellm only
+   reassembles the reply on the STREAMING path. A STREAMED `/v1/chat/completions` returns 200
+   (opencode + every agentic client streams — the real path). A NON-STREAMED call hits a
+   litellm bridge bug (`ChatgptException - Unknown items in responses API response: []`, HTTP
+   500). That is benign in a fallback chain — a non-streaming caller that reaches this hop
+   just rolls on to the next fallback. Don't make it the sole/last hop if non-streaming
+   callers must succeed there, and don't chase the 500 as a config error.
+
 ## Router tuning for fallbacks
 ```yaml
 router_settings:

@@ -2,13 +2,15 @@
 # =============================================================================
 # ferry observability stack — teardown.
 #
-# Stops everything bringup.sh started: the VictoriaMetrics, ferry-metrics-exporter,
-# and Grafana nohup daemons (by PID file, with a port fallback). Idempotent — safe
-# to run when nothing is up.
+# Stops everything bringup.sh started: the VictoriaMetrics, VictoriaLogs,
+# ferry-metrics-exporter, ferry-log-shipper, and Grafana nohup daemons (by PID file,
+# with a port fallback for the ones that listen). Idempotent — safe to run when
+# nothing is up.
 #
 # Usage:  bash observ/teardown.sh [--purge]
 #           --purge   ALSO delete the runtime state dir (~/.config/ferry/observ:
-#                     VictoriaMetrics TSDB, Grafana DB, materialized provisioning, logs).
+#                     VictoriaMetrics TSDB, VictoriaLogs store, Grafana DB,
+#                     materialized provisioning, logs).
 #                     Without it, data is left in place for the next bringup.
 #
 # Contract: observ/CONTRACT.md. Owned by the "bringup" seat.
@@ -60,11 +62,15 @@ kill_port() { # $1 = port, $2 = human name
 
 kill_pidfile "$STATE/grafana.pid"  "Grafana"
 kill_pidfile "$STATE/exporter.pid" "ferry-metrics-exporter"
+# The shipper is a pusher — it listens on nothing, so its PID file is the ONLY handle.
+kill_pidfile "$STATE/shipper.pid"  "ferry-log-shipper"
 kill_pidfile "$STATE/vm.pid"       "VictoriaMetrics"
-# Port fallback for anything the PID files missed.
+kill_pidfile "$STATE/vlogs.pid"    "VictoriaLogs"
+# Port fallback for anything the PID files missed (listeners only — not the shipper).
 kill_port 3001 "Grafana"
 kill_port 9092 "ferry-metrics-exporter"
 kill_port 8429 "VictoriaMetrics"
+kill_port 9428 "VictoriaLogs"
 
 # ----------------------------------------------------------------------------- state
 if [[ "$PURGE" -eq 1 ]]; then

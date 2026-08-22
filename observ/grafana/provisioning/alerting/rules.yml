@@ -11,9 +11,14 @@
 # Series labels (e.g. `client`, `status`, `kind`) flow through B and C unchanged, so a query that
 # returns multiple series fires one alert instance per breaching series/label combination.
 #
-# None of the 7 rules below need the `>= bool` / `> bool` PromQL workaround (Grafana's classic
+# None of the 9 rules below need the `>= bool` / `> bool` PromQL workaround (Grafana's classic
 # threshold evaluator has no native gte/lte) — every threshold here is a strict > or < , both of
 # which the threshold step supports directly (gt/lt).
+#
+# Rules 8-9 query litellm-native metrics (litellm_deployment_successful_fallbacks_total,
+# litellm_deployment_cooled_down_total) scraped by VM directly from litellm's own :8090/metrics,
+# not emitted by our exporter — see CONTRACT.md's "litellm-native" section. These metrics ship
+# enabled by default, unlike the rest of that section's opt-in panels.
 apiVersion: 1
 
 groups:
@@ -562,3 +567,160 @@ groups:
           severity: warning
         annotations:
           summary: "ferry_health_check_latency_ms > 2000 (metric: ferry_health_check_latency_ms, threshold: > 2000ms) — the /health/liveliness round-trip is degraded. Current: {{ $values.B.Value }}ms."
+
+      # 8. Orchestrator fallback fired — warning. litellm-native counter, labeled per
+      # requested_model→fallback_model pair; summed across all pairs here (any fallback hop is
+      # the signal). Any occurrence in the trailing 5m fires immediately — same discrete-event
+      # rationale as rules 4/5 (a fallback hop is itself the alert-worthy fact, not a rate to
+      # debounce). Inspect the requested_model/fallback_model labels on
+      # litellm_deployment_successful_fallbacks_total in Explore to see which chain fired.
+      - uid: ferry-orchestrator-fallback
+        title: "Orchestrator fallback fired"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: sum(increase(litellm_deployment_successful_fallbacks_total[5m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 0s
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "sum(increase(litellm_deployment_successful_fallbacks_total[5m])) > 0 — {{ $values.B.Value }} fallback hop(s) were served in the last 5m because a primary deployment failed (requested_model→fallback_model — check litellm_deployment_successful_fallbacks_total's labels in Explore for which chain fired)."
+
+      # 9. Deployment cooled down — warning. litellm-native counter: a backend was pulled out of
+      # rotation (e.g. a 429/quota exception tripped its cooldown window). Any occurrence in the
+      # trailing 5m fires immediately, same discrete-event rationale as rule 8.
+      - uid: ferry-deployment-cooled-down
+        title: "Deployment cooled down"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: sum(increase(litellm_deployment_cooled_down_total[5m]))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 0s
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "sum(increase(litellm_deployment_cooled_down_total[5m])) > 0 — {{ $values.B.Value }} deployment cooldown event(s) in the last 5m (a backend was pulled out of rotation, e.g. on a 429/quota exception — check litellm_deployment_cooled_down_total's litellm_model_name/model_id/exception_status labels in Explore for which one)."

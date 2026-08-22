@@ -2,12 +2,12 @@
 # =============================================================================
 # ferry observability stack — smoke test.
 #
-# Runs one check per layer (exporter -> VictoriaMetrics -> scrape landed -> Grafana),
-# prints a PASS/FAIL line for each, and exits nonzero if ANY check fails. Safe to run
-# repeatedly; run it right after observ/bringup.sh.
+# Runs one check per layer (exporter -> VictoriaMetrics -> scrape landed ->
+# VictoriaLogs -> logs landed -> Grafana), prints a PASS/FAIL line for each, and exits
+# nonzero if ANY check fails. Safe to run repeatedly; run it right after observ/bringup.sh.
 #
-# Contract: observ/CONTRACT.md — ports 9092 (exporter) / 8429 (VM) / 3001 (Grafana).
-# Owned by the "bringup" seat.
+# Contract: observ/CONTRACT.md — ports 9092 (exporter) / 8429 (VM) / 9428 (VictoriaLogs)
+# / 3001 (Grafana). Owned by the "bringup" seat.
 # =============================================================================
 set -euo pipefail
 
@@ -52,7 +52,33 @@ else
   fail "VictoriaMetrics query for ferry_up returned no value after ~20s of retries"
 fi
 
-# 5) Grafana health API returns HTTP 200
+# 5) VictoriaLogs health
+if curl -fsS --max-time 5 http://127.0.0.1:9428/health >/dev/null 2>&1; then
+  pass "VictoriaLogs /health (127.0.0.1:9428)"
+else
+  fail "VictoriaLogs /health (127.0.0.1:9428) — is victoria-logs running? (check $HOME/.config/ferry/observ/logs/vlogs.log)"
+fi
+
+# 6) Logs are actually LANDING in VictoriaLogs (the ferry-log-shipper is pushing).
+#    The shipper batches, so the first flush can lag — retry for ~20s like check 4.
+#    LogsQL '*' matches everything; limit=1 keeps the response to a single line.
+#    A response line is one JSON record, so any '{' means at least one log landed.
+VL_OK=0
+for _ in 1 2 3 4 5 6 7; do
+  if curl -fsS --max-time 5 'http://127.0.0.1:9428/select/logsql/query' \
+       --data-urlencode 'query=*' --data-urlencode 'limit=1' 2>/dev/null | grep -q '{'; then
+    VL_OK=1
+    break
+  fi
+  sleep 3
+done
+if [[ "$VL_OK" -eq 1 ]]; then
+  pass "VictoriaLogs has log lines (logsql query '*' returned a result)"
+else
+  fail "VictoriaLogs logsql query returned nothing after ~20s — is ferry-log-shipper running and is the ferry proxy logging? (check $HOME/.config/ferry/observ/logs/shipper.log)"
+fi
+
+# 7) Grafana health API returns HTTP 200
 CODE="$(curl -fsS --max-time 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:3001/api/health 2>/dev/null || true)"
 if [[ "$CODE" == "200" ]]; then
   pass "Grafana /api/health (127.0.0.1:3001) -> 200"

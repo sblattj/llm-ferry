@@ -2,7 +2,10 @@
 #
 # VictoriaMetrics (ferry, :8429) reads this at start via -promscrape.config=. Host processes
 # over loopback (no compose DNS) — see observ/bringup.sh. Ports per CONTRACT.md:
-#   ferry-exporter 9092  ·  litellm proxy 8090 (opt-in native /metrics).
+#   ferry-exporter 9092  ·  litellm proxy 8090 (native /metrics, on by default).
+#
+# NB: only METRICS are scraped here. Logs go to VictoriaLogs (:9428) and are PUSHED
+# in by the ferry-log-shipper daemon — VictoriaLogs has no scrape config at all.
 # Owned by the "bringup" seat.
 
 global:
@@ -15,11 +18,13 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:9092"]
 
-  # litellm-native metrics — OPT-IN enrichment, NOT emitted by our exporter.
-  # Off by default: litellm's /metrics is 404 until the user enables the prometheus
-  # callback (see observ/README.md "Enable litellm-native metrics"). VM tolerates the
-  # target being down — the scrape just fails harmlessly and no litellm_* series exist,
-  # so the ferry-backends "LLM internals" row shows "No data" until it is enabled.
+  # litellm-native metrics — enrichment served by litellm itself, NOT by our exporter.
+  # ON BY DEFAULT as of the current ferry: the litellm.yaml template (and the live
+  # config) set callbacks: ["prometheus"], and `ferry install` bundles the
+  # prometheus_client dependency, so /metrics serves rather than 404s out of the box.
+  # If a hand-edited config drops that callback, VM tolerates the target being down —
+  # the scrape fails harmlessly, no litellm_* series exist, and the ferry-backends
+  # "LLM internals" row falls back to "No data". Never make a ferry_* panel depend on it.
   - job_name: "litellm"
     metrics_path: /metrics
     static_configs:

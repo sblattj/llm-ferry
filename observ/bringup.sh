@@ -2,15 +2,24 @@
 # =============================================================================
 # ferry observability stack — bring-up (Mac primary; Linux best-effort).
 #
-# Brings up a local Grafana + VictoriaMetrics dashboard stack for llm-ferry as
-# nohup daemons with PID files (ferry's own idiom — NOT launchd). Coexists with
-# the g0vs1g desk stack (3000/8428/9847) by using distinct ports + data dir:
+# Brings up a local Grafana + VictoriaMetrics + VictoriaLogs dashboard stack for
+# llm-ferry as nohup daemons with PID files (ferry's own idiom — NOT launchd).
+# Coexists with the g0vs1g desk stack (3000/8428/9847) by using distinct ports +
+# data dir:
 #
 #   proxy log + litellm /health,/models + litellm.yaml
 #        │
-#        └─(ferry-metrics-exporter :9092)─▶ VictoriaMetrics :8429 ─▶ Grafana :3001
-#                                                  ▲
-#                             litellm :8090/metrics (OPT-IN, off by default)
+#        ├─(ferry-metrics-exporter :9092)─▶ VictoriaMetrics :8429 ─┐
+#        │                                         ▲               │
+#        │                    litellm :8090/metrics (on by default) ├─▶ Grafana :3001
+#        │                                                         │
+#        └─(ferry-log-shipper, push)──────▶ VictoriaLogs   :9428 ──┘
+#
+# Metrics live in VictoriaMetrics (:8429, pull/scrape); raw ferry proxy log lines
+# live in VictoriaLogs (:9428), pushed there by the ferry-log-shipper daemon (a
+# tailer — no listening port of its own). Grafana reads both; the logs datasource
+# needs the `victoriametrics-logs-datasource` plugin, auto-installed at boot via
+# GF_INSTALL_PLUGINS below.
 #
 # Idempotent: safe to re-run. Guards every start on a port-already-listening
 # check, re-materializes the provisioning tree, and never double-starts a daemon.
@@ -48,6 +57,7 @@ PROV_RUN="$STATE/grafana-provisioning"
 DASH_SRC="$OBSERV/grafana/dashboards"
 SCRAPE_CFG="$OBSERV/victoriametrics/scrape.yml"
 EXPORTER="$OBSERV/ferry-metrics-exporter"
+SHIPPER="$OBSERV/ferry-log-shipper"
 
 info() { printf '\033[1;36m[bringup]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[bringup] WARN:\033[0m %s\n' "$*" >&2; }
@@ -80,7 +90,7 @@ fi
 info "repo root : $REPO_ROOT"
 info "state dir : $STATE"
 info "platform  : $OS"
-mkdir -p "$STATE"/{vm-data,grafana-data,grafana-provisioning,logs}
+mkdir -p "$STATE"/{vm-data,vlogs-data,grafana-data,grafana-provisioning,logs}
 
 # ----------------------------------------------------------------------------- secrets
 # FERRY_ALERT_WEBHOOK is the optional Grafana alert contact-point URL. Source it
@@ -115,21 +125,26 @@ export GF_SECURITY_ADMIN_PASSWORD="${GF_SECURITY_ADMIN_PASSWORD:-ferry-observ}"
 # docker, else fall back to a static-binary download into $STATE (best-effort; TODO
 # markers where a version/URL can't be verified here). The Mac path is fully working.
 VM_BIN=""
+VL_BIN=""
 GF_BIN=""
 GF_HOMEPATH=""
 
 resolve_mac_binaries() {
   VM_BIN="$(command -v victoria-metrics || command -v victoriametrics || true)"
+  VL_BIN="$(command -v victoria-logs || command -v victorialogs || true)"
   GF_BIN="$(command -v grafana || true)"
-  if [[ -z "$VM_BIN" || -z "$GF_BIN" ]]; then
+  if [[ -z "$VM_BIN" || -z "$VL_BIN" || -z "$GF_BIN" ]]; then
     if command -v brew >/dev/null 2>&1; then
-      info "installing missing formulae via brew (victoriametrics/grafana) ..."
+      info "installing missing formulae via brew (victoriametrics/victorialogs/grafana) ..."
       brew list victoriametrics >/dev/null 2>&1 || brew install victoriametrics
+      # NB: the formula is `victorialogs` but the binary it puts on PATH is `victoria-logs`.
+      brew list victorialogs    >/dev/null 2>&1 || brew install victorialogs
       brew list grafana         >/dev/null 2>&1 || brew install grafana
       VM_BIN="$(command -v victoria-metrics || command -v victoriametrics || true)"
+      VL_BIN="$(command -v victoria-logs || command -v victorialogs || true)"
       GF_BIN="$(command -v grafana || true)"
     else
-      warn "brew not found and victoria-metrics/grafana are not on PATH."
+      warn "brew not found and victoria-metrics/victoria-logs/grafana are not on PATH."
     fi
   fi
   local brew_prefix; brew_prefix="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
@@ -138,11 +153,13 @@ resolve_mac_binaries() {
 
 resolve_linux_binaries() {
   VM_BIN="$(command -v victoria-metrics || command -v victoriametrics || true)"
+  VL_BIN="$(command -v victoria-logs || command -v victorialogs || true)"
   GF_BIN="$(command -v grafana || command -v grafana-server || true)"
   if [[ -n "$VM_BIN" && -n "$GF_BIN" ]]; then
     # Native packages present (e.g. linuxbrew or distro packages) — use them.
     GF_HOMEPATH="$(dirname "$(dirname "$GF_BIN")")/share/grafana"
     [[ -d "$GF_HOMEPATH" ]] || GF_HOMEPATH="/usr/share/grafana"
+    [[ -n "$VL_BIN" ]] || warn "TODO(linux): victoria-logs not on PATH — VictoriaLogs (:9428) will be skipped; logs land nowhere."
     return
   fi
   if command -v docker >/dev/null 2>&1; then
@@ -151,16 +168,21 @@ resolve_linux_binaries() {
     warn "  docker run -d --name ferry-vm --network host -v $STATE/vm-data:/vm-data \\"
     warn "    victoriametrics/victoria-metrics:v1.150.0 \\"
     warn "    -promscrape.config=$SCRAPE_CFG -storageDataPath=/vm-data -httpListenAddr=127.0.0.1:8429 -retentionPeriod=12"
+    warn "  docker run -d --name ferry-vlogs --network host -v $STATE/vlogs-data:/vlogs-data \\"
+    warn "    victoriametrics/victoria-logs:latest \\"
+    warn "    -storageDataPath=/vlogs-data -httpListenAddr=127.0.0.1:9428 -retentionPeriod=12"
     warn "  docker run -d --name ferry-grafana --network host \\"
     warn "    -e GF_SERVER_HTTP_PORT=3001 -e GF_PATHS_PROVISIONING=/prov -v $PROV_RUN:/prov \\"
+    warn "    -e GF_INSTALL_PLUGINS=victoriametrics-logs-datasource \\"
     warn "    -v $DASH_SRC:$DASH_SRC grafana/grafana-oss:13.2.0"
     warn "  (materialize provisioning below still applies; then run observ/verify.sh)"
   else
     warn "Linux without docker or native binaries."
     warn "TODO(linux): download static binaries into $STATE (URLs/versions NOT verified here):"
     warn "  VictoriaMetrics: https://github.com/VictoriaMetrics/VictoriaMetrics/releases (victoria-metrics-linux-<arch>-v1.150.0.tar.gz)"
+    warn "  VictoriaLogs:    https://github.com/VictoriaMetrics/VictoriaLogs/releases (victoria-logs-linux-<arch>-*.tar.gz)"
     warn "  Grafana OSS:     https://grafana.com/grafana/download (grafana-13.2.0.linux-<arch>.tar.gz)"
-    warn "  then set VM_BIN / GF_BIN / GF_HOMEPATH to the extracted paths and re-run."
+    warn "  then set VM_BIN / VL_BIN / GF_BIN / GF_HOMEPATH to the extracted paths and re-run."
   fi
 }
 
@@ -222,6 +244,24 @@ else
   warn "no VictoriaMetrics binary resolved — skipping VM start (see Linux TODO above)."
 fi
 
+# ----------------------------------------------------------------------------- VictoriaLogs (:9428)
+# Log storage, sibling to VM. No scrape config — logs are PUSHED in by the
+# ferry-log-shipper below. Same 12-month retention as the TSDB.
+if port_listening 9428; then
+  info "VictoriaLogs already listening on :9428 — leaving it."
+elif [[ -n "$VL_BIN" ]]; then
+  info "starting VictoriaLogs (:9428) via $VL_BIN"
+  nohup "$VL_BIN" \
+    -storageDataPath="$STATE/vlogs-data" \
+    -httpListenAddr=127.0.0.1:9428 \
+    -retentionPeriod=12 \
+    >"$STATE/logs/vlogs.log" 2>&1 &
+  echo $! >"$STATE/vlogs.pid"
+  info "VictoriaLogs pid $(cat "$STATE/vlogs.pid") — log: $STATE/logs/vlogs.log"
+else
+  warn "no VictoriaLogs binary resolved — skipping VictoriaLogs start (see Linux TODO above)."
+fi
+
 # ----------------------------------------------------------------------------- exporter (:9092)
 if [[ -f "$EXPORTER" ]]; then
   chmod +x "$EXPORTER" 2>/dev/null || true
@@ -239,6 +279,26 @@ else
   warn "exporter not started (file missing)."
 fi
 
+# ----------------------------------------------------------------------------- log shipper (pusher — no port)
+# Tails the ferry proxy log and PUSHES lines into VictoriaLogs :9428. It listens on
+# nothing, so the "already running" guard is the PID file rather than a port check.
+if [[ -f "$SHIPPER" ]]; then
+  chmod +x "$SHIPPER" 2>/dev/null || true
+else
+  warn "shipper $SHIPPER not found yet — start will no-op until it lands (orchestrator runs bringup after all seats)."
+fi
+SHIPPER_PID="$(cat "$STATE/shipper.pid" 2>/dev/null || true)"
+if [[ -n "$SHIPPER_PID" ]] && kill -0 "$SHIPPER_PID" 2>/dev/null; then
+  info "ferry-log-shipper already running (pid $SHIPPER_PID) — leaving it."
+elif [[ -f "$SHIPPER" ]]; then
+  info "starting ferry-log-shipper (push -> VictoriaLogs :9428) via python3"
+  nohup python3 "$SHIPPER" --vlogs http://127.0.0.1:9428 >"$STATE/logs/shipper.log" 2>&1 &
+  echo $! >"$STATE/shipper.pid"
+  info "shipper pid $(cat "$STATE/shipper.pid") — log: $STATE/logs/shipper.log"
+else
+  warn "log shipper not started (file missing)."
+fi
+
 # ----------------------------------------------------------------------------- Grafana (:3001)
 if port_listening 3001; then
   info "Grafana already listening on :3001 — leaving it."
@@ -246,7 +306,9 @@ elif [[ -n "$GF_BIN" ]]; then
   info "starting Grafana (:3001) via $GF_BIN server"
   # GF_* env overrides beat any grafana.ini; the host path uses pure env (no --config),
   # so the committed grafana.ini stays the container artifact. Provisioning + data + logs
-  # all live under the runtime STATE dir.
+  # all live under the runtime STATE dir. GF_INSTALL_PLUGINS makes Grafana fetch the
+  # VictoriaLogs datasource plugin on boot (first start only — needs network once); the
+  # provisioned vlogs datasource is unusable without it.
   GF_PATHS_PROVISIONING="$PROV_RUN" \
   GF_PATHS_DATA="$STATE/grafana-data" \
   GF_PATHS_LOGS="$STATE/logs" \
@@ -255,6 +317,7 @@ elif [[ -n "$GF_BIN" ]]; then
   GF_SERVER_HTTP_PORT=3001 \
   GF_ANALYTICS_REPORTING_ENABLED=false \
   GF_ANALYTICS_CHECK_FOR_UPDATES=false \
+  GF_INSTALL_PLUGINS=victoriametrics-logs-datasource \
     nohup "$GF_BIN" server --homepath "$GF_HOMEPATH" \
     >"$STATE/logs/grafana.log" 2>&1 &
   echo $! >"$STATE/grafana.pid"
@@ -278,8 +341,10 @@ cat <<EOF
  ferry observability stack — UP
 =============================================================================
  Grafana           : http://127.0.0.1:3001   (login: $GF_SECURITY_ADMIN_USER / $GF_SECURITY_ADMIN_PASSWORD)
- VictoriaMetrics   : http://127.0.0.1:8429
+ VictoriaMetrics   : http://127.0.0.1:8429   (metrics TSDB — scrapes the exporter)
+ VictoriaLogs      : http://127.0.0.1:9428   (log storage — logs pushed in, not scraped)
  Exporter /metrics : http://127.0.0.1:9092/metrics
+ Log shipper       : ferry-log-shipper -> :9428  (pusher, no port; pid file $STATE/shipper.pid)
  State / logs      : $STATE  (logs in $STATE/logs)
 -----------------------------------------------------------------------------
  This is a LOCAL surface (127.0.0.1 only). To reach it from the LAN or tailnet,

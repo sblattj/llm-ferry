@@ -85,18 +85,25 @@ mkdir -p "$STATE"/{vm-data,grafana-data,grafana-provisioning,logs}
 # ----------------------------------------------------------------------------- secrets
 # FERRY_ALERT_WEBHOOK is the optional Grafana alert contact-point URL. Source it
 # best-effort from ferry's own secrets file and the shared dotorg secrets, so
-# envsubst can bake it into the runtime alerting tree. Alerts still SHOW in the
-# Grafana UI if it is unset — they just do not deliver to the webhook.
+# envsubst can bake it into the runtime alerting tree.
 set +u
 # shellcheck disable=SC1090
 [[ -f "$HOME/.config/ferry/secrets.env" ]] && source "$HOME/.config/ferry/secrets.env" 2>/dev/null || true
 # shellcheck disable=SC1090
 [[ -f "$HOME/.dotorg/zsh/secrets.zsh" ]] && source "$HOME/.dotorg/zsh/secrets.zsh" 2>/dev/null || true
 set -u
+# Grafana 13.2.0 treats an EMPTY webhook url as a FATAL provisioning error — it refuses
+# to boot ("required field 'url' is not specified"). So an unset webhook must still expand
+# to a syntactically-valid URL. Default to an inert local sink on the exporter host: the
+# contact point provisions cleanly, every alert still shows in the Grafana UI, and delivery
+# is only ever attempted on an actual alert fire (a harmless POST to a no-op path that 404s,
+# never a connection-refused storm). Set FERRY_ALERT_WEBHOOK to route alerts for real.
 if [[ -z "${FERRY_ALERT_WEBHOOK:-}" ]]; then
-  warn "FERRY_ALERT_WEBHOOK not set — Grafana alerts will NOT deliver (dashboards still work)."
+  warn "FERRY_ALERT_WEBHOOK not set — alerts show in the Grafana UI but will NOT deliver (using inert sink URL)."
+  export FERRY_ALERT_WEBHOOK="http://127.0.0.1:9092/ferry-alert-noop"
+else
+  export FERRY_ALERT_WEBHOOK
 fi
-export FERRY_ALERT_WEBHOOK="${FERRY_ALERT_WEBHOOK:-}"
 
 # ----------------------------------------------------------------------------- config tokens
 export VM_URL="${VM_URL:-http://127.0.0.1:8429}"

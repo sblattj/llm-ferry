@@ -21,10 +21,16 @@ new name (`orchestrator-fallback`, `orchestrator-fallback-2`) wired into `fallba
 ## Checklist
 1. **Capacity MUST be independent of the primary** (the #1 mistake). A fallback sharing a
    rate-limit bucket with the primary — OR with your own interactive use of that same
-   account (classic trap: pointing the fallback at a Claude Max/Pro subscription your
-   interactive Claude Code sessions already drain) — will `429` exactly when you need it.
-   Prefer a DIFFERENT provider/account. A pay-per-token API (e.g. Fireworks) has its OWN
-   capacity and only bills when the fallback actually fires.
+   account — will `429` exactly when you need it. Prefer a DIFFERENT provider/account. A
+   pay-per-token API (e.g. Fireworks) has its OWN capacity and only bills when the
+   fallback actually fires.
+   **Do not use a Claude Max/Pro SUBSCRIPTION token (`sk-ant-oat…`) as a fallback.** It
+   isn't just bucket-sharing: Anthropic restricts those OAuth tokens to Claude Code
+   itself and rejects other clients' traffic with an opaque `429 rate_limit_error`
+   (even with the quota untouched — and `/v1/models` still returns 200, so that check
+   proves nothing). litellm's `sk-ant-oat` Bearer handling does not get around this.
+   For a Claude fallback use a pay-per-token **API key** (`ANTHROPIC_API_KEY`,
+   `sk-ant-api…`) — independent bucket, supported, bills only when the hop fires.
 2. **Add a new `model_name` block** per fallback hop in `model_list` (NOT under the
    `orchestrator` name, NOT in any pool).
 3. **Chain order: fast first, slow/cheap last.** The example chains DeepSeek V4 Pro (fast,

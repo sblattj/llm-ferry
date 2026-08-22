@@ -1,0 +1,24 @@
+# llm-ferry observability — Grafana unified alerting: contact points (apiVersion 1)
+# Grafana 13.2.0. Routes every alert (via policies.yml) to the ferry-webhook contact point.
+#
+# Webhook token handling (CONTRACT.md "Webhook"): this file is COMMITTED with the literal
+# ${FERRY_ALERT_WEBHOOK} token intact — the real webhook URL is NEVER committed. bringup.sh
+# materializes a RUNTIME copy of the whole provisioning tree into
+# ~/.config/ferry/observ/grafana-provisioning/ via envsubst (same pattern as the g0vs1g desk
+# stack) and launches Grafana pointed there — never at this repo tree directly with the token
+# unexpanded. The token is OPTIONAL: if FERRY_ALERT_WEBHOOK is unset/empty at bringup time,
+# envsubst expands it to an empty url — the webhook delivery simply no-ops, but every alert
+# still shows in the Grafana UI (Alerting > Alert rules / Firing).
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: ferry-webhook
+    receivers:
+      - uid: ferry-webhook-receiver
+        type: webhook
+        settings:
+          # Literal token — envsubst-expanded at bringup time. Never a real URL here.
+          url: ${FERRY_ALERT_WEBHOOK}
+          httpMethod: POST
+        disableResolveMessage: false

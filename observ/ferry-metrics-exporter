@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""ferry-metrics-exporter — a Prometheus exporter for the ferry LAN AI relay.
+
+Serves Prometheus text (v0.0.4) on http://127.0.0.1:9092/metrics for the
+llm-ferry observability stack (VictoriaMetrics + Grafana). It emits the
+`ferry_` metric contract in observ/CONTRACT.md — meta, health/serving,
+cumulative traffic counters, and litellm.yaml topology — with $0 cost: it
+reads the local proxy access log plus litellm's /health/liveliness and
+/v1/models (no model calls, no token spend). Standard library only.
+
+It deliberately REUSES the proven parsers from the sibling `ferry-dash`
+dashboard (loaded via importlib — that file has no .py extension):
+
+  * Activity       — the incremental proxy-log tailer + cumulative counters
+  * find_log(port) — proxy-log auto-discovery (incl. macOS /var/folders TMPDIR)
+  * load_topology  — the tiny litellm.yaml topology parser (no PyYAML dep)
+  * http_json      — the passive /health + /v1/models caller
+
+so the log regex, discovery, and topology parse are single-sourced with the
+dashboard. The exporter EXTENDS Activity (JointActivity) to also track the
+joint (client, status) distribution and cumulative backend-event counters
+that Prometheus needs but the dashboard's marginals do not carry.
+
+Usage:
+  ferry-metrics-exporter                      # serve on http://127.0.0.1:9092
+  ferry-metrics-exporter --port 9092 --ferry http://127.0.0.1:8090
+  ferry-metrics-exporter --config ~/.config/ferry/litellm.yaml --key local
+
+Endpoints:
+  GET /metrics  -> Prometheus text; Content-Type text/plain; version=0.0.4
+  GET /healthz  -> {"ok": true}
+  anything else -> 404
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import os
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BUILD_VERSION = "1"
+POLL_INTERVAL_SECONDS = 5.0     # cache the litellm calls so a 15s VM scrape doesn't hammer :8090
+CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+# ── reuse: load the sibling ferry-dash (no .py extension) as a module ───────
+def load_ferry_dash():
+    """Import ferry-dash's proven Activity / find_log / load_topology / http_json.
+
+    ferry-dash lives at the repo/worktree root (this file is under observ/).
+    Loading it only executes its top-level definitions — its server main() is
+    guarded by `if __name__ == "__main__"`, so nothing binds a socket.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "..", "ferry-dash"),          # observ/ -> <root>/ferry-dash
+        os.path.join(here, "..", "..", "ferry-dash"),     # fallback if nested deeper
+        os.path.expanduser("~/code/llm-ferry/ferry-dash"),
+    ]
+    tried = []
+    for c in candidates:
+        c = os.path.abspath(c)
+        tried.append(c)
+        if os.path.isfile(c):
+            loader = importlib.machinery.SourceFileLoader("ferry_dash", c)
+            spec = importlib.util.spec_from_loader("ferry_dash", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise ImportError("ferry-dash not found (looked in: %s)" % ", ".join(tried))
+
+
+_FD = load_ferry_dash()
+http_json = _FD.http_json
+load_topology = _FD.load_topology
+find_log = _FD.find_log
+Activity = _FD.Activity
+
+
+# ── traffic: extend the dashboard's tailer with the joint + event counters ──
+class JointActivity(Activity):
+    """Activity + the (client, status) joint counters and cumulative backend
+    events Prometheus needs. Reuses the base regex (ACCESS), the incremental
+    offset/truncation tail, and the base event-detection substrings verbatim;
+    it only adds dimensions the dashboard's marginals cannot reconstruct.
+
+    All counters are in-memory and CUMULATIVE since exporter start (poll only
+    ever adds), so `ferry_requests_total` never decreases between scrapes.
+    """
+
+    def __init__(self, logpath):
+        super().__init__(logpath)
+        self.by_client_status = {}                          # (ip, status) -> count
+        self.backend_events = {"kimi_quota": 0, "rate_limit": 0}
+        self.backend_event_ts = {}                          # kind -> epoch of last occurrence
+
+    def poll(self):
+        if not self.logpath or not os.path.exists(self.logpath):
+            return
+        try:
+            size = os.path.getsize(self.logpath)
+            if size < self.offset:                          # log truncated/rotated (ferry restart)
+                self.offset = 0
+            with open(self.logpath, "r", errors="replace") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+                self.offset = f.tell()
+        except Exception:
+            return
+        new = 0
+        with self.lock:
+            for line in chunk.splitlines():
+                m = self.ACCESS.search(line)
+                if m:
+                    ip, _method, path, status = m.groups()
+                    # count only real inference; skip /v1/models + /health polls
+                    if path.startswith("/v1/chat/completions"):
+                        self.total += 1
+                        new += 1
+                        self.by_status[status] = self.by_status.get(status, 0) + 1
+                        self.by_client[ip] = self.by_client.get(ip, 0) + 1
+                        key = (ip, status)
+                        self.by_client_status[key] = self.by_client_status.get(key, 0) + 1
+                low = line.lower()
+                if "permission_error" in low and "usage limit" in low:
+                    now = time.time()
+                    self.backend_events["kimi_quota"] += 1
+                    self.backend_event_ts["kimi_quota"] = now
+                    self.last_event = {"kind": "kimi_quota", "t": now}
+                elif "rate_limit" in low or "ratelimiterror" in low:
+                    now = time.time()
+                    self.backend_events["rate_limit"] += 1
+                    self.backend_event_ts["rate_limit"] = now
+                    self.last_event = {"kind": "rate_limit", "t": now}
+            self.buckets.append(new)
+            self.buckets = self.buckets[-40:]
+
+    def traffic_snapshot(self):
+        with self.lock:
+            return {
+                "by_client_status": dict(self.by_client_status),
+                "backend_events": dict(self.backend_events),
+                "backend_event_ts": dict(self.backend_event_ts),
+            }
+
+
+# ── Prometheus text rendering (v0.0.4) ──────────────────────────────────────
+def esc_label(v):
+    return str(v).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def fmt_value(v):
+    """A plain decimal, or None if the value is missing/NaN/inf (=> omit series)."""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, int):
+        return str(v)
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f == float("inf") or f == float("-inf"):     # NaN / inf -> omit
+        return None
+    if f.is_integer():
+        return str(int(f))
+    return repr(f)
+
+
+def render_labels(pairs):
+    if not pairs:
+        return ""
+    return "{" + ",".join('%s="%s"' % (k, esc_label(v)) for k, v in pairs) + "}"
+
+
+class Family:
+    """One metric NAME: HELP + TYPE emitted once, then its (sorted) samples."""
+
+    def __init__(self, name, help_text, typ):
+        self.name = name
+        self.help_text = help_text
+        self.typ = typ
+        self.samples = []                    # (label_pairs_or_None, value)
+
+    def add(self, value, labels=None):
+        self.samples.append((labels, value))
+        return self
+
+    def render(self):
+        body = []
+        for labels, value in self.samples:
+            s = fmt_value(value)
+            if s is None:                    # omit a series whose source value is missing; never NaN
+                continue
+            body.append("%s%s %s" % (self.name, render_labels(labels), s))
+        if not body:
+            return []                        # no samples -> omit the whole family (incl. HELP/TYPE)
+        body.sort()                          # deterministic ordering within the family
+        return ["# HELP %s %s" % (self.name, self.help_text),
+                "# TYPE %s %s" % (self.name, self.typ)] + body
+
+
+# ── collector ───────────────────────────────────────────────────────────────
+class Collector:
+    def __init__(self, ferry, key, config_path, activity, started=None):
+        self.ferry = ferry.rstrip("/")
+        self.key = key
+        self.config_path = config_path
+        self.activity = activity
+        self.started = started if started is not None else time.time()
+        self.poll_interval = POLL_INTERVAL_SECONDS
+        # litellm poll cache (refreshed at most every poll_interval)
+        self._llm_lock = threading.Lock()
+        self._llm_ts = 0.0
+        self._ferry_up = False
+        self._health_ms = None
+        self._models = []
+
+    # -- litellm health/serving, cached so a fast scrape can't hammer :8090 --
+    def refresh_litellm(self, now=None, force=False):
+        now = time.time() if now is None else now
+        with self._llm_lock:
+            if not force and self._llm_ts > 0 and (now - self._llm_ts) < self.poll_interval:
+                return
+            live = http_json(self.ferry + "/health/liveliness", self.key, timeout=4)
+            self._ferry_up = bool(live.get("ok"))
+            self._health_ms = live.get("ms")
+            models = []
+            if self._ferry_up:
+                m = http_json(self.ferry + "/v1/models", self.key, timeout=4)
+                if m.get("ok"):
+                    data = (m.get("json") or {}).get("data") or []
+                    models = [x.get("id") for x in data
+                              if isinstance(x, dict) and x.get("id")]
+            self._models = models
+            self._llm_ts = now
+
+    def render(self):
+        """Never raises. Always returns at least ferry_exporter_up + build_info."""
+        now = time.time()
+        out = []
+        # -- meta (always emitted, before anything that could fail) ----------
+        out += Family("ferry_exporter_up",
+                      "1 if the ferry metrics exporter is running.", "gauge").add(1).render()
+        out += Family("ferry_exporter_build_info",
+                      "Ferry metrics exporter build info.", "gauge").add(
+                          1, [("version", BUILD_VERSION)]).render()
+        out += Family("ferry_scrape_timestamp_seconds",
+                      "Unix time when this scrape was produced.", "gauge").add(now).render()
+        out += Family("ferry_exporter_uptime_seconds",
+                      "Seconds since the exporter started.", "gauge").add(
+                          int(now - self.started)).render()
+        # -- dynamic sources; each guarded so one failure can't drop others --
+        for block in (self._health_block, self._traffic_block, self._topology_block):
+            try:
+                out += block(now)
+            except Exception as e:
+                sys.stderr.write("ferry-metrics-exporter: %s error: %s\n"
+                                 % (getattr(block, "__name__", "collect"), e))
+        return "\n".join(out) + "\n"
+
+    # -- health / serving -------------------------------------------------
+    def _health_block(self, now):
+        self.refresh_litellm(now)
+        out = []
+        out += Family("ferry_up",
+                      "1 if litellm /health/liveliness returns ok, else 0.", "gauge").add(
+                          1 if self._ferry_up else 0).render()
+        if self._ferry_up and self._health_ms is not None:
+            out += Family("ferry_health_check_latency_ms",
+                          "Round-trip ms to litellm /health/liveliness (passive, no token spend).",
+                          "gauge").add(self._health_ms).render()
+        out += Family("ferry_models_served",
+                      "Number of model ids served by litellm /v1/models.", "gauge").add(
+                          len(self._models)).render()
+        mi = Family("ferry_model_info", "One series per served model id.", "gauge")
+        for mid in self._models:
+            mi.add(1, [("model", mid)])
+        out += mi.render()
+        return out
+
+    # -- traffic (cumulative counters from the proxy log) -----------------
+    def _traffic_block(self, now):
+        self.activity.poll()
+        snap = self.activity.traffic_snapshot()
+        out = []
+        req = Family("ferry_requests_total",
+                     "Inference requests (/v1/chat/completions) by client IP and HTTP status.",
+                     "counter")
+        for (client, status), n in snap["by_client_status"].items():
+            req.add(n, [("client", client), ("status", status)])
+        out += req.render()
+        ev = Family("ferry_backend_events_total",
+                    "Backend events detected in the proxy log, by kind.", "counter")
+        for kind, n in snap["backend_events"].items():
+            if n:                               # omit a kind that has never fired
+                ev.add(n, [("kind", kind)])
+        out += ev.render()
+        ts = Family("ferry_backend_event_timestamp_seconds",
+                    "Unix time of the last backend event of each kind.", "gauge")
+        for kind, epoch in snap["backend_event_ts"].items():
+            ts.add(epoch, [("kind", kind)])
+        out += ts.render()
+        return out
+
+    # -- topology (parse litellm.yaml) ------------------------------------
+    def _topology_block(self, now):
+        topo = load_topology(self.config_path)
+        out = []
+        groups = topo.get("groups") or {}
+        if not topo.get("error"):
+            counts = [g.get("count", 0) for g in groups.values()]
+            pool = max(counts) if counts else 0
+            out += Family("ferry_worker_pool_size",
+                          "Number of deployments in the largest pooled model_name group.",
+                          "gauge").add(pool).render()
+            dep = Family("ferry_deployment_info",
+                         "One series per unique (model_name, underlying model) deployment.",
+                         "gauge")
+            seen = set()
+            for mname, g in groups.items():
+                for model in (g.get("models") or []):
+                    key = (mname, model)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    dep.add(1, [("model_name", mname), ("model", model)])
+            out += dep.render()
+            fb = (topo.get("fallbacks") or {}).get("orchestrator") or []
+            out += Family("ferry_fallback_chain_length",
+                          "Length of the orchestrator's strict fallback chain (0 if none).",
+                          "gauge").add(len(fb)).render()
+        # config mtime is independent of parse success
+        try:
+            mtime = os.path.getmtime(self.config_path)
+        except Exception:
+            mtime = None
+        out += Family("ferry_route_config_mtime_seconds",
+                      "Modification time (unix seconds) of litellm.yaml.", "gauge").add(
+                          mtime).render()
+        return out
+
+
+# ── HTTP server ─────────────────────────────────────────────────────────────
+def make_handler(collector):
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype):
+            b = body.encode() if isinstance(body, str) else body
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            try:
+                self.wfile.write(b)
+            except Exception:
+                pass
+
+        def do_GET(self):
+            path = self.path.split("?")[0]
+            if path == "/metrics":
+                try:
+                    text = collector.render()
+                except Exception as e:            # last-ditch: never 500
+                    sys.stderr.write("ferry-metrics-exporter: render failed: %s\n" % e)
+                    text = ("# HELP ferry_exporter_up 1 if the ferry metrics exporter is running.\n"
+                            "# TYPE ferry_exporter_up gauge\nferry_exporter_up 1\n"
+                            "# HELP ferry_exporter_build_info Ferry metrics exporter build info.\n"
+                            "# TYPE ferry_exporter_build_info gauge\n"
+                            'ferry_exporter_build_info{version="%s"} 1\n' % BUILD_VERSION)
+                self._send(200, text, CONTENT_TYPE)
+            elif path == "/healthz":
+                self._send(200, '{"ok":true}', "application/json")
+            else:
+                self._send(404, "not found\n", "text/plain; charset=utf-8")
+
+        def log_message(self, *a):                # silence per-request stderr spam
+            pass
+
+    return Handler
+
+
+def build_collector(args, started=None):
+    ferry_port = args.ferry.rsplit(":", 1)[-1].split("/")[0]
+    logpath = args.log or find_log(ferry_port)
+    activity = JointActivity(logpath)
+    collector = Collector(args.ferry, args.key, args.config, activity, started=started)
+    return collector, logpath
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Prometheus metrics exporter for the ferry LAN AI relay.")
+    ap.add_argument("--port", type=int, default=9092, help="exporter port (default 9092)")
+    ap.add_argument("--ferry", default="http://127.0.0.1:8090", help="ferry/litellm base URL")
+    ap.add_argument("--config", default=os.path.expanduser("~/.config/ferry/litellm.yaml"),
+                    help="litellm.yaml route config path")
+    ap.add_argument("--log", default=None, help="proxy log path (auto-discovered if omitted)")
+    ap.add_argument("--key", default="local", help="proxy auth bearer (default 'local')")
+    return ap.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    collector, logpath = build_collector(args)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(collector))
+    except OSError as e:
+        raise SystemExit("ferry-metrics-exporter: cannot bind 127.0.0.1:%d (%s). Try --port."
+                         % (args.port, e))
+    print("ferry-metrics-exporter -> http://127.0.0.1:%d/metrics   "
+          "(ferry %s, config %s, log %s)"
+          % (args.port, collector.ferry, args.config, logpath or "not found"))
+    print("Ctrl-C to stop.")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nferry-metrics-exporter stopped.")
+
+
+if __name__ == "__main__":
+    main()

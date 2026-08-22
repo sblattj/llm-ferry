@@ -1,0 +1,19 @@
+# ferry observability stack — Grafana dashboard-provider provisioning (apiVersion 1)
+# Grafana 13.2.0. Committed value points at a container-style mount path. observ/bringup.sh
+# OVERRIDES this path (via env/GF_* override, not by editing this file) to point at the repo's
+# own observ/grafana/dashboards directory, since there is no container mount on the Mac.
+apiVersion: 1
+
+providers:
+  - name: ferry
+    orgId: 1
+    folder: Ferry
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      # Mac bringup rewrites this to <repoRoot>/observ/grafana/dashboards via an env/GF override
+      # at launch time — never by editing this committed value.
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

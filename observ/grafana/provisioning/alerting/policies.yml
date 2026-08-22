@@ -1,0 +1,20 @@
+# llm-ferry observability — Grafana unified alerting: notification policy tree (apiVersion 1)
+# Grafana 13.2.0. A single default policy routes every alert to the ferry-webhook contact point
+# (contactpoints.yml). Alerts are grouped by alertname (e.g. two clients both tripping
+# "High error rate" at once still fans out as two separate alert instances/labels, but they
+# group together by alertname for notification purposes).
+apiVersion: 1
+
+policies:
+  - orgId: 1
+    receiver: ferry-webhook
+    group_by:
+      - alertname
+    # Wait 30s after the first alert in a new group before sending the initial notification, so a
+    # burst of related series (e.g. multiple clients tripping "High error rate" at once) lands in
+    # one notification rather than one-per-series.
+    group_wait: 30s
+    # Wait 5m before sending a notification about new alerts added to an already-notified group.
+    group_interval: 5m
+    # Re-send an unresolved alert's notification at most every 4h (never less than group_interval).
+    repeat_interval: 4h

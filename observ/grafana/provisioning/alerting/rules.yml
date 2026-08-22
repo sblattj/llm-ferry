@@ -1,0 +1,564 @@
+# llm-ferry observability — Grafana unified alerting: alert rules (apiVersion 1)
+# Grafana 13.2.0. All rules query datasource uid "ferry-vm" (fixed contract, CONTRACT.md
+# "Grafana datasource UID") and route to the "ferry-webhook" contact point via policies.yml.
+# Metric names/thresholds match CONTRACT.md's "Metric contract" section exactly.
+#
+# Query pattern (Grafana's standard three-step query→reduce→threshold, used by every rule below):
+#   A - an instant Prometheus query against ferry-vm (raw or computed metric value, 10m lookback
+#       window so range functions like rate()/increase() over a shorter window always have data)
+#   B - a "reduce" expression (reducer: last) collapsing A's window to a single value per series
+#   C - a "threshold" expression evaluating B against the rule's condition; C is the `condition`
+# Series labels (e.g. `client`, `status`, `kind`) flow through B and C unchanged, so a query that
+# returns multiple series fires one alert instance per breaching series/label combination.
+#
+# None of the 7 rules below need the `>= bool` / `> bool` PromQL workaround (Grafana's classic
+# threshold evaluator has no native gte/lte) — every threshold here is a strict > or < , both of
+# which the threshold step supports directly (gt/lt).
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: ferry-alerts
+    folder: Ferry Alerts
+    interval: 1m
+    rules:
+      # 1. Ferry down — critical. ferry_up is always emitted as 0 or 1 by a healthy exporter
+      # (CONTRACT.md: "still emit ferry_exporter_up 1 + ferry_up 0 ... never 500"), so a true
+      # absence of this series means the exporter itself is unreachable — that case is covered
+      # by "Exporter down" below, so noDataState here stays NoData (don't double-fire).
+      - uid: ferry-down
+        title: "Ferry down"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: ferry_up
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 2m
+        isPaused: false
+        labels:
+          severity: critical
+        annotations:
+          summary: "ferry_up == 0 (metric: ferry_up, threshold: < 1) — litellm's /health/liveliness check is failing; the relay is down or unreachable."
+
+      # 2. Exporter down — critical. ferry_exporter_up is a meta gauge always set to 1 by a
+      # running exporter, so "== 0" never legitimately happens; the real failure mode is the
+      # whole series going ABSENT (the exporter process is down or the VM scrape target is
+      # unreachable) — noDataState: Alerting treats that absence as a firing alert too, per the
+      # standard "no data / == 0" pattern.
+      - uid: ferry-exporter-down
+        title: "Exporter down"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: ferry_exporter_up
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 1
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        # A missing series (scrape target unreachable, exporter process down) is treated as the
+        # alert firing too, so "absent" is covered by noDataState, not just the "== 0" threshold.
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 2m
+        isPaused: false
+        labels:
+          severity: critical
+        annotations:
+          summary: "ferry_exporter_up == 0 (or absent) — metric: ferry_exporter_up, threshold: < 1 — the ferry-metrics-exporter target is down or unreachable by VictoriaMetrics."
+
+      # 3. High error rate — warning. clamp_min on the denominator avoids a 0/0 NaN when there is
+      # no traffic in the window at all (that quiet-period case correctly yields 0, not a firing
+      # alert).
+      - uid: ferry-high-error-rate
+        title: "High error rate"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: 100 * sum(rate(ferry_requests_total{status=~"[45].."}[5m])) / clamp_min(sum(rate(ferry_requests_total[5m])), 0.0001)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 10
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 5m
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "5xx/4xx share of ferry_requests_total over the last 5m > 10% (metric: 100 * sum(rate(ferry_requests_total{status=~\"[45]..\"}[5m])) / sum(rate(ferry_requests_total[5m])), threshold: > 10). Current: {{ $values.B.Value }}%."
+
+      # 4. Backend rate-limit storm — warning. increase() over the trailing 10m; fires
+      # immediately (no debounce window — a burst of rate-limit events is itself the signal).
+      - uid: ferry-ratelimit-storm
+        title: "Backend rate-limit storm"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: increase(ferry_backend_events_total{kind="rate_limit"}[10m])
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 5
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 0s
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "increase(ferry_backend_events_total{kind=\"rate_limit\"}[10m]) > 5 — {{ $values.B.Value }} rate-limit event(s) from the backend in the last 10m."
+
+      # 5. Kimi quota exhausted — warning. Any occurrence in the trailing 15m is the signal;
+      # fires immediately, same rationale as rule 4 (a discrete backend event, not a noisy
+      # continuous metric that needs debouncing).
+      - uid: ferry-kimi-quota-exhausted
+        title: "Kimi quota exhausted"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 900
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: increase(ferry_backend_events_total{kind="kimi_quota"}[15m])
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 0s
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "increase(ferry_backend_events_total{kind=\"kimi_quota\"}[15m]) > 0 — a kimi_quota backend event fired in the last 15m. Current: {{ $values.B.Value }}."
+
+      # 6. Key pool shrank — warning. A healthy pool should have several keys; below 2 means
+      # near-zero headroom for a key rotation/outage.
+      - uid: ferry-key-pool-shrank
+        title: "Key pool shrank"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: ferry_worker_pool_size
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: lt
+                    params:
+                      - 2
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 10m
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "ferry_worker_pool_size < 2 (metric: ferry_worker_pool_size, threshold: < 2) — the pooled-model key rotation has shrunk to near-zero headroom. Current: {{ $values.B.Value }}."
+
+      # 7. Health-check latency high — warning. The passive round-trip to /health/liveliness
+      # (no token spend) is degraded.
+      - uid: ferry-health-check-latency-high
+        title: "Health-check latency high"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: ferry_health_check_latency_ms
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 2000
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 5m
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "ferry_health_check_latency_ms > 2000 (metric: ferry_health_check_latency_ms, threshold: > 2000ms) — the /health/liveliness round-trip is degraded. Current: {{ $values.B.Value }}ms."

@@ -88,7 +88,9 @@ def load_topology(path):
     topo = {"error": None, "groups": {}, "order": [], "fallbacks": {}, "routing": {}}
     section = None      # "models" | "router" | None
     cur = None
-    for ln in open(path, errors="replace").read().splitlines():
+    with open(path, errors="replace") as _f:   # close the handle (no ResourceWarning under 3.14+)
+        _lines = _f.read().splitlines()
+    for ln in _lines:
         if re.match(r"^model_list:", ln):
             section = "models"; continue
         if re.match(r"^router_settings:", ln):

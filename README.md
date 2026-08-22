@@ -111,6 +111,8 @@ ferry dash --open        # live web dashboard at http://localhost:8091
 
 A live local dashboard for the route proxy — no browser polling of the LAN, it runs on the host. It shows ferry up/down, the served model groups, the **orchestrator topology read from your `litellm.yaml`** (primary → the `fallbacks` chain), the worker pool, and **recent request activity parsed from the proxy log** (rate, status breakdown, per-client, a sparkline). **Auto-refresh costs nothing** — it only reads the local log plus `/health/liveliness` and `/v1/models`. A **"Test backends"** button is the only thing that spends tokens: it actively pings each backend and reports *which fallback hop actually served* + latency. Pure Python **standard library**, so it runs under any `python3` — no venv, no pip. (Also available standalone as `ferry-dash`.)
 
+For a richer, persistent view, `ferry dash --grafana` stands up a full **Grafana + VictoriaMetrics** observability stack on `http://localhost:3001` — request-rate, error-rate, and latency dashboards, backend/fallback topology, and alerting, backed by metrics history that persists across sessions (unlike the lightweight page's in-memory view). It runs as local `nohup` daemons under `~/.config/ferry/observ/` (Grafana `:3001`, VictoriaMetrics `:8429`, a small metrics exporter `:9092`) — `ferry dash --grafana --open` brings the stack up and opens the browser, `ferry dash --grafana --down` tears it down. See [`observ/README.md`](observ/README.md) for setup, ports, and what each dashboard covers.
+
 ## Ports
 
 | Port | Purpose | Started by |

@@ -1,0 +1,446 @@
+{
+  "title": "Ferry Overview",
+  "uid": "ferry-overview",
+  "tags": ["llm-ferry", "overview"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "links": [],
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "",
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "### Ferry Overview\nAt-a-glance liveness for the **llm-ferry** LAN LLM relay — is litellm serving (`ferry_up`), how many models are behind it, request volume + error rate, key-pool size, health-check latency, per-model detail, exporter freshness, and backend cooldown/rate-limit events. Source: `ferry-metrics-exporter` (:9092) scraped by VictoriaMetrics."
+      },
+      "transparent": true
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Ferry Up",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_up",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green" }, "0": { "text": "DOWN", "color": "red" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#d03b3b", "value": null },
+              { "color": "#0ca30c", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" },
+          "noValue": "n/a"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Models served",
+      "gridPos": { "h": 5, "w": 4, "x": 4, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_models_served",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "#2a78d6" },
+          "noValue": "0"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Requests (1h)",
+      "gridPos": { "h": 5, "w": 4, "x": 8, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum(increase(ferry_requests_total[1h]))",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "fixed", "fixedColor": "#1baf7a" },
+          "noValue": "0"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Error rate",
+      "gridPos": { "h": 5, "w": 4, "x": 12, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "100 * sum(rate(ferry_requests_total{status=~\"[45]..\"}[5m])) / clamp_min(sum(rate(ferry_requests_total[5m])),0.0001)",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#0ca30c", "value": null },
+              { "color": "#fab219", "value": 1 },
+              { "color": "#d03b3b", "value": 5 }
+            ]
+          },
+          "color": { "mode": "thresholds" },
+          "noValue": "n/a"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Key pool size",
+      "gridPos": { "h": 5, "w": 4, "x": 16, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_worker_pool_size",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "fixed", "fixedColor": "#eb6834" },
+          "noValue": "0"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Request rate (req/s)",
+      "description": "sum(rate(ferry_requests_total[1m])) overall, plus by status.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum(rate(ferry_requests_total[1m]))",
+          "legendFormat": "total",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (status)(rate(ferry_requests_total[1m]))",
+          "legendFormat": "{{status}}",
+          "refId": "B"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "gradientMode": "none",
+            "stacking": { "mode": "none", "group": "A" }
+          },
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#2a78d6", "value": null }]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "total" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#2a78d6" } },
+              { "id": "custom.lineWidth", "value": 3 }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Health-check latency",
+      "description": "ferry_health_check_latency_ms — passive round-trip to litellm /health/liveliness.",
+      "gridPos": { "h": 8, "w": 4, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_health_check_latency_ms",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "#0ca30c", "value": null },
+              { "color": "#fab219", "value": 200 },
+              { "color": "#d03b3b", "value": 1000 }
+            ]
+          },
+          "color": { "mode": "thresholds" },
+          "noValue": "n/a"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Models served",
+      "description": "ferry_model_info{model} — one series per served model id.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_model_info",
+          "instant": true,
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "instance": true,
+              "job": true,
+              "Value": true
+            },
+            "indexByName": {},
+            "renameByName": {
+              "model": "Model"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [{ "field": "Model" }]
+          }
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "cellOptions": { "type": "auto" }, "filterable": true, "inspect": false }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 10,
+      "type": "stat",
+      "title": "Exporter uptime",
+      "description": "ferry_exporter_uptime_seconds",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_exporter_uptime_seconds",
+          "instant": true,
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "horizontal",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "wideLayout": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dtdurations",
+          "color": { "mode": "fixed", "fixedColor": "#1baf7a" },
+          "noValue": "n/a"
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Backend events",
+      "description": "ferry_backend_events_total by {{kind}} — spikes when a key cools (kimi_quota) or a backend 429s (rate_limit).",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (kind)(increase(ferry_backend_events_total[1m]))",
+          "legendFormat": "{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": {
+            "drawStyle": "bars",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 5,
+            "gradientMode": "none",
+            "stacking": { "mode": "normal", "group": "A" }
+          },
+          "color": { "mode": "palette-classic" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#eb6834", "value": null }]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": ".*kimi_quota.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#eb6834" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": ".*rate_limit.*" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#d03b3b" } }]
+          }
+        ]
+      }
+    }
+  ]
+}

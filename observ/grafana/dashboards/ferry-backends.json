@@ -1,0 +1,512 @@
+{
+  "id": null,
+  "uid": "ferry-backends",
+  "title": "Ferry Backends & Keys",
+  "tags": ["llm-ferry", "backends"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 0,
+  "liveNow": false,
+  "weekStart": "",
+  "fiscalYearStartMonth": 0,
+  "timezone": "browser",
+  "refresh": "15s",
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "links": [],
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 100,
+      "type": "text",
+      "title": "",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 3 },
+      "options": {
+        "mode": "markdown",
+        "content": "## Ferry Backends & Keys\nLitellm proxy topology (`~/.config/ferry/litellm.yaml`) and the Gemini key pool — deployments, fallback chain, config freshness — from `ferry-metrics-exporter`, scraped by VictoriaMetrics every ~15s. **The LLM-internals row below requires litellm's native prometheus callback** (`callbacks: [\"prometheus\"]` in litellm.yaml, off by default) and shows No data until it's enabled — see `observ/README.md`."
+      }
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Gemini key pool",
+      "description": "ferry_worker_pool_size — number of deployments in litellm.yaml whose model_name is the pooled Gemini model.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 3, "w": 8, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#0ca30c", "value": null }]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_worker_pool_size",
+          "legendFormat": "Gemini key pool",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Fallback hops",
+      "description": "ferry_fallback_chain_length — length of the orchestrator's fallback chain (0 if none configured).",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 8, "y": 3, "w": 8, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#2a78d6", "value": null }]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_fallback_chain_length",
+          "legendFormat": "Fallback hops",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Total deployments",
+      "description": "count(ferry_deployment_info) — total model_list entries in litellm.yaml.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 16, "y": 3, "w": 8, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#1baf7a", "value": null }]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "count(ferry_deployment_info)",
+          "legendFormat": "Total deployments",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Deployments (topology)",
+      "description": "ferry_deployment_info{model_name,model} — one row per model_list deployment in litellm.yaml, labels promoted to columns.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 7, "w": 24, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#0ca30c", "value": null }]
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Time" },
+            "properties": [{ "id": "custom.hidden", "value": true }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Value" },
+            "properties": [{ "id": "custom.hidden", "value": true }]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "transformations": [
+        { "id": "labelsToFields", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "Value": true },
+            "indexByName": { "model_name": 0, "model": 1 },
+            "renameByName": { "model_name": "Model name (routed alias)", "model": "Model (litellm.yaml model_list)" }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "ferry_deployment_info",
+          "legendFormat": "",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "litellm.yaml last edited",
+      "description": "time() - ferry_route_config_mtime_seconds — how long ago the running route config was last edited. Detects a config change without diffing the file.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 15, "w": 24, "h": 4 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dtdurations",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#2a78d6", "value": null }]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "time() - ferry_route_config_mtime_seconds",
+          "legendFormat": "Route config age",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "LLM internals — requires litellm prometheus (see observ/README.md)",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "collapsed": false,
+      "gridPos": { "x": 0, "y": 19, "w": 24, "h": 1 },
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "text",
+      "title": "",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 20, "w": 24, "h": 3 },
+      "options": {
+        "mode": "markdown",
+        "content": "**Opt-in — off by default.** The four panels below read litellm's own `/metrics` endpoint (`http://127.0.0.1:8090/metrics`), which is **404 until litellm's prometheus callback is enabled**. They will show **No data** until you set `callbacks: [\"prometheus\"]` in `~/.config/ferry/litellm.yaml` and restart (`ferry down && ferry up --route`). Metric names below are best-effort for litellm 1.97.0 and may need adjustment for the version actually running — see `observ/README.md`."
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Request latency p50/p95",
+      "description": "OPT-IN (litellm-native, requires callbacks:[\"prometheus\"]). histogram_quantile over litellm_request_total_latency_metric_bucket — this exact bucket-metric name is best-effort for litellm 1.97.0 and may need adjustment per the litellm version actually running.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 23, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 5,
+            "stacking": { "mode": "none", "group": "A" },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": { "type": "linear" },
+            "hideFrom": { "tooltip": false, "viz": false, "legend": false },
+            "thresholdsStyle": { "mode": "off" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byFrameRefID", "options": "A" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#2a78d6" } },
+              { "id": "custom.lineStyle", "value": { "fill": "solid" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byFrameRefID", "options": "B" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#eb6834" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "histogram_quantile(0.5, sum by (le)(rate(litellm_request_total_latency_metric_bucket[5m])))",
+          "legendFormat": "p50",
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "histogram_quantile(0.95, sum by (le)(rate(litellm_request_total_latency_metric_bucket[5m])))",
+          "legendFormat": "p95",
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Tokens/min",
+      "description": "OPT-IN (litellm-native, requires callbacks:[\"prometheus\"]). litellm_total_tokens_metric is best-effort for litellm 1.97.0 — the closest token-count metric may differ per the version actually running.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 12, "y": 23, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 6,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "never",
+            "pointSize": 5,
+            "stacking": { "mode": "none", "group": "A" },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "scaleDistribution": { "type": "linear" },
+            "hideFrom": { "tooltip": false, "viz": false, "legend": false },
+            "thresholdsStyle": { "mode": "off" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byFrameRefID", "options": "A" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "#1baf7a" } },
+              { "id": "custom.lineStyle", "value": { "fill": "solid" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "legend": { "displayMode": "list", "placement": "bottom", "calcs": [] }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum(rate(litellm_total_tokens_metric[1m])) * 60",
+          "legendFormat": "Tokens/min",
+          "instant": false
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Per-deployment success/failure",
+      "description": "OPT-IN (litellm-native, requires callbacks:[\"prometheus\"]). litellm_deployment_success_responses + litellm_deployment_failure_responses, joined by deployment label.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 31, "w": 16, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#0ca30c", "value": null }]
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Successes" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "#d03b3b", "value": null },
+                    { "color": "#0ca30c", "value": 1 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Failures" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "#0ca30c", "value": null },
+                    { "color": "#fab219", "value": 1 },
+                    { "color": "#d03b3b", "value": 5 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Time" },
+            "properties": [{ "id": "custom.hidden", "value": true }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Time 1" },
+            "properties": [{ "id": "custom.hidden", "value": true }]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "transformations": [
+        { "id": "labelsToFields", "options": {} },
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "Time 1": true },
+            "renameByName": { "Successes": "Successes", "Failures": "Failures" }
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "litellm_deployment_success_responses",
+          "legendFormat": "Successes",
+          "instant": true
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "litellm_deployment_failure_responses",
+          "legendFormat": "Failures",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Spend",
+      "description": "OPT-IN (litellm-native, requires callbacks:[\"prometheus\"]). litellm_spend_metric.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 16, "y": 31, "w": 8, "h": 8 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#0ca30c", "value": null }]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "litellm_spend_metric",
+          "legendFormat": "Spend",
+          "instant": true
+        }
+      ]
+    }
+  ]
+}

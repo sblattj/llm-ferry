@@ -1,0 +1,30 @@
+# ferry observability stack — Grafana datasource provisioning (apiVersion 1)
+# Grafana 13.2.0. This file is COMMITTED with the ${VM_URL} token intact — it is materialized
+# (envsubst) into a runtime copy by observ/bringup.sh (-> ~/.config/ferry/observ/grafana-provisioning/),
+# per CONTRACT.md's "Webhook" / "Datasource URL" contract. Never point Grafana at this repo tree
+# directly with the token unexpanded.
+apiVersion: 1
+
+# Re-provisioning idempotency: delete any prior "Ferry VM" datasource (by name) before the
+# `datasources` list below is (re)applied, so repeated bringup runs never accumulate duplicates.
+deleteDatasources:
+  - name: Ferry VM
+    orgId: 1
+
+datasources:
+  - name: Ferry VM
+    type: prometheus
+    # Fixed contract (CONTRACT.md "Grafana datasource UID"): every dashboard panel targets
+    # {"type":"prometheus","uid":"ferry-vm"}. This uid MUST NOT change.
+    uid: ferry-vm
+    access: proxy
+    # Default http://127.0.0.1:8429 on the Mac (VM native, Homebrew). The literal ${VM_URL}
+    # token is expanded by observ/bringup.sh via envsubst — see CONTRACT.md "Webhook".
+    url: ${VM_URL}
+    orgId: 1
+    isDefault: true
+    editable: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"
+      prometheusType: Prometheus

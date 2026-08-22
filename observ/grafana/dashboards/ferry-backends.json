@@ -178,11 +178,10 @@
         "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" }
       },
       "transformations": [
-        { "id": "labelsToFields", "options": {} },
         {
           "id": "organize",
           "options": {
-            "excludeByName": { "Time": true, "Value": true },
+            "excludeByName": { "Time": true, "Value": true, "__name__": true, "instance": true, "job": true },
             "indexByName": { "model_name": 0, "model": 1 },
             "renameByName": { "model_name": "Model name (routed alias)", "model": "Model (litellm.yaml model_list)" }
           }
@@ -194,7 +193,8 @@
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
           "expr": "ferry_deployment_info",
           "legendFormat": "",
-          "instant": true
+          "instant": true,
+          "format": "table"
         }
       ]
     },

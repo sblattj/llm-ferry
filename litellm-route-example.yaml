@@ -152,6 +152,12 @@ router_settings:
                                              # the fallback fires. 1 keeps a worker pool
                                              # resilient to a blip without that penalty.
   # Strict failover chain: a failed `orchestrator` reroutes to the fallback list in
-  # order (fast model first, last resort last). Only orchestrator has a fallback;
-  # the gemini-3.7-flash pool is untouched.
-  fallbacks: [{"orchestrator": ["orchestrator-fallback", "orchestrator-fallback-2"]}]
+  # order (fast model first, last resort last).
+  #
+  # A worker POOL can have a fallback too: when every key in the gemini-3.7-flash pool
+  # is cooled down (all on 429), overflow reroutes to the model(s) listed instead of
+  # returning a raw 429 to the client. Point it at a model with spare capacity (here the
+  # orchestrator's own primary). litellm fallbacks are single-hop (not transitive), so
+  # the fallback target's own fallback list is NOT chained in. Remove the second entry
+  # if you want the pool to hard-fail rather than spill over.
+  fallbacks: [{"orchestrator": ["orchestrator-fallback", "orchestrator-fallback-2"]}, {"gemini-3.7-flash": ["orchestrator"]}]

@@ -380,7 +380,7 @@
       "id": 6,
       "type": "timeseries",
       "title": "Success vs failure rate by model",
-      "description": "sum by (litellm_model_name)(rate(litellm_deployment_success_responses_total[$__rate_interval])) vs the matching failure counter. Note the label here is litellm_model_name (the deployment's routed alias), not model. Success is green, failure red — any red line at all means that deployment is erroring.",
+      "description": "sum by (requested_model)(rate(litellm_proxy_total_requests_metric_total{status_code=~\"2..\"}[$__rate_interval])) vs rate(litellm_proxy_failed_requests_metric_total[$__rate_interval]). Keyed by requested_model (the model the client asked for). Success is green, failure red — any red line at all means that model is erroring. Uses the PROXY counters so streaming 429s (e.g. Gemini pool exhaustion) are counted; the litellm_deployment_* counters miss streaming.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 12, "y": 20, "w": 12, "h": 9 },
       "fieldConfig": {
@@ -432,15 +432,15 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum by (litellm_model_name) (rate(litellm_deployment_success_responses_total[$__rate_interval]))",
-          "legendFormat": "{{litellm_model_name}} · success",
+          "expr": "sum by (requested_model) (rate(litellm_proxy_total_requests_metric_total{status_code=~\"2..\"}[$__rate_interval]))",
+          "legendFormat": "{{requested_model}} · success",
           "instant": false
         },
         {
           "refId": "B",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum by (litellm_model_name) (rate(litellm_deployment_failure_responses_total[$__rate_interval]))",
-          "legendFormat": "{{litellm_model_name}} · failure",
+          "expr": "sum by (requested_model) (rate(litellm_proxy_failed_requests_metric_total[$__rate_interval]))",
+          "legendFormat": "{{requested_model}} · failure",
           "instant": false
         }
       ]

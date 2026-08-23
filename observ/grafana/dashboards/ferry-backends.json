@@ -376,8 +376,8 @@
     {
       "id": 10,
       "type": "table",
-      "title": "Per-deployment success/failure",
-      "description": "litellm-native. increase(litellm_deployment_success_responses_total[$__range]) and the matching failure counter, summed by litellm_model_name and joined into one row per deployment over the selected range.",
+      "title": "Per-model success/failure (client-facing)",
+      "description": "litellm-native. increase(litellm_proxy_total_requests_metric_total{status_code=~\"2..\"}[$__range]) vs increase(litellm_proxy_failed_requests_metric_total[$__range]), summed by requested_model and joined into one row per model over the selected range. Uses the PROXY counters (keyed by the model the client requested) so streaming calls — including Gemini pool 429s — are counted; the litellm_deployment_* counters miss streaming.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 0, "y": 31, "w": 16, "h": 8 },
       "fieldConfig": {
@@ -458,8 +458,8 @@
               "job": true,
               "job 1": true
             },
-            "indexByName": { "litellm_model_name": 0, "Value": 1, "Value 1": 2 },
-            "renameByName": { "litellm_model_name": "Model", "Value": "Successes", "Value 1": "Failures" }
+            "indexByName": { "requested_model": 0, "Value": 1, "Value 1": 2 },
+            "renameByName": { "requested_model": "Model", "Value": "Successes", "Value 1": "Failures" }
           }
         },
         {
@@ -471,7 +471,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum by (litellm_model_name) (increase(litellm_deployment_success_responses_total[$__range]))",
+          "expr": "sum by (requested_model) (increase(litellm_proxy_total_requests_metric_total{status_code=~\"2..\"}[$__range]))",
           "legendFormat": "",
           "instant": true,
           "format": "table"
@@ -479,7 +479,7 @@
         {
           "refId": "B",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum by (litellm_model_name) (increase(litellm_deployment_failure_responses_total[$__range]))",
+          "expr": "sum by (requested_model) (increase(litellm_proxy_failed_requests_metric_total[$__range]))",
           "legendFormat": "",
           "instant": true,
           "format": "table"
@@ -536,7 +536,7 @@
       "id": 13,
       "type": "table",
       "title": "Failures by model + reason (selected range)",
-      "description": "sum by (litellm_model_name, exception_class, exception_status)(increase(litellm_deployment_failure_responses_total[$__range])) — which deployment failed, with the litellm exception class and HTTP status that caused it (e.g. RateLimitError / 429).",
+      "description": "sum by (requested_model, exception_class, exception_status)(increase(litellm_proxy_failed_requests_metric_total[$__range])) — every client-facing failure by the model the client requested, with the litellm exception class and HTTP status (e.g. VertexAIError / 429). Uses the PROXY failed-requests counter, not litellm_deployment_failure_responses_total: streaming calls (agentic clients stream) do NOT increment the deployment counter, so Gemini pool 429s only show up here.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 0, "y": 40, "w": 14, "h": 9 },
       "fieldConfig": {
@@ -591,9 +591,9 @@
           "id": "organize",
           "options": {
             "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
-            "indexByName": { "litellm_model_name": 0, "exception_class": 1, "exception_status": 2, "Value": 3 },
+            "indexByName": { "requested_model": 0, "exception_class": 1, "exception_status": 2, "Value": 3 },
             "renameByName": {
-              "litellm_model_name": "Model",
+              "requested_model": "Model",
               "exception_class": "Exception",
               "exception_status": "HTTP status",
               "Value": "Failures"
@@ -609,7 +609,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum by (litellm_model_name, exception_class, exception_status) (increase(litellm_deployment_failure_responses_total[$__range]))",
+          "expr": "sum by (requested_model, exception_class, exception_status) (increase(litellm_proxy_failed_requests_metric_total[$__range]))",
           "legendFormat": "",
           "instant": true,
           "format": "table"
@@ -620,7 +620,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Failure rate by model",
-      "description": "sum by (litellm_model_name)(rate(litellm_deployment_failure_responses_total[$__rate_interval])) — when each deployment started erroring. Flat zero is healthy; a step up is the moment a backend went bad and fallbacks began firing (see the fallback tables below).",
+      "description": "sum by (requested_model)(rate(litellm_proxy_failed_requests_metric_total[$__rate_interval])) — when each model started erroring, client-facing. Flat zero is healthy; a step up is the moment a backend went bad and fallbacks began firing (see the fallback tables below). Uses the PROXY failed-requests counter so streaming 429s (e.g. the Gemini pool exhausting quota) are included.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 14, "y": 40, "w": 10, "h": 9 },
       "fieldConfig": {
@@ -661,8 +661,8 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum by (litellm_model_name) (rate(litellm_deployment_failure_responses_total[$__rate_interval]))",
-          "legendFormat": "{{litellm_model_name}}",
+          "expr": "sum by (requested_model) (rate(litellm_proxy_failed_requests_metric_total[$__rate_interval]))",
+          "legendFormat": "{{requested_model}}",
           "instant": false
         }
       ]

@@ -228,8 +228,12 @@ cmd_install() {
   # 0.136.3. Left unpinned, uv resolves fastapi 0.141+ and the proxy dies at
   # startup with a misleading "ModuleNotFoundError: No module named 'proxy_server'".
   # The [proxy] extra is what pulls fastapi/uvicorn in the first place.
+  # prometheus_client is what litellm's native /metrics needs: without it, setting
+  # `callbacks: ["prometheus"]` in litellm.yaml crashes startup with
+  # "ModuleNotFoundError: No module named 'prometheus_client'". Bundling it here lets
+  # the observ Grafana stack chart per-model usage, failures, and fallback events.
   echo ">>> Installing 'litellm' via uv..."
-  uv tool install 'litellm[proxy]==1.97.0' --with 'fastapi==0.136.3' --force
+  uv tool install 'litellm[proxy]==1.97.0' --with 'fastapi==0.136.3' --with 'prometheus_client' --force
 
   # Download default local models (macOS only — Linux has no local MLX serving).
   if (( IS_MAC )); then

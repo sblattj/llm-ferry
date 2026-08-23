@@ -81,28 +81,43 @@ model_list:
   #     timeout: 600
 
   # -- Worker pool: Gemini 3.7 Flash across N keys (each in its OWN project) --
+  # model_info.id gives each deployment a STABLE, human-readable id. litellm stamps
+  # it onto the `model_id` label of the per-deployment metrics, so the Grafana
+  # per-key failure panels can say "gemini-key-3 is 429ing" instead of an opaque
+  # hash (the hash also changes whenever a key value changes, so it's useless for
+  # tracking one key over time). Ids must be unique across the whole model_list.
   - model_name: gemini-3.7-flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY        # project #1
+    model_info:
+      id: gemini-key-1
 
   - model_name: gemini-3.7-flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_2      # project #2
+    model_info:
+      id: gemini-key-2
 
   - model_name: gemini-3.7-flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_3      # project #3
+    model_info:
+      id: gemini-key-3
   - model_name: gemini-3.7-flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_4      # project #4
+    model_info:
+      id: gemini-key-4
   - model_name: gemini-3.7-flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_5      # project #5
+    model_info:
+      id: gemini-key-5
   # Scale the pool to however many independent-project keys you have — add or
   # delete deployments to match. Each key MUST live in its own Google Cloud
   # project to add real headroom (Gemini quota is per-project, not per-key).
@@ -110,6 +125,8 @@ model_list:
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_6      # project #6
+    model_info:
+      id: gemini-key-6
 
 litellm_settings:
   # Exposes litellm-native /metrics on :8090 (per-model usage, per-deployment

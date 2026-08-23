@@ -897,6 +897,139 @@
           "format": "table"
         }
       ]
+    },
+    {
+      "id": 18,
+      "type": "table",
+      "title": "Gemini pool — failures by key (selected range)",
+      "description": "sum by (model_id, exception_status)(increase(litellm_proxy_failed_requests_metric_total{requested_model=\"gemini-3.7-flash\"}[$__range])) — WHICH individual Gemini key failed, and why (429 = quota, 403 = auth/permission). The Key column is the deployment's model_info.id (gemini-key-1 … gemini-key-10); set those in litellm.yaml so this reads as a name instead of a hash. Every key showing 429s means the whole pool is saturated — add capacity or a worker fallback.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 0, "y": 57, "w": 14, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#d03b3b", "value": null }]
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": { "type": "auto" },
+            "filterable": true,
+            "inspect": false
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Failures" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "#0ca30c", "value": null },
+                    { "color": "#fab219", "value": 1 },
+                    { "color": "#d03b3b", "value": 5 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "HTTP status" },
+            "properties": [{ "id": "custom.width", "value": 120 }]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": { "show": true, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "instance": true, "job": true },
+            "indexByName": { "model_id": 0, "exception_status": 1, "Value": 2 },
+            "renameByName": {
+              "model_id": "Key",
+              "exception_status": "HTTP status",
+              "Value": "Failures"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": { "fields": {}, "sort": [{ "field": "Failures", "desc": true }] }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (model_id, exception_status) (increase(litellm_proxy_failed_requests_metric_total{requested_model=\"gemini-3.7-flash\"}[$__range]))",
+          "legendFormat": "",
+          "instant": true,
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Gemini 429s by key",
+      "description": "sum by (model_id)(rate(litellm_proxy_failed_requests_metric_total{requested_model=\"gemini-3.7-flash\", exception_status=\"429\"}[$__rate_interval])) — per-key 429 rate over time. When many lines rise together the whole pool is exhausting; a single rising line is one key hitting its per-project quota.",
+      "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+      "gridPos": { "x": 14, "y": 57, "w": 10, "h": 9 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "decimals": 3,
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": { "mode": "none", "group": "A" },
+            "axisPlacement": "auto",
+            "axisLabel": "429/s",
+            "scaleDistribution": { "type": "linear" },
+            "hideFrom": { "tooltip": false, "viz": false, "legend": false },
+            "thresholdsStyle": { "mode": "off" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{ "color": "#d03b3b", "value": null }]
+          },
+          "mappings": []
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "table", "placement": "bottom", "showLegend": true, "calcs": ["lastNotNull", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "prometheus", "uid": "ferry-vm" },
+          "expr": "sum by (model_id) (rate(litellm_proxy_failed_requests_metric_total{requested_model=\"gemini-3.7-flash\", exception_status=\"429\"}[$__rate_interval]))",
+          "legendFormat": "{{model_id}}",
+          "instant": false
+        }
+      ]
     }
   ]
 }

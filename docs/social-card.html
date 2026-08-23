@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 640px; overflow: hidden; }
+  body {
+    font-family: -apple-system, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+    background: #0a0e14;
+    color: #e9eef5;
+    position: relative;
+  }
+  /* accent glows */
+  .glow-t { position: absolute; top: -320px; left: -220px; width: 760px; height: 760px;
+            background: radial-gradient(circle, rgba(0,170,170,.28), transparent 62%); }
+  .glow-b { position: absolute; bottom: -360px; right: -240px; width: 820px; height: 820px;
+            background: radial-gradient(circle, rgba(65,41,145,.34), transparent 62%); }
+  /* faint grid */
+  .grid { position: absolute; inset: 0;
+          background-image: linear-gradient(rgba(255,255,255,.028) 1px, transparent 1px),
+                            linear-gradient(90deg, rgba(255,255,255,.028) 1px, transparent 1px);
+          background-size: 44px 44px; }
+  .topbar { position: absolute; top: 0; left: 0; right: 0; height: 6px;
+            background: linear-gradient(90deg, #0aa 0%, #0aa 55%, #412991 100%); }
+
+  .wrap { position: relative; z-index: 2; height: 100%;
+          display: grid; grid-template-columns: 1fr 400px; }
+  .left  { padding: 72px 0 64px 76px; display: flex; flex-direction: column; }
+  .right { position: relative; }
+
+  .brand { display: flex; align-items: center; gap: 14px; margin-bottom: 40px; }
+  .brand .mark { font-size: 34px; font-weight: 800; letter-spacing: -.02em; color: #fff; }
+  .brand .boat { font-size: 34px; }
+  .brand .tag  { margin-left: 6px; font-size: 15px; font-weight: 600; letter-spacing: .14em;
+                 text-transform: uppercase; color: #6fe3e3; padding: 5px 11px;
+                 border: 1px solid rgba(0,170,170,.4); border-radius: 999px; background: rgba(0,170,170,.08); }
+
+  h1 { font-size: 62px; line-height: 1.04; font-weight: 800; letter-spacing: -.025em;
+       color: #f4f8fc; max-width: 760px; }
+  h1 .hi { color: #17c7c7; }
+  .sub { margin-top: 26px; font-size: 25px; line-height: 1.38; font-weight: 450;
+         color: #a7b4c4; max-width: 700px; }
+  .sub b { color: #dfe8f2; font-weight: 650; }
+
+  .pills { margin-top: auto; display: flex; flex-wrap: wrap; gap: 12px; max-width: 720px; }
+  .pill { font-size: 17px; font-weight: 600; color: #cdd8e6;
+          padding: 9px 16px; border-radius: 10px; border: 1px solid rgba(255,255,255,.11);
+          background: rgba(255,255,255,.04); display: flex; align-items: center; gap: 8px; }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: #17c7c7; }
+  .pill.p .dot { background: #8a6fe8; }
+
+  .foot { margin-top: 30px; display: flex; align-items: center; gap: 18px;
+          font-size: 18px; color: #7d8a9c; }
+  .foot .repo { color: #cdd8e6; font-weight: 650; }
+  .foot .sep { color: #3a4656; }
+
+  /* right-side diagram: one host -> LAN clients */
+  svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+  <div class="glow-t"></div>
+  <div class="glow-b"></div>
+  <div class="grid"></div>
+  <div class="topbar"></div>
+
+  <div class="wrap">
+    <div class="left">
+      <div class="brand">
+        <span class="boat">🛥️</span>
+        <span class="mark">llm-ferry</span>
+        <span class="tag">LAN AI gateway</span>
+      </div>
+
+      <h1>Turn one Mac into a<br><span class="hi">private AI gateway</span><br>for your whole LAN.</h1>
+
+      <p class="sub">Serve your cloud API keys <b>and</b> local GPU models to every device —
+        from one OpenAI-compatible endpoint. <b>Keys never leave the host.</b></p>
+
+      <div class="pills">
+        <span class="pill"><span class="dot"></span>OpenAI-compatible API</span>
+        <span class="pill"><span class="dot"></span>Local MLX + cloud</span>
+        <span class="pill p"><span class="dot"></span>Automatic fallback routing</span>
+        <span class="pill p"><span class="dot"></span>Join clients with one curl</span>
+      </div>
+
+      <div class="foot">
+        <span class="repo">github.com/sblattj/llm-ferry</span>
+        <span class="sep">•</span>
+        <span>macOS · Linux</span>
+        <span class="sep">•</span>
+        <span>MIT</span>
+      </div>
+    </div>
+
+    <div class="right">
+      <svg viewBox="0 0 400 640" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="edge" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0" stop-color="#17c7c7" stop-opacity=".9"/>
+            <stop offset="1" stop-color="#17c7c7" stop-opacity=".25"/>
+          </linearGradient>
+          <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+            <feGaussianBlur stdDeviation="6"/>
+          </filter>
+        </defs>
+
+        <!-- edges host -> clients -->
+        <g stroke="url(#edge)" stroke-width="2.5">
+          <path d="M96 320 C 190 320, 210 128, 300 128"/>
+          <path d="M96 320 C 190 320, 210 245, 300 245"/>
+          <path d="M96 320 C 190 320, 210 395, 300 395"/>
+          <path d="M96 320 C 190 320, 210 512, 300 512"/>
+        </g>
+        <!-- moving pulses -->
+        <g fill="#7ff0f0">
+          <circle r="4" cx="0" cy="0"><animateMotion dur="2.4s" repeatCount="indefinite" path="M96 320 C 190 320, 210 128, 300 128"/></circle>
+          <circle r="4" cx="0" cy="0"><animateMotion dur="2.8s" repeatCount="indefinite" path="M96 320 C 190 320, 210 245, 300 245"/></circle>
+          <circle r="4" cx="0" cy="0"><animateMotion dur="2.2s" repeatCount="indefinite" path="M96 320 C 190 320, 210 395, 300 395"/></circle>
+          <circle r="4" cx="0" cy="0"><animateMotion dur="3.0s" repeatCount="indefinite" path="M96 320 C 190 320, 210 512, 300 512"/></circle>
+        </g>
+
+        <!-- HOST node -->
+        <circle cx="96" cy="320" r="62" fill="#17c7c7" opacity=".18" filter="url(#soft)"/>
+        <circle cx="96" cy="320" r="46" fill="#0b1720" stroke="#17c7c7" stroke-width="2.5"/>
+        <!-- padlock icon (keys stay on the host) -->
+        <g stroke="#17c7c7" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M89 302 v-6 a7 7 0 0 1 14 0 v6"/>
+        </g>
+        <rect x="84" y="302" width="24" height="18" rx="3.5" fill="#17c7c7"/>
+        <circle cx="96" cy="309" r="2.4" fill="#0b1720"/>
+        <rect x="94.8" y="310" width="2.4" height="5" rx="1" fill="#0b1720"/>
+        <text x="96" y="342" text-anchor="middle" font-size="14" font-weight="700" fill="#cdeeee"
+              letter-spacing="1" font-family="-apple-system,system-ui,sans-serif">HOST</text>
+
+        <!-- client nodes (drawn device glyphs) -->
+        <g stroke="#8394a8" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round">
+          <!-- laptop -->
+          <g transform="translate(336,129)">
+            <rect x="300" y="106" width="72" height="46" rx="9" transform="translate(-336,-129)" fill="#12161f" stroke="#3a4656" stroke-width="1.5"/>
+            <rect x="-15" y="-11" width="30" height="19" rx="2"/>
+            <path d="M-21 10 h42"/>
+          </g>
+          <!-- laptop -->
+          <g transform="translate(336,246)">
+            <rect x="300" y="223" width="72" height="46" rx="9" transform="translate(-336,-246)" fill="#12161f" stroke="#3a4656" stroke-width="1.5"/>
+            <rect x="-15" y="-11" width="30" height="19" rx="2"/>
+            <path d="M-21 10 h42"/>
+          </g>
+          <!-- phone -->
+          <g transform="translate(336,396)">
+            <rect x="300" y="373" width="72" height="46" rx="9" transform="translate(-336,-396)" fill="#12161f" stroke="#3a4656" stroke-width="1.5"/>
+            <rect x="-9" y="-13" width="18" height="26" rx="3.5"/>
+            <path d="M-3 9 h6"/>
+          </g>
+          <!-- desktop -->
+          <g transform="translate(336,513)">
+            <rect x="300" y="490" width="72" height="46" rx="9" transform="translate(-336,-513)" fill="#12161f" stroke="#3a4656" stroke-width="1.5"/>
+            <rect x="-15" y="-12" width="30" height="18" rx="2"/>
+            <path d="M-5 6 v4 M5 6 v4 M-9 11 h18"/>
+          </g>
+        </g>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>

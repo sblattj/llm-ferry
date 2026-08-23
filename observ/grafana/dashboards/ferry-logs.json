@@ -3,7 +3,7 @@
   "uid": "ferry-logs",
   "tags": ["llm-ferry", "logs"],
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "graphTooltip": 0,
   "timezone": "browser",
@@ -230,6 +230,50 @@
         "sortOrder": "Descending"
       },
       "fieldConfig": { "defaults": {}, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Gemini 429 rate",
+      "description": "Gemini quota-exhaustion 429s over time, counted from VictoriaLogs (`_msg:~\"429 Too Many Requests\"`) alongside fallback hops. An at-a-glance BURST watch on the logs dashboard: brief blips are normal (failover absorbs them), a sustained spike means the pool's aggregate rate limit is being exceeded. For per-KEY attribution (which key is 429ing), see the 'Gemini 429s by key' panel on the Backends dashboard, which uses litellm_proxy_failed_requests_metric_total grouped by model_id.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 30 },
+      "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+      "targets": [
+        {
+          "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+          "refId": "A",
+          "editorMode": "code",
+          "queryType": "statsRange",
+          "expr": "source:proxy AND _msg:~\"429 Too Many Requests\" | stats count() as \"429s\"",
+          "legendFormat": "Gemini 429s",
+          "step": "$__interval"
+        },
+        {
+          "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
+          "refId": "B",
+          "editorMode": "code",
+          "queryType": "statsRange",
+          "expr": "source:proxy AND _msg:~\"[Ff]allback\" | stats count() as \"fallbacks\"",
+          "legendFormat": "fallbacks fired",
+          "step": "$__interval"
+        }
+      ],
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["sum", "max"] },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 60, "showPoints": "never", "stacking": { "mode": "none", "group": "A" } },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Gemini 429s" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } } ] },
+          { "matcher": { "id": "byName", "options": "fallbacks fired" }, "properties": [ { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } } ] }
+        ]
+      }
     }
   ]
 }

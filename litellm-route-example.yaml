@@ -46,6 +46,7 @@ model_list:
       model: anthropic/k3-256k
       api_key: os.environ/KIMI_API_KEY
       api_base: https://api.kimi.com/coding      # -> https://api.kimi.com/coding/v1/messages
+      reasoning_effort: max        # drop_params:true below drops this where a provider rejects it
       timeout: 600
 
   # -- Orchestrator FALLBACK chain (example: Fireworks DeepSeek V4 Pro, GLM 5.2) --
@@ -58,11 +59,13 @@ model_list:
     litellm_params:
       model: fireworks_ai/accounts/fireworks/models/deepseek-v4-pro-0813
       api_key: os.environ/FIREWORKS_API_KEY
+      reasoning_effort: max
       timeout: 600
   - model_name: orchestrator-fallback-2      # last resort: slower/cheaper
     litellm_params:
       model: fireworks_ai/accounts/fireworks/models/glm-5p2
       api_key: os.environ/FIREWORKS_API_KEY
+      reasoning_effort: max
       timeout: 600
 
   # -- Alternative fallback: a ChatGPT SUBSCRIPTION (not pay-per-token) ---------

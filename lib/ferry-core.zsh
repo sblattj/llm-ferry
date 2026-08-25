@@ -93,6 +93,23 @@ HF_PORT="8096"
 PROXY_PORT="8097"
 LOCAL_MODEL="mlx-community/Qwen3.8-27B-nvfp4"
 LOCAL_DRAFT="mlx-community/Qwen3.8-27B-MTP-8bit"
+# KV-cache memory governor (measured 2026-08-25, 128GB M5 Max): the stock launch
+# kept the full fp16 KV of EVERY request in the APC prefix cache — one 121k-token
+# opencode session peaked the server at 97GB phys_footprint (GPU wired ceiling is
+# ~90-100GB on a 128GB Mac => the "caps out around 30k tokens" wall under
+# concurrent agents; `ps` RSS is blind to this, use `footprint <pid>`). With
+# 4-bit KV + a bounded APC pool + a concurrent-seq cap, the SAME session peaked
+# 56GB, idled at 35GB, and decoded ~60% faster (32 vs 20 tok/s at 64k context).
+# Set any of these to "" to drop the flag from the launch line.
+LOCAL_KV_BITS="4"         # --kv-bits: 4-bit KV cache quant (weights stay nvfp4)
+LOCAL_MAX_KV="131072"     # --max-kv-size: prompt+max_tokens over this => clean 400, not OOM
+LOCAL_MAX_SEQS="4"        # --max-num-seqs: max concurrent sequences (subagent fan-out)
+LOCAL_APC_BLOCKS="512"    # APC_NUM_BLOCKS: retained prefix-pool size (x16 tokens)
+# Local ORCHESTRATOR model: nemotron_h hybrid (6/52 full-attention layers, 2 KV heads)
+# => ~6KB KV/token, so main + several concurrent subagents fit comfortably in 128GB.
+# ~3B active params (A3B) keeps decode fast; NVFP4 aligns with kv-cache optimization work.
+# No MTP draft model exists for it -> launch without --draft-model.
+LOCAL_MODEL_ORCH="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
 MDNS_NAME="$(detect_mdns_name)"
 
 # Default cloud model associations

@@ -99,7 +99,12 @@ Run the command `ferry share` prints — it embeds your host's live mDNS name an
 curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 ```
 
-`ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, configures your chosen editor to the host endpoint, and adds a `host-code` shell shortcut. Then:
+`ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, configures your chosen editor to the host endpoint, and adds a `host-code` shell shortcut. It also installs two opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation — your default opencode config is untouched):
+
+- `opencode-cloud` — the route-mode "orch" pattern: `orchestrator` main + Gemini Flash subagents. Needs `ferry up --route` on the host.
+- `opencode-local` — the all-local lane: main **and** subagent models both on the host GPU. Needs `ferry up --orch` on the host.
+
+Then:
 
 ```bash
 ferry status                     # connection health + the host's active model
@@ -116,6 +121,7 @@ ferry up -c          # cloud proxy to the default Gemini model, on port 8090
 ferry up -l          # local MLX GPU model, on port 8090
 ferry up -m <id>     # cloud proxy for a specific LiteLLM model id
 ferry up --route     # serve orchestrator + worker pool from ~/.config/ferry/litellm.yaml
+ferry up --orch      # local orchestrator lane: Nemotron 3 Nano 30B A3B NVFP4 on the GPU
 ferry dash --open    # live route-proxy dashboard at http://localhost:8091
 ferry status         # active listeners + the loaded model
 ferry down           # stop all servers, proxies, and share servers
@@ -128,6 +134,7 @@ ferry down           # stop all servers, proxies, and share servers
 ## Contents
 
 - [Route mode — orchestrator + fallback + worker failover](#route-mode--orchestrator--fallback--worker-failover)
+- [Local orchestrator lane — `ferry up --orch`](#local-orchestrator-lane--ferry-up---orch)
 - [Dashboards & observability](#dashboards--observability)
 - [Ports](#ports)
 - [Ferrying models & files across the LAN](#ferrying-models--files-across-the-lan)
@@ -160,6 +167,10 @@ A **ChatGPT Plus/Pro subscription** can serve a fallback hop too, via LiteLLM's 
 > LiteLLM only **routes and fails over** — the "orchestrator delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to `orchestrator` and the subagent model to `gemini-3.7-flash`.
 
 **opencode auto-wiring.** On a client, `ferry opencode` wires opencode to the host — it detects the served models (setting up the `orchestrator` + `gemini-3.7-flash` split when both are present), merges non-destructively into your existing config, and backs up the old one first. It also **pins opencode's built-in agents** — `build`/`plan` to the orchestrator, and the `general`/`explore`/`scout` subagents to the worker model — so the fan-out actually uses the cheap lane.
+
+## Local orchestrator lane — `ferry up --orch`
+
+Route mode's all-local counterpart: serve `mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` (~19.3 GB, MLX) on the same `:8090` endpoint. It's a `nemotron_h` hybrid MoE — only 6 of 52 layers are full attention with just 2 KV heads × 128 head dim — so the KV cache is ~6 KB/token, under 1 GB per 128k-token agent stream. A local orchestrator plus several **concurrent subagents** fit comfortably in a 128 GB Mac's RAM, while ~3B active params (A3B) keep decode fast; the NVFP4 quantization aligns with the ongoing nvfp4 KV-cache work. No speculative draft model. On a client, run `opencode-local` to pin opencode's main *and* subagent models to it.
 
 ## Dashboards & observability
 
@@ -268,7 +279,9 @@ uvx whosaid ...            # uv/PyPI, huggingface_hub, git, curl — now downloa
 
 ## Local models
 
-Local mode serves an MLX model via `mlx-vlm`. The default (`mlx-community/Qwen3.8-27B-nvfp4`, with `mlx-community/Qwen3.8-27B-MTP-8bit` as a speculative draft) is just an **example** — swap it for any MLX-compatible model your Mac's unified memory can hold by editing `LOCAL_MODEL` in `ferry`. Speculative decoding is optional. Local GPU serving is **macOS / Apple Silicon only**.
+Local mode serves an MLX model via `mlx-vlm`. The default (`mlx-community/Qwen3.8-27B-nvfp4`, with `mlx-community/Qwen3.8-27B-MTP-8bit` as a speculative draft) is just an **example** — swap it for any MLX-compatible model your Mac's unified memory can hold by editing `LOCAL_MODEL` in `ferry`. Speculative decoding is optional. A second built-in local lane, `ferry up --orch`, serves the Nemotron Nano hybrid MoE as a subagent-friendly local orchestrator (see [Local orchestrator lane](#local-orchestrator-lane--ferry-up---orch)). Local GPU serving is **macOS / Apple Silicon only**.
+
+**KV-cache memory governor:** Default local launches now ship with `--kv-bits 4`, `--max-kv-size 131072`, `--max-num-seqs 4`, and `APC_NUM_BLOCKS=512`. Measured on a 128GB M5 Max during a 121k-token agentic session: peak GPU footprint dropped 97GB -> 56GB, idle retained memory fell 57GB -> 35GB, and decode ran ~60% faster. Monitor live usage with `footprint <pid>` (`ps RSS` does not show Metal wired memory). Disable any knob by setting it to `""` in `lib/ferry-core.zsh` (or passing flags in `host-serve.sh`).
 
 ## Platform support
 
@@ -290,7 +303,7 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | Command | Mode | What it does |
 |---|---|---|
 | `install` | host | Install `uv`, `litellm` (+ `mlx-vlm` & default models on macOS), link `ferry` globally |
-| `up [-l\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | Start the local GPU server, cloud proxy, or multi-model route config on `8090` (no args → interactive catalog; `-r`/`--route` → route mode) |
+| `up [-l\|-c\|-m <id>\|-r\|--orch\|-i] [-p <port>]` | host | Start the local GPU server, cloud proxy, or multi-model route config on `8090` (no args → interactive catalog; `-r`/`--route` → route mode; `--orch` → local orchestrator lane) |
 | `down` | host | Stop all servers, cloud proxies, and share/proxy servers |
 | `status` | both | Host: listeners + active model. Client: connection health + host's active model |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |

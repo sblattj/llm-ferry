@@ -47,8 +47,12 @@ cmd_install() {
         uv run huggingface-cli download "$model_id"
       fi
     }
+    echo ">>> Fetching Model 1: Qwen 3.8-27B (nvfp4 quantized)"
     download_model "$LOCAL_MODEL"
+    echo ">>> Fetching Model 2: Qwen 3.8-27B MTP Speculative Drafter (8-bit)"
     download_model "$LOCAL_DRAFT"
+    echo ">>> Fetching Model 3: NVIDIA Nemotron 3 Nano 30B A3B (local orchestrator, NVFP4)"
+    download_model "$LOCAL_MODEL_ORCH"
   else
     echo ">>> Linux detected: skipping mlx-vlm and local model downloads."
     echo "    Local GPU serving is macOS / Apple Silicon only. On Linux, serve via"

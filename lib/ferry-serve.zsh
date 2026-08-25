@@ -76,6 +76,7 @@ chat_models.sort(key=lambda x: x[0], reverse=True)
 options = []
 # Option 1 is ALWAYS the local Apple Silicon GPU Qwen model
 options.append(("local", "Local GPU Qwen 3.8-27B (APC + Speculative MTP)"))
+options.append(("local-orch", "Local GPU NVIDIA Nemotron 3 Nano 30B A3B (orchestrator + subagents, NVFP4)"))
 
 for _, m_id, m_desc in chat_models:
     options.append((f"gemini/{m_id}", f"[Cloud] {m_desc} (gemini/{m_id})"))
@@ -87,19 +88,19 @@ sys.stderr.write("==============================================================
 for idx, (m_id, label) in enumerate(options, 1):
     sys.stderr.write(f"  {idx}) {label}\n")
 sys.stderr.write("=================================================================\n")
-sys.stderr.write(f"Select a model to launch (1-{len(options)}) [Default: 2]: ")
+sys.stderr.write(f"Select a model to launch (1-{len(options)}) [Default: 3]: ")
 sys.stderr.flush()
 
 try:
     # Read response directly from /dev/tty
     with open("/dev/tty", "r") as tty:
         choice_str = tty.readline().strip()
-    choice = int(choice_str) if choice_str else 2
+    choice = int(choice_str) if choice_str else 3
 except Exception:
-    choice = 2
+    choice = 3
 
 if choice < 1 or choice > len(options):
-    choice = 2
+    choice = 3
 
 selected_id = options[choice - 1][0]
 print(selected_id)
@@ -108,6 +109,8 @@ PYEOF
 
   if [[ "$chosen_model" == "local" ]]; then
     LAUNCH_MODE="local"
+  elif [[ "$chosen_model" == "local-orch" ]]; then
+    LAUNCH_MODE="local-orch"
   elif [[ "$chosen_model" == "__ERROR:"* ]]; then
     echo "Error parsing live models. Falling back to Local GPU model."
     LAUNCH_MODE="local"
@@ -141,6 +144,11 @@ cmd_up() {
       case "$1" in
         -l|--local)
           LAUNCH_MODE="local"
+          skip_catalog=1
+          shift
+          ;;
+        -o|--orch)
+          LAUNCH_MODE="local-orch"
           skip_catalog=1
           shift
           ;;
@@ -214,16 +222,67 @@ cmd_up() {
     fi
     
     export APC_ENABLED=1
+    export APC_NUM_BLOCKS="${LOCAL_APC_BLOCKS:-512}"
     echo ">>> Launching local GPU model server with APC and MTP..."
     echo "    Model: $LOCAL_MODEL"
     echo "    Port:  $target_port"
-    
-    nohup mlx_vlm.server \
-      --model "$LOCAL_MODEL" \
-      --draft-model "$LOCAL_DRAFT" \
-      --host 0.0.0.0 \
-      --port "$target_port" > "$LOCAL_LOG" 2>&1 & disown
+    echo "    KV gov: kv-bits=${LOCAL_KV_BITS:-off} max-kv=${LOCAL_MAX_KV:-off} seqs=${LOCAL_MAX_SEQS:-off} apc-blocks=${APC_NUM_BLOCKS}"
+
+    # KV/memory governor flags are conditional so "" disables any of them
+    # (see lib/ferry-core.zsh for the measured motivation).
+    local mlargs=(
+      --model "$LOCAL_MODEL"
+      --host 0.0.0.0
+      --port "$target_port"
+    )
+    [[ -n "${LOCAL_DRAFT:-}" ]]      && mlargs+=(--draft-model "$LOCAL_DRAFT")
+    [[ -n "${LOCAL_KV_BITS:-}" ]]    && mlargs+=(--kv-bits "$LOCAL_KV_BITS")
+    [[ -n "${LOCAL_MAX_KV:-}" ]]     && mlargs+=(--max-kv-size "$LOCAL_MAX_KV")
+    [[ -n "${LOCAL_MAX_SEQS:-}" ]]   && mlargs+=(--max-num-seqs "$LOCAL_MAX_SEQS")
+
+    nohup mlx_vlm.server "${mlargs[@]}" > "$LOCAL_LOG" 2>&1 & disown
       
+    echo ">>> Running in background. Log: $LOCAL_LOG"
+    
+  elif [[ "$LAUNCH_MODE" == "local-orch" ]]; then
+    # Local GPU orchestrator serving uses Apple MLX — macOS / Apple Silicon only.
+    if (( ! IS_MAC )); then
+      echo "Error: local GPU serving uses Apple MLX (macOS / Apple Silicon only)."
+      echo "       On Linux, serve a cloud / OpenAI-compatible endpoint instead:"
+      echo "         ferry up --route        # multiple models from litellm.yaml"
+      echo "         ferry up --cloud        # default Gemini model"
+      echo "         ferry up --model <id>   # any LiteLLM model string"
+      exit 1
+    fi
+
+    # Start local GPU server
+    if ! command -v mlx_vlm.server >/dev/null 2>&1; then
+      echo "Error: 'mlx_vlm.server' is missing. Run: ferry install"
+      exit 1
+    fi
+    
+    export APC_ENABLED=1
+    export APC_NUM_BLOCKS="${LOCAL_APC_BLOCKS:-512}"
+    echo ">>> Launching local GPU orchestrator lane (nemotron_h hybrid MoE, concurrent subagents)..."
+    echo "    Model: $LOCAL_MODEL_ORCH"
+    echo "    Port:  $target_port"
+    echo "    KV gov: kv-bits=${LOCAL_KV_BITS:-off} max-kv=${LOCAL_MAX_KV:-off} seqs=${LOCAL_MAX_SEQS:-off} apc-blocks=${APC_NUM_BLOCKS}"
+    echo "    (subagent fan-out: raise LOCAL_MAX_SEQS to admit more concurrent agents)"
+
+    # Same KV/memory governor flags as the --local lane (nemotron_h's KV is already
+    # tiny, but the seqs cap + bounded APC pool are what make a fan-out safe).
+    # No draft model exists for the orchestrator lane.
+    local mlargs=(
+      --model "$LOCAL_MODEL_ORCH"
+      --host 0.0.0.0
+      --port "$target_port"
+    )
+    [[ -n "${LOCAL_KV_BITS:-}" ]]    && mlargs+=(--kv-bits "$LOCAL_KV_BITS")
+    [[ -n "${LOCAL_MAX_KV:-}" ]]     && mlargs+=(--max-kv-size "$LOCAL_MAX_KV")
+    [[ -n "${LOCAL_MAX_SEQS:-}" ]]   && mlargs+=(--max-num-seqs "$LOCAL_MAX_SEQS")
+
+    nohup mlx_vlm.server "${mlargs[@]}" > "$LOCAL_LOG" 2>&1 & disown
+
     echo ">>> Running in background. Log: $LOCAL_LOG"
     
   elif [[ "$LAUNCH_MODE" == "cloud" ]]; then

@@ -113,10 +113,16 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # MLX servers this script launches, wired into that same config as
 # openai-compatible backends on 127.0.0.1.
 
-# Local ORCHESTRATOR lane — the "smart" local model: dense-ish 27B at nvfp4, and
-# the only local lane with an MTP draft model, so speculative decoding applies.
+# Local ORCHESTRATOR lane — the "smart" local model: dense-ish 27B at nvfp4.
+# MTP speculative decoding is OFF by default: with the KV-cache governor
+# (--kv-bits), the draft-verify path in mlx-vlm's qwen3_5 attention crashes on
+# the SECOND request of any conversation (cache hit -> keys arrive as a
+# quantized tuple -> AttributeError 'tuple' has no attribute 'shape' -> 500
+# APIConnectionError for the client). Verified 2026-08-25: identical request
+# twice on one lane = 200 then 500. Set LOCAL_DRAFT_ORCH to re-enable at your
+# own risk (and consider also clearing LOCAL_ORCH_KV_BITS).
 LOCAL_MODEL_ORCH="mlx-community/Qwen3.8-27B-nvfp4"
-LOCAL_DRAFT_ORCH="mlx-community/Qwen3.8-27B-MTP-8bit"
+LOCAL_DRAFT_ORCH=""
 
 # Local SUBAGENT lane — nemotron_h hybrid MoE (6/52 full-attention layers, 2 KV
 # heads) => ~6KB KV/token and ~3B active params, so several concurrent subagents

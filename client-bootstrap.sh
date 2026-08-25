@@ -87,32 +87,10 @@ cat <<EOF > "$HOME/.config/ferry/client.json"
 EOF
 echo "    Successfully saved profile: ~/.config/ferry/client.json"
 
-# 3. Interactive Selection Menu: Choose favorite tools
-echo ""
-echo ">>> Which developer tools would you like to configure for LLM-Ferry?"
-echo "  1) opencode CLI  (recommended; full auto-integration, auto-detects the host's served models)"
-echo "  2) VS Code Continue Extension (config.json generator)"
-echo "  3) Cursor IDE"
-echo "  4) Set up ALL integrations"
-printf "Select option (1-4) [Default: 1]: "
-
-read TOOL_CHOICE < /dev/tty
-TOOL_CHOICE="${TOOL_CHOICE:-1}"
-
-# Initialize setup flags
-SETUP_OPENCODE=0
-SETUP_CONTINUE=0
-SETUP_CURSOR=0
-
-case "$TOOL_CHOICE" in
-  1) SETUP_OPENCODE=1 ;;
-  2) SETUP_CONTINUE=1 ;;
-  3) SETUP_CURSOR=1 ;;
-  4) SETUP_OPENCODE=1; SETUP_CONTINUE=1; SETUP_CURSOR=1 ;;
-  *) SETUP_OPENCODE=1 ;;
-esac
-
-# 4. Interactive Selection Menu: Choose default model (Sorted Chronologically, Newest First)
+# 3. Interactive Selection Menu: Choose default lane
+# (The host predetermines the MODELS behind each lane — /v1/models on the host is
+#  ground truth and `ferry opencode` auto-detects it. You are only picking which
+#  lane your tools default to.)
 SELECTED_MODEL="$LANE_ORCH" # default
 echo ""
 echo ">>> Which LANE should your integrations default to on the host?"
@@ -139,48 +117,47 @@ case "$MODEL_CHOICE" in
   *) SELECTED_MODEL="$LANE_ORCH" ;;
 esac
 
-# 5. Perform Automatic opencode configuration
-if (( SETUP_OPENCODE )); then
-  echo ""
-  echo ">>> Auto-configuring 'opencode' to route through the host (detects served models)..."
-  # Honour the lane picked in the menu above. `ferry opencode` auto-detects and
-  # defaults to the CLOUD pair, so a local pick has to be passed through
-  # explicitly — otherwise choosing "local-orch" silently wires orch + flash.
-  OC_LANE_FLAG=""
-  case "$SELECTED_MODEL" in
-    "$LANE_LOCAL_ORCH"|"$LANE_LOCAL_SUB") OC_LANE_FLAG="--local" ;;
-  esac
-  if "$HOME/.local/bin/ferry" opencode --host "$HOST_NAME" --port "$HOST_PORT" $OC_LANE_FLAG; then
-    :
-  else
-    echo "    WARNING: 'ferry opencode' failed. Wire opencode manually: add an openai-compatible"
-    echo "    provider with baseURL=http://$HOST_NAME:$HOST_PORT/v1, apiKey=local, and a model from"
-    echo "    http://$HOST_NAME:$HOST_PORT/v1/models."
-  fi
+# 4. Automatic opencode configuration (the one supported integration; everything
+# else can point an OpenAI-compatible client at http://HOST:8090/v1 by hand).
+echo ""
+echo ">>> Auto-configuring 'opencode' to route through the host (detects served models)..."
+# Honour the lane picked in the menu above. `ferry opencode` auto-detects and
+# defaults to the CLOUD pair, so a local pick has to be passed through
+# explicitly — otherwise choosing "local-orch" silently wires orch + flash.
+OC_LANE_FLAG=""
+case "$SELECTED_MODEL" in
+  "$LANE_LOCAL_ORCH"|"$LANE_LOCAL_SUB") OC_LANE_FLAG="--local" ;;
+esac
+if "$HOME/.local/bin/ferry" opencode --host "$HOST_NAME" --port "$HOST_PORT" $OC_LANE_FLAG; then
+  :
+else
+  echo "    WARNING: 'ferry opencode' failed. Wire opencode manually: add an openai-compatible"
+  echo "    provider with baseURL=http://$HOST_NAME:$HOST_PORT/v1, apiKey=local, and a model from"
+  echo "    http://$HOST_NAME:$HOST_PORT/v1/models."
+fi
 
-  # Setup shell alias in .zshrc
-  echo ">>> Configuring terminal 'host-code' shortcut in ~/.zshrc..."
-  ZSHRC="$HOME/.zshrc"
-  ALIAS_LINE="alias host-code='opencode'"
+# Setup shell alias in .zshrc
+echo ">>> Configuring terminal 'host-code' shortcut in ~/.zshrc..."
+ZSHRC="$HOME/.zshrc"
+ALIAS_LINE="alias host-code='opencode'"
 
-  if [[ -f "$ZSHRC" ]]; then
-    if grep -q "^alias host-code=" "$ZSHRC" 2>/dev/null; then
-      # Update existing alias
-      sed -i '' "s|^alias host-code=.*|$ALIAS_LINE|" "$ZSHRC" 2>/dev/null || \
-        sed -i "s|^alias host-code=.*|$ALIAS_LINE|" "$ZSHRC"
-      echo "    Updated existing alias 'host-code' in ~/.zshrc"
-    else
-      # Add new alias
-      echo "" >> "$ZSHRC"
-      echo "# LLM-Ferry Shortcut" >> "$ZSHRC"
-      echo "$ALIAS_LINE" >> "$ZSHRC"
-      echo "    Added shortcut 'host-code' to ~/.zshrc"
-    fi
+if [[ -f "$ZSHRC" ]]; then
+  if grep -q "^alias host-code=" "$ZSHRC" 2>/dev/null; then
+    # Update existing alias
+    sed -i '' "s|^alias host-code=.*|$ALIAS_LINE|" "$ZSHRC" 2>/dev/null || \
+      sed -i "s|^alias host-code=.*|$ALIAS_LINE|" "$ZSHRC"
+    echo "    Updated existing alias 'host-code' in ~/.zshrc"
   else
-    # Create a zshrc with the alias
-    echo "$ALIAS_LINE" > "$ZSHRC"
-    echo "    Created ~/.zshrc and added shortcut 'host-code'"
+    # Add new alias
+    echo "" >> "$ZSHRC"
+    echo "# LLM-Ferry Shortcut" >> "$ZSHRC"
+    echo "$ALIAS_LINE" >> "$ZSHRC"
+    echo "    Added shortcut 'host-code' to ~/.zshrc"
   fi
+else
+  # Create a zshrc with the alias
+  echo "$ALIAS_LINE" > "$ZSHRC"
+  echo "    Created ~/.zshrc and added shortcut 'host-code'"
 fi
 
 # Ensure ~/.local/bin is in PATH in client ~/.zshrc
@@ -201,12 +178,14 @@ fi
 # Ensure opencode profile functions (opencode-cloud, opencode-local) are in ~/.zshrc
 echo ">>> Configuring opencode profile functions in ~/.zshrc..."
 ZSHRC="$HOME/.zshrc"
-START_MARKER="# >>> ferry opencode profiles >>>"
-END_MARKER="# <<< ferry opencode profiles <<<"
 touch "$ZSHRC"
 
-# Strip any existing ferry opencode profiles block before re-adding
-python3 - "$ZSHRC" "$START_MARKER" "$END_MARKER" <<'PYEOF'
+# Strip any existing ferry opencode profiles block before re-adding, and remove
+# LEGACY `alias opencode-cloud` / `alias opencode-local` lines from older
+# hand-wired setups: an alias defined above the function definition makes zsh
+# expand it inside `opencode-local() {` -> "defining function based on alias"
+# -> "parse error near ()" on every future `source ~/.zshrc`.
+python3 - "$ZSHRC" "# >>> ferry opencode profiles >>>" "# <<< ferry opencode profiles <<<" <<'PYEOF'
 import sys
 rc, start, end = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(rc) as f:
@@ -222,6 +201,9 @@ for ln in lines:
         continue
     if not skip:
         out.append(ln)
+# legacy aliases collide with the function names below
+out = [l for l in out if not l.lstrip().startswith("alias opencode-cloud=")
+       and not l.lstrip().startswith("alias opencode-local=")]
 while out and out[-1].strip() == "":
     out.pop()
 with open(rc, "w") as f:
@@ -230,25 +212,40 @@ with open(rc, "w") as f:
         f.write("\n")
 PYEOF
 
-cat <<EOF >> "$ZSHRC"
-$START_MARKER
-# opencode-cloud: the CLOUD pair — `orch` drives (build/plan), `flash` runs the
+# QUOTED heredoc: the body is written VERBATIM (no $, backtick, or quote
+# expansion — an unquoted heredoc turned the `orch` in a comment into a command
+# substitution). Host/port are spliced in afterwards via unique placeholders.
+cat <<'EOF' >> "$ZSHRC"
+# >>> ferry opencode profiles >>>
+# Defensive: an alias with a function's name anywhere earlier in the file (or in
+# the live shell) breaks the definitions below with "defining function based on
+# alias". Kill them first.
+unalias opencode-cloud opencode-local 2>/dev/null
+
+# opencode-cloud: the CLOUD pair — orch drives (build/plan), flash runs the
 # fan-out (general/explore/scout). Nothing touches the host GPU.
 opencode-cloud() {
-  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://$HOST_NAME:$HOST_PORT/v1","apiKey":"local"},"models":{"orch":{},"flash":{}}}},"model":"ferry/orch","small_model":"ferry/flash","agent":{"build":{"model":"ferry/orch"},"plan":{"model":"ferry/orch"},"general":{"model":"ferry/flash"},"explore":{"model":"ferry/flash"},"scout":{"model":"ferry/flash"}}}' command opencode "\$@"
+  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://__FERRY_HOST__:__FERRY_PORT__/v1","apiKey":"local"},"models":{"orch":{},"flash":{}}}},"model":"ferry/orch","small_model":"ferry/flash","agent":{"build":{"model":"ferry/orch"},"plan":{"model":"ferry/orch"},"general":{"model":"ferry/flash"},"explore":{"model":"ferry/flash"},"scout":{"model":"ferry/flash"}}}' command opencode "$@"
 }
 
 # opencode-local: the GPU pair — both lanes on the host's Apple Silicon, nothing
-# leaving the machine. `local-orch` drives (build/plan) and `local-sub` runs the
+# leaving the machine. local-orch drives (build/plan) and local-sub runs the
 # fan-out (general/explore/scout): the subagent lane is a hybrid-attention MoE
 # whose tiny KV cache lets many parallel agents fit in the host's RAM, so the
 # expensive lane is not spent on cheap work.
 opencode-local() {
-  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://$HOST_NAME:$HOST_PORT/v1","apiKey":"local"},"models":{"local-orch":{},"local-sub":{}}}},"model":"ferry/local-orch","small_model":"ferry/local-sub","agent":{"build":{"model":"ferry/local-orch"},"plan":{"model":"ferry/local-orch"},"general":{"model":"ferry/local-sub"},"explore":{"model":"ferry/local-sub"},"scout":{"model":"ferry/local-sub"}}}' command opencode "\$@"
+  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://__FERRY_HOST__:__FERRY_PORT__/v1","apiKey":"local"},"models":{"local-orch":{},"local-sub":{}}}},"model":"ferry/local-orch","small_model":"ferry/local-sub","agent":{"build":{"model":"ferry/local-orch"},"plan":{"model":"ferry/local-orch"},"general":{"model":"ferry/local-sub"},"explore":{"model":"ferry/local-sub"},"scout":{"model":"ferry/local-sub"}}}' command opencode "$@"
 }
 
-$END_MARKER
+# <<< ferry opencode profiles <<<
 EOF
+python3 - "$ZSHRC" "$HOST_NAME" "$HOST_PORT" <<'PYEOF'
+import sys
+rc, host, port = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(rc).read()
+s = s.replace("__FERRY_HOST__", host).replace("__FERRY_PORT__", port)
+open(rc, "w").write(s)
+PYEOF
 echo "    Successfully added opencode profile functions to ~/.zshrc."
 
 # Install the local-lane opencode guardrails: /fan-out command + spawning-subagents
@@ -342,7 +339,7 @@ SKILLMD
   echo "              ~/.config/opencode/skills/spawning-subagents/SKILL.md"
 fi
 
-# 6. Output integration guides based on selection
+# 5. Wrap up
 echo "================================================================="
 echo ">>> SUCCESS! Client setup is complete."
 echo "    Please open a NEW terminal window (or run: source ~/.zshrc)."
@@ -355,35 +352,10 @@ echo "    - Send Quick Msg to Host:    \033[1;32mferry msg \"Everything is worki
 echo "    - Stream terminal logs:      \033[1;32mopencode run \"...\" 2>&1 | ferry log\033[0m"
 echo ""
 
-if (( SETUP_OPENCODE )); then
-  echo ">>> OPENCODE CLI INSTANT ACCESS:"
-  echo "    You can now call the host model using standard commands:"
-  echo "    \033[1;32mhost-code run \"Build a snake game in Python\"\033[0m"
-  echo "    (Or run bare 'opencode' commands — default model is now set to 'ferry')"
-  echo "    opencode-cloud   -> cloud pair: orch drives, flash fans out"
-  echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
-  echo ""
-fi
-
-if (( SETUP_CONTINUE )); then
-  echo ">>> VS CODE CONTINUE CONFIGURATION:"
-  echo "    Add this model block to your ~/.continue/config.json file:"
-  echo "    {"
-  echo "      \"title\": \"LLM-Ferry Model\","
-  echo "      \"provider\": \"openai\","
-  echo "      \"model\": \"$SELECTED_MODEL\","
-  echo "      \"apiBase\": \"http://$HOST_NAME:$HOST_PORT/v1\","
-  echo "      \"apiKey\": \"local\""
-  echo "    }"
-  echo ""
-fi
-
-if (( SETUP_CURSOR )); then
-  echo ">>> CURSOR IDE CONFIGURATION:"
-  echo "    1. Go to Settings -> Models -> OpenAI-Compatible"
-  echo "    2. Toggle ON"
-  echo "    3. Set Base URL:  \033[1;32mhttp://$HOST_NAME:$HOST_PORT/v1\033[0m"
-  echo "    4. Set API Key:   local"
-  echo "    5. Click 'Add Model...' and enter: \033[1;32m$SELECTED_MODEL\033[0m"
-  echo "================================================================="
-fi
+echo ">>> OPENCODE CLI INSTANT ACCESS:"
+echo "    You can now call the host model using standard commands:"
+echo "    \033[1;32mhost-code run \"Build a snake game in Python\"\033[0m"
+echo "    (Or run bare 'opencode' commands — default model is now set to 'ferry')"
+echo "    opencode-cloud   -> cloud pair: orch drives, flash fans out"
+echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
+echo ""

@@ -114,15 +114,10 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # openai-compatible backends on 127.0.0.1.
 
 # Local ORCHESTRATOR lane — the "smart" local model: dense-ish 27B at nvfp4.
-# MTP speculative decoding is OFF by default: with the KV-cache governor
-# (--kv-bits), the draft-verify path in mlx-vlm's qwen3_5 attention crashes on
-# the SECOND request of any conversation (cache hit -> keys arrive as a
-# quantized tuple -> AttributeError 'tuple' has no attribute 'shape' -> 500
-# APIConnectionError for the client). Verified 2026-08-25: identical request
-# twice on one lane = 200 then 500. Set LOCAL_DRAFT_ORCH to re-enable at your
-# own risk (and consider also clearing LOCAL_ORCH_KV_BITS).
+# MTP speculative decoding ON with UNQUANTIZED KV @64k (see the per-lane note
+# below for the crash that rules out draft+quantized-KV).
 LOCAL_MODEL_ORCH="mlx-community/Qwen3.8-27B-nvfp4"
-LOCAL_DRAFT_ORCH=""
+LOCAL_DRAFT_ORCH="mlx-community/Qwen3.8-27B-MTP-8bit"
 
 # Local SUBAGENT lane — nemotron_h hybrid MoE (6/52 full-attention layers, 2 KV
 # heads) => ~6KB KV/token and ~3B active params, so several concurrent subagents
@@ -157,8 +152,15 @@ LOCAL_APC_BLOCKS="512"    # APC_NUM_BLOCKS: retained prefix-pool size (x16 token
 
 # Per-lane overrides — export any of these to govern ONE lane without touching the
 # other (e.g. LOCAL_SUB_MAX_KV=65536 to shrink the subagent lane's context budget).
-LOCAL_ORCH_KV_BITS="${LOCAL_ORCH_KV_BITS:-$LOCAL_KV_BITS}"
-LOCAL_ORCH_MAX_KV="${LOCAL_ORCH_MAX_KV:-$LOCAL_MAX_KV}"
+#
+# local-orch runs MTP speculative decoding + UNQUANTIZED KV @64k (measured
+# 2026-08-25): the draft-verify path crashes on any quantized cache (tuple keys,
+# AttributeError — turn 2 of every conversation 500s), but draft + full KV is
+# stable (3/3 cache-hit requests 200) and decodes ~53% faster (37.8 vs 24.8
+# tok/s). Full KV @64k = 16GB (256KB/token, 64 layers x 4 kv heads x 256 dim).
+# To revert to the quantized no-draft lane: LOCAL_DRAFT_ORCH="" + kv-bits 4.
+LOCAL_ORCH_KV_BITS=""
+LOCAL_ORCH_MAX_KV="65536"
 LOCAL_ORCH_MAX_SEQS="${LOCAL_ORCH_MAX_SEQS:-$LOCAL_MAX_SEQS}"
 LOCAL_ORCH_APC_BLOCKS="${LOCAL_ORCH_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
 LOCAL_SUB_KV_BITS="${LOCAL_SUB_KV_BITS:-$LOCAL_KV_BITS}"

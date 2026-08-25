@@ -10,7 +10,8 @@
         "models": {
           "orch": {},
           "flash": {},
-          "mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4": {}
+          "local-orch": {},
+          "local-sub": {}
         }
       }
     },

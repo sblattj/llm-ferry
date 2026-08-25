@@ -283,6 +283,13 @@ Local mode serves an MLX model via `mlx-vlm`. The default (`mlx-community/Qwen3.
 
 **KV-cache memory governor:** Default local launches now ship with `--kv-bits 4`, `--max-kv-size 131072`, `--max-num-seqs 4`, and `APC_NUM_BLOCKS=512`. Measured on a 128GB M5 Max during a 121k-token agentic session: peak GPU footprint dropped 97GB -> 56GB, idle retained memory fell 57GB -> 35GB, and decode ran ~60% faster. Monitor live usage with `footprint <pid>` (`ps RSS` does not show Metal wired memory). Disable any knob by setting it to `""` in `lib/ferry-core.zsh` (or passing flags in `host-serve.sh`).
 
+**Known issues on the Nemotron `--orch` lane (measured 2026-08-25):**
+
+- **`nemotron_h` continuous-batching crash (mlx-vlm).** The batching engine passes both `input_ids` and `inputs_embeds`; the `nemotron_h` `LanguageModel.__call__` forwards both to a backbone that requires exactly one → `ValueError: Provide exactly one of inputs or inputs_embeds` on every request. Until fixed upstream, patch `.../site-packages/mlx_vlm/models/nemotron_h/language.py` — in `LanguageModel.__call__`, before the `self.backbone(...)` call, add: `if inputs_embeds is not None: inputs = None`.
+- **Flaky `task`-tool calls.** Nemotron frequently emits malformed task calls (hallucinated `task_id`, missing `description`) that opencode rejects *before the tool runs* — the model then silently retries the identical broken call (measured: 444 consecutive errors; also 22 identical 38-token retries). Fix shipped: `client-bootstrap.sh` installs a `/fan-out` command and a `spawning-subagents` skill into `~/.config/opencode/`. The recipe must sit in the **user message** (`/fan-out` does this); placing it in system instructions made failures worse. With it: 3/3 valid parallel task calls, zero schema errors.
+- **Residual model limits.** Bare tool calls (read/write/bash) are reliable; single delegation works. Complex multi-brief orchestration still exceeds the 30B model — it duplicates briefs or stops to ask clarifying questions instead of integrating. Prefer one component per `/fan-out` invocation, or use the Qwen local lane for heavy orchestration.
+- **Headless-run doom signature.** Watch the *server* log (opencode's `--format json` stream lags and misses in-flight loops): 3+ consecutive requests with identical generated-token counts and `finish_reason=tool_calls` = kill it.
+
 ## Platform support
 
 `ferry` and `ferry-dash` run on **macOS and Linux/Ubuntu**.

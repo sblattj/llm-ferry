@@ -240,6 +240,89 @@ $END_MARKER
 EOF
 echo "    Successfully added opencode profile functions to ~/.zshrc."
 
+# Install the local-lane opencode guardrails: /fan-out command + spawning-subagents
+# skill (global dirs — opencode picks them up automatically). Keep the heredoc
+# bodies in sync with opencode/command/fan-out.md and
+# opencode/skills/spawning-subagents/SKILL.md in the llm-ferry repo.
+# Context: Nemotron (the opencode-local model) produces malformed task-tool
+# calls (hallucinated task_id, missing description) that are rejected before
+# the tool runs, causing silent retry doom loops. The recipe injected as the
+# USER message (what /fan-out does) is the empirically working fix.
+if command -v opencode >/dev/null 2>&1; then
+  echo ">>> Installing opencode local-lane guardrails (/fan-out + spawning-subagents skill)..."
+  mkdir -p "$HOME/.config/opencode/command" "$HOME/.config/opencode/skills/spawning-subagents"
+
+  cat > "$HOME/.config/opencode/command/fan-out.md" <<'FANOUT'
+---
+description: Fan a build task out to up to 3 parallel subagents with the safe task-tool recipe (for local models like Nemotron whose raw task calls get rejected).
+---
+
+Task: $ARGUMENTS
+
+Delegation rules, follow EXACTLY:
+
+- First split this task into up to THREE self-contained component briefs. If the task is small, fewer is fine; if it cannot be split, do it yourself and skip delegation.
+- Call the task tool once per brief. You may launch them in parallel.
+- Each task call MUST have exactly these three fields and nothing else:
+  - description: a short 3-5 word label
+  - subagent_type: the string "general"
+  - prompt: the complete brief
+- Do NOT pass task_id or any other field. Do NOT nest delegation: a brief must never mention subagents, delegating, or orchestrating — it describes concrete work and what to return.
+- If a tool call errors, read the error, fix the named field, and retry that call ONCE. Never resend an identical failing call.
+
+After the subagents return, integrate their results into the final artifact yourself, write it to disk, and verify it exists and is complete.
+FANOUT
+
+  cat > "$HOME/.config/opencode/skills/spawning-subagents/SKILL.md" <<'SKILLMD'
+---
+name: spawning-subagents
+description: Use when calling the task tool on the local Nemotron lane (opencode-local / ferry up --orch) to delegate work to subagents. Prevents malformed task calls (hallucinated task_id, missing description, nested delegation) that silently stall local agent sessions; covers the exact three-field call recipe and retry-once rule.
+---
+
+# Spawning subagents on the local lane (Nemotron / small local models)
+
+Local orchestrator models (e.g. NVIDIA Nemotron 3 Nano 30B A3B) frequently
+produce malformed `task` tool calls — hallucinated `task_id` fields, missing
+`description`, or nested delegation — which the harness rejects before the
+tool ever runs. The failure looks like a silent stall: no tool output, the
+model silently retrying the same broken call every turn.
+
+Follow these rules EVERY time you call the `task` tool:
+
+1. The call MUST have exactly these three fields — nothing else:
+   - `description`: a short 3-5 word label for the subtask
+   - `subagent_type`: the string "general"
+   - `prompt`: the complete, self-contained brief
+2. NEVER pass `task_id`, `command`, `model`, or any other field. `task_id` is
+   reserved for resuming an existing session and must start with "ses" — if
+   you invent one, the call fails.
+3. NEVER write a brief that tells the subagent to delegate further. One level
+   of fan-out only.
+4. If a tool call returns an error, read the error text, fix the named field,
+   and retry that call ONCE with corrected arguments. Never resend an
+   identical failing call.
+5. Do the integration work yourself: subagents return code/modules; the main
+   agent writes files and verifies them on disk.
+
+## Operational notes (measured 2026-08-25)
+
+- The recipe works when it sits in the USER message (end of context). Putting
+  it in system instructions or relying on the model to load this skill made
+  failures WORSE with Nemotron — use the `/fan-out` command, which injects
+  the recipe as the user message, rather than hoping the model finds it.
+- Bare tool calls (read/write/bash) are reliable on this model; only the
+  `task` schema is flaky.
+- Doom-loop signature for headless runs: repeated server requests with
+  IDENTICAL generated-token counts and finish_reason=tool_calls every turn
+  (e.g. 22 identical 38-token calls). Kill on 3+ identical consecutive.
+  Server-side request logs are ground truth; opencode's `--format json`
+  stream lags and can miss in-flight loops entirely.
+SKILLMD
+
+  echo "    Installed: ~/.config/opencode/command/fan-out.md"
+  echo "              ~/.config/opencode/skills/spawning-subagents/SKILL.md"
+fi
+
 # 6. Output integration guides based on selection
 echo "================================================================="
 echo ">>> SUCCESS! Client setup is complete."

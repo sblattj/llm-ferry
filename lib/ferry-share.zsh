@@ -67,6 +67,10 @@ class DynamicHandler(SimpleHTTPRequestHandler):
                         content = f.read()
                     content = content.replace("HOST_MDNS_PLACEHOLDER", mdns_name)
                     content = content.replace("SHARE_PORT_PLACEHOLDER", str(port))
+                    # Also rewrite the script's own your-host.local fallback, so
+                    # even the no-injection code path lands on the real host.
+                    content = content.replace("your-host.local", mdns_name)
+                    content = content.replace('"your-host.local"', f'"{mdns_name}"')
                     body = content.encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/x-sh")

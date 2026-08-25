@@ -32,31 +32,56 @@ echo "================================================================="
 echo "Target Host Server: http://$HOST_NAME:$HOST_PORT"
 echo "================================================================="
 
-# 1. Test basic network connectivity to the host (with interactive fallback if it fails)
+# 1. Resolve the host. Try, in order, WITHOUT ever prompting first:
+#    (a) the share server's injected mDNS name (normal case — no prompt at all)
+#    (b) the host saved by a previous run in ~/.config/ferry/client.json
+#    (c) a raw LAN-IP prompt as the last resort (mDNS `.local` resolution is
+#        flaky on some corp networks, so accept an IP too).
+# The prompt only appears when every automatic candidate fails.
 echo ">>> Probing host at http://$HOST_NAME:$HOST_PORT..."
 if curl -fsS -m 3 "http://$HOST_NAME:$HOST_PORT/v1/models" >/dev/null 2>&1; then
   echo "    \033[1;32mSUCCESS: Connected to host inference server!\033[0m"
 else
-  echo "    \033[1;31mCould not connect to the default host at $HOST_NAME:$HOST_PORT.\033[0m"
-  echo "    Please enter the host's correct mDNS hostname or LAN IP"
-  printf "    (e.g., mymacbook.local or 192.168.0.100) [Enter to skip/keep default]: "
-  
-  # Read from /dev/tty because stdin is redirected during a 'curl | zsh' pipe.
-  # `|| true` so an EOF/missing tty degrades to "keep default" instead of
-  # aborting the whole script (set -e kills on a failed read).
-  read NEW_HOST_NAME < /dev/tty || true
-  
-  if [[ -n "${NEW_HOST_NAME:-}" ]]; then
-    HOST_NAME="$NEW_HOST_NAME"
-    echo ">>> Probing new host at http://$HOST_NAME:$HOST_PORT..."
+  # (b) last-known host from a previous bootstrap
+  SAVED_HOST=""
+  if [[ -f "$HOME/.config/ferry/client.json" ]]; then
+    SAVED_HOST=$(python3 -c "import json;print(json.load(open('$HOME/.config/ferry/client.json')).get('host',''))" 2>/dev/null || true)
+  fi
+  if [[ -n "$SAVED_HOST" && "$SAVED_HOST" != "$HOST_NAME" ]]; then
+    echo ">>> First probe failed; retrying with last-known host $SAVED_HOST..."
+    HOST_NAME="$SAVED_HOST"
     if curl -fsS -m 3 "http://$HOST_NAME:$HOST_PORT/v1/models" >/dev/null 2>&1; then
       echo "    \033[1;32mSUCCESS: Connected to host inference server at $HOST_NAME!\033[0m"
     else
-      echo "    \033[1;33mWARNING: Still could not connect to $HOST_NAME:$HOST_PORT.\033[0m"
-      echo "    We will proceed with configuring client shortcuts anyway."
+      HOST_NAME=""
     fi
   else
-    echo "    Keeping default host: $HOST_NAME"
+    HOST_NAME=""
+  fi
+
+  # (c) last resort: ask — mDNS name or LAN IP both accepted
+  if [[ -z "$HOST_NAME" ]]; then
+    echo "    \033[1;31mCould not auto-detect the host.\033[0m"
+    echo "    Please enter the host's mDNS hostname or LAN IP"
+    printf "    (e.g., mymacbook.local or 192.168.0.100) [Enter to abort]: "
+
+    # Read from /dev/tty because stdin is redirected during a 'curl | zsh' pipe.
+    # `|| true` so an EOF/missing tty degrades instead of aborting under set -e.
+    read NEW_HOST_NAME < /dev/tty || true
+
+    if [[ -n "${NEW_HOST_NAME:-}" ]]; then
+      HOST_NAME="$NEW_HOST_NAME"
+      echo ">>> Probing new host at http://$HOST_NAME:$HOST_PORT..."
+      if curl -fsS -m 3 "http://$HOST_NAME:$HOST_PORT/v1/models" >/dev/null 2>&1; then
+        echo "    \033[1;32mSUCCESS: Connected to host inference server at $HOST_NAME!\033[0m"
+      else
+        echo "    \033[1;33mWARNING: Still could not connect to $HOST_NAME:$HOST_PORT.\033[0m"
+        echo "    We will proceed with configuring client shortcuts anyway."
+      fi
+    else
+      echo "    No host entered; aborting."
+      exit 1
+    fi
   fi
 fi
 

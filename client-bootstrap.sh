@@ -22,6 +22,7 @@ fi
 
 # Default Model lists
 MODEL_LOCAL="mlx-community/Qwen3.8-27B-nvfp4"
+MODEL_LOCAL_ORCH="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
 MODEL_CLAUDE="anthropic/claude-3-7-sonnet-20250219"
 MODEL_GEMINI="gemini/gemini-3.7-flash"
 MODEL_GEMINI_2="gemini/gemini-2.0-flash"
@@ -122,7 +123,8 @@ echo "  3) [Cloud] Gemini 2.0 Flash  (gemini/gemini-2.0-flash)"
 echo ""
 echo " Local (runs on the host's Apple Silicon GPU via MLX):"
 echo "  4) [Local] Qwen 3.8-27B GPU  (mlx-community/Qwen3.8-27B-nvfp4)"
-printf "Select option (1-4) [Default: 1]: "
+echo "  5) [Local] NVIDIA Nemotron 3 Nano 30B A3B (orchestrator-grade, subagent-friendly)  (mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4)"
+printf "Select option (1-5) [Default: 1]: "
 
 read MODEL_CHOICE < /dev/tty
 MODEL_CHOICE="${MODEL_CHOICE:-1}"
@@ -132,6 +134,7 @@ case "$MODEL_CHOICE" in
   2) SELECTED_MODEL="$MODEL_CLAUDE" ;;
   3) SELECTED_MODEL="$MODEL_GEMINI_2" ;;
   4) SELECTED_MODEL="$MODEL_LOCAL" ;;
+  5) SELECTED_MODEL="$MODEL_LOCAL_ORCH" ;;
   *) SELECTED_MODEL="$MODEL_GEMINI" ;;
 esac
 
@@ -187,6 +190,56 @@ else
   echo "$PATH_LINE" > "$ZSHRC"
 fi
 
+# Ensure opencode profile functions (opencode-cloud, opencode-local) are in ~/.zshrc
+echo ">>> Configuring opencode profile functions in ~/.zshrc..."
+ZSHRC="$HOME/.zshrc"
+START_MARKER="# >>> ferry opencode profiles >>>"
+END_MARKER="# <<< ferry opencode profiles <<<"
+touch "$ZSHRC"
+
+# Strip any existing ferry opencode profiles block before re-adding
+python3 - "$ZSHRC" "$START_MARKER" "$END_MARKER" <<'PYEOF'
+import sys
+rc, start, end = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(rc) as f:
+    lines = f.readlines()
+out, skip = [], False
+for ln in lines:
+    s = ln.rstrip("\n")
+    if s == start:
+        skip = True
+        continue
+    if s == end:
+        skip = False
+        continue
+    if not skip:
+        out.append(ln)
+while out and out[-1].strip() == "":
+    out.pop()
+with open(rc, "w") as f:
+    f.writelines(out)
+    if out:
+        f.write("\n")
+PYEOF
+
+cat <<EOF >> "$ZSHRC"
+$START_MARKER
+# opencode-cloud: route-mode 'orch' pattern — orchestrator main + Gemini Flash subagents.
+# Requires the host running \`ferry up --route\`.
+opencode-cloud() {
+  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://$HOST_NAME:$HOST_PORT/v1","apiKey":"local"},"models":{"orchestrator":{},"gemini-3.7-flash":{}}}},"model":"ferry/orchestrator","small_model":"ferry/gemini-3.7-flash","agent":{"build":{"model":"ferry/orchestrator"},"plan":{"model":"ferry/orchestrator"},"general":{"model":"ferry/gemini-3.7-flash"},"explore":{"model":"ferry/gemini-3.7-flash"},"scout":{"model":"ferry/gemini-3.7-flash"}}}' command opencode "\$@"
+}
+
+# opencode-local: all-local lane — host GPU runs NVIDIA Nemotron 3 Nano 30B A3B (NVFP4)
+# for BOTH main and subagents (hybrid attention = tiny KV cache -> many parallel agents
+# fit in the host's RAM). Requires the host running \`ferry up --orch\`.
+opencode-local() {
+  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://$HOST_NAME:$HOST_PORT/v1","apiKey":"local"},"models":{"mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":{}}}},"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4","small_model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4","agent":{"build":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"},"plan":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"},"general":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"},"explore":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"},"scout":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"}}}' command opencode "\$@"
+}
+$END_MARKER
+EOF
+echo "    Successfully added opencode profile functions to ~/.zshrc."
+
 # 6. Output integration guides based on selection
 echo "================================================================="
 echo ">>> SUCCESS! Client setup is complete."
@@ -205,6 +258,8 @@ if (( SETUP_OPENCODE )); then
   echo "    You can now call the host model using standard commands:"
   echo "    \033[1;32mhost-code run \"Build a snake game in Python\"\033[0m"
   echo "    (Or run bare 'opencode' commands — default model is now set to 'ferry')"
+  echo "    opencode-cloud   -> 'orch' pattern: orchestrator main + Gemini Flash subagents (host: ferry up --route)"
+  echo "    opencode-local   -> all-local: Nemotron 3 Nano 30B A3B NVFP4 main + subagents on the host GPU (host: ferry up --orch)"
   echo ""
 fi
 

@@ -39,6 +39,8 @@ Ferrying models & files across the LAN:
 
 Options for 'up':
   -l, --local        Launch local GPU model ($LOCAL_MODEL) [macOS / Apple Silicon only]
+  -o, --orch         Launch the local ORCHESTRATOR model ($LOCAL_MODEL_ORCH) — main +
+                        concurrent subagents on the host GPU [macOS / Apple Silicon only]
   -c, --cloud        Proxy to default cloud model ($DEFAULT_GEMINI)
   -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
   -r, --route        Serve MULTIPLE models from a litellm config (orchestrator + key failover)
@@ -49,6 +51,7 @@ Options for 'up':
 Examples:
   ferry up             # Starts in interactive mode to query Gemini's active catalog
   ferry up --route     # Serve orchestrator + Gemini key-failover from litellm.yaml
+  ferry up --orch      # Local orchestrator lane (Nemotron 3 Nano 30B A3B NVFP4) for opencode-local
   ferry dash --open    # Open the live route-proxy dashboard in your browser
   ferry status         # View connection health diagnostics
   ferry msg "hello"    # Sends telemetry message back to the host Mac

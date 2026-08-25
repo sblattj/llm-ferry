@@ -66,6 +66,9 @@ download_model "mlx-community/Qwen3.8-27B-nvfp4"
 echo ">>> Fetching Model 2: Qwen 3.8-27B MTP Speculative Drafter (8-bit)"
 download_model "mlx-community/Qwen3.8-27B-MTP-8bit"
 
+echo ">>> Fetching Model 3: NVIDIA Nemotron 3 Nano 30B A3B (local orchestrator, NVFP4)"
+download_model "mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+
 # 6. Check and recommend VRAM adjustments
 TOTAL_MEM_GB=$(sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024/1024)}')
 echo ">>> System unified memory detected: ${TOTAL_MEM_GB}GB"

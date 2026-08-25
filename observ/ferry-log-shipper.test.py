@@ -151,6 +151,30 @@ class TestModelExtraction(unittest.TestCase):
         r = S.parse_line("LiteLLM: Proxy initialized with Config, Set models: orchestrator-kimi")
         self.assertEqual(r["requested_model"], "orchestrator-kimi")
 
+    def test_current_lane_names_are_recognised_as_groups(self):
+        """Every lane name the stack serves must scan as a model GROUP.
+
+        The names were shortened (orchestrator->orch, gemini-3.7-flash->flash) and
+        two GPU lanes were added; if the group regex misses one, its log lines lose
+        their requested_model label and drop out of the Grafana per-lane views.
+        """
+        for lane in ("orch", "orch-kimi", "orch-deepseek", "orch-gpt56-sol",
+                     "flash", "local-orch", "local-sub",
+                     "orchestrator", "orchestrator-fallback"):
+            r = S.parse_line(
+                "LiteLLM: Proxy initialized with Config, Set models: %s" % lane)
+            self.assertEqual(r["requested_model"], lane, "lane %r not recognised" % lane)
+
+    def test_group_scan_does_not_match_inside_a_backend_id(self):
+        """`flash` must not be clipped out of the middle of `gemini-3.7-flash`.
+
+        The backend id is a MODEL, not a group; a bare-substring match there would
+        mislabel every Gemini line as a request for the `flash` lane.
+        """
+        r = S.parse_line("15:53:00 - LiteLLM:INFO: selected gemini-3.7-flash for this call")
+        self.assertEqual(r["model"], "gemini-3.7-flash")
+        self.assertEqual(r["requested_model"], "")
+
     def test_model_absent_leaves_empty_strings(self):
         r = S.parse_line(ACCESS_OK)
         self.assertEqual(r["model"], "")

@@ -1,5 +1,5 @@
 ---
-description: Fan a build task out to up to 3 parallel subagents with the safe task-tool recipe (for local models like Nemotron whose raw task calls get rejected).
+description: Fan a build task out to up to 3 parallel subagents with the safe task-tool recipe (for local lanes, whose raw task calls get rejected).
 ---
 
 Task: $ARGUMENTS

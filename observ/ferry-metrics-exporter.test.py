@@ -63,8 +63,10 @@ INFO:     2.2.2.2:6002 - "POST /v1/chat/completions HTTP/1.1" 500 Internal Serve
 INFO:     9.9.9.9:7003 - "GET /v1/models HTTP/1.1" 200 OK
 """
 
-# A tiny litellm.yaml: a 3-key gemini pool + orchestrator + one fallback dep,
-# and a strict fallback chain of length 2.
+# A tiny litellm.yaml in the PRE-RENAME shape (`orchestrator` / `gemini-3.7-flash`):
+# a 3-key gemini pool + orchestrator + one fallback dep, and a chain of length 2.
+# Kept deliberately: it is what proves the exporter's back-compat fallback-key
+# lookup still reports a real chain length for a config written before the rename.
 YAML_FIXTURE = """\
 model_list:
   - model_name: orchestrator
@@ -86,6 +88,39 @@ model_list:
 router_settings:
   routing_strategy: usage-based-routing-v2
   fallbacks: [{"orchestrator": ["orchestrator-gpt56-sol", "orchestrator-deepseek"]}]
+"""
+
+# The CURRENT lane shape: `orch` + its fallback hops, the `flash` pool, and the two
+# local GPU lanes. local-orch/local-sub are intentionally absent from `fallbacks`.
+YAML_FIXTURE_LANES = """\
+model_list:
+  - model_name: orch
+    litellm_params:
+      model: zai/glm-5.3
+  - model_name: orch-deepseek
+    litellm_params:
+      model: fireworks_ai/deepseek-v4
+  - model_name: flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+  - model_name: flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+  - model_name: flash
+    litellm_params:
+      model: gemini/gemini-3.7-flash
+  - model_name: local-orch
+    litellm_params:
+      model: openai/mlx-community/Qwen3.8-27B-nvfp4
+      api_base: http://127.0.0.1:8092/v1
+  - model_name: local-sub
+    litellm_params:
+      model: openai/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+      api_base: http://127.0.0.1:8093/v1
+
+router_settings:
+  routing_strategy: usage-based-routing-v2
+  fallbacks: [{"orch": ["orch-gpt56-sol", "orch-deepseek"]}, {"flash": ["orch"]}]
 """
 
 
@@ -241,6 +276,35 @@ class TopologyTest(unittest.TestCase):
             r'ferry_deployment_info\{model_name="orchestrator",model="anthropic/k3-256k"\} 1')
         # route config mtime is emitted (config is readable)
         self.assertIn("ferry_route_config_mtime_seconds", text)
+
+    def test_current_lane_names_topology(self):
+        """The post-rename config must report the same topology as the legacy one.
+
+        Guards the exporter's fallback-key lookup: it reads `orch` first and only
+        falls back to `orchestrator`, so a rename must not silently flatline
+        ferry_fallback_chain_length at 0.
+        """
+        path = os.path.join(self.tmp, "lanes.yaml")
+        with open(path, "w") as f:
+            f.write(YAML_FIXTURE_LANES)
+        col = EXP.Collector("http://127.0.0.1:%d" % closed_port(), "local", path, self.act)
+        text = col.render()
+        self.assertIn("ferry_worker_pool_size 3", text)          # 3 flash deployments
+        self.assertIn("ferry_fallback_chain_length 2", text)     # orch chain of length 2
+        self.assertRegex(
+            text,
+            r'ferry_deployment_info\{model_name="flash",model="gemini/gemini-3\.7-flash"\} 1')
+        self.assertRegex(
+            text,
+            r'ferry_deployment_info\{model_name="orch",model="zai/glm-5\.3"\} 1')
+        # Both local GPU lanes are exported as deployments even though they take
+        # no fallbacks - a stopped lane must still be visible in the metrics.
+        self.assertRegex(
+            text,
+            r'ferry_deployment_info\{model_name="local-orch",model="openai/mlx-community/Qwen3\.8-27B-nvfp4"\} 1')
+        self.assertRegex(
+            text,
+            r'ferry_deployment_info\{model_name="local-sub",')
 
     def test_unreadable_config_omits_topology_but_not_meta(self):
         col = EXP.Collector("http://127.0.0.1:%d" % closed_port(),

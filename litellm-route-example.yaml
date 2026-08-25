@@ -1,47 +1,55 @@
-# litellm-route-example.yaml — template for `ferry up --route`
+# litellm-route-example.yaml — template for `ferry up`
 # ---------------------------------------------------------------------------
-# Serves MULTIPLE models on one OpenAI/Anthropic-compatible endpoint so LAN
-# clients (or localhost) get an orchestrator model plus cheaper worker models
-# with automatic key failover — all API keys staying on the host.
+# THE FERRY STACK — several named LANES on one OpenAI/Anthropic-compatible
+# endpoint, so LAN clients (or localhost) get a big driving model, a cheap
+# high-volume worker pool, and the host's own GPU models — all from one URL,
+# with every API key staying on the host.
 #
-#   orchestrator          -> a "big" planning/driving model (example: Kimi K3)
-#   orchestrator-fallback -> an INDEPENDENT model litellm reroutes to when the
-#                            orchestrator fails; chain several for depth (example:
-#                            Fireworks DeepSeek V4 Pro first, GLM 5.2 last)
-#   gemini-3.7-flash      -> worker model, pooled across MULTIPLE API keys
+# A lane NAME is the contract clients bind to. The model behind a lane is
+# swappable HERE without touching a single client config, which is the whole
+# reason the names are roles (`orch`, `flash`) and not model ids.
 #
-# Multi-key pool: the identical `gemini-3.7-flash` deployments below form one
-# pool. `usage-based-routing-v2` sends each call to the least-used key
-# (proactive even split); on a 429/error litellm retries on another key and
-# cools the failed one out for `cooldown_time`.
+#   orch          -> the "big" planning/driving model (example: Kimi K3)
+#   orch-fallback -> an INDEPENDENT model litellm reroutes to when `orch` fails;
+#                    chain several for depth (example: Fireworks DeepSeek V4 Pro
+#                    first, GLM 5.2 last)
+#   flash         -> cheap high-volume worker lane, pooled across MULTIPLE keys
+#   local-orch    -> the host GPU's "smart" model, via mlx_vlm.server on :8092
+#   local-sub     -> the host GPU's cheap fan-out model, via mlx_vlm.server on :8093
+#
+# Multi-key pool: the identical `flash` deployments below form one pool.
+# `usage-based-routing-v2` sends each call to the least-used key (proactive even
+# split); on a 429/error litellm retries on another key and cools the failed one
+# out for `cooldown_time`.
 #
 # IMPORTANT: Gemini quota is per-GCP-PROJECT, not per-key — so each key only
 # adds real headroom if it lives in its OWN Google Cloud project. Two keys in
 # one project share the same quota. Add or remove deployments to match how many
 # independent-project keys you actually have.
 #
-# Orchestrator fallback (strict failover): the `orchestrator-fallback` deployment
-# is a SEPARATE model_name, reached ONLY via router_settings.fallbacks when the
-# orchestrator errors — a 429, a 5xx, or a hard quota 403. Pick a fallback whose
-# capacity is INDEPENDENT of the primary: a different provider or account.
+# Orchestrator fallback (strict failover): the `orch-fallback` deployment is a
+# SEPARATE model_name, reached ONLY via router_settings.fallbacks when `orch`
+# errors — a 429, a 5xx, or a hard quota 403. Pick a fallback whose capacity is
+# INDEPENDENT of the primary: a different provider or account.
 # (Lesson from the field: a fallback that shares a rate-limit bucket with your
 # primary — or with your own interactive use of that same account — will 429
 # exactly when you need it. A pay-per-token API like Fireworks has its own
 # capacity and only bills when the fallback actually fires.)
 #
-# First run of `ferry up --route` copies this file to ~/.config/ferry/litellm.yaml.
+# First run of `ferry up` copies this file to ~/.config/ferry/litellm.yaml.
 # Edit THAT copy, then export the API keys it references (in your shell or
 # ~/.config/ferry/secrets.env). Never commit real keys.
 #
-# Launch:  ferry up --route            # uses ~/.config/ferry/litellm.yaml
+# Launch:  ferry up                 # GPU lanes + this config = every lane
+#          ferry up --route         # this config alone (cloud lanes only)
 # ---------------------------------------------------------------------------
 
 model_list:
-  # -- Orchestrator (example: Kimi K3, an Anthropic-compatible endpoint) -----
+  # -- orch: the driving model (example: Kimi K3, an Anthropic-compatible endpoint) --
   # Swap for any provider. For an Anthropic-format base, litellm appends
   # /v1/messages to api_base. For a plain OpenAI provider, drop api_base and use
   # e.g. `model: openai/<id>` with api_key: os.environ/OPENAI_API_KEY.
-  - model_name: orchestrator
+  - model_name: orch
     litellm_params:
       model: anthropic/k3-256k
       api_key: os.environ/KIMI_API_KEY
@@ -49,19 +57,19 @@ model_list:
       reasoning_effort: max        # drop_params:true below drops this where a provider rejects it
       timeout: 600
 
-  # -- Orchestrator FALLBACK chain (example: Fireworks DeepSeek V4 Pro, GLM 5.2) --
+  # -- orch FALLBACK chain (example: Fireworks DeepSeek V4 Pro, GLM 5.2) -------
   # Separate model_names, NOT in any pool — reached only via the `fallbacks:`
-  # mapping below when `orchestrator` fails, in the order listed there. Fireworks
-  # is a pay-per-token API with its OWN capacity, so it never contends with the
+  # mapping below when `orch` fails, in the order listed there. Fireworks is a
+  # pay-per-token API with its OWN capacity, so it never contends with the
   # primary; billed only when a hop fires. Chain as many as you like, FAST model
   # first and a slower/cheaper one last. Swap for any independent provider/account.
-  - model_name: orchestrator-fallback        # 1st fallback: fast
+  - model_name: orch-fallback                # 1st fallback: fast
     litellm_params:
       model: fireworks_ai/accounts/fireworks/models/deepseek-v4-pro-0813
       api_key: os.environ/FIREWORKS_API_KEY
       reasoning_effort: max
       timeout: 600
-  - model_name: orchestrator-fallback-2      # last resort: slower/cheaper
+  - model_name: orch-fallback-2              # last resort: slower/cheaper
     litellm_params:
       model: fireworks_ai/accounts/fireworks/models/glm-5p2
       api_key: os.environ/FIREWORKS_API_KEY
@@ -76,46 +84,46 @@ model_list:
   # /v1/chat/completions works (opencode streams), but a non-streamed call 500s
   # with "Unknown items in responses API response: []" and just rolls to the next
   # fallback. gpt-5.6-sol / gpt-5.4 work; codex-* ids are rejected for ChatGPT accounts.
-  # - model_name: orchestrator-fallback
+  # - model_name: orch-fallback
   #   litellm_params:
   #     model: chatgpt/responses/gpt-5.6-sol
   #     api_key: "chatgpt-oauth"     # placeholder; provider reads auth.json
   #     reasoning_effort: max
   #     timeout: 600
 
-  # -- Worker pool: Gemini 3.7 Flash across N keys (each in its OWN project) --
+  # -- flash: worker pool across N keys (each in its OWN project) --------------
   # model_info.id gives each deployment a STABLE, human-readable id. litellm stamps
   # it onto the `model_id` label of the per-deployment metrics, so the Grafana
   # per-key failure panels can say "gemini-key-3 is 429ing" instead of an opaque
   # hash (the hash also changes whenever a key value changes, so it's useless for
   # tracking one key over time). Ids must be unique across the whole model_list.
-  - model_name: gemini-3.7-flash
+  - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY        # project #1
     model_info:
       id: gemini-key-1
 
-  - model_name: gemini-3.7-flash
+  - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_2      # project #2
     model_info:
       id: gemini-key-2
 
-  - model_name: gemini-3.7-flash
+  - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_3      # project #3
     model_info:
       id: gemini-key-3
-  - model_name: gemini-3.7-flash
+  - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_4      # project #4
     model_info:
       id: gemini-key-4
-  - model_name: gemini-3.7-flash
+  - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_5      # project #5
@@ -124,18 +132,60 @@ model_list:
   # Scale the pool to however many independent-project keys you have — add or
   # delete deployments to match. Each key MUST live in its own Google Cloud
   # project to add real headroom (Gemini quota is per-project, not per-key).
-  - model_name: gemini-3.7-flash
+  - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
       api_key: os.environ/GEMINI_API_KEY_6      # project #6
     model_info:
       id: gemini-key-6
 
+  # -- LOCAL GPU lanes: the host's own MLX models, addressable by name ---------
+  # `ferry up` launches one mlx_vlm.server per lane on an internal loopback port
+  # and these two deployments front them, so a GPU model is just another lane on
+  # the same endpoint as the cloud ones. Three things matter here:
+  #
+  #   1. The string after `openai/` is sent to the backend VERBATIM and MUST be
+  #      the exact HuggingFace id mlx_vlm preloaded — that is what hits the warm
+  #      model cache instead of triggering a fresh load (or a download).
+  #   2. `api_key` is a required-but-unused placeholder: mlx_vlm.server runs
+  #      without --api-key, but litellm's openai provider demands the field.
+  #   3. `timeout` overrides the global request_timeout, because a cold
+  #      deep-context prefill on-GPU can legitimately outrun 600s.
+  #
+  # NO fallback is wired for either local lane, deliberately: the point of asking
+  # for a local lane is that the request stays on this machine, so a dead GPU lane
+  # must surface as an error rather than silently spending a cloud quota.
+  #
+  # These lanes stay listed even when the GPU servers are not running (e.g. under
+  # `ferry up --route`); calls to them simply fail until the backend is up.
+  - model_name: local-orch
+    litellm_params:
+      model: openai/mlx-community/Qwen3.8-27B-nvfp4
+      api_base: http://127.0.0.1:8092/v1
+      api_key: "local"
+      timeout: 1800
+    model_info:
+      id: local-orch-mlx
+
+  - model_name: local-sub
+    litellm_params:
+      model: openai/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+      api_base: http://127.0.0.1:8093/v1
+      api_key: "local"
+      timeout: 1800
+    model_info:
+      id: local-sub-mlx
+
 litellm_settings:
   # Exposes litellm-native /metrics on :8090 (per-model usage, per-deployment
   # success/failure, fallback events) for the Grafana stack. Requires the
   # `prometheus_client` dep (bundled by `ferry install`).
   callbacks: ["prometheus"]
+  drop_params: true    # DROP provider-unsupported params (e.g. tool_choice, which every
+                       # agentic client sends) instead of erroring. Without this, a
+                       # provider whose litellm capability map lacks tool_choice raises
+                       # UnsupportedParamsError on EVERY tool-using call, and the lane
+                       # falls through to a slower hop for no real reason.
   num_retries: 3
   request_timeout: 600
 
@@ -154,13 +204,25 @@ router_settings:
                                              # num_retries adds retry-backoff latency before
                                              # the fallback fires. 1 keeps a worker pool
                                              # resilient to a blip without that penalty.
-  # Strict failover chain: a failed `orchestrator` reroutes to the fallback list in
-  # order (fast model first, last resort last).
+
+  # Optional back-compat: if you rename a lane, alias the OLD name to the new one
+  # so clients wired before the rename keep working. `hidden: true` keeps the alias
+  # OUT of /v1/models, so the catalog advertises only the real lane names while the
+  # old ids still resolve instead of 404-ing mid-session.
+  # model_group_alias:
+  #   orchestrator:     {model: "orch",  hidden: true}
+  #   gemini-3.7-flash: {model: "flash", hidden: true}
+
+  # Strict failover chain: a failed `orch` reroutes to the fallback list in order
+  # (fast model first, last resort last).
   #
-  # A worker POOL can have a fallback too: when every key in the gemini-3.7-flash pool
-  # is cooled down (all on 429), overflow reroutes to the model(s) listed instead of
-  # returning a raw 429 to the client. Point it at a model with spare capacity (here the
-  # orchestrator's own primary). litellm fallbacks are single-hop (not transitive), so
-  # the fallback target's own fallback list is NOT chained in. Remove the second entry
+  # A worker POOL can have a fallback too: when every key in the `flash` pool is
+  # cooled down (all on 429), overflow reroutes to the model(s) listed instead of
+  # returning a raw 429 to the client. Point it at a lane with spare capacity (here
+  # `orch` itself). litellm fallbacks are single-hop (not transitive), so the
+  # fallback target's own fallback list is NOT chained in. Remove the second entry
   # if you want the pool to hard-fail rather than spill over.
-  fallbacks: [{"orchestrator": ["orchestrator-fallback", "orchestrator-fallback-2"]}, {"gemini-3.7-flash": ["orchestrator"]}]
+  #
+  # Note what is ABSENT: neither local lane appears here. See the deployment
+  # comments above for why that is deliberate.
+  fallbacks: [{"orch": ["orch-fallback", "orch-fallback-2"]}, {"flash": ["orch"]}]

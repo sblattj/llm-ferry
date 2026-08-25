@@ -1,6 +1,66 @@
 
 # ----------------- COMMANDS -----------------
 
+# _ferry_patch_nemotron_batching — make the `local-sub` lane actually answer.
+#
+# mlx-vlm's continuous-batching engine (generate/ar.py) passes BOTH `input_ids`
+# and `inputs_embeds` on every request, but the `nemotron_h` backbone requires
+# exactly one and raises `ValueError: Provide exactly one of inputs or
+# inputs_embeds`. Unpatched, EVERY request to the Nemotron lane fails — the lane
+# starts, reports healthy, and 500s on first use.
+#
+# The fix is two lines in LanguageModel.__call__: prefer inputs_embeds when it is
+# present. This runs on every `ferry install` because `uv tool install --force`
+# rewrites site-packages and discards the previous patch.
+#
+# Idempotent and fail-soft by design: it no-ops when already patched, no-ops when
+# the upstream shape changes (i.e. when the bug is fixed), and never fails the
+# install — a missing patch costs one lane, a broken install costs all of them.
+_ferry_patch_nemotron_batching() {
+  echo ">>> Patching mlx-vlm nemotron_h for continuous batching (local-sub lane)..."
+  python3 - <<'PYEOF' || echo "    (patch step skipped; local-sub may 500 on every request)"
+import glob, os, sys
+
+CANDIDATES = []
+# The uv-managed tool venv is the path `ferry install` creates.
+CANDIDATES += glob.glob(os.path.expanduser(
+    "~/.local/share/uv/tools/mlx-vlm/lib/python*/site-packages/mlx_vlm/models/nemotron_h/language.py"))
+# Fall back to any importable mlx_vlm (pip/conda installs).
+try:
+    import mlx_vlm  # noqa
+    CANDIDATES.append(os.path.join(os.path.dirname(mlx_vlm.__file__),
+                                   "models", "nemotron_h", "language.py"))
+except Exception:
+    pass
+
+path = next((c for c in CANDIDATES if os.path.exists(c)), None)
+if not path:
+    print("    nemotron_h/language.py not found - nothing to patch.")
+    sys.exit(0)
+
+src = open(path).read()
+ANCHOR = "        out = self.backbone(inputs, cache=cache, inputs_embeds=inputs_embeds)"
+GUARD = "        if inputs_embeds is not None:\n            inputs = None\n"
+
+if GUARD in src:
+    print(f"    Already patched: {path}")
+    sys.exit(0)
+if ANCHOR not in src:
+    # Upstream changed this call site - most likely the bug is fixed. Do not
+    # guess at a new insertion point; leave the file alone.
+    print(f"    Upstream shape changed (anchor absent) - leaving {path} untouched.")
+    sys.exit(0)
+
+patched = src.replace(ANCHOR,
+    "        # Continuous batching (generate/ar.py) always passes BOTH input_ids and\n"
+    "        # inputs_embeds (it runs on embeddings); the backbone requires exactly\n"
+    "        # one, so defer to inputs_embeds whenever it is present.\n"
+    + GUARD + ANCHOR, 1)
+open(path, "w").write(patched)
+print(f"    Patched: {path}")
+PYEOF
+}
+
 cmd_install() {
   echo "================================================================="
   echo "               PROVISIONING LLM-FERRY SYSTEM HOST"
@@ -47,12 +107,17 @@ cmd_install() {
         uv run huggingface-cli download "$model_id"
       fi
     }
-    echo ">>> Fetching Model 1: Qwen 3.8-27B (nvfp4 quantized)"
+    echo ">>> Fetching Model 1: Qwen 3.8-27B nvfp4 (the local-orch lane)"
     download_model "$LOCAL_MODEL"
-    echo ">>> Fetching Model 2: Qwen 3.8-27B MTP Speculative Drafter (8-bit)"
+    echo ">>> Fetching Model 2: Qwen 3.8-27B MTP speculative drafter, 8-bit (local-orch)"
     download_model "$LOCAL_DRAFT"
-    echo ">>> Fetching Model 3: NVIDIA Nemotron 3 Nano 30B A3B (local orchestrator, NVFP4)"
-    download_model "$LOCAL_MODEL_ORCH"
+    echo ">>> Fetching Model 3: NVIDIA Nemotron 3 Nano 30B A3B NVFP4 (the local-sub lane)"
+    download_model "$LOCAL_MODEL_SUB"
+
+    # The local-sub lane is unusable without this patch — see the function's
+    # comment. It MUST run after `uv tool install mlx-vlm --force` above, which
+    # replaces site-packages and therefore discards any previous patch.
+    _ferry_patch_nemotron_batching
   else
     echo ">>> Linux detected: skipping mlx-vlm and local model downloads."
     echo "    Local GPU serving is macOS / Apple Silicon only. On Linux, serve via"

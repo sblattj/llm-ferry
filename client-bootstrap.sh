@@ -194,18 +194,38 @@ PYEOF
 # OPENCODE_CONFIG at it.
 mkdir -p "$HOME/.config/ferry"
 OC_DIR="$HOME/.config/ferry"
-cat <<'EOF' > "$OC_DIR/opencode-cloud.json"
-{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://__FERRY_HOST__:__FERRY_PORT__/v1","apiKey":"local"},"models":{"orch":{},"flash":{}}}},"model":"ferry/orch","small_model":"ferry/flash","agent":{"build":{"model":"ferry/orch"},"plan":{"model":"ferry/orch"},"general":{"model":"ferry/flash"},"explore":{"model":"ferry/flash"},"scout":{"model":"ferry/flash"}}}
-EOF
-cat <<'EOF' > "$OC_DIR/opencode-local.json"
-{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://__FERRY_HOST__:__FERRY_PORT__/v1","apiKey":"local"},"models":{"local-orch":{},"local-sub":{}}}},"model":"ferry/local-orch","small_model":"ferry/local-sub","agent":{"build":{"model":"ferry/local-orch"},"plan":{"model":"ferry/local-orch"},"general":{"model":"ferry/local-sub"},"explore":{"model":"ferry/local-sub"},"scout":{"model":"ferry/local-sub"}}}
-EOF
-python3 - "$OC_DIR/opencode-cloud.json" "$OC_DIR/opencode-local.json" "$HOST_NAME" "$HOST_PORT" <<'PYEOF'
-import sys
-for path in (sys.argv[1], sys.argv[2]):
-    s = open(path).read()
-    s = s.replace("__FERRY_HOST__", sys.argv[3]).replace("__FERRY_PORT__", sys.argv[4])
-    open(path, "w").write(s)
+python3 - "$OC_DIR" "$HOST_NAME" "$HOST_PORT" <<'PYEOF'
+import json, sys
+oc_dir, host, port = sys.argv[1], sys.argv[2], sys.argv[3]
+base = f"http://{host}:{port}/v1"
+# opencode model limits: the local lanes cap KV at 131072 (128k) tokens, so a
+# 100k-token prompt + opencode's 32k output reservation tips over into a clean
+# 400 (max_tokens is reserved against the KV budget). 8k output keeps prompts
+# up to ~123k admissible; compact summaries never need 32k anyway.
+local_limit = {"limit": {"context": 131072, "output": 8192}}
+provs = {
+    "opencode-cloud.json": {
+        "provider": {"ferry": {"npm": "@ai-sdk/openai-compatible",
+                               "options": {"baseURL": base, "apiKey": "local"},
+                               "models": {"orch": {}, "flash": {}}}},
+        "model": "ferry/orch", "small_model": "ferry/flash",
+    },
+    "opencode-local.json": {
+        "provider": {"ferry": {"npm": "@ai-sdk/openai-compatible",
+                               "options": {"baseURL": base, "apiKey": "local"},
+                               "models": {"local-orch": local_limit,
+                                          "local-sub": local_limit}}},
+        "model": "ferry/local-orch", "small_model": "ferry/local-sub",
+        "agent": {"build": {"model": "ferry/local-orch"},
+                  "plan": {"model": "ferry/local-orch"},
+                  "general": {"model": "ferry/local-sub"},
+                  "explore": {"model": "ferry/local-sub"},
+                  "scout": {"model": "ferry/local-sub"}},
+    },
+}
+for name, cfg in provs.items():
+    with open(f"{oc_dir}/{name}", "w") as f:
+        json.dump(cfg, f)
 PYEOF
 
 cat <<'EOF' >> "$ZSHRC"

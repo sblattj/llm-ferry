@@ -67,11 +67,16 @@ class DynamicHandler(SimpleHTTPRequestHandler):
                         content = f.read()
                     content = content.replace("HOST_MDNS_PLACEHOLDER", mdns_name)
                     content = content.replace("SHARE_PORT_PLACEHOLDER", str(port))
+                    body = content.encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "application/x-sh")
-                    self.send_header("Content-Length", str(len(content)))
+                    # Content-Length MUST count BYTES, not characters: the script
+                    # contains multi-byte UTF-8 (em-dashes), and a char-count header
+                    # silently truncates the tail (an unterminated `echo "` at EOF,
+                    # which the client's zsh reports as `unmatched "`).
+                    self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
-                    self.wfile.write(content.encode("utf-8"))
+                    self.wfile.write(body)
                     return
                 except Exception as e:
                     print(f"Error performing dynamic replacement: {e}")

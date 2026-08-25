@@ -184,8 +184,30 @@ with open(rc, "w") as f:
         f.write("\n")
 PYEOF
 
-# QUOTED heredoc: the body is written VERBATIM (no $, backtick, or quote
-# expansion). Host/port are spliced in afterwards via unique placeholders.
+# QUOTED heredocs: bodies written VERBATIM (no $, backtick, or quote expansion).
+# Host/port are spliced in afterwards via unique placeholders.
+#
+# MECHANISM NOTE: opencode takes config via OPENCODE_CONFIG (a FILE PATH), not
+# an env var holding JSON — an invented OPENCODE_CONFIG_CONTENT is silently
+# ignored and every wrapper silently runs whatever the default config is. So
+# each pair gets a real config file written here, and the wrappers point
+# OPENCODE_CONFIG at it.
+mkdir -p "$HOME/.config/ferry"
+OC_DIR="$HOME/.config/ferry"
+cat <<'EOF' > "$OC_DIR/opencode-cloud.json"
+{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://__FERRY_HOST__:__FERRY_PORT__/v1","apiKey":"local"},"models":{"orch":{},"flash":{}}}},"model":"ferry/orch","small_model":"ferry/flash","agent":{"build":{"model":"ferry/orch"},"plan":{"model":"ferry/orch"},"general":{"model":"ferry/flash"},"explore":{"model":"ferry/flash"},"scout":{"model":"ferry/flash"}}}
+EOF
+cat <<'EOF' > "$OC_DIR/opencode-local.json"
+{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://__FERRY_HOST__:__FERRY_PORT__/v1","apiKey":"local"},"models":{"local-orch":{},"local-sub":{}}}},"model":"ferry/local-orch","small_model":"ferry/local-sub","agent":{"build":{"model":"ferry/local-orch"},"plan":{"model":"ferry/local-orch"},"general":{"model":"ferry/local-sub"},"explore":{"model":"ferry/local-sub"},"scout":{"model":"ferry/local-sub"}}}
+EOF
+python3 - "$OC_DIR/opencode-cloud.json" "$OC_DIR/opencode-local.json" "$HOST_NAME" "$HOST_PORT" <<'PYEOF'
+import sys
+for path in (sys.argv[1], sys.argv[2]):
+    s = open(path).read()
+    s = s.replace("__FERRY_HOST__", sys.argv[3]).replace("__FERRY_PORT__", sys.argv[4])
+    open(path, "w").write(s)
+PYEOF
+
 cat <<'EOF' >> "$ZSHRC"
 # >>> ferry opencode profiles >>>
 # Defensive: an alias with a function's name anywhere earlier in the file (or in
@@ -193,49 +215,37 @@ cat <<'EOF' >> "$ZSHRC"
 # alias". Kill them first.
 unalias opencode opencode-cloud opencode-local 2>/dev/null
 
-_FERRY_CFG_DIR="$HOME/.config/ferry"
-_FERRY_LANE_FILE="$_FERRY_CFG_DIR/last-lane"
-_FERRY_CFG_CLOUD='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://__FERRY_HOST__:__FERRY_PORT__/v1","apiKey":"local"},"models":{"orch":{},"flash":{}}}},"model":"ferry/orch","small_model":"ferry/flash","agent":{"build":{"model":"ferry/orch"},"plan":{"model":"ferry/orch"},"general":{"model":"ferry/flash"},"explore":{"model":"ferry/flash"},"scout":{"model":"ferry/flash"}}}'
-_FERRY_CFG_LOCAL='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://__FERRY_HOST__:__FERRY_PORT__/v1","apiKey":"local"},"models":{"local-orch":{},"local-sub":{}}}},"model":"ferry/local-orch","small_model":"ferry/local-sub","agent":{"build":{"model":"ferry/local-orch"},"plan":{"model":"ferry/local-orch"},"general":{"model":"ferry/local-sub"},"explore":{"model":"ferry/local-sub"},"scout":{"model":"ferry/local-sub"}}}'
-
 # Bare `opencode` routes through whichever lane you used LAST (cloud until you
-# first run opencode-local). An explicit OPENCODE_CONFIG_CONTENT always wins, so
-# other tools/wrappers passing their own config are unaffected.
+# first run opencode-local). An explicit OPENCODE_CONFIG always wins, so other
+# tools/wrappers passing their own config are unaffected.
 opencode() {
-  if [[ -n "${OPENCODE_CONFIG_CONTENT:-}" ]]; then
+  if [[ -n "${OPENCODE_CONFIG:-}" ]]; then
     command opencode "$@"
     return
   fi
-  local cfg="$_FERRY_CFG_CLOUD"
-  [[ "$(cat "$_FERRY_LANE_FILE" 2>/dev/null)" == "local" ]] && cfg="$_FERRY_CFG_LOCAL"
-  OPENCODE_CONFIG_CONTENT="$cfg" command opencode "$@"
+  local cfg="$HOME/.config/ferry/opencode-cloud.json"
+  [[ "$(cat "$HOME/.config/ferry/last-lane" 2>/dev/null)" == "local" ]] && cfg="$HOME/.config/ferry/opencode-local.json"
+  OPENCODE_CONFIG="$cfg" command opencode "$@"
 }
 
 # opencode-cloud: the CLOUD pair — orch drives (build/plan), flash runs the
 # fan-out (general/explore/scout). Nothing touches the host GPU. Sets the
 # bare-`opencode` default.
 opencode-cloud() {
-  mkdir -p "$_FERRY_CFG_DIR" && printf 'cloud\n' > "$_FERRY_LANE_FILE"
-  OPENCODE_CONFIG_CONTENT="$_FERRY_CFG_CLOUD" command opencode "$@"
+  mkdir -p "$HOME/.config/ferry" && printf 'cloud\n' > "$HOME/.config/ferry/last-lane"
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-cloud.json" command opencode "$@"
 }
 
 # opencode-local: the GPU pair — local-orch drives (build/plan), local-sub runs
 # the fan-out (a hybrid-attention MoE whose tiny KV cache lets many parallel
 # agents fit in the host's RAM). Nothing leaves the host. Sets the default.
 opencode-local() {
-  mkdir -p "$_FERRY_CFG_DIR" && printf 'local\n' > "$_FERRY_LANE_FILE"
-  OPENCODE_CONFIG_CONTENT="$_FERRY_CFG_LOCAL" command opencode "$@"
+  mkdir -p "$HOME/.config/ferry" && printf 'local\n' > "$HOME/.config/ferry/last-lane"
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-local.json" command opencode "$@"
 }
 
 # <<< ferry opencode profiles <<<
 EOF
-python3 - "$ZSHRC" "$HOST_NAME" "$HOST_PORT" <<'PYEOF'
-import sys
-rc, host, port = sys.argv[1], sys.argv[2], sys.argv[3]
-s = open(rc).read()
-s = s.replace("__FERRY_HOST__", host).replace("__FERRY_PORT__", port)
-open(rc, "w").write(s)
-PYEOF
 echo "    Successfully added opencode profile functions to ~/.zshrc."
 
 # Install the local-lane opencode guardrails: /fan-out command + spawning-subagents

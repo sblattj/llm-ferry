@@ -85,8 +85,12 @@ cmd_opencode() {
   # all-on-the-host-GPU session. Falls back to whatever single lane the host serves.
   # Non-destructive: backs up and merges.
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
-  local oc_config="$HOME/.config/opencode/opencode.json"
-  local force_model="" force_small="" set_default=1 prefer_local=0
+  # opencode resolves its config from $OPENCODE_CONFIG when that is set, so
+  # honour it here too. Writing the hardcoded default on a machine that sets
+  # OPENCODE_CONFIG edits a file opencode never reads: the command reports
+  # success, and nothing changes.
+  local oc_config="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
+  local force_model="" force_small="" set_default=1 prefer_local=0 force_write=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -97,23 +101,35 @@ cmd_opencode() {
       --small-model)  force_small="$2"; shift 2 ;;
       --no-default)   set_default=0; shift ;;
       --local)        prefer_local=1; shift ;;
+      --force)        force_write=1; shift ;;
       --cloud)        prefer_local=0; shift ;;
       *) echo "Unknown option for 'ferry opencode': $1"; exit 1 ;;
     esac
   done
 
   if [[ -z "$oc_host" ]]; then
-    echo "Error: no host known. Pass --host <mdns-or-ip> (or run this on a bootstrapped"
-    echo "client where ~/.config/ferry/client.json exists)."
-    exit 1
+    if (( CLIENT_MODE )); then
+      # A bootstrapped client whose profile exists but carries no host.
+      echo "Error: ~/.config/ferry/client.json has no 'host'. Re-run the client"
+      echo "bootstrap, or pass --host <mdns-or-ip> explicitly."
+      exit 1
+    fi
+    # HOST: the proxy is on this very machine, so loopback is the right default.
+    # Wiring the host to its own endpoint is the point of running one — every
+    # local tool then shares the lanes, the fallback chain, and the observability,
+    # and no tool on this box needs its own copy of a provider key.
+    oc_host="127.0.0.1"
+    echo ">>> No --host and no client profile: this is the HOST, so wiring it to its"
+    echo "    own proxy at http://127.0.0.1:$oc_port/v1."
   fi
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" <<'PYEOF'
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" <<'PYEOF'
 import json, os, re, sys, shutil, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
 set_default = sys.argv[6] == "1"
 prefer_local = sys.argv[7] == "1"
+force_write = sys.argv[8] == "1"
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
@@ -157,6 +173,15 @@ if os.path.exists(cfg_path):
         stripped = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/',
                           lambda m: m.group(1) or '', raw, flags=re.S)
         stripped = re.sub(r',\s*([}\]])', r'\1', stripped)
+        if not force_write:
+            print("    REFUSING to rewrite a COMMENTED config:")
+            print(f"      {cfg_path}")
+            print("    This file has comments (JSONC). Writing it back would DROP every")
+            print("    one of them - json.dump cannot round-trip comments - so a")
+            print("    hand-maintained config would come back stripped of its notes.")
+            print("    Either edit it by hand (see the lane names in /v1/models), or")
+            print("    re-run with --force to overwrite it anyway.")
+            sys.exit(2)
         try:
             cfg = json.loads(stripped)
             print("    (Existing opencode config had JSONC comments; parsed tolerantly)")

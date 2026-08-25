@@ -143,7 +143,14 @@ esac
 if (( SETUP_OPENCODE )); then
   echo ""
   echo ">>> Auto-configuring 'opencode' to route through the host (detects served models)..."
-  if "$HOME/.local/bin/ferry" opencode --host "$HOST_NAME" --port "$HOST_PORT"; then
+  # Honour the lane picked in the menu above. `ferry opencode` auto-detects and
+  # defaults to the CLOUD pair, so a local pick has to be passed through
+  # explicitly — otherwise choosing "local-orch" silently wires orch + flash.
+  OC_LANE_FLAG=""
+  case "$SELECTED_MODEL" in
+    "$LANE_LOCAL_ORCH"|"$LANE_LOCAL_SUB") OC_LANE_FLAG="--local" ;;
+  esac
+  if "$HOME/.local/bin/ferry" opencode --host "$HOST_NAME" --port "$HOST_PORT" $OC_LANE_FLAG; then
     :
   else
     echo "    WARNING: 'ferry opencode' failed. Wire opencode manually: add an openai-compatible"

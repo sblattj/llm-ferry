@@ -135,7 +135,11 @@ KNOWN_MODEL = re.compile(
     r"(?:glm-[\w.-]+|gemini-[\w.-]+|deepseek[\w.-]*|gpt-[\w.-]+|k3-[\w.-]+"
     r"|kimi[\w.-]*|claude-[\w.-]+))")
 # Ferry's model GROUPS (what a client asks for) as opposed to a backend id.
-KNOWN_GROUP = re.compile(r"(?<![\w.-])(orchestrator(?:-[\w.-]+)?)")
+# Lane names: `orch` (+ its `orch-*` fallback hops), `flash`, and the two GPU
+# lanes `local-orch` / `local-sub`. `orchestrator` is the pre-rename name, kept
+# so log lines emitted by an older config still resolve to a group.
+KNOWN_GROUP = re.compile(
+    r"(?<![\w.-])((?:local-)?orch(?:estrator)?(?:-[\w.-]+)?|local-sub|flash)")
 
 # Captures that are grammar, not identity ("model not in built-in cost map").
 _STOPWORDS = {"model", "name", "group", "none", "null", "not", "in", "the",

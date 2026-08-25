@@ -20,12 +20,12 @@ if [[ "$SHARE_PORT" == "SHARE_PORT_PLACEHOLDER" ]]; then
   SHARE_PORT="8095"
 fi
 
-# Default Model lists
-MODEL_LOCAL="mlx-community/Qwen3.8-27B-nvfp4"
-MODEL_LOCAL_ORCH="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
-MODEL_CLAUDE="anthropic/claude-3-7-sonnet-20250219"
-MODEL_GEMINI="gemini/gemini-3.7-flash"
-MODEL_GEMINI_2="gemini/gemini-2.0-flash"
+# The host serves LANES, not raw model ids: a lane name is a stable role that the
+# host can re-point at a different model without any client ever being edited.
+LANE_ORCH="orch"              # cloud: the big driving model + its fallback chain
+LANE_FLASH="flash"            # cloud: cheap high-volume worker pool
+LANE_LOCAL_ORCH="local-orch"  # host GPU: the "smart" local model
+LANE_LOCAL_SUB="local-sub"    # host GPU: the cheap local fan-out model
 
 echo "================================================================="
 echo "            BOOTSTRAPPING CLIENT LAPTOP FOR LLM-FERRY"
@@ -113,29 +113,30 @@ case "$TOOL_CHOICE" in
 esac
 
 # 4. Interactive Selection Menu: Choose default model (Sorted Chronologically, Newest First)
-SELECTED_MODEL="$MODEL_GEMINI" # default
+SELECTED_MODEL="$LANE_ORCH" # default
 echo ""
-echo ">>> Which model should your integrations default to using on the host?"
-echo " Cloud (recommended — uses the host's API keys):"
-echo "  1) [Cloud] Gemini 3.7 Flash  (gemini/gemini-3.7-flash) [Recommended Default]"
-echo "  2) [Cloud] Claude 3.7 Sonnet (anthropic/claude-3-7-sonnet-20250219)"
-echo "  3) [Cloud] Gemini 2.0 Flash  (gemini/gemini-2.0-flash)"
+echo ">>> Which LANE should your integrations default to on the host?"
+echo "    (The host serves all of these at once on one endpoint. You are picking a"
+echo "     default, not a restriction — any tool can name another lane per request.)"
+echo ""
+echo " Cloud (uses the host's API keys; nothing runs on the host GPU):"
+echo "  1) orch        big driving model + strict fallback chain [Recommended Default]"
+echo "  2) flash       cheap high-volume worker pool"
 echo ""
 echo " Local (runs on the host's Apple Silicon GPU via MLX):"
-echo "  4) [Local] Qwen 3.8-27B GPU  (mlx-community/Qwen3.8-27B-nvfp4)"
-echo "  5) [Local] NVIDIA Nemotron 3 Nano 30B A3B (orchestrator-grade, subagent-friendly)  (mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4)"
-printf "Select option (1-5) [Default: 1]: "
+echo "  3) local-orch  the host GPU's smart model"
+echo "  4) local-sub   the host GPU's cheap fan-out model"
+printf "Select option (1-4) [Default: 1]: "
 
 read MODEL_CHOICE < /dev/tty
 MODEL_CHOICE="${MODEL_CHOICE:-1}"
 
 case "$MODEL_CHOICE" in
-  1) SELECTED_MODEL="$MODEL_GEMINI" ;;
-  2) SELECTED_MODEL="$MODEL_CLAUDE" ;;
-  3) SELECTED_MODEL="$MODEL_GEMINI_2" ;;
-  4) SELECTED_MODEL="$MODEL_LOCAL" ;;
-  5) SELECTED_MODEL="$MODEL_LOCAL_ORCH" ;;
-  *) SELECTED_MODEL="$MODEL_GEMINI" ;;
+  1) SELECTED_MODEL="$LANE_ORCH" ;;
+  2) SELECTED_MODEL="$LANE_FLASH" ;;
+  3) SELECTED_MODEL="$LANE_LOCAL_ORCH" ;;
+  4) SELECTED_MODEL="$LANE_LOCAL_SUB" ;;
+  *) SELECTED_MODEL="$LANE_ORCH" ;;
 esac
 
 # 5. Perform Automatic opencode configuration
@@ -224,18 +225,21 @@ PYEOF
 
 cat <<EOF >> "$ZSHRC"
 $START_MARKER
-# opencode-cloud: route-mode 'orch' pattern — orchestrator main + Gemini Flash subagents.
-# Requires the host running \`ferry up --route\`.
+# opencode-cloud: the CLOUD pair — `orch` drives (build/plan), `flash` runs the
+# fan-out (general/explore/scout). Nothing touches the host GPU.
 opencode-cloud() {
-  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://$HOST_NAME:$HOST_PORT/v1","apiKey":"local"},"models":{"orchestrator":{},"gemini-3.7-flash":{}}}},"model":"ferry/orchestrator","small_model":"ferry/gemini-3.7-flash","agent":{"build":{"model":"ferry/orchestrator"},"plan":{"model":"ferry/orchestrator"},"general":{"model":"ferry/gemini-3.7-flash"},"explore":{"model":"ferry/gemini-3.7-flash"},"scout":{"model":"ferry/gemini-3.7-flash"}}}' command opencode "\$@"
+  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://$HOST_NAME:$HOST_PORT/v1","apiKey":"local"},"models":{"orch":{},"flash":{}}}},"model":"ferry/orch","small_model":"ferry/flash","agent":{"build":{"model":"ferry/orch"},"plan":{"model":"ferry/orch"},"general":{"model":"ferry/flash"},"explore":{"model":"ferry/flash"},"scout":{"model":"ferry/flash"}}}' command opencode "\$@"
 }
 
-# opencode-local: all-local lane — host GPU runs NVIDIA Nemotron 3 Nano 30B A3B (NVFP4)
-# for BOTH main and subagents (hybrid attention = tiny KV cache -> many parallel agents
-# fit in the host's RAM). Requires the host running \`ferry up --orch\`.
+# opencode-local: the GPU pair — both lanes on the host's Apple Silicon, nothing
+# leaving the machine. `local-orch` drives (build/plan) and `local-sub` runs the
+# fan-out (general/explore/scout): the subagent lane is a hybrid-attention MoE
+# whose tiny KV cache lets many parallel agents fit in the host's RAM, so the
+# expensive lane is not spent on cheap work.
 opencode-local() {
-  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://$HOST_NAME:$HOST_PORT/v1","apiKey":"local"},"models":{"mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4":{}}}},"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4","small_model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4","agent":{"build":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"},"plan":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"},"general":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"},"explore":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"},"scout":{"model":"ferry/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"}}}' command opencode "\$@"
+  OPENCODE_CONFIG_CONTENT='{"provider":{"ferry":{"npm":"@ai-sdk/openai-compatible","options":{"baseURL":"http://$HOST_NAME:$HOST_PORT/v1","apiKey":"local"},"models":{"local-orch":{},"local-sub":{}}}},"model":"ferry/local-orch","small_model":"ferry/local-sub","agent":{"build":{"model":"ferry/local-orch"},"plan":{"model":"ferry/local-orch"},"general":{"model":"ferry/local-sub"},"explore":{"model":"ferry/local-sub"},"scout":{"model":"ferry/local-sub"}}}' command opencode "\$@"
 }
+
 $END_MARKER
 EOF
 echo "    Successfully added opencode profile functions to ~/.zshrc."
@@ -254,7 +258,7 @@ if command -v opencode >/dev/null 2>&1; then
 
   cat > "$HOME/.config/opencode/command/fan-out.md" <<'FANOUT'
 ---
-description: Fan a build task out to up to 3 parallel subagents with the safe task-tool recipe (for local models like Nemotron whose raw task calls get rejected).
+description: Fan a build task out to up to 3 parallel subagents with the safe task-tool recipe (for local lanes, whose raw task calls get rejected).
 ---
 
 Task: $ARGUMENTS
@@ -276,25 +280,29 @@ FANOUT
   cat > "$HOME/.config/opencode/skills/spawning-subagents/SKILL.md" <<'SKILLMD'
 ---
 name: spawning-subagents
-description: Use when calling the task tool on the local Nemotron lane (opencode-local / ferry up --orch) to delegate work to subagents. Prevents malformed task calls (hallucinated task_id, missing description, nested delegation) that silently stall local agent sessions; covers the exact three-field call recipe and retry-once rule.
+description: Use when calling the task tool from a LOCAL lane (opencode-local, or any ferry local-* model) to delegate work to subagents. Prevents malformed task calls (hallucinated task_id, missing description, nested delegation) that silently stall local agent sessions; covers the exact three-field call recipe and retry-once rule.
 ---
 
-# Spawning subagents on the local lane (Nemotron / small local models)
+# Spawning subagents on the local lanes
 
-Local orchestrator models (e.g. NVIDIA Nemotron 3 Nano 30B A3B) frequently
-produce malformed `task` tool calls — hallucinated `task_id` fields, missing
-`description`, or nested delegation — which the harness rejects before the
-tool ever runs. The failure looks like a silent stall: no tool output, the
-model silently retrying the same broken call every turn.
+Small local models driving a fan-out frequently produce malformed `task` tool
+calls - hallucinated `task_id` fields, missing `description`, or nested
+delegation - which the harness rejects before the tool ever runs. The failure
+looks like a silent stall: no tool output, the model silently retrying the same
+broken call every turn.
+
+This applies to whichever local model is DRIVING. On ferry that is the
+`local-orch` lane; `local-sub` is the lane the subagents themselves run on and
+does not issue `task` calls.
 
 Follow these rules EVERY time you call the `task` tool:
 
-1. The call MUST have exactly these three fields — nothing else:
+1. The call MUST have exactly these three fields - nothing else:
    - `description`: a short 3-5 word label for the subtask
    - `subagent_type`: the string "general"
    - `prompt`: the complete, self-contained brief
 2. NEVER pass `task_id`, `command`, `model`, or any other field. `task_id` is
-   reserved for resuming an existing session and must start with "ses" — if
+   reserved for resuming an existing session and must start with "ses" - if
    you invent one, the call fails.
 3. NEVER write a brief that tells the subagent to delegate further. One level
    of fan-out only.
@@ -306,12 +314,16 @@ Follow these rules EVERY time you call the `task` tool:
 
 ## Operational notes (measured 2026-08-25)
 
+Measured with NVIDIA Nemotron 3 Nano 30B A3B driving the session. It has since
+moved to the `local-sub` (subagent) lane, so it is no longer the default driver
+- but the failure mode is a property of small local models issuing `task`
+calls, not of that one model, so the recipe still applies to whatever drives.
+
 - The recipe works when it sits in the USER message (end of context). Putting
   it in system instructions or relying on the model to load this skill made
-  failures WORSE with Nemotron — use the `/fan-out` command, which injects
-  the recipe as the user message, rather than hoping the model finds it.
-- Bare tool calls (read/write/bash) are reliable on this model; only the
-  `task` schema is flaky.
+  failures WORSE - use the `/fan-out` command, which injects the recipe as the
+  user message, rather than hoping the model finds it.
+- Bare tool calls (read/write/bash) are reliable; only the `task` schema is flaky.
 - Doom-loop signature for headless runs: repeated server requests with
   IDENTICAL generated-token counts and finish_reason=tool_calls every turn
   (e.g. 22 identical 38-token calls). Kill on 3+ identical consecutive.
@@ -341,8 +353,8 @@ if (( SETUP_OPENCODE )); then
   echo "    You can now call the host model using standard commands:"
   echo "    \033[1;32mhost-code run \"Build a snake game in Python\"\033[0m"
   echo "    (Or run bare 'opencode' commands — default model is now set to 'ferry')"
-  echo "    opencode-cloud   -> 'orch' pattern: orchestrator main + Gemini Flash subagents (host: ferry up --route)"
-  echo "    opencode-local   -> all-local: Nemotron 3 Nano 30B A3B NVFP4 main + subagents on the host GPU (host: ferry up --orch)"
+  echo "    opencode-cloud   -> cloud pair: orch drives, flash fans out"
+  echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
   echo ""
 fi
 

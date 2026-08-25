@@ -79,12 +79,14 @@ PYEOF
 
 cmd_opencode() {
   # [Client] Wire this laptop's opencode config to route through the host's ferry endpoint.
-  # Auto-detects the host's served models: if the host serves `orchestrator` + a worker
-  # (e.g. gemini-3.7-flash), it sets up the orchestrator/worker split; otherwise it wires
-  # whatever single model the host serves. Non-destructive: backs up and merges.
+  # Auto-detects the host's served LANES and sets up the driver/subagent split:
+  # `orch` drives (build/plan) and `flash` runs the fan-out (general/explore/scout).
+  # `--local` picks the GPU pair (`local-orch` + `local-sub`) instead, for an
+  # all-on-the-host-GPU session. Falls back to whatever single lane the host serves.
+  # Non-destructive: backs up and merges.
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
   local oc_config="$HOME/.config/opencode/opencode.json"
-  local force_model="" force_small="" set_default=1
+  local force_model="" force_small="" set_default=1 prefer_local=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -94,6 +96,8 @@ cmd_opencode() {
       --model)        force_model="$2"; shift 2 ;;
       --small-model)  force_small="$2"; shift 2 ;;
       --no-default)   set_default=0; shift ;;
+      --local)        prefer_local=1; shift ;;
+      --cloud)        prefer_local=0; shift ;;
       *) echo "Unknown option for 'ferry opencode': $1"; exit 1 ;;
     esac
   done
@@ -104,11 +108,12 @@ cmd_opencode() {
     exit 1
   fi
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" <<'PYEOF'
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" <<'PYEOF'
 import json, os, re, sys, shutil, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
 set_default = sys.argv[6] == "1"
+prefer_local = sys.argv[7] == "1"
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
@@ -120,9 +125,24 @@ try:
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring from flags/defaults)")
 
-# --- Decide main + worker models ---
-main = force_model or ("orchestrator" if "orchestrator" in served else (served[0] if served else "orchestrator"))
-small = force_small or ("gemini-3.7-flash" if "gemini-3.7-flash" in served else "")
+# --- Decide the driver lane + the subagent lane ---
+# Lane names are the stable contract; the model behind a lane can change on the
+# host without any client edit. `--local` prefers the GPU pair, otherwise cloud.
+# Each preference falls through to the other pair, then to the first served lane,
+# so a host running only half the stack still wires up correctly.
+LANE_PAIRS = [("local-orch", "local-sub"), ("orch", "flash")]
+if not prefer_local:
+    LANE_PAIRS.reverse()
+
+main, small = "", ""
+for driver, sub in LANE_PAIRS:
+    if driver in served:
+        main = driver
+        small = sub if sub in served else ""
+        break
+
+main = force_model or main or (served[0] if served else "orch")
+small = force_small or small
 
 model_ids = list(dict.fromkeys(served + [main] + ([small] if small else [])))
 models = {mid: {} for mid in model_ids}
@@ -164,7 +184,8 @@ if set_default:
     if small:
         cfg["small_model"] = f"ferry/{small}"
     # Pin opencode's built-in agents so the fan-out uses the cheap worker:
-    #   primary build/plan -> orchestrator (main); subagents general/explore/scout -> worker (small).
+    #   primary build/plan -> the driver lane (main); subagents general/explore/scout -> the
+    #   subagent lane (small), so a fan-out spends the cheap lane, not the expensive one.
     # setdefault preserves any existing per-agent prompt/permissions; we only set model.
     agents = cfg.setdefault("agent", {})
     for a in ("build", "plan"):

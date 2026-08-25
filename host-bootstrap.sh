@@ -60,14 +60,46 @@ download_model() {
   fi
 }
 
-echo ">>> Fetching Model 1: Qwen 3.8-27B (nvfp4 quantized)"
+echo ">>> Fetching Model 1: Qwen 3.8-27B nvfp4 (the local-orch lane)"
 download_model "mlx-community/Qwen3.8-27B-nvfp4"
 
-echo ">>> Fetching Model 2: Qwen 3.8-27B MTP Speculative Drafter (8-bit)"
+echo ">>> Fetching Model 2: Qwen 3.8-27B MTP speculative drafter, 8-bit (local-orch)"
 download_model "mlx-community/Qwen3.8-27B-MTP-8bit"
 
-echo ">>> Fetching Model 3: NVIDIA Nemotron 3 Nano 30B A3B (local orchestrator, NVFP4)"
+echo ">>> Fetching Model 3: NVIDIA Nemotron 3 Nano 30B A3B NVFP4 (the local-sub lane)"
 download_model "mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+
+# mlx-vlm's continuous-batching engine passes BOTH input_ids and inputs_embeds,
+# but the nemotron_h backbone requires exactly one — so WITHOUT this patch every
+# request to the local-sub lane 500s ("Provide exactly one of inputs or
+# inputs_embeds"). Must run after the mlx-vlm install above, which rewrites
+# site-packages. Idempotent; no-ops once upstream fixes the call site.
+# Keep in sync with _ferry_patch_nemotron_batching in lib/ferry-install.zsh.
+echo ">>> Patching mlx-vlm nemotron_h for continuous batching (local-sub lane)..."
+python3 - <<'PYEOF' || echo "    (patch step skipped; local-sub may 500 on every request)"
+import glob, os, sys
+cands = glob.glob(os.path.expanduser(
+    "~/.local/share/uv/tools/mlx-vlm/lib/python*/site-packages/mlx_vlm/models/nemotron_h/language.py"))
+try:
+    import mlx_vlm  # noqa
+    cands.append(os.path.join(os.path.dirname(mlx_vlm.__file__), "models", "nemotron_h", "language.py"))
+except Exception:
+    pass
+path = next((c for c in cands if os.path.exists(c)), None)
+if not path:
+    print("    nemotron_h/language.py not found - nothing to patch."); sys.exit(0)
+src = open(path).read()
+ANCHOR = "        out = self.backbone(inputs, cache=cache, inputs_embeds=inputs_embeds)"
+GUARD = "        if inputs_embeds is not None:\n            inputs = None\n"
+if GUARD in src:
+    print(f"    Already patched: {path}"); sys.exit(0)
+if ANCHOR not in src:
+    print(f"    Upstream shape changed (anchor absent) - leaving {path} untouched."); sys.exit(0)
+open(path, "w").write(src.replace(ANCHOR,
+    "        # Continuous batching always passes BOTH input_ids and inputs_embeds;\n"
+    "        # the backbone requires exactly one, so defer to inputs_embeds.\n" + GUARD + ANCHOR, 1))
+print(f"    Patched: {path}")
+PYEOF
 
 # 6. Check and recommend VRAM adjustments
 TOTAL_MEM_GB=$(sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024/1024)}')

@@ -87,12 +87,49 @@ detect_mdns_name() {
   echo "${base}.local"
 }
 
-PORT="8090"
+# ---- Ports ----
+# In STACK mode (plain `ferry up`) PORT is the ONE door clients use: litellm sits
+# there and fans out to the cloud lanes plus the two MLX backends below, which
+# listen on their own ports and are NOT meant to be addressed directly by clients.
+PORT="8090"               # litellm front door — the single LAN endpoint
 SHARE_PORT="8095"
 HF_PORT="8096"
 PROXY_PORT="8097"
-LOCAL_MODEL="mlx-community/Qwen3.8-27B-nvfp4"
-LOCAL_DRAFT="mlx-community/Qwen3.8-27B-MTP-8bit"
+LOCAL_ORCH_PORT="8092"    # MLX backend for the `local-orch` lane
+LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
+# NOTE: 8091 is deliberately skipped — `ferry dash` binds it. The stack and the
+# dashboard are meant to run together, so the lanes start above it.
+
+# ---- The four served lanes ----
+# Lane names are the STABLE contract clients bind to; the model behind a lane is
+# swappable without touching a single client config.
+#
+#   orch        -> GLM 5.3 (Z.ai Coding Plan) + a 4-hop cloud fallback chain
+#   flash       -> Gemini 3.7 Flash across 10 per-project keys (load-balanced pool)
+#   local-orch  -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
+#   local-sub   -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
+#
+# The cloud lanes live in the litellm route config; the two local lanes are the
+# MLX servers this script launches, wired into that same config as
+# openai-compatible backends on 127.0.0.1.
+
+# Local ORCHESTRATOR lane — the "smart" local model: dense-ish 27B at nvfp4, and
+# the only local lane with an MTP draft model, so speculative decoding applies.
+LOCAL_MODEL_ORCH="mlx-community/Qwen3.8-27B-nvfp4"
+LOCAL_DRAFT_ORCH="mlx-community/Qwen3.8-27B-MTP-8bit"
+
+# Local SUBAGENT lane — nemotron_h hybrid MoE (6/52 full-attention layers, 2 KV
+# heads) => ~6KB KV/token and ~3B active params, so several concurrent subagents
+# stay fast and cheap on memory. No MTP draft is published for it -> no
+# --draft-model on this lane.
+LOCAL_MODEL_SUB="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+LOCAL_DRAFT_SUB=""
+
+# Back-compat: the single-lane `--local` flag predates the stack and still means
+# "serve the local orchestrator model on its own".
+LOCAL_MODEL="$LOCAL_MODEL_ORCH"
+LOCAL_DRAFT="$LOCAL_DRAFT_ORCH"
+
 # KV-cache memory governor (measured 2026-08-25, 128GB M5 Max): the stock launch
 # kept the full fp16 KV of EVERY request in the APC prefix cache — one 121k-token
 # opencode session peaked the server at 97GB phys_footprint (GPU wired ceiling is
@@ -101,15 +138,27 @@ LOCAL_DRAFT="mlx-community/Qwen3.8-27B-MTP-8bit"
 # 4-bit KV + a bounded APC pool + a concurrent-seq cap, the SAME session peaked
 # 56GB, idled at 35GB, and decoded ~60% faster (32 vs 20 tok/s at 64k context).
 # Set any of these to "" to drop the flag from the launch line.
+#
+# STACK MODE runs BOTH local lanes at these same generous settings (~15GB + ~18GB
+# of resident weights before any KV). That is a deliberate choice for best
+# single-lane latency; the tradeoff is that two simultaneously-busy deep-context
+# lanes CAN approach the wired ceiling. Watch it with `ferry status`, and shrink a
+# lane by exporting the per-lane overrides below.
 LOCAL_KV_BITS="4"         # --kv-bits: 4-bit KV cache quant (weights stay nvfp4)
 LOCAL_MAX_KV="131072"     # --max-kv-size: prompt+max_tokens over this => clean 400, not OOM
 LOCAL_MAX_SEQS="4"        # --max-num-seqs: max concurrent sequences (subagent fan-out)
 LOCAL_APC_BLOCKS="512"    # APC_NUM_BLOCKS: retained prefix-pool size (x16 tokens)
-# Local ORCHESTRATOR model: nemotron_h hybrid (6/52 full-attention layers, 2 KV heads)
-# => ~6KB KV/token, so main + several concurrent subagents fit comfortably in 128GB.
-# ~3B active params (A3B) keeps decode fast; NVFP4 aligns with kv-cache optimization work.
-# No MTP draft model exists for it -> launch without --draft-model.
-LOCAL_MODEL_ORCH="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+
+# Per-lane overrides — export any of these to govern ONE lane without touching the
+# other (e.g. LOCAL_SUB_MAX_KV=65536 to shrink the subagent lane's context budget).
+LOCAL_ORCH_KV_BITS="${LOCAL_ORCH_KV_BITS:-$LOCAL_KV_BITS}"
+LOCAL_ORCH_MAX_KV="${LOCAL_ORCH_MAX_KV:-$LOCAL_MAX_KV}"
+LOCAL_ORCH_MAX_SEQS="${LOCAL_ORCH_MAX_SEQS:-$LOCAL_MAX_SEQS}"
+LOCAL_ORCH_APC_BLOCKS="${LOCAL_ORCH_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
+LOCAL_SUB_KV_BITS="${LOCAL_SUB_KV_BITS:-$LOCAL_KV_BITS}"
+LOCAL_SUB_MAX_KV="${LOCAL_SUB_MAX_KV:-$LOCAL_MAX_KV}"
+LOCAL_SUB_MAX_SEQS="${LOCAL_SUB_MAX_SEQS:-$LOCAL_MAX_SEQS}"
+LOCAL_SUB_APC_BLOCKS="${LOCAL_SUB_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
 MDNS_NAME="$(detect_mdns_name)"
 
 # Default cloud model associations
@@ -146,6 +195,9 @@ LOG_DIR="${TMPDIR:-/tmp}/ferry-logs"
 mkdir -p "$LOG_DIR"
 LOCAL_LOG="$LOG_DIR/local-gpu-$PORT.log"
 CLOUD_LOG="$LOG_DIR/cloud-proxy-$PORT.log"
+# Stack mode gives each MLX lane its own log so a crash is attributable to a lane.
+LOCAL_ORCH_LOG="$LOG_DIR/local-orch-$LOCAL_ORCH_PORT.log"
+LOCAL_SUB_LOG="$LOG_DIR/local-sub-$LOCAL_SUB_PORT.log"
 SHARE_LOG="$LOG_DIR/share-$SHARE_PORT.log"
 
 # Load local secrets if present (e.g. GEMINI_API_KEY). Export the variable in your

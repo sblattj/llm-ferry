@@ -38,22 +38,36 @@ Ferrying models & files across the LAN:
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
 
 Options for 'up':
-  -l, --local        Launch local GPU model ($LOCAL_MODEL) [macOS / Apple Silicon only]
-  -o, --orch         Launch the local ORCHESTRATOR model ($LOCAL_MODEL_ORCH) — main +
-                        concurrent subagents on the host GPU [macOS / Apple Silicon only]
+  (no flags)         THE STACK — all four lanes on one endpoint (:$PORT):
+                       orch        cloud  GLM 5.3 + strict fallback chain
+                       flash       cloud  Gemini 3.7 Flash key pool
+                       local-orch  GPU    $LOCAL_MODEL_ORCH
+                       local-sub   GPU    $LOCAL_MODEL_SUB
+                     The GPU lanes run on internal ports $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT;
+                     clients only ever address :$PORT and pick a lane by name.
+  -a, --all, --stack Same as no flags (explicit form)
+  -l, --local, --local-orch
+                     Launch ONLY the local orchestrator lane ($LOCAL_MODEL_ORCH)
+                       [macOS / Apple Silicon only]
+  -s, --sub, --local-sub
+                     Launch ONLY the local subagent lane ($LOCAL_MODEL_SUB)
+                       [macOS / Apple Silicon only]
+  -o, --orch         Alias of --local-orch. NOTE: the orchestrator lane is now Qwen;
+                       Nemotron moved to --local-sub.
   -c, --cloud        Proxy to default cloud model ($DEFAULT_GEMINI)
   -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
-  -r, --route        Serve MULTIPLE models from a litellm config (orchestrator + key failover)
+  -r, --route        Serve only the CLOUD lanes (orch + flash) from the litellm config
                        Uses ~/.config/ferry/litellm.yaml (seeded from template on first run)
-  -i, --interactive  Force launch the interactive model selection catalog
+  -i, --interactive  Force launch the interactive lane/model selection catalog
   -p, --port <port>  Override listening port [default: $PORT]
 
 Examples:
-  ferry up             # Starts in interactive mode to query Gemini's active catalog
-  ferry up --route     # Serve orchestrator + Gemini key-failover from litellm.yaml
-  ferry up --orch      # Local orchestrator lane (Nemotron 3 Nano 30B A3B NVFP4) for opencode-local
+  ferry up             # The full stack: orch + flash + local-orch + local-sub on :$PORT
+  ferry up --route     # Cloud lanes only (no GPU weights resident)
+  ferry up --local-sub # Just the Nemotron subagent lane, alone on :$PORT
+  ferry up -i          # Interactive catalog (query Gemini's live model list)
   ferry dash --open    # Open the live route-proxy dashboard in your browser
-  ferry status         # View connection health diagnostics
+  ferry status         # Per-lane health, memory, and served lane names
   ferry msg "hello"    # Sends telemetry message back to the host Mac
   cat err.log | ferry log  # Stream errors back to host Mac
 EOF

@@ -1,13 +1,19 @@
 ---
 name: add-fallback-orchestrator
-description: Use when adding a fallback/backup orchestrator model to llm-ferry's route proxy (~/.config/ferry/litellm.yaml) so the primary orchestrator fails over to an independent model on error. Covers strict-failover wiring (separate model_name, router_settings.fallbacks, chain order), the independent-capacity rule, and router tuning. For the load-balanced worker pool instead, use add-worker-model.
+description: Use when adding a fallback/backup model to the orch lane in llm-ferry's route proxy (~/.config/ferry/litellm.yaml) so it fails over to an independent model on error. Covers strict-failover wiring (separate model_name, router_settings.fallbacks, chain order), the independent-capacity rule, and router tuning. For the load-balanced worker pool instead, use add-worker-model.
 ---
 
 # Add a fallback orchestrator to the ferry route proxy
 
-The **orchestrator** is the big planning/driving model (e.g. Kimi K3). A **fallback
-orchestrator** is an INDEPENDENT model litellm reroutes to when the primary orchestrator
-errors. You edit `~/.config/ferry/litellm.yaml` (seeded from `litellm-route-example.yaml`).
+The **`orch` lane** is the big planning/driving model. A **fallback orchestrator** is an
+INDEPENDENT model litellm reroutes to when `orch` errors. You edit
+`~/.config/ferry/litellm.yaml` (seeded from `litellm-route-example.yaml`).
+
+Ferry serves four lanes: `orch` and `flash` (cloud) plus `local-orch` and `local-sub`
+(host GPU). Only `orch` gets a failover chain. The two LOCAL lanes are deliberately
+OUTSIDE every chain — the point of naming a local lane is that the request stays on the
+machine, so a dead GPU lane must error rather than silently spend a cloud quota. Do not
+"helpfully" add fallbacks for them.
 
 ## Strict failover vs. the worker pool — pick the right skill
 - **This skill (fallback orchestrator):** STRICT FAILOVER. A SEPARATE `model_name`, reached
@@ -15,8 +21,8 @@ errors. You edit `~/.config/ferry/litellm.yaml` (seeded from `litellm-route-exam
 - **`add-worker-model` (worker pool):** LOAD-BALANCED. IDENTICAL `model_name` deployments
   that `usage-based-routing-v2` splits across proactively (even split), not on error.
 
-A fallback is NOT another deployment reusing the primary's `orchestrator` name. It is a
-new name (`orchestrator-fallback`, `orchestrator-fallback-2`) wired into `fallbacks`.
+A fallback is NOT another deployment reusing the primary's `orch` name. It is a new name
+(`orch-fallback`, `orch-deepseek`, …) wired into `fallbacks`.
 
 ## Checklist
 1. **Capacity MUST be independent of the primary** (the #1 mistake). A fallback sharing a
@@ -32,11 +38,11 @@ new name (`orchestrator-fallback`, `orchestrator-fallback-2`) wired into `fallba
    For a Claude fallback use a pay-per-token **API key** (`ANTHROPIC_API_KEY`,
    `sk-ant-api…`) — independent bucket, supported, bills only when the hop fires.
 2. **Add a new `model_name` block** per fallback hop in `model_list` (NOT under the
-   `orchestrator` name, NOT in any pool).
+   `orch` name, NOT in any pool).
 3. **Chain order: fast first, slow/cheap last.** The example chains DeepSeek V4 Pro (fast,
    carries the real work) first and GLM 5.2 (slower) as last resort. Multiple hops allowed.
-4. **Wire it into `router_settings.fallbacks`.** Only the orchestrator gets a fallback; the
-   worker pool is untouched.
+4. **Wire it into `router_settings.fallbacks`.** Only `orch` gets a failover chain; the
+   worker pool and both local lanes are untouched.
 5. **Provider format:** for an Anthropic-format endpoint, litellm appends `/v1/messages` to
    `api_base` (so `api_base` OMITS it). For a plain OpenAI-compatible provider, DROP
    `api_base` and use `model: openai/<id>` with `api_key: os.environ/<VAR>`.
@@ -48,7 +54,7 @@ new name (`orchestrator-fallback`, `orchestrator-fallback-2`) wired into `fallba
 Primary orchestrator already present:
 ```yaml
 model_list:
-  - model_name: orchestrator
+  - model_name: orch
     litellm_params:
       model: anthropic/k3-256k
       api_key: os.environ/KIMI_API_KEY
@@ -58,12 +64,12 @@ model_list:
 
 ADD the fallback block(s) — separate names, on an INDEPENDENT account:
 ```yaml
-  - model_name: orchestrator-fallback          # 1st fallback: fast, carries the work
+  - model_name: orch-fallback          # 1st fallback: fast, carries the work
     litellm_params:
       model: fireworks_ai/accounts/fireworks/models/deepseek-v4-pro-0813
       api_key: os.environ/FIREWORKS_API_KEY    # pay-per-token: own capacity, no contention
       timeout: 600
-  - model_name: orchestrator-fallback-2        # last resort: slower/cheaper
+  - model_name: orch-fallback-2        # last resort: slower/cheaper
     litellm_params:
       model: fireworks_ai/accounts/fireworks/models/glm-5p2
       api_key: os.environ/FIREWORKS_API_KEY
@@ -72,17 +78,17 @@ ADD the fallback block(s) — separate names, on an INDEPENDENT account:
 
 For a plain OpenAI-compatible fallback instead (no `api_base`):
 ```yaml
-  - model_name: orchestrator-fallback
+  - model_name: orch-fallback
     litellm_params:
       model: openai/<id>
       api_key: os.environ/<VAR>
       timeout: 600
 ```
 
-ADD the mapping under `router_settings` (only `orchestrator` is remapped):
+ADD the mapping under `router_settings` (only `orch` is remapped):
 ```yaml
 router_settings:
-  fallbacks: [{"orchestrator": ["orchestrator-fallback", "orchestrator-fallback-2"]}]
+  fallbacks: [{"orch": ["orch-fallback", "orch-fallback-2"]}]
 ```
 
 ## ChatGPT subscription as a fallback (litellm `chatgpt/` provider)
@@ -97,7 +103,7 @@ provider (it talks to `chatgpt.com/backend-api/codex`, the Responses API Codex u
    required-but-ignored placeholder.
 2. **Deployment shape** — the `responses/` segment scopes litellm's chat→responses bridge:
    ```yaml
-     - model_name: orchestrator-chatgpt
+     - model_name: orch-chatgpt
        litellm_params:
          model: chatgpt/responses/gpt-5.6-sol   # gpt-5.6-sol / gpt-5.4 work; codex-* ids are rejected
          api_key: "chatgpt-oauth"               # placeholder; provider reads auth.json
@@ -129,11 +135,11 @@ value governs failover.)
 
 ## Apply + verify
 ```bash
-ferry down && ferry up --route      # reload ~/.config/ferry/litellm.yaml
+ferry down && ferry up             # reload ~/.config/ferry/litellm.yaml
 ferry dash                          # then click "Test backends"
 ```
 "Test backends" actively pings each backend and reports WHICH fallback hop served + latency
-(the dashboard also renders the orchestrator topology: primary -> the `fallbacks` chain).
+(the dashboard also renders the `orch` topology: primary -> the `fallbacks` chain, and probes all four lanes).
 A `rate_limit_error` from the primary is EXPECTED/NORMAL when the fallback is doing its job
 — it is NOT an auth failure. Make sure the fallback's key is exported (shell or
 `~/.config/ferry/secrets.env`); never commit real keys.

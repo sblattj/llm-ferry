@@ -329,9 +329,13 @@ class Collector:
                     seen.add(key)
                     dep.add(1, [("model_name", mname), ("model", model)])
             out += dep.render()
-            fb = (topo.get("fallbacks") or {}).get("orchestrator") or []
+            # The driving lane is `orch`; `orchestrator` is the pre-rename name and is
+            # still accepted so an old config keeps reporting a real chain length
+            # instead of silently flatlining at 0.
+            _fbs = topo.get("fallbacks") or {}
+            fb = _fbs.get("orch") or _fbs.get("orchestrator") or []
             out += Family("ferry_fallback_chain_length",
-                          "Length of the orchestrator's strict fallback chain (0 if none).",
+                          "Length of the driving lane's strict fallback chain (0 if none).",
                           "gauge").add(len(fb)).render()
         # config mtime is independent of parse success
         try:

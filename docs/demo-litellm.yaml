@@ -2,16 +2,16 @@
 # It is a REAL litellm proxy config, but every model uses litellm's `mock_response`,
 # so the demo needs ZERO API keys and makes ZERO network calls — the OpenAI-compatible
 # endpoint and the /v1/chat/completions round-trip are genuine, the model replies are canned.
-# Mirrors the real ferry shape: one `orchestrator` model + a `gemini-3.7-flash` worker.
+# Mirrors the real ferry shape: an `orch` lane + a `flash` worker lane.
 model_list:
-  - model_name: orchestrator
+  - model_name: orch
     litellm_params:
-      model: openai/orchestrator
-      mock_response: "Ferry online. I'm the orchestrator, served from this one Mac to every device on your LAN through a single OpenAI-compatible endpoint. Your API keys never leave the host."
-  - model_name: gemini-3.7-flash
+      model: openai/orch
+      mock_response: "Ferry online. I'm the orch lane, served from this one Mac to every device on your LAN through a single OpenAI-compatible endpoint. Your API keys never leave the host."
+  - model_name: flash
     litellm_params:
-      model: openai/gemini-3.7-flash
-      mock_response: "gemini-3.7-flash worker here, one of a load-balanced pool of keys living on the host."
+      model: openai/flash
+      mock_response: "flash worker lane here, one of a load-balanced pool of keys living on the host."
 
 litellm_settings:
   drop_params: true

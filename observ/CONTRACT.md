@@ -40,7 +40,7 @@ mirror their structure and the validated dataviz palette. Adapt names/ports/metr
 ## Data-source paths the exporter reads (from ferry-core.zsh)
 - Proxy access log: `${TMPDIR:-/tmp}/ferry-logs/cloud-proxy-8090.log` (auto-discover like ferry-dash's `find_log`; on macOS TMPDIR is under `/var/folders/*/*/T/`). The exporter MUST reuse ferry-dash's discovery + `Activity` log parser (see `~/code/llm-ferry/ferry-dash`).
 - litellm base: `http://127.0.0.1:8090` (`/health/liveliness`, `/v1/models`; bearer key default `local`).
-- Route config: `~/.config/ferry/litellm.yaml` (topology: orchestrator + fallbacks + the gemini pool).
+- Route config: `~/.config/ferry/litellm.yaml` (topology: the `orch` lane + its fallbacks, the `flash` pool, and the two local GPU lanes `local-orch`/`local-sub`).
 
 The access-log line format (reuse this regex verbatim): `(\d+\.\d+\.\d+\.\d+):\d+ - "(\w+) (\S+) [^"]*" (\d+)` → (ip, method, path, status). Count only `path.startswith("/v1/chat/completions")` as a real inference request (skip `/v1/models` + `/health` polls). The log carries NO latency/token fields — those come only from litellm-native metrics.
 
@@ -70,9 +70,9 @@ All gauges unless marked counter. HELP+TYPE once per metric name. Omit a series 
 VM derives RPS = `rate(sum(ferry_requests_total))`, error rate = `sum(rate(ferry_requests_total{status=~"[45].."})) / sum(rate(ferry_requests_total))`, per-client, per-status.
 
 ### Topology (parse `~/.config/ferry/litellm.yaml`)
-- `ferry_worker_pool_size` — number of deployments whose `model_name` is the pooled model (e.g. `gemini-3.7-flash`)
+- `ferry_worker_pool_size` — number of deployments whose `model_name` is the pooled lane (e.g. `flash`)
 - `ferry_deployment_info{model_name,model}` = 1 — one per `model_list` deployment
-- `ferry_fallback_chain_length` — length of the orchestrator's fallback chain (0 if none)
+- `ferry_fallback_chain_length` — length of the `orch` lane's fallback chain (0 if none; the pre-rename `orchestrator` key is still accepted)
 - `ferry_route_config_mtime_seconds` — mtime of litellm.yaml (detects a config edit)
 
 ### litellm-native (OPT-IN — scraped by VM directly from `http://127.0.0.1:8090/metrics`, NOT emitted by our exporter)

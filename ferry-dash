@@ -219,7 +219,11 @@ def get_status():
 def probe_backends():
     ferry, key = CFG["ferry"], CFG["key"]
     out = {}
-    for label, model in (("orchestrator", "orchestrator"), ("gemini-3.7-flash", "gemini-3.7-flash")):
+    # Probe every lane the stack serves. The local GPU lanes are included so a
+    # cold/stopped mlx_vlm.server shows up here as a red lane instead of only
+    # surfacing when a client call fails.
+    for label, model in (("orch", "orch"), ("flash", "flash"),
+                         ("local-orch", "local-orch"), ("local-sub", "local-sub")):
         r = http_json(ferry + "/v1/chat/completions", key, "POST",
                       {"model": model, "messages": [{"role": "user", "content": "ping"}],
                        "max_tokens": 4}, timeout=60)
@@ -344,18 +348,18 @@ let PROBE={};
 function dotFor(state){return {up:'green',down:'red',active:'green',standby:'amber',bad:'red'}[state]||'';}
 
 function renderOrch(st){
-  const t=st.topology||{}, groups=t.groups||{}, fb=(t.fallbacks||{}).orchestrator||[];
+  const t=st.topology||{}, groups=t.groups||{}, fb=(t.fallbacks||{}).orch||[];
   const ev=(st.activity||{}).last_event;
   const box=$('#orchbody'); box.innerHTML=''; box.className='';
   // primary
-  const pg=groups.orchestrator||{models:[]};
+  const pg=groups.orch||{models:[]};
   let pstate='blue', ptag='primary';
   if(ev && ev.kind==='kimi_quota'){pstate='red';ptag='quota-exhausted (403)';}
-  const pr=PROBE.orchestrator;
+  const pr=PROBE.orch;
   if(pr && pr.served_by){ const served=shortModel(pr.served_by);
     if((pg.models[0]||'').includes(served)){pstate='green';ptag='serving ('+pr.ms+'ms)';}
     else{pstate='red';ptag='down → '+served;} }
-  box.appendChild(mkRow('', 'Kimi K3  ·  '+shortModel(pg.models[0]||'orchestrator'), 'primary', pstate, ptag));
+  box.appendChild(mkRow('', shortModel(pg.models[0]||'orch'), 'orch · primary', pstate, ptag));
   // fallback chain
   fb.forEach((g,i)=>{
     const gg=groups[g]||{models:[]}; const served=pr&&pr.served_by?shortModel(pr.served_by):null;
@@ -376,7 +380,7 @@ function mkRow(step,name,sub,state,tag){
 function renderWork(st){
   const t=st.topology||{}, groups=t.groups||{};
   const box=$('#workbody'); box.innerHTML=''; box.className='';
-  Object.keys(groups).filter(g=>!g.startsWith('orchestrator')).forEach(g=>{
+  Object.keys(groups).filter(g=>g!=='orch' && !g.startsWith('orch-')).forEach(g=>{
     const gg=groups[g]; const pr=PROBE[g];
     let state='blue', tag=gg.count>1?gg.count+' keys · pool':'1 key';
     if(pr){ state=pr.ok?'green':'red'; tag=(pr.ok?'healthy ('+pr.ms+'ms)':'error '+(pr.status||''))+' · '+(gg.count+' keys'); }

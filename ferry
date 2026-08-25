@@ -92,12 +92,49 @@ detect_mdns_name() {
   echo "${base}.local"
 }
 
-PORT="8090"
+# ---- Ports ----
+# In STACK mode (plain `ferry up`) PORT is the ONE door clients use: litellm sits
+# there and fans out to the cloud lanes plus the two MLX backends below, which
+# listen on their own ports and are NOT meant to be addressed directly by clients.
+PORT="8090"               # litellm front door — the single LAN endpoint
 SHARE_PORT="8095"
 HF_PORT="8096"
 PROXY_PORT="8097"
-LOCAL_MODEL="mlx-community/Qwen3.8-27B-nvfp4"
-LOCAL_DRAFT="mlx-community/Qwen3.8-27B-MTP-8bit"
+LOCAL_ORCH_PORT="8092"    # MLX backend for the `local-orch` lane
+LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
+# NOTE: 8091 is deliberately skipped — `ferry dash` binds it. The stack and the
+# dashboard are meant to run together, so the lanes start above it.
+
+# ---- The four served lanes ----
+# Lane names are the STABLE contract clients bind to; the model behind a lane is
+# swappable without touching a single client config.
+#
+#   orch        -> GLM 5.3 (Z.ai Coding Plan) + a 4-hop cloud fallback chain
+#   flash       -> Gemini 3.7 Flash across 10 per-project keys (load-balanced pool)
+#   local-orch  -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
+#   local-sub   -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
+#
+# The cloud lanes live in the litellm route config; the two local lanes are the
+# MLX servers this script launches, wired into that same config as
+# openai-compatible backends on 127.0.0.1.
+
+# Local ORCHESTRATOR lane — the "smart" local model: dense-ish 27B at nvfp4, and
+# the only local lane with an MTP draft model, so speculative decoding applies.
+LOCAL_MODEL_ORCH="mlx-community/Qwen3.8-27B-nvfp4"
+LOCAL_DRAFT_ORCH="mlx-community/Qwen3.8-27B-MTP-8bit"
+
+# Local SUBAGENT lane — nemotron_h hybrid MoE (6/52 full-attention layers, 2 KV
+# heads) => ~6KB KV/token and ~3B active params, so several concurrent subagents
+# stay fast and cheap on memory. No MTP draft is published for it -> no
+# --draft-model on this lane.
+LOCAL_MODEL_SUB="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+LOCAL_DRAFT_SUB=""
+
+# Back-compat: the single-lane `--local` flag predates the stack and still means
+# "serve the local orchestrator model on its own".
+LOCAL_MODEL="$LOCAL_MODEL_ORCH"
+LOCAL_DRAFT="$LOCAL_DRAFT_ORCH"
+
 # KV-cache memory governor (measured 2026-08-25, 128GB M5 Max): the stock launch
 # kept the full fp16 KV of EVERY request in the APC prefix cache — one 121k-token
 # opencode session peaked the server at 97GB phys_footprint (GPU wired ceiling is
@@ -106,15 +143,27 @@ LOCAL_DRAFT="mlx-community/Qwen3.8-27B-MTP-8bit"
 # 4-bit KV + a bounded APC pool + a concurrent-seq cap, the SAME session peaked
 # 56GB, idled at 35GB, and decoded ~60% faster (32 vs 20 tok/s at 64k context).
 # Set any of these to "" to drop the flag from the launch line.
+#
+# STACK MODE runs BOTH local lanes at these same generous settings (~15GB + ~18GB
+# of resident weights before any KV). That is a deliberate choice for best
+# single-lane latency; the tradeoff is that two simultaneously-busy deep-context
+# lanes CAN approach the wired ceiling. Watch it with `ferry status`, and shrink a
+# lane by exporting the per-lane overrides below.
 LOCAL_KV_BITS="4"         # --kv-bits: 4-bit KV cache quant (weights stay nvfp4)
 LOCAL_MAX_KV="131072"     # --max-kv-size: prompt+max_tokens over this => clean 400, not OOM
 LOCAL_MAX_SEQS="4"        # --max-num-seqs: max concurrent sequences (subagent fan-out)
 LOCAL_APC_BLOCKS="512"    # APC_NUM_BLOCKS: retained prefix-pool size (x16 tokens)
-# Local ORCHESTRATOR model: nemotron_h hybrid (6/52 full-attention layers, 2 KV heads)
-# => ~6KB KV/token, so main + several concurrent subagents fit comfortably in 128GB.
-# ~3B active params (A3B) keeps decode fast; NVFP4 aligns with kv-cache optimization work.
-# No MTP draft model exists for it -> launch without --draft-model.
-LOCAL_MODEL_ORCH="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+
+# Per-lane overrides — export any of these to govern ONE lane without touching the
+# other (e.g. LOCAL_SUB_MAX_KV=65536 to shrink the subagent lane's context budget).
+LOCAL_ORCH_KV_BITS="${LOCAL_ORCH_KV_BITS:-$LOCAL_KV_BITS}"
+LOCAL_ORCH_MAX_KV="${LOCAL_ORCH_MAX_KV:-$LOCAL_MAX_KV}"
+LOCAL_ORCH_MAX_SEQS="${LOCAL_ORCH_MAX_SEQS:-$LOCAL_MAX_SEQS}"
+LOCAL_ORCH_APC_BLOCKS="${LOCAL_ORCH_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
+LOCAL_SUB_KV_BITS="${LOCAL_SUB_KV_BITS:-$LOCAL_KV_BITS}"
+LOCAL_SUB_MAX_KV="${LOCAL_SUB_MAX_KV:-$LOCAL_MAX_KV}"
+LOCAL_SUB_MAX_SEQS="${LOCAL_SUB_MAX_SEQS:-$LOCAL_MAX_SEQS}"
+LOCAL_SUB_APC_BLOCKS="${LOCAL_SUB_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
 MDNS_NAME="$(detect_mdns_name)"
 
 # Default cloud model associations
@@ -151,6 +200,9 @@ LOG_DIR="${TMPDIR:-/tmp}/ferry-logs"
 mkdir -p "$LOG_DIR"
 LOCAL_LOG="$LOG_DIR/local-gpu-$PORT.log"
 CLOUD_LOG="$LOG_DIR/cloud-proxy-$PORT.log"
+# Stack mode gives each MLX lane its own log so a crash is attributable to a lane.
+LOCAL_ORCH_LOG="$LOG_DIR/local-orch-$LOCAL_ORCH_PORT.log"
+LOCAL_SUB_LOG="$LOG_DIR/local-sub-$LOCAL_SUB_PORT.log"
 SHARE_LOG="$LOG_DIR/share-$SHARE_PORT.log"
 
 # Load local secrets if present (e.g. GEMINI_API_KEY). Export the variable in your
@@ -198,22 +250,36 @@ Ferrying models & files across the LAN:
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
 
 Options for 'up':
-  -l, --local        Launch local GPU model ($LOCAL_MODEL) [macOS / Apple Silicon only]
-  -o, --orch         Launch the local ORCHESTRATOR model ($LOCAL_MODEL_ORCH) — main +
-                        concurrent subagents on the host GPU [macOS / Apple Silicon only]
+  (no flags)         THE STACK — all four lanes on one endpoint (:$PORT):
+                       orch        cloud  GLM 5.3 + strict fallback chain
+                       flash       cloud  Gemini 3.7 Flash key pool
+                       local-orch  GPU    $LOCAL_MODEL_ORCH
+                       local-sub   GPU    $LOCAL_MODEL_SUB
+                     The GPU lanes run on internal ports $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT;
+                     clients only ever address :$PORT and pick a lane by name.
+  -a, --all, --stack Same as no flags (explicit form)
+  -l, --local, --local-orch
+                     Launch ONLY the local orchestrator lane ($LOCAL_MODEL_ORCH)
+                       [macOS / Apple Silicon only]
+  -s, --sub, --local-sub
+                     Launch ONLY the local subagent lane ($LOCAL_MODEL_SUB)
+                       [macOS / Apple Silicon only]
+  -o, --orch         Alias of --local-orch. NOTE: the orchestrator lane is now Qwen;
+                       Nemotron moved to --local-sub.
   -c, --cloud        Proxy to default cloud model ($DEFAULT_GEMINI)
   -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
-  -r, --route        Serve MULTIPLE models from a litellm config (orchestrator + key failover)
+  -r, --route        Serve only the CLOUD lanes (orch + flash) from the litellm config
                        Uses ~/.config/ferry/litellm.yaml (seeded from template on first run)
-  -i, --interactive  Force launch the interactive model selection catalog
+  -i, --interactive  Force launch the interactive lane/model selection catalog
   -p, --port <port>  Override listening port [default: $PORT]
 
 Examples:
-  ferry up             # Starts in interactive mode to query Gemini's active catalog
-  ferry up --route     # Serve orchestrator + Gemini key-failover from litellm.yaml
-  ferry up --orch      # Local orchestrator lane (Nemotron 3 Nano 30B A3B NVFP4) for opencode-local
+  ferry up             # The full stack: orch + flash + local-orch + local-sub on :$PORT
+  ferry up --route     # Cloud lanes only (no GPU weights resident)
+  ferry up --local-sub # Just the Nemotron subagent lane, alone on :$PORT
+  ferry up -i          # Interactive catalog (query Gemini's live model list)
   ferry dash --open    # Open the live route-proxy dashboard in your browser
-  ferry status         # View connection health diagnostics
+  ferry status         # Per-lane health, memory, and served lane names
   ferry msg "hello"    # Sends telemetry message back to the host Mac
   cat err.log | ferry log  # Stream errors back to host Mac
 EOF
@@ -221,6 +287,66 @@ EOF
 }
 
 # ----------------- COMMANDS -----------------
+
+# _ferry_patch_nemotron_batching — make the `local-sub` lane actually answer.
+#
+# mlx-vlm's continuous-batching engine (generate/ar.py) passes BOTH `input_ids`
+# and `inputs_embeds` on every request, but the `nemotron_h` backbone requires
+# exactly one and raises `ValueError: Provide exactly one of inputs or
+# inputs_embeds`. Unpatched, EVERY request to the Nemotron lane fails — the lane
+# starts, reports healthy, and 500s on first use.
+#
+# The fix is two lines in LanguageModel.__call__: prefer inputs_embeds when it is
+# present. This runs on every `ferry install` because `uv tool install --force`
+# rewrites site-packages and discards the previous patch.
+#
+# Idempotent and fail-soft by design: it no-ops when already patched, no-ops when
+# the upstream shape changes (i.e. when the bug is fixed), and never fails the
+# install — a missing patch costs one lane, a broken install costs all of them.
+_ferry_patch_nemotron_batching() {
+  echo ">>> Patching mlx-vlm nemotron_h for continuous batching (local-sub lane)..."
+  python3 - <<'PYEOF' || echo "    (patch step skipped; local-sub may 500 on every request)"
+import glob, os, sys
+
+CANDIDATES = []
+# The uv-managed tool venv is the path `ferry install` creates.
+CANDIDATES += glob.glob(os.path.expanduser(
+    "~/.local/share/uv/tools/mlx-vlm/lib/python*/site-packages/mlx_vlm/models/nemotron_h/language.py"))
+# Fall back to any importable mlx_vlm (pip/conda installs).
+try:
+    import mlx_vlm  # noqa
+    CANDIDATES.append(os.path.join(os.path.dirname(mlx_vlm.__file__),
+                                   "models", "nemotron_h", "language.py"))
+except Exception:
+    pass
+
+path = next((c for c in CANDIDATES if os.path.exists(c)), None)
+if not path:
+    print("    nemotron_h/language.py not found - nothing to patch.")
+    sys.exit(0)
+
+src = open(path).read()
+ANCHOR = "        out = self.backbone(inputs, cache=cache, inputs_embeds=inputs_embeds)"
+GUARD = "        if inputs_embeds is not None:\n            inputs = None\n"
+
+if GUARD in src:
+    print(f"    Already patched: {path}")
+    sys.exit(0)
+if ANCHOR not in src:
+    # Upstream changed this call site - most likely the bug is fixed. Do not
+    # guess at a new insertion point; leave the file alone.
+    print(f"    Upstream shape changed (anchor absent) - leaving {path} untouched.")
+    sys.exit(0)
+
+patched = src.replace(ANCHOR,
+    "        # Continuous batching (generate/ar.py) always passes BOTH input_ids and\n"
+    "        # inputs_embeds (it runs on embeddings); the backbone requires exactly\n"
+    "        # one, so defer to inputs_embeds whenever it is present.\n"
+    + GUARD + ANCHOR, 1)
+open(path, "w").write(patched)
+print(f"    Patched: {path}")
+PYEOF
+}
 
 cmd_install() {
   echo "================================================================="
@@ -268,12 +394,17 @@ cmd_install() {
         uv run huggingface-cli download "$model_id"
       fi
     }
-    echo ">>> Fetching Model 1: Qwen 3.8-27B (nvfp4 quantized)"
+    echo ">>> Fetching Model 1: Qwen 3.8-27B nvfp4 (the local-orch lane)"
     download_model "$LOCAL_MODEL"
-    echo ">>> Fetching Model 2: Qwen 3.8-27B MTP Speculative Drafter (8-bit)"
+    echo ">>> Fetching Model 2: Qwen 3.8-27B MTP speculative drafter, 8-bit (local-orch)"
     download_model "$LOCAL_DRAFT"
-    echo ">>> Fetching Model 3: NVIDIA Nemotron 3 Nano 30B A3B (local orchestrator, NVFP4)"
-    download_model "$LOCAL_MODEL_ORCH"
+    echo ">>> Fetching Model 3: NVIDIA Nemotron 3 Nano 30B A3B NVFP4 (the local-sub lane)"
+    download_model "$LOCAL_MODEL_SUB"
+
+    # The local-sub lane is unusable without this patch — see the function's
+    # comment. It MUST run after `uv tool install mlx-vlm --force` above, which
+    # replaces site-packages and therefore discards any previous patch.
+    _ferry_patch_nemotron_batching
   else
     echo ">>> Linux detected: skipping mlx-vlm and local model downloads."
     echo "    Local GPU serving is macOS / Apple Silicon only. On Linux, serve via"
@@ -317,8 +448,8 @@ select_model_from_catalog() {
   if [[ -z "${GEMINI_API_KEY:-}" ]]; then
     echo "Error: GEMINI_API_KEY is not set in your environment or ~/.config/ferry/secrets.env."
     echo "Please set GEMINI_API_KEY to access cloud models dynamically."
-    echo "Fallback: Launching Local GPU model instead."
-    LAUNCH_MODE="local"
+    echo "Fallback: launching the local-orch GPU lane instead."
+    LAUNCH_MODE="local-orch"
     return
   fi
 
@@ -326,8 +457,8 @@ select_model_from_catalog() {
   local raw_models
   if ! raw_models=$(curl -fsS -m 5 "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}" 2>/dev/null); then
     echo "WARNING: Could not connect to Gemini's server to retrieve live list."
-    echo "Fallback: Launching Local GPU model instead."
-    LAUNCH_MODE="local"
+    echo "Fallback: launching the local-orch GPU lane instead."
+    LAUNCH_MODE="local-orch"
     return
   fi
 
@@ -382,9 +513,11 @@ chat_models.sort(key=lambda x: x[0], reverse=True)
 
 # Generate list of options
 options = []
-# Option 1 is ALWAYS the local Apple Silicon GPU Qwen model
-options.append(("local", "Local GPU Qwen 3.8-27B (APC + Speculative MTP)"))
-options.append(("local-orch", "Local GPU NVIDIA Nemotron 3 Nano 30B A3B (orchestrator + subagents, NVFP4)"))
+# Option 1 is ALWAYS the full stack: every lane on one endpoint. Options 2-3 are the
+# single GPU lanes for when you want ONE model on :8090 and nothing else resident.
+options.append(("stack", "FULL STACK - orch + flash (cloud) + local-orch + local-sub (GPU), one endpoint"))
+options.append(("local-orch", "Local GPU Qwen 3.8-27B nvfp4 only (local-orch lane, APC + speculative MTP)"))
+options.append(("local-sub", "Local GPU NVIDIA Nemotron 3 Nano 30B A3B NVFP4 only (local-sub lane)"))
 
 for _, m_id, m_desc in chat_models:
     options.append((f"gemini/{m_id}", f"[Cloud] {m_desc} (gemini/{m_id})"))
@@ -396,36 +529,138 @@ sys.stderr.write("==============================================================
 for idx, (m_id, label) in enumerate(options, 1):
     sys.stderr.write(f"  {idx}) {label}\n")
 sys.stderr.write("=================================================================\n")
-sys.stderr.write(f"Select a model to launch (1-{len(options)}) [Default: 3]: ")
+sys.stderr.write(f"Select a lane to launch (1-{len(options)}) [Default: 1 = full stack]: ")
 sys.stderr.flush()
 
 try:
     # Read response directly from /dev/tty
     with open("/dev/tty", "r") as tty:
         choice_str = tty.readline().strip()
-    choice = int(choice_str) if choice_str else 3
+    choice = int(choice_str) if choice_str else 1
 except Exception:
-    choice = 3
+    choice = 1
 
 if choice < 1 or choice > len(options):
-    choice = 3
+    choice = 1
 
 selected_id = options[choice - 1][0]
 print(selected_id)
 PYEOF
 )
 
-  if [[ "$chosen_model" == "local" ]]; then
-    LAUNCH_MODE="local"
-  elif [[ "$chosen_model" == "local-orch" ]]; then
-    LAUNCH_MODE="local-orch"
+  if [[ "$chosen_model" == "stack" || "$chosen_model" == "local" \
+     || "$chosen_model" == "local-orch" || "$chosen_model" == "local-sub" ]]; then
+    LAUNCH_MODE="$chosen_model"
   elif [[ "$chosen_model" == "__ERROR:"* ]]; then
-    echo "Error parsing live models. Falling back to Local GPU model."
-    LAUNCH_MODE="local"
+    echo "Error parsing live models. Falling back to the full stack."
+    LAUNCH_MODE="stack"
   else
     LAUNCH_MODE="cloud"
     CLOUD_PROVIDER="gemini"
     CLOUD_MODEL="$chosen_model"
+  fi
+}
+
+# ---- Stack helpers ---------------------------------------------------------
+# `ferry up` (no args) runs the STACK: litellm on $PORT is the ONE door clients
+# use, and it fans out to the cloud lanes plus two MLX servers on internal ports.
+# These helpers exist so the stack and the single-lane flags launch MLX the same
+# way — one launch line, one governor, no drift between them.
+
+# _ferry_free_port <port> — stop whatever is holding <port> so a lane can bind it.
+_ferry_free_port() {
+  local p="$1"
+  if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> Port $p is already in use. Stopping conflicting server..."
+    lsof -ti tcp:"$p" | xargs kill -9 2>/dev/null || true
+    sleep 1
+  fi
+}
+
+# _ferry_launch_mlx <label> <model> <draft|""> <port> <log> <kv_bits> <max_kv> <max_seqs> <apc_blocks>
+# Launch ONE mlx_vlm.server lane in the background under the KV/memory governor.
+# Every governor flag is conditional, so passing "" for one drops it from the
+# launch line rather than sending an empty value.
+_ferry_launch_mlx() {
+  local label="$1" model="$2" draft="$3" port="$4" log="$5"
+  local kv_bits="$6" max_kv="$7" max_seqs="$8" apc_blocks="$9"
+
+  # APC is env-driven, not a flag. Exporting immediately before each nohup means
+  # each lane inherits ITS OWN pool size (the child snapshots the env at fork).
+  export APC_ENABLED=1
+  [[ -n "$apc_blocks" ]] && export APC_NUM_BLOCKS="$apc_blocks"
+
+  local mlargs=(
+    --model "$model"
+    --host 0.0.0.0
+    --port "$port"
+  )
+  [[ -n "$draft" ]]    && mlargs+=(--draft-model "$draft")
+  [[ -n "$kv_bits" ]]  && mlargs+=(--kv-bits "$kv_bits")
+  [[ -n "$max_kv" ]]   && mlargs+=(--max-kv-size "$max_kv")
+  [[ -n "$max_seqs" ]] && mlargs+=(--max-num-seqs "$max_seqs")
+
+  echo ">>> [$label] $model"
+  echo "        port   :$port   draft=${draft:-none}"
+  echo "        KV gov kv-bits=${kv_bits:-off} max-kv=${max_kv:-off} seqs=${max_seqs:-off} apc-blocks=${apc_blocks:-off}"
+  echo "        log    $log"
+  nohup mlx_vlm.server "${mlargs[@]}" > "$log" 2>&1 & disown
+}
+
+# _ferry_wait_http <url> <label> [timeout-seconds]
+# Poll until <url> answers, so `ferry up` reports REAL readiness instead of
+# "launched". mlx_vlm preloads inside its FastAPI lifespan, so the port does not
+# accept connections until the weights are resident — any 200 here means the lane
+# is genuinely warm, never "listening but still loading". A cold 15-18GB lane
+# legitimately takes tens of seconds. Returns 1 on timeout; callers tolerate that
+# (the lane keeps loading in the background).
+_ferry_wait_http() {
+  local url="$1" label="$2" timeout="${3:-600}" waited=0
+  while (( waited < timeout )); do
+    if curl -fsS -m 3 "$url" >/dev/null 2>&1; then
+      echo ">>> [$label] \033[1;32mREADY\033[0m (${waited}s)"
+      return 0
+    fi
+    sleep 3
+    waited=$(( waited + 3 ))
+    (( waited % 15 == 0 )) && echo "    [$label] loading... ${waited}s"
+  done
+  echo ">>> [$label] \033[1;33mNOT READY\033[0m after ${timeout}s - still loading, or check its log."
+  return 1
+}
+
+# _ferry_require_route_config — set FERRY_ROUTE_CONFIG, seeding it from the
+# shipped template on first run (then exiting so keys can be filled in first).
+# NOT a command-substitution helper on purpose: `exit` has to end `ferry up`,
+# which it cannot do from inside a $(...) subshell.
+_ferry_require_route_config() {
+  FERRY_ROUTE_CONFIG="$DEFAULT_ROUTE_CONFIG"
+  if [[ ! -f "$FERRY_ROUTE_CONFIG" ]]; then
+    mkdir -p "$(dirname "$FERRY_ROUTE_CONFIG")"
+    if [[ -f "$ROUTE_TEMPLATE" ]]; then
+      cp "$ROUTE_TEMPLATE" "$FERRY_ROUTE_CONFIG"
+      echo ">>> Seeded route config from template:"
+      echo "    $FERRY_ROUTE_CONFIG"
+      echo "    Edit it (set your model ids), export the keys it references"
+      echo "    (e.g. GLM_API_KEY, GEMINI_API_KEY, GEMINI_API_KEY_2), then re-run."
+      exit 0
+    fi
+    echo "Error: No route config at $FERRY_ROUTE_CONFIG and no template at $ROUTE_TEMPLATE."
+    exit 1
+  fi
+}
+
+# _ferry_warn_missing_keys — warn (never hard-fail) about unset keys the shipped
+# route template references. A lane whose key is missing 401s; the others are fine.
+_ferry_warn_missing_keys() {
+  local missing=()
+  [[ -z "${GLM_API_KEY:-}" ]]      && missing+=("GLM_API_KEY (orch primary)")
+  [[ -z "${GEMINI_API_KEY:-}" ]]   && missing+=("GEMINI_API_KEY (flash pool)")
+  [[ -z "${GEMINI_API_KEY_2:-}" ]] && missing+=("GEMINI_API_KEY_2 (flash pool)")
+  if (( ${#missing[@]} > 0 )); then
+    echo ">>> WARNING: these env vars are unset; lanes that need them will 401:"
+    for m in "${missing[@]}"; do echo "      - $m"; done
+    echo "    Export them in your shell or ~/.config/ferry/secrets.env."
   fi
 }
 
@@ -435,27 +670,46 @@ cmd_up() {
     exit 1
   fi
 
-  local LAUNCH_MODE="local" # Default if arguments parsed override it
+  local LAUNCH_MODE="stack" # Default if arguments parsed override it
   local CLOUD_PROVIDER=""
   local CLOUD_MODEL=""
   local target_port="$PORT"
   local skip_catalog=0
 
-  # If no arguments passed, launch the interactive model catalog!
+  # No arguments = the FULL STACK (all four lanes on one endpoint). The
+  # interactive catalog, which used to be the no-arg default, now lives behind -i.
   if [[ $# -eq 0 ]]; then
-    select_model_from_catalog
+    LAUNCH_MODE="stack"
     skip_catalog=1
   fi
   
   if (( ! skip_catalog )); then
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        -l|--local)
-          LAUNCH_MODE="local"
+        -a|--all|--stack)
+          LAUNCH_MODE="stack"
+          skip_catalog=1
+          shift
+          ;;
+        -l|--local|--local-orch)
+          # The local ORCHESTRATOR lane alone on the target port.
+          LAUNCH_MODE="local-orch"
+          skip_catalog=1
+          shift
+          ;;
+        -s|--sub|--local-sub)
+          # The local SUBAGENT lane alone on the target port.
+          LAUNCH_MODE="local-sub"
           skip_catalog=1
           shift
           ;;
         -o|--orch)
+          # `--orch` predates the lane split, when the local orchestrator WAS
+          # Nemotron. The orchestrator lane is now Qwen; Nemotron is the subagent
+          # lane. Point --orch at whatever "local orchestrator" currently means
+          # and say so, so a muscle-memory invocation is not silently redefined.
+          echo ">>> Note: the local orchestrator lane is now $LOCAL_MODEL_ORCH."
+          echo "    Nemotron moved to the subagent lane - use 'ferry up --local-sub' for it."
           LAUNCH_MODE="local-orch"
           skip_catalog=1
           shift
@@ -510,89 +764,113 @@ cmd_up() {
   # Port-accurate cloud/route log name (the global CLOUD_LOG is pinned to the default port).
   local cloud_log="$LOG_DIR/cloud-proxy-$target_port.log"
 
-  if [[ "$LAUNCH_MODE" == "local" ]]; then
-    # Local GPU serving is Apple MLX — macOS / Apple Silicon only. Guard every
-    # path that lands here (explicit --local, the interactive catalog, and its
-    # key-missing/offline fallbacks) so Linux never tries to exec mlx_vlm.server.
+  # ── Shared guard for every lane that needs the GPU ───────────────────────
+  # Local GPU serving is Apple MLX — macOS / Apple Silicon only. In STACK mode a
+  # non-Mac degrades to the cloud lanes rather than failing outright, because the
+  # cloud half of the stack is perfectly servable on Linux.
+  if [[ "$LAUNCH_MODE" == "stack" || "$LAUNCH_MODE" == local-* ]]; then
     if (( ! IS_MAC )); then
-      echo "Error: local GPU serving uses Apple MLX (macOS / Apple Silicon only)."
-      echo "       On Linux, serve a cloud / OpenAI-compatible endpoint instead:"
-      echo "         ferry up --route        # multiple models from litellm.yaml"
-      echo "         ferry up --cloud        # default Gemini model"
-      echo "         ferry up --model <id>   # any LiteLLM model string"
-      exit 1
-    fi
-
-    # Start local GPU server
-    if ! command -v mlx_vlm.server >/dev/null 2>&1; then
+      if [[ "$LAUNCH_MODE" == "stack" ]]; then
+        echo ">>> Local GPU lanes need Apple MLX (macOS / Apple Silicon only)."
+        echo "    Serving the CLOUD lanes only (orch + flash) — same endpoint, two lanes."
+        LAUNCH_MODE="route"
+      else
+        echo "Error: local GPU serving uses Apple MLX (macOS / Apple Silicon only)."
+        echo "       On Linux, serve a cloud / OpenAI-compatible endpoint instead:"
+        echo "         ferry up --route        # multiple models from litellm.yaml"
+        echo "         ferry up --cloud        # default Gemini model"
+        echo "         ferry up --model <id>   # any LiteLLM model string"
+        exit 1
+      fi
+    elif ! command -v mlx_vlm.server >/dev/null 2>&1; then
       echo "Error: 'mlx_vlm.server' is missing. Run: ferry install"
       exit 1
     fi
-    
-    export APC_ENABLED=1
-    export APC_NUM_BLOCKS="${LOCAL_APC_BLOCKS:-512}"
-    echo ">>> Launching local GPU model server with APC and MTP..."
-    echo "    Model: $LOCAL_MODEL"
-    echo "    Port:  $target_port"
-    echo "    KV gov: kv-bits=${LOCAL_KV_BITS:-off} max-kv=${LOCAL_MAX_KV:-off} seqs=${LOCAL_MAX_SEQS:-off} apc-blocks=${APC_NUM_BLOCKS}"
+  fi
 
-    # KV/memory governor flags are conditional so "" disables any of them
-    # (see lib/ferry-core.zsh for the measured motivation).
-    local mlargs=(
-      --model "$LOCAL_MODEL"
-      --host 0.0.0.0
-      --port "$target_port"
-    )
-    [[ -n "${LOCAL_DRAFT:-}" ]]      && mlargs+=(--draft-model "$LOCAL_DRAFT")
-    [[ -n "${LOCAL_KV_BITS:-}" ]]    && mlargs+=(--kv-bits "$LOCAL_KV_BITS")
-    [[ -n "${LOCAL_MAX_KV:-}" ]]     && mlargs+=(--max-kv-size "$LOCAL_MAX_KV")
-    [[ -n "${LOCAL_MAX_SEQS:-}" ]]   && mlargs+=(--max-num-seqs "$LOCAL_MAX_SEQS")
-
-    nohup mlx_vlm.server "${mlargs[@]}" > "$LOCAL_LOG" 2>&1 & disown
-      
-    echo ">>> Running in background. Log: $LOCAL_LOG"
-    
-  elif [[ "$LAUNCH_MODE" == "local-orch" ]]; then
-    # Local GPU orchestrator serving uses Apple MLX — macOS / Apple Silicon only.
-    if (( ! IS_MAC )); then
-      echo "Error: local GPU serving uses Apple MLX (macOS / Apple Silicon only)."
-      echo "       On Linux, serve a cloud / OpenAI-compatible endpoint instead:"
-      echo "         ferry up --route        # multiple models from litellm.yaml"
-      echo "         ferry up --cloud        # default Gemini model"
-      echo "         ferry up --model <id>   # any LiteLLM model string"
+  if [[ "$LAUNCH_MODE" == "stack" ]]; then
+    # ── THE STACK: one door, four lanes ────────────────────────────────────
+    #   litellm on $target_port  ->  orch        (cloud: GLM 5.3 + fallback chain)
+    #                            ->  flash       (cloud: Gemini 3.7 Flash key pool)
+    #                            ->  local-orch  (MLX on :$LOCAL_ORCH_PORT)
+    #                            ->  local-sub   (MLX on :$LOCAL_SUB_PORT)
+    # The two MLX ports are INTERNAL plumbing — clients only ever talk to
+    # $target_port, and the lane names there are the contract they bind to.
+    if ! command -v litellm >/dev/null 2>&1; then
+      echo "Error: 'litellm' is missing. Run: ferry install"
       exit 1
     fi
+    _ferry_require_route_config
+    _ferry_warn_missing_keys
 
-    # Start local GPU server
-    if ! command -v mlx_vlm.server >/dev/null 2>&1; then
-      echo "Error: 'mlx_vlm.server' is missing. Run: ferry install"
-      exit 1
-    fi
-    
-    export APC_ENABLED=1
-    export APC_NUM_BLOCKS="${LOCAL_APC_BLOCKS:-512}"
-    echo ">>> Launching local GPU orchestrator lane (nemotron_h hybrid MoE, concurrent subagents)..."
-    echo "    Model: $LOCAL_MODEL_ORCH"
-    echo "    Port:  $target_port"
-    echo "    KV gov: kv-bits=${LOCAL_KV_BITS:-off} max-kv=${LOCAL_MAX_KV:-off} seqs=${LOCAL_MAX_SEQS:-off} apc-blocks=${APC_NUM_BLOCKS}"
-    echo "    (subagent fan-out: raise LOCAL_MAX_SEQS to admit more concurrent agents)"
+    echo "================================================================="
+    echo "   FERRY STACK — four lanes, one endpoint"
+    echo "================================================================="
+    echo "   orch         cloud   GLM 5.3 + strict fallback chain"
+    echo "   flash        cloud   Gemini 3.7 Flash key pool"
+    echo "   local-orch   GPU     $LOCAL_MODEL_ORCH"
+    echo "   local-sub    GPU     $LOCAL_MODEL_SUB"
+    echo "================================================================="
 
-    # Same KV/memory governor flags as the --local lane (nemotron_h's KV is already
-    # tiny, but the seqs cap + bounded APC pool are what make a fan-out safe).
-    # No draft model exists for the orchestrator lane.
-    local mlargs=(
-      --model "$LOCAL_MODEL_ORCH"
-      --host 0.0.0.0
-      --port "$target_port"
-    )
-    [[ -n "${LOCAL_KV_BITS:-}" ]]    && mlargs+=(--kv-bits "$LOCAL_KV_BITS")
-    [[ -n "${LOCAL_MAX_KV:-}" ]]     && mlargs+=(--max-kv-size "$LOCAL_MAX_KV")
-    [[ -n "${LOCAL_MAX_SEQS:-}" ]]   && mlargs+=(--max-num-seqs "$LOCAL_MAX_SEQS")
+    _ferry_free_port "$LOCAL_ORCH_PORT"
+    _ferry_free_port "$LOCAL_SUB_PORT"
 
-    nohup mlx_vlm.server "${mlargs[@]}" > "$LOCAL_LOG" 2>&1 & disown
+    # Both MLX lanes start first and load CONCURRENTLY: the two loads are
+    # dominated by streaming ~33GB out of the HF cache, so overlapping them is
+    # markedly faster than serialising, and neither blocks the other's warm-up.
+    _ferry_launch_mlx "local-orch" "$LOCAL_MODEL_ORCH" "$LOCAL_DRAFT_ORCH" \
+      "$LOCAL_ORCH_PORT" "$LOCAL_ORCH_LOG" \
+      "$LOCAL_ORCH_KV_BITS" "$LOCAL_ORCH_MAX_KV" "$LOCAL_ORCH_MAX_SEQS" "$LOCAL_ORCH_APC_BLOCKS"
+    _ferry_launch_mlx "local-sub" "$LOCAL_MODEL_SUB" "$LOCAL_DRAFT_SUB" \
+      "$LOCAL_SUB_PORT" "$LOCAL_SUB_LOG" \
+      "$LOCAL_SUB_KV_BITS" "$LOCAL_SUB_MAX_KV" "$LOCAL_SUB_MAX_SEQS" "$LOCAL_SUB_APC_BLOCKS"
 
-    echo ">>> Running in background. Log: $LOCAL_LOG"
-    
+    # litellm does NOT probe its backends at boot, so the front door can come up
+    # in parallel with the GPU lanes. A call that arrives before a lane is warm
+    # fails on THAT lane only — the cloud lanes are servable immediately.
+    echo ">>> [front] litellm --config $FERRY_ROUTE_CONFIG"
+    echo "        port   :$target_port"
+    echo "        log    $cloud_log"
+    nohup litellm \
+      --config "$FERRY_ROUTE_CONFIG" \
+      --port "$target_port" \
+      --host 0.0.0.0 > "$cloud_log" 2>&1 & disown
+
+    echo ">>> Waiting for lanes (MLX loads ~33GB of weights — that is the slow part)..."
+    _ferry_wait_http "http://127.0.0.1:$target_port/v1/models"       "front"      120 || true
+    _ferry_wait_http "http://127.0.0.1:$LOCAL_ORCH_PORT/v1/models"   "local-orch" 900 || true
+    _ferry_wait_http "http://127.0.0.1:$LOCAL_SUB_PORT/v1/models"    "local-sub"  900 || true
+
+    echo "================================================================="
+    echo ">>> Stack up. Lanes served on http://$MDNS_NAME:$target_port/v1 :"
+    curl -fsS -m 5 "http://127.0.0.1:$target_port/v1/models" 2>/dev/null \
+      | python3 -c "import json,sys; [print('       ' + m['id']) for m in json.load(sys.stdin).get('data', [])]" 2>/dev/null \
+      || echo "       (front door not answering yet — check $cloud_log)"
+    echo "-----------------------------------------------------------------"
+    echo "    Onboard clients:  ferry share"
+    echo "    Live dashboard:   ferry dash"
+    echo "    Stop everything:  ferry down"
+    echo "================================================================="
+
+  elif [[ "$LAUNCH_MODE" == "local-orch" || "$LAUNCH_MODE" == "local" ]]; then
+    # ONE lane on the target port: the local orchestrator model, no litellm in
+    # front. Clients address it by its HuggingFace id, not by a lane name.
+    echo ">>> Launching the local-orch lane alone (no route proxy)."
+    _ferry_launch_mlx "local-orch" "$LOCAL_MODEL_ORCH" "$LOCAL_DRAFT_ORCH" \
+      "$target_port" "$LOCAL_LOG" \
+      "$LOCAL_ORCH_KV_BITS" "$LOCAL_ORCH_MAX_KV" "$LOCAL_ORCH_MAX_SEQS" "$LOCAL_ORCH_APC_BLOCKS"
+    _ferry_wait_http "http://127.0.0.1:$target_port/v1/models" "local-orch" 900 || true
+
+  elif [[ "$LAUNCH_MODE" == "local-sub" ]]; then
+    # ONE lane on the target port: the local subagent model (nemotron_h hybrid
+    # MoE). Raise LOCAL_SUB_MAX_SEQS to admit more concurrent agents.
+    echo ">>> Launching the local-sub lane alone (no route proxy)."
+    echo "    (subagent fan-out: raise LOCAL_SUB_MAX_SEQS to admit more concurrent agents)"
+    _ferry_launch_mlx "local-sub" "$LOCAL_MODEL_SUB" "$LOCAL_DRAFT_SUB" \
+      "$target_port" "$LOCAL_LOG" \
+      "$LOCAL_SUB_KV_BITS" "$LOCAL_SUB_MAX_KV" "$LOCAL_SUB_MAX_SEQS" "$LOCAL_SUB_APC_BLOCKS"
+    _ferry_wait_http "http://127.0.0.1:$target_port/v1/models" "local-sub" 900 || true
+
   elif [[ "$LAUNCH_MODE" == "cloud" ]]; then
     # Start cloud API proxy
     if ! command -v litellm >/dev/null 2>&1; then
@@ -617,55 +895,28 @@ cmd_up() {
 
     echo ">>> Cloud proxy running in background. Log: $cloud_log"
   elif [[ "$LAUNCH_MODE" == "route" ]]; then
-    # Multi-model routing via a litellm config: an orchestrator model plus
-    # worker model(s) with automatic key failover (two same-named deployments).
+    # The CLOUD half of the stack: the litellm route config without the local GPU
+    # lanes. Same config file, same lane names — `local-orch`/`local-sub` are still
+    # listed by /v1/models but have no backend running, so calls to them fail.
     if ! command -v litellm >/dev/null 2>&1; then
       echo "Error: 'litellm' is missing. Run: ferry install"
       exit 1
     fi
 
-    local route_config="$DEFAULT_ROUTE_CONFIG"
+    _ferry_require_route_config
+    _ferry_warn_missing_keys
 
-    # First run: seed the config from the shipped template, then STOP so the
-    # user can set their model ids / keys before we launch anything.
-    if [[ ! -f "$route_config" ]]; then
-      mkdir -p "$(dirname "$route_config")"
-      if [[ -f "$ROUTE_TEMPLATE" ]]; then
-        cp "$ROUTE_TEMPLATE" "$route_config"
-        echo ">>> Seeded route config from template:"
-        echo "    $route_config"
-        echo "    Edit it (set your model ids), export the keys it references"
-        echo "    (e.g. KIMI_API_KEY, GEMINI_API_KEY, GEMINI_API_KEY_2), then"
-        echo "    re-run 'ferry up --route'."
-        exit 0
-      else
-        echo "Error: No route config at $route_config and no template at $ROUTE_TEMPLATE."
-        exit 1
-      fi
-    fi
-
-    # Warn (don't hard-fail) on unset keys the default template expects.
-    local missing=()
-    [[ -z "${KIMI_API_KEY:-}" ]]     && missing+=("KIMI_API_KEY")
-    [[ -z "${GEMINI_API_KEY:-}" ]]   && missing+=("GEMINI_API_KEY")
-    [[ -z "${GEMINI_API_KEY_2:-}" ]] && missing+=("GEMINI_API_KEY_2 (failover)")
-    if (( ${#missing[@]} > 0 )); then
-      echo ">>> WARNING: these env vars are unset; models that need them will 401:"
-      for m in "${missing[@]}"; do echo "      - $m"; done
-      echo "    Export them in your shell or ~/.config/ferry/secrets.env."
-    fi
-
-    echo ">>> Serving MULTIPLE models via litellm route config:"
-    echo "    Config: $route_config"
+    echo ">>> Serving the CLOUD lanes via litellm route config:"
+    echo "    Config: $FERRY_ROUTE_CONFIG"
     echo "    Port:   $target_port"
 
     nohup litellm \
-      --config "$route_config" \
+      --config "$FERRY_ROUTE_CONFIG" \
       --port "$target_port" \
       --host 0.0.0.0 > "$cloud_log" 2>&1 & disown
 
     echo ">>> Route proxy running in background. Log: $cloud_log"
-    echo "    Served models:  curl -s http://127.0.0.1:$target_port/v1/models"
+    echo "    Served lanes:  curl -s http://127.0.0.1:$target_port/v1/models"
   fi
 }
 
@@ -676,9 +927,20 @@ cmd_down() {
   fi
 
   echo ">>> Stopping all LLM-Ferry servers, cloud proxies, and share servers..."
-  
-  # Terminate local model servers
+
+  # Terminate local model servers. One pkill covers BOTH stack lanes (they are the
+  # same binary on different ports) as well as any single-lane server.
   pkill -f mlx_vlm.server || true
+
+  # Belt-and-braces: free the stack's internal lane ports even if something OTHER
+  # than mlx_vlm.server ended up holding one (a wedged uvicorn child, a stale
+  # process from a killed run). Without this a later `ferry up` finds the port
+  # taken and the lane silently never binds.
+  for _p in "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT"; do
+    if lsof -nP -iTCP:"$_p" -sTCP:LISTEN >/dev/null 2>&1; then
+      lsof -ti tcp:"$_p" | xargs kill -9 2>/dev/null || true
+    fi
+  done
   
   # Terminate LiteLLM proxies
   pkill -f "litellm --model" || true
@@ -737,24 +999,51 @@ cmd_status() {
   echo "Host active LAN IP:  http://$LAN_IP"
   echo "================================================================="
 
-  # Check active ports
-  for p in 8090 8095; do
+  # Check active ports. $PORT is the client-facing door; the two lane ports are
+  # INTERNAL backends (only populated in stack mode) and are labelled as such so
+  # an OFFLINE lane port is not mistaken for the endpoint being down.
+  local _label
+  for p in "$PORT" "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" "$SHARE_PORT"; do
+    case "$p" in
+      "$PORT")            _label="endpoint" ;;
+      "$LOCAL_ORCH_PORT") _label="local-orch lane (internal)" ;;
+      "$LOCAL_SUB_PORT")  _label="local-sub lane (internal)" ;;
+      "$SHARE_PORT")      _label="client share" ;;
+      *)                  _label="" ;;
+    esac
     if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
-      local pid=$(lsof -t -iTCP:"$p" -sTCP:LISTEN)
+      local pid=$(lsof -t -iTCP:"$p" -sTCP:LISTEN | head -1)
       local cmd=$(ps -p "$pid" -o comm= 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
-      echo ">>> Port $p is \033[1;32mONLINE\033[0m (PID: $pid, Command: $cmd)"
-      
-      # If port is our model server, query the active model
-      if [[ "$cmd" == "Python" || "$cmd" == "python3" || "$cmd" == "litellm" || "$p" == "8090" ]]; then
-        local models=$(curl -fsS -m 2 "http://127.0.0.1:$p/v1/models" 2>/dev/null || echo "")
+      echo ">>> Port $p ($_label) is \033[1;32mONLINE\033[0m (PID: $pid, Command: $cmd)"
+
+      # phys_footprint is the number that matters for an MLX lane — RSS is blind
+      # to wired GPU memory, so `ps` cheerfully under-reports a 50GB model server.
+      if [[ "$p" == "$LOCAL_ORCH_PORT" || "$p" == "$LOCAL_SUB_PORT" ]] && command -v footprint >/dev/null 2>&1; then
+        local fp=$(footprint "$pid" 2>/dev/null | grep -iE "phys_footprint" | head -1 | tr -s ' ')
+        [[ -n "$fp" ]] && echo "    Memory: $fp"
+      fi
+
+      if [[ "$p" == "$LOCAL_ORCH_PORT" || "$p" == "$LOCAL_SUB_PORT" ]]; then
+        # An MLX lane's /v1/models lists the whole HuggingFace CACHE, not what is
+        # loaded — printing it would advertise eight models this lane cannot serve
+        # without a reload. The launch line is the truth, so read --model from argv.
+        local loaded=$(ps -p "$pid" -o args= 2>/dev/null | sed -E 's/.*--model[= ]+([^ ]+).*/\1/')
+        [[ -n "$loaded" ]] && echo "    Model loaded: \033[1;32m$loaded\033[0m"
+        echo "    (internal backend — address this lane as a lane name on :$PORT, not here)"
+      elif [[ "$p" != "$SHARE_PORT" ]]; then
+        # The front door: list every lane it serves, not just the first one.
+        local models=$(curl -fsS -m 3 "http://127.0.0.1:$p/v1/models" 2>/dev/null || echo "")
         if [[ -n "$models" ]]; then
-          local active=$(echo "$models" | python3 -c "import json,sys; d=json.load(sys.stdin).get('data',[]); print(d[0]['id'] if d else 'None')")
-          echo "    Active Model loaded: \033[1;32m$active\033[0m"
-          echo "    Test with: curl -fsS -H \"Content-Type: application/json\" -d '{\"model\":\"$active\",\"messages\":[{\"role\":\"user\",\"content\":\"Say Hello!\"}],\"max_tokens\":10}' http://$MDNS_NAME:$p/v1/chat/completions"
+          local served=$(echo "$models" | python3 -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "")
+          if [[ -n "$served" ]]; then
+            echo "    Lanes served: \033[1;32m$served\033[0m"
+            local first=${served%% *}
+            echo "    Test with: curl -fsS -H \"Content-Type: application/json\" -d '{\"model\":\"$first\",\"messages\":[{\"role\":\"user\",\"content\":\"Say Hello!\"}],\"max_tokens\":10}' http://$MDNS_NAME:$p/v1/chat/completions"
+          fi
         fi
       fi
     else
-      echo ">>> Port $p is \033[1;31mOFFLINE\033[0m"
+      echo ">>> Port $p ($_label) is \033[1;31mOFFLINE\033[0m"
     fi
   done
 
@@ -1448,12 +1737,14 @@ PYEOF
 
 cmd_opencode() {
   # [Client] Wire this laptop's opencode config to route through the host's ferry endpoint.
-  # Auto-detects the host's served models: if the host serves `orchestrator` + a worker
-  # (e.g. gemini-3.7-flash), it sets up the orchestrator/worker split; otherwise it wires
-  # whatever single model the host serves. Non-destructive: backs up and merges.
+  # Auto-detects the host's served LANES and sets up the driver/subagent split:
+  # `orch` drives (build/plan) and `flash` runs the fan-out (general/explore/scout).
+  # `--local` picks the GPU pair (`local-orch` + `local-sub`) instead, for an
+  # all-on-the-host-GPU session. Falls back to whatever single lane the host serves.
+  # Non-destructive: backs up and merges.
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
   local oc_config="$HOME/.config/opencode/opencode.json"
-  local force_model="" force_small="" set_default=1
+  local force_model="" force_small="" set_default=1 prefer_local=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1463,6 +1754,8 @@ cmd_opencode() {
       --model)        force_model="$2"; shift 2 ;;
       --small-model)  force_small="$2"; shift 2 ;;
       --no-default)   set_default=0; shift ;;
+      --local)        prefer_local=1; shift ;;
+      --cloud)        prefer_local=0; shift ;;
       *) echo "Unknown option for 'ferry opencode': $1"; exit 1 ;;
     esac
   done
@@ -1473,11 +1766,12 @@ cmd_opencode() {
     exit 1
   fi
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" <<'PYEOF'
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" <<'PYEOF'
 import json, os, re, sys, shutil, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
 set_default = sys.argv[6] == "1"
+prefer_local = sys.argv[7] == "1"
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
@@ -1489,9 +1783,24 @@ try:
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring from flags/defaults)")
 
-# --- Decide main + worker models ---
-main = force_model or ("orchestrator" if "orchestrator" in served else (served[0] if served else "orchestrator"))
-small = force_small or ("gemini-3.7-flash" if "gemini-3.7-flash" in served else "")
+# --- Decide the driver lane + the subagent lane ---
+# Lane names are the stable contract; the model behind a lane can change on the
+# host without any client edit. `--local` prefers the GPU pair, otherwise cloud.
+# Each preference falls through to the other pair, then to the first served lane,
+# so a host running only half the stack still wires up correctly.
+LANE_PAIRS = [("local-orch", "local-sub"), ("orch", "flash")]
+if not prefer_local:
+    LANE_PAIRS.reverse()
+
+main, small = "", ""
+for driver, sub in LANE_PAIRS:
+    if driver in served:
+        main = driver
+        small = sub if sub in served else ""
+        break
+
+main = force_model or main or (served[0] if served else "orch")
+small = force_small or small
 
 model_ids = list(dict.fromkeys(served + [main] + ([small] if small else [])))
 models = {mid: {} for mid in model_ids}
@@ -1533,7 +1842,8 @@ if set_default:
     if small:
         cfg["small_model"] = f"ferry/{small}"
     # Pin opencode's built-in agents so the fan-out uses the cheap worker:
-    #   primary build/plan -> orchestrator (main); subagents general/explore/scout -> worker (small).
+    #   primary build/plan -> the driver lane (main); subagents general/explore/scout -> the
+    #   subagent lane (small), so a fan-out spends the cheap lane, not the expensive one.
     # setdefault preserves any existing per-agent prompt/permissions; we only set model.
     agents = cfg.setdefault("agent", {})
     for a in ("build", "plan"):

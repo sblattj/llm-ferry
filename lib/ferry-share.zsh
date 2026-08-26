@@ -19,9 +19,14 @@ cmd_share() {
   echo "Serving directory: $APP_DIR"
   echo "Port bound:        $target_port"
   echo "================================================================="
-  echo ">>> COMMAND TO RUN ON ANY CLIENT LAPTOP ON THE SAME LAN:"
+  echo ">>> FIRST-TIME SETUP on any client laptop on the same LAN:"
   echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-bootstrap.sh | zsh\033[0m"
   echo "    (or: curl -fsSL http://$LAN_IP:$target_port/client-bootstrap.sh | zsh)"
+  echo ""
+  echo ">>> CATCH UP an already-bootstrapped client (re-pull the CLI, re-apply"
+  echo "    the opencode takeover; leaves ~/.zshrc alone):"
+  echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-reset.sh | zsh\033[0m"
+  echo "    (or: curl -fsSL http://$LAN_IP:$target_port/client-reset.sh | zsh)"
   echo "================================================================="
   echo ">>> Starting Dynamic Python HTTP share server in background..."
 
@@ -59,8 +64,14 @@ class DynamicHandler(SimpleHTTPRequestHandler):
             tar.add(root, arcname=arcname)
 
     def do_GET(self):
-        if self.path == "/client-bootstrap.sh" or self.path.endswith("/client-bootstrap.sh"):
-            file_path = os.path.join(self.directory, "client-bootstrap.sh")
+        # Client-facing scripts get the host's live identity injected. Add a name
+        # here and it is served the same way; serve it as a plain static file and
+        # its placeholders reach the client verbatim, where they resolve to a
+        # bogus `your-host.local` and the script fails at its first request.
+        INJECTED = ("client-bootstrap.sh", "client-reset.sh")
+        requested = self.path.rsplit("/", 1)[-1]
+        if requested in INJECTED:
+            file_path = os.path.join(self.directory, requested)
             if os.path.exists(file_path):
                 try:
                     with open(file_path, "r", encoding="utf-8") as f:

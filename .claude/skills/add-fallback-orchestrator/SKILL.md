@@ -56,7 +56,7 @@ Primary orchestrator already present:
 model_list:
   - model_name: orch
     litellm_params:
-      model: anthropic/k3-256k
+      model: anthropic/k3
       api_key: os.environ/KIMI_API_KEY
       api_base: https://api.kimi.com/coding   # -> .../coding/v1/messages
       timeout: 600

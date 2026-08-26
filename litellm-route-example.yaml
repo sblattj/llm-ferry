@@ -59,7 +59,7 @@ model_list:
   # e.g. `model: openai/<id>` with api_key: os.environ/OPENAI_API_KEY.
   - model_name: orch
     litellm_params:
-      model: anthropic/k3-256k
+      model: anthropic/k3
       api_key: os.environ/KIMI_API_KEY
       api_base: https://api.kimi.com/coding      # -> https://api.kimi.com/coding/v1/messages
       reasoning_effort: max        # drop_params:true below drops this where a provider rejects it

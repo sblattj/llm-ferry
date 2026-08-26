@@ -147,6 +147,17 @@ class TestModelExtraction(unittest.TestCase):
         r = S.parse_line("15:53:00 - LiteLLM:INFO: selected gemini-3.7-flash for this call")
         self.assertEqual(r["model"], "gemini-3.7-flash")
 
+    def test_known_id_scan_matches_bare_k3(self):
+        # The orch lane moved from `k3-256k` to the 1M-context `k3` (2026-08-26).
+        # `k3` is a WHOLE id, so the KNOWN_MODEL scan must match it with no
+        # suffix — the key/value patterns cover `model=`, this covers prose.
+        r = S.parse_line("15:53:00 - LiteLLM:INFO: selected anthropic/k3 for this call")
+        self.assertEqual(r["model"], "anthropic/k3")
+
+    def test_known_id_scan_still_matches_suffixed_k3(self):
+        r = S.parse_line("15:53:00 - LiteLLM:INFO: selected anthropic/k3-256k for this call")
+        self.assertEqual(r["model"], "anthropic/k3-256k")
+
     def test_known_group_scan_fills_requested_model(self):
         r = S.parse_line("LiteLLM: Proxy initialized with Config, Set models: orchestrator-kimi")
         self.assertEqual(r["requested_model"], "orchestrator-kimi")

@@ -191,12 +191,13 @@ A **ChatGPT Plus/Pro subscription** can serve a fallback hop too, via LiteLLM's 
 ```yaml
 router_settings:
   model_group_alias:
-    orchestrator:     {model: "orch",  hidden: true}   # legacy
-    gemini-3.7-flash: {model: "flash", hidden: true}   # legacy — a name that now lies
-    super-flash:      {model: "flash", hidden: true}   # neutral role name
+    orchestrator: {model: "orch",  hidden: true}   # legacy name, still resolves
+    super-flash:  {model: "flash", hidden: true}   # a role, not a model
 ```
 
-**Never let a real model id become the name clients type.** `gemini-3.7-flash` above is the cautionary case: the worker lane later moved from Gemini 3.7 Flash to GLM 5.3 Flash, so a client still sending that id gets a different vendor's model under Google's name — and because the alias is `hidden`, nothing in `/v1/models` reveals the discrepancy. Alias to a *role* (`super-flash`), which survives the model behind it changing. `ferry opencode` enforces the same rule from the client side: it writes only lane names, never a model id.
+**Never let a real model id become the name clients type.** It is tempting to alias a lane to the model currently behind it, and it goes wrong the first time you re-point that lane: clients keep sending a vendor's model name and get someone else's model back, while `hidden: true` means nothing in `/v1/models` reveals the discrepancy. Name the *role* instead — a role survives the model behind it changing, which is the entire reason clients address lanes. `ferry opencode` enforces the same rule from the client side: it writes only lane names, never a model id.
+
+A `hidden` alias is also how you give a lane to one class of traffic without advertising it. `super-flash` above is the **housekeeping** lane — `ferry opencode` points opencode's `title`/`summary`/`compaction` agents at it — and because it is an alias rather than a `model_name`, it never appears in the catalogue that every client on the LAN can read.
 
 **Add models with Claude Code.** This repo bundles two skills — [`add-fallback-orchestrator`](.claude/skills/add-fallback-orchestrator/SKILL.md) and [`add-worker-model`](.claude/skills/add-worker-model/SKILL.md) — that walk Claude through editing your `litellm.yaml` correctly: the strict-failover-chain vs. load-balanced-pool distinction, the independent-capacity rule for fallbacks, and the per-project-quota gotcha **plus the Google ToS line a worker-key pool must not cross**. Just ask Claude Code to "add a fallback orchestrator" or "add another worker key."
 
@@ -214,18 +215,23 @@ It is a **surgical takeover, not a merge**. Four keys belong to ferry and are re
 | key | becomes |
 |---|---|
 | `model` | `ferry/<driver>` |
-| `small_model` | `ferry/<worker>` |
+| `small_model` | `ferry/<housekeeper>` |
 | `permission` | `"allow"` |
 | `agent` | all seven built-ins pinned (below) |
 
 `plugin` is *appended* to, never replaced — [`@prevalentware/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin) is added if it isn't already there.
 
-All seven of opencode's built-in agents get pinned, so nothing silently escapes to a model you aren't paying for on purpose:
+All seven of opencode's built-in agents get pinned across **three roles**, so nothing silently escapes to a model you aren't paying for on purpose:
 
-- **`build`, `plan`** → the driving lane (`orch` / `local-orch`)
-- **`general`, `explore`, `title`, `summary`, `compaction`** → the cheap worker lane (`flash` / `local-sub`)
+| role | agents | cloud | GPU |
+|---|---|---|---|
+| driver | `build`, `plan` | `orch` | `local-orch` |
+| worker | `general`, `explore` | `flash` | `local-sub` |
+| housekeeper | `title`, `summary`, `compaction` | `super-flash` | `local-sub` |
 
-`title`, `summary` and `compaction` matter more than they look: they fire constantly in the background, and an unpinned `compaction` sends your *entire transcript* to whatever the default model is.
+The housekeeping three matter more than they look. They fire on their own schedule rather than as part of a fan-out, and an unpinned `compaction` sends your *entire transcript* to whatever the default model is. Giving them their own lane also keeps a compaction — the largest single request opencode ever makes — from queueing behind a fan-out that has just saturated the worker pool. `small_model` follows the same lane, since opencode's schema describes it as the model "for tasks like title generation".
+
+On the GPU pair there is no third lane, so the housekeeper shares `local-sub`. Point the housekeeper anywhere with `--housekeeper <lane>`.
 
 **`agent` is replaced wholesale rather than merged**, which is the point — a stale per-agent pin is exactly the drift this ends. Before every write, the previous config is copied to `<name>.<UTC-timestamp>.jsonc` beside it (last 10 kept, `--keep N` to change), so a takeover is always reversible and any custom agent you had is recoverable. The `.jsonc` extension is deliberate: opencode's schema allows comments, and the snapshot is where they survive the rewrite.
 

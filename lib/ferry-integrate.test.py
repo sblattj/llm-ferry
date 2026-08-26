@@ -12,16 +12,15 @@ is a bug someone already hit:
   * FOUR keys are ferry's and get replaced outright — permission, model,
     small_model, agent. `agent` is replaced WHOLESALE rather than merged,
     because a stale per-agent pin is exactly the drift this command exists to
-    end: a client carried `compaction -> ferry/gemini-3.7-flash` for months
-    after that lane was renamed, resolving only through a `hidden: true`
-    back-compat alias that /v1/models does not advertise.
+    end: a client carried a `compaction` pin naming a retired vendor model for
+    months after that lane was re-pointed, resolving only through a
+    `hidden: true` back-compat alias that /v1/models does not advertise.
   * EVERY other key is left alone. Nuking a user's mcp/lsp/theme block is the
     regression this file exists to catch.
   * `provider.ferry.models` declares exactly the LANE PAIR, never the served
-    catalogue. The host advertises the fallback deployments too (flash-gem,
-    orch-deepseek, ...); those are reached by the router on overflow, not by a
-    client picking one out of a menu, and a real model id must never reach a
-    client config.
+    catalogue. The host advertises the router-only fallback deployments too;
+    those are reached on overflow, not by a client picking one out of a menu,
+    and a real model id must never reach a client config.
   * A snapshot of the previous file is written first, so the takeover is
     reversible — and it is written as .jsonc because opencode's schema sets
     allowComments/allowTrailingCommas, so a hand-maintained config legitimately
@@ -45,13 +44,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FERRY = os.path.join(REPO, "ferry")
 
-# What the live host advertises. Only `orch` and `flash` may reach a config.
-CATALOGUE = ["orch", "orch-zai-glm53", "orch-deepseek", "orch-gpt56-sol",
-             "flash", "flash-or-glm", "flash-gem", "flash-or",
+# A representative host catalogue: the four role lanes plus the router-only
+# fallback deployments that sit behind them. Only the roles may reach a config.
+# `super-flash` is deliberately ABSENT — it is a hidden alias, so a real host
+# does not advertise it either, and the housekeeper must wire up anyway.
+CATALOGUE = ["orch", "orch-fallback-1", "orch-fallback-2", "orch-fallback-3",
+             "flash", "flash-fallback-1", "flash-fallback-2", "flash-fallback-3",
              "local-orch", "local-sub"]
 
 BUILTIN_AGENTS = {"build", "plan", "general", "explore",
                   "title", "summary", "compaction"}
+
+# Three roles, not two. The housekeeping agents fire on their own schedule and a
+# compaction call carries the whole transcript, so they get their own lane rather
+# than queueing behind a fan-out on the worker.
+DRIVER_AGENTS = ("build", "plan")
+WORKER_AGENTS = ("general", "explore")
+HOUSE_AGENTS = ("title", "summary", "compaction")
 
 SNAP_RE = re.compile(r"^[^/]+\.\d{8}T\d{6}Z(-\d+)?\.jsonc$")
 
@@ -122,12 +131,12 @@ class TestTakeoverScope(FerryOpencodeCase):
         "username": "someone",
         "permission": {"bash": "ask", "edit": "ask"},
         "model": "anthropic/claude-opus-4",
-        "small_model": "ferry/gemini-3.7-flash",
+        "small_model": "ferry/retired-vendor-model",
         "mcp": {"context7": {"type": "local", "command": ["npx", "ctx7"]}},
         "lsp": {"typescript": {"disabled": False}},
         "agent": {
             "build": {"model": "ferry/orch"},
-            "compaction": {"model": "ferry/gemini-3.7-flash"},
+            "compaction": {"model": "ferry/retired-vendor-model"},
             "scout": {"model": "ferry/flash"},
             "my-custom-agent": {"model": "ferry/flash", "prompt": "be terse"},
         },
@@ -155,7 +164,10 @@ class TestTakeoverScope(FerryOpencodeCase):
         self.run_ferry()
         cfg = self.read()
         self.assertEqual(cfg["model"], "ferry/orch")
-        self.assertEqual(cfg["small_model"], "ferry/flash")
+        # small_model follows the HOUSEKEEPER. opencode's schema calls it the
+        # model "for tasks like title generation" — the housekeeping role, not
+        # the fan-out one.
+        self.assertEqual(cfg["small_model"], "ferry/super-flash")
 
     def test_agent_section_is_replaced_wholesale(self):
         self.run_ferry()
@@ -165,20 +177,22 @@ class TestTakeoverScope(FerryOpencodeCase):
         self.assertNotIn("scout", agent, "scout is not an opencode agent")
 
     def test_stale_retired_lane_pin_is_gone(self):
-        # The whole point: `compaction -> ferry/gemini-3.7-flash` resolved only
+        # The whole point: `compaction -> ferry/retired-vendor-model` resolved only
         # through a hidden back-compat alias. After a takeover, no key anywhere
         # in the file may name anything but the two lanes.
         self.run_ferry()
         blob = json.dumps(self.read())
-        self.assertNotIn("gemini-3.7-flash", blob)
+        self.assertNotIn("retired-vendor-model", blob)
 
-    def test_driver_and_worker_split(self):
+    def test_three_way_role_split(self):
         self.run_ferry()
         agent = self.read()["agent"]
-        for a in ("build", "plan"):
+        for a in DRIVER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/orch")
-        for a in ("general", "explore", "title", "summary", "compaction"):
+        for a in WORKER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/flash")
+        for a in HOUSE_AGENTS:
+            self.assertEqual(agent[a]["model"], "ferry/super-flash")
 
     def test_no_default_leaves_the_takeover_keys_alone(self):
         self.run_ferry("--no-default")
@@ -192,16 +206,24 @@ class TestTakeoverScope(FerryOpencodeCase):
 class TestLaneNamesOnly(FerryOpencodeCase):
     """The served catalogue validates the pair; it never populates the config."""
 
-    def test_only_the_lane_pair_is_declared(self):
+    def test_only_the_three_roles_are_declared(self):
         self.run_ferry()
         models = self.read()["provider"]["ferry"]["models"]
-        self.assertEqual(set(models), {"orch", "flash"})
+        self.assertEqual(set(models), {"orch", "flash", "super-flash"})
+
+    def test_hidden_housekeeper_does_not_warn(self):
+        # A hidden model_group_alias resolves on a request but is deliberately
+        # absent from /v1/models (see CATALOGUE above, which omits super-flash
+        # exactly as the live host does). Validating it against the catalogue
+        # would warn on every correct setup.
+        out = self.run_ferry()
+        self.assertNotIn("does not serve", out)
 
     def test_fallback_deployments_never_reach_the_config(self):
         self.run_ferry()
         blob = json.dumps(self.read())
-        for lane in ("flash-gem", "flash-or", "flash-or-glm",
-                     "orch-deepseek", "orch-zai-glm53", "orch-gpt56-sol"):
+        for lane in ("flash-fallback-1", "flash-fallback-2", "flash-fallback-3",
+                     "orch-fallback-1", "orch-fallback-2", "orch-fallback-3"):
             self.assertNotIn(lane, blob, f"{lane} is router-only, not client-selectable")
 
     def test_local_pair_carries_the_kv_limits(self):
@@ -210,11 +232,15 @@ class TestLaneNamesOnly(FerryOpencodeCase):
         self.run_ferry("--local")
         cfg = self.read()
         models = cfg["provider"]["ferry"]["models"]
+        # No third GPU lane exists, so the housekeeper shares the worker — and
+        # the models map must not end up with a duplicate entry for it.
         self.assertEqual(set(models), {"local-orch", "local-sub"})
         for lane in models.values():
             self.assertEqual(lane["limit"], {"context": 131072, "output": 8192})
         self.assertEqual(cfg["model"], "ferry/local-orch")
         self.assertEqual(cfg["small_model"], "ferry/local-sub")
+        for a in HOUSE_AGENTS:
+            self.assertEqual(cfg["agent"][a]["model"], "ferry/local-sub")
 
     def test_unserved_lane_warns_instead_of_silently_wiring(self):
         out = self.run_ferry("--model", "no-such-lane")

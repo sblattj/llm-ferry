@@ -108,9 +108,10 @@ model_list:
   # ONE `model_info:` key per deployment. YAML silently keeps the LAST duplicate,
   # so a second block pasted in during an edit does not merge and does not error
   # — it REPLACES the id. Hit 2026-08-26: a `flash` deployment carrying two
-  # model_info blocks answered /v1/model/info with its fallback's id, and every
-  # panel grouped by model_id then reported free coding-plan traffic and paid
-  # overflow as the same deployment. Nothing warns you; check /v1/model/info.
+  # model_info blocks answered /v1/model/info with its own FALLBACK's id, so
+  # every panel grouped by model_id folded the primary and the fallback into one
+  # series — exactly the split those panels exist to show. Nothing warns you;
+  # check /v1/model/info after any edit here.
   #
   # Why ONE deployment and not a pool of six? Because the old template shipped a
   # `# project #1 … # project #6` pool and that pattern is a Google APIs ToS §2.d
@@ -196,15 +197,18 @@ router_settings:
   # OUT of /v1/models, so the catalog advertises only the real lane names while the
   # old ids still resolve instead of 404-ing mid-session.
   #
-  # NEVER let a real model id become the name clients type. `gemini-3.7-flash`
-  # below is the cautionary example: the worker lane later moved to GLM 5.3
-  # Flash, so every client still sending that id is served a different vendor's
-  # model under Google's name. An alias should be a role (`super-flash`), so it
-  # survives the model behind it changing.
+  # NEVER alias a lane to the name of the model currently behind it. The first
+  # time you re-point that lane, every client still sending the old id is served
+  # a different model under the old name — and `hidden: true` means /v1/models
+  # shows nothing amiss. Alias to a ROLE; a role survives the model changing.
+  #
+  # A hidden alias is also how you hand one class of traffic its own lane without
+  # advertising it: `super-flash` below is the housekeeping lane that
+  # `ferry opencode` pins title/summary/compaction to. Because it is an alias and
+  # not a `model_name`, it stays out of the catalogue every LAN client can read.
   # model_group_alias:
-  #   orchestrator:     {model: "orch",  hidden: true}
-  #   gemini-3.7-flash: {model: "flash", hidden: true}   # legacy: a name that now lies
-  #   super-flash:      {model: "flash", hidden: true}   # neutral: prefer this shape
+  #   orchestrator: {model: "orch",  hidden: true}   # legacy name, still resolves
+  #   super-flash:  {model: "flash", hidden: true}   # a role, not a model
 
   # Strict failover chain: a failed `orch` reroutes to the fallback list in order
   # (fast model first, last resort last).

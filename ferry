@@ -576,13 +576,77 @@ PYEOF
 # way — one launch line, one governor, no drift between them.
 
 # _ferry_free_port <port> — stop whatever is holding <port> so a lane can bind it.
+# POLLS for the port to actually clear rather than sleeping a fixed second: a
+# server that is shutting down releases its listener before the process exits,
+# and a fixed sleep either wastes time or races (see _ferry_reset_log).
 _ferry_free_port() {
-  local p="$1"
+  local p="$1" waited=0
   if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
     echo ">>> Port $p is already in use. Stopping conflicting server..."
     lsof -ti tcp:"$p" | xargs kill -9 2>/dev/null || true
-    sleep 1
+    while (( waited < 10 )); do
+      lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+      sleep 1
+      waited=$(( waited + 1 ))
+    done
+    echo ">>> WARNING: port $p still held after ${waited}s — the bind below may fail."
   fi
+}
+
+# _ferry_reset_log <path> — hand the next lane a FRESH log inode.
+#
+# Why unlink instead of truncating with `>`: a server that is shutting down keeps
+# writing (uvicorn's "Application shutdown complete", "Finished server process")
+# from an fd whose offset is already tens of KB in. If the launch truncates that
+# same inode to zero first, those straggler writes land at the OLD offset and
+# punch a SPARSE HOLE of NUL bytes, restoring the file's size — while the newly
+# launched process, holding its own offset-0 fd, writes underneath the hole and
+# never reaches EOF. The log's mtime then ticks on every request while its SIZE
+# never moves, and ferry-log-shipper — which attaches at EOF — sits forever past
+# everything being written and ships nothing. Observability goes dark with every
+# process still healthy. (Hit 2026-08-26 restarting the route proxy: a 91,956-byte
+# log pinned at exactly 91,956 bytes for 20 minutes of live traffic.)
+#
+# Unlinking severs the two writers completely: the straggler keeps its now-nameless
+# inode (reclaimed when it closes), and the launch below creates a brand-new one.
+# ferry-log-shipper already treats a new inode as a rotation and re-reads from zero.
+_ferry_reset_log() {
+  local log="$1"
+  [[ -n "$log" ]] || return 0
+  mkdir -p "${log:h}" 2>/dev/null || true
+  rm -f "$log" 2>/dev/null || true
+}
+
+# _ferry_stop_litellm [port] — stop the litellm proxy and WAIT for it to exit.
+# With a port, only the proxy serving THAT port is reaped, so `ferry up --port 8099`
+# never takes down a lane someone else is using on :8090. With no argument (cmd_down)
+# every litellm this CLI launches is reaped.
+#
+# The wait is the point. litellm drops its listener seconds before its last log
+# write, so a port check alone reports "free" while the process is still writing —
+# and the launch that follows then truncates that log underneath it (see
+# _ferry_reset_log). Callers run this BEFORE touching the log path.
+_ferry_stop_litellm() {
+  local port="${1:-}" waited=0 pat label
+  if [[ -n "$port" ]]; then
+    pat="litellm .*--port ${port}( |$)"
+    label="the litellm proxy on :$port"
+  else
+    pat="litellm --(config|model) "
+    label="every litellm proxy"
+  fi
+
+  pgrep -f "$pat" >/dev/null 2>&1 || return 0
+  echo ">>> Stopping $label and waiting for it to exit..."
+  pkill -f "$pat" 2>/dev/null || true
+  while (( waited < 15 )); do
+    pgrep -f "$pat" >/dev/null 2>&1 || return 0
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  echo ">>> WARNING: $label still running after ${waited}s — forcing."
+  pkill -9 -f "$pat" 2>/dev/null || true
+  sleep 1
 }
 
 # _ferry_launch_mlx <label> <model> <draft|""> <port> <log> <kv_bits> <max_kv> <max_seqs> <apc_blocks>
@@ -612,7 +676,8 @@ _ferry_launch_mlx() {
   echo "        port   :$port   draft=${draft:-none}"
   echo "        KV gov kv-bits=${kv_bits:-off} max-kv=${max_kv:-off} seqs=${max_seqs:-off} apc-blocks=${apc_blocks:-off}"
   echo "        log    $log"
-  nohup mlx_vlm.server "${mlargs[@]}" > "$log" 2>&1 & disown
+  _ferry_reset_log "$log"
+  nohup mlx_vlm.server "${mlargs[@]}" >> "$log" 2>&1 & disown
 }
 
 # _ferry_wait_http <url> <label> [timeout-seconds]
@@ -761,12 +826,13 @@ cmd_up() {
     done
   fi
 
-  # Stop any conflicting server on the target port first
-  if lsof -nP -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo ">>> Port $target_port is already in use. Stopping conflicting server..."
-    lsof -ti tcp:"$target_port" | xargs kill -9 2>/dev/null || true
-    sleep 1
-  fi
+  # Stop the previous proxy and any conflicting server on the target port, and WAIT
+  # for both to be gone. Order matters: reap litellm by name FIRST (it releases the
+  # listener before it finishes writing its log), then clear whatever else holds the
+  # port. Doing only the port check lets a still-shutting-down litellm survive into
+  # the launch below and corrupt the fresh log — see _ferry_reset_log.
+  _ferry_stop_litellm "$target_port"
+  _ferry_free_port "$target_port"
 
   # Port-accurate cloud/route log name (the global CLOUD_LOG is pinned to the default port).
   local cloud_log="$LOG_DIR/cloud-proxy-$target_port.log"
@@ -838,10 +904,11 @@ cmd_up() {
     echo ">>> [front] litellm --config $FERRY_ROUTE_CONFIG"
     echo "        port   :$target_port"
     echo "        log    $cloud_log"
+    _ferry_reset_log "$cloud_log"
     nohup litellm \
       --config "$FERRY_ROUTE_CONFIG" \
       --port "$target_port" \
-      --host 0.0.0.0 > "$cloud_log" 2>&1 & disown
+      --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
 
     echo ">>> Waiting for lanes (MLX loads ~33GB of weights — that is the slow part)..."
     _ferry_wait_http "http://127.0.0.1:$target_port/v1/models"       "front"      120 || true
@@ -895,10 +962,11 @@ cmd_up() {
     echo "    Port: $target_port"
     
     # Launch LiteLLM proxy
+    _ferry_reset_log "$cloud_log"
     nohup litellm \
       --model "$CLOUD_MODEL" \
       --port "$target_port" \
-      --host 0.0.0.0 > "$cloud_log" 2>&1 & disown
+      --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
 
     echo ">>> Cloud proxy running in background. Log: $cloud_log"
   elif [[ "$LAUNCH_MODE" == "route" ]]; then
@@ -917,10 +985,11 @@ cmd_up() {
     echo "    Config: $FERRY_ROUTE_CONFIG"
     echo "    Port:   $target_port"
 
+    _ferry_reset_log "$cloud_log"
     nohup litellm \
       --config "$FERRY_ROUTE_CONFIG" \
       --port "$target_port" \
-      --host 0.0.0.0 > "$cloud_log" 2>&1 & disown
+      --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
 
     echo ">>> Route proxy running in background. Log: $cloud_log"
     echo "    Served lanes:  curl -s http://127.0.0.1:$target_port/v1/models"
@@ -949,11 +1018,11 @@ cmd_down() {
     fi
   done
   
-  # Terminate LiteLLM proxies
-  pkill -f "litellm --model" || true
-
-  # Route mode runs `litellm --config …`, which the --model matcher above misses.
-  pkill -f "litellm --config" || true
+  # Terminate LiteLLM proxies. Both matchers plus the WAIT live in
+  # _ferry_stop_litellm: `ferry down && ferry up` used to race, because litellm
+  # keeps writing its log for a few seconds after `down` returns, and the next
+  # launch would then truncate that same inode underneath it (see _ferry_reset_log).
+  _ferry_stop_litellm
 
   # Terminate sharing Python servers. They run as `python3 - <port> <dir> ferry-share-marker`
   # with the script fed on stdin via heredoc, so "DynamicHandler" lives in stdin and never

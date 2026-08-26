@@ -42,6 +42,28 @@ mirror their structure and the validated dataviz palette. Adapt names/ports/metr
 - litellm base: `http://127.0.0.1:8090` (`/health/liveliness`, `/v1/models`; bearer key default `local`).
 - Route config: `~/.config/ferry/litellm.yaml` (topology: the `orch` lane + its fallbacks, the `flash` pool, and the two local GPU lanes `local-orch`/`local-sub`).
 
+### The proxy log's lifecycle across a restart (why the shipper can go dark)
+
+`ferry up` gives each relaunch a **fresh log inode** (`_ferry_reset_log` unlinks the
+old file) and opens it in **append** mode, and it **waits** for the previous litellm
+to exit (`_ferry_stop_litellm`) before doing either. All three parts are load-bearing
+and none may be simplified back to a plain `> "$cloud_log"`:
+
+- litellm drops its listener seconds before its last log write, so a port check
+  reports "free" while uvicorn is still writing `Application shutdown complete`.
+- Those straggler writes go out on an fd whose offset is already tens of KB in. If
+  the launch truncated that same inode first, they land past the truncation point
+  and punch a **sparse hole of NUL bytes** that restores the file's size, while the
+  newly launched process writes underneath it from offset 0 and never reaches EOF.
+- The log's mtime then ticks on every request while its **size never moves**, so any
+  consumer that attaches at EOF — `ferry-log-shipper`, `ferry-dash` — sits forever
+  past everything being written. Every process stays healthy; the pipeline is dark.
+
+Consumers MUST detect rotation by **inode**, not by size (the shipper does: `log
+rotated (inode changed) — rereading from byte 0`). Regression tests:
+`python3 lib/ferry-serve.test.py`. Observed 2026-08-26: a 91,956-byte log pinned at
+exactly 91,956 bytes through 20 minutes of live traffic.
+
 The access-log line format (reuse this regex verbatim): `(\d+\.\d+\.\d+\.\d+):\d+ - "(\w+) (\S+) [^"]*" (\d+)` → (ip, method, path, status). Count only `path.startswith("/v1/chat/completions")` as a real inference request (skip `/v1/models` + `/health` polls). The log carries NO latency/token fields — those come only from litellm-native metrics.
 
 ---

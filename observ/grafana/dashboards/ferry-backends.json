@@ -901,8 +901,8 @@
     {
       "id": 18,
       "type": "table",
-      "title": "Gemini pool — failures by key (selected range)",
-      "description": "sum by (model_id, exception_status)(increase(litellm_proxy_failed_requests_metric_total{requested_model=\"gemini-3.7-flash\"}[$__range])) — WHICH individual Gemini key failed, and why (429 = quota, 403 = auth/permission). The Key column is the deployment's model_info.id (gemini-key-1 … gemini-key-10); set those in litellm.yaml so this reads as a name instead of a hash. Every key showing 429s means the whole pool is saturated — add capacity or a worker fallback.",
+      "title": "Worker lane — failures by deployment (selected range)",
+      "description": "sum by (model_id, exception_status)(increase(litellm_proxy_failed_requests_metric_total{requested_model=\"flash\"}[$__range])) — WHICH deployment in the worker chain failed, and why (429 = quota/rate, 403 = auth or credits exhausted). The Key column is the deployment's model_info.id — coding-glm-flash-1 (Z.ai coding plan, the primary), or-glm-flash-1 (GLM via OpenRouter), gemini-key-1 (Google direct), openrouter-gemini-1. Give every deployment a DISTINCT id in litellm.yaml or this panel lies: a duplicate `model_info:` key once made the primary and its paid fallback report the same id, conflating free coding-plan traffic with paid overflow. Failures concentrated on coding-glm-flash-1 mean the plan credits are dry and the chain is spilling to paid hops.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 0, "y": 57, "w": 14, "h": 9 },
       "fieldConfig": {
@@ -973,7 +973,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum by (model_id, exception_status) (increase(litellm_proxy_failed_requests_metric_total{requested_model=\"gemini-3.7-flash\"}[$__range]))",
+          "expr": "sum by (model_id, exception_status) (increase(litellm_proxy_failed_requests_metric_total{requested_model=\"flash\"}[$__range]))",
           "legendFormat": "",
           "instant": true,
           "format": "table"
@@ -983,8 +983,8 @@
     {
       "id": 19,
       "type": "timeseries",
-      "title": "Gemini 429s by key",
-      "description": "sum by (model_id)(rate(litellm_proxy_failed_requests_metric_total{requested_model=\"gemini-3.7-flash\", exception_status=\"429\"}[$__rate_interval])) — per-key 429 rate over time. When many lines rise together the whole pool is exhausting; a single rising line is one key hitting its per-project quota.",
+      "title": "Worker lane 429s by deployment",
+      "description": "sum by (model_id)(rate(litellm_proxy_failed_requests_metric_total{requested_model=\"flash\", exception_status=\"429\"}[$__rate_interval])) — per-deployment 429 rate over time for the worker lane. A single rising line is one provider rate-limiting or running out of credits; many lines rising together means the whole fallback chain is saturated and `flash` is about to spill to `orch`.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 14, "y": 57, "w": 10, "h": 9 },
       "fieldConfig": {
@@ -1025,7 +1025,7 @@
         {
           "refId": "A",
           "datasource": { "type": "prometheus", "uid": "ferry-vm" },
-          "expr": "sum by (model_id) (rate(litellm_proxy_failed_requests_metric_total{requested_model=\"gemini-3.7-flash\", exception_status=\"429\"}[$__rate_interval]))",
+          "expr": "sum by (model_id) (rate(litellm_proxy_failed_requests_metric_total{requested_model=\"flash\", exception_status=\"429\"}[$__rate_interval]))",
           "legendFormat": "{{model_id}}",
           "instant": false
         }

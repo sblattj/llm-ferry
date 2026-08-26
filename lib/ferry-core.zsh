@@ -169,8 +169,19 @@ LOCAL_SUB_MAX_SEQS="${LOCAL_SUB_MAX_SEQS:-$LOCAL_MAX_SEQS}"
 LOCAL_SUB_APC_BLOCKS="${LOCAL_SUB_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
 MDNS_NAME="$(detect_mdns_name)"
 
-# Default cloud model associations
-DEFAULT_GEMINI="gemini/gemini-3.7-flash"
+# Default cloud model for `ferry serve --cloud`.
+#
+# This one HAS to be a real provider/model id, not a lane name: --cloud runs a
+# bare `litellm --model "$DEFAULT_CLOUD_MODEL"` with no route config at all, so
+# there is no lane table to resolve against. It rides OpenRouter deliberately —
+# one env var (OPENROUTER_API_KEY) and the stock api_base, whereas the Z.ai
+# coding endpoint that backs the `flash` lane needs a custom api_base the bare
+# `litellm --model` form has nowhere to put.
+#
+# Was `gemini/gemini-3.7-flash` (as DEFAULT_GEMINI) until v1.8.4. v1.8.0 retired
+# the multi-project Gemini key pool, so `--cloud` had been defaulting to a key
+# the host no longer holds and failing its own preflight check.
+DEFAULT_CLOUD_MODEL="openrouter/z-ai/glm-5.3-flash"
 
 # Route mode: serve multiple models (orchestrator + failover workers) from a litellm config
 DEFAULT_ROUTE_CONFIG="$HOME/.config/ferry/litellm.yaml"

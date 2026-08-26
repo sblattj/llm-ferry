@@ -119,14 +119,46 @@ echo "    Successfully saved profile: ~/.config/ferry/client.json"
 # `opencode-cloud` / `opencode-local` wrappers pick a pair per invocation, and
 # bare `opencode` follows whichever wrapper ran last (cloud until then). So the
 # persistent default written here is always the cloud pair.
+#
+# MECHANISM NOTE: opencode takes config via OPENCODE_CONFIG (a FILE PATH), not
+# an env var holding JSON — an invented OPENCODE_CONFIG_CONTENT is silently
+# ignored and every wrapper silently runs whatever the default config is. So
+# each pair gets a real config file written here, and the wrappers below point
+# OPENCODE_CONFIG at it.
+#
+# ONE WRITER: every one of these files is written by `ferry opencode`, never by
+# this script. That command is a surgical takeover — it replaces exactly
+# permission / model / small_model / agent, appends the goal plugin, leaves
+# every other key alone, and snapshots the previous file to <name>.<UTC>.jsonc
+# before it writes. This script used to json.dump the two profiles from
+# scratch instead, which silently ate any agent, permission, mcp or command
+# block the user had added to them on every re-run.
 echo ""
-echo ">>> Auto-configuring 'opencode' to route through the host (detects served models)..."
-if "$HOME/.local/bin/ferry" opencode --host "$HOST_NAME" --port "$HOST_PORT"; then
-  :
-else
-  echo "    WARNING: 'ferry opencode' failed. Wire opencode manually: add an openai-compatible"
-  echo "    provider with baseURL=http://$HOST_NAME:$HOST_PORT/v1, apiKey=local, and a model from"
-  echo "    http://$HOST_NAME:$HOST_PORT/v1/models."
+echo ">>> Auto-configuring 'opencode' to route through the host..."
+mkdir -p "$HOME/.config/ferry"
+OC_FAILED=0
+# target|extra-flags — the two ferry profiles the wrappers select between, plus
+# opencode's own default config for a bare `command opencode` or a non-zsh shell.
+for oc_target in \
+  "$HOME/.config/opencode/opencode.json|" \
+  "$HOME/.config/ferry/opencode-cloud.json|" \
+  "$HOME/.config/ferry/opencode-local.json|--local"
+do
+  oc_path="${oc_target%%|*}"
+  oc_flag="${oc_target#*|}"
+  echo "    -> $oc_path"
+  # Unset OPENCODE_CONFIG for the call: `ferry opencode` honours it as the
+  # default target, and a bootstrap that inherited one from the caller's shell
+  # would write the same file three times.
+  if ! env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" opencode \
+        --host "$HOST_NAME" --port "$HOST_PORT" --config "$oc_path" $oc_flag; then
+    OC_FAILED=1
+  fi
+done
+if [[ $OC_FAILED -eq 1 ]]; then
+  echo "    WARNING: 'ferry opencode' failed for at least one target. Wire opencode"
+  echo "    manually: an openai-compatible provider with baseURL=http://$HOST_NAME:$HOST_PORT/v1,"
+  echo "    apiKey=local, and a LANE NAME from http://$HOST_NAME:$HOST_PORT/v1/models."
 fi
 
 # Setup shell alias in .zshrc
@@ -209,50 +241,11 @@ with open(rc, "w") as f:
         f.write("\n")
 PYEOF
 
-# QUOTED heredocs: bodies written VERBATIM (no $, backtick, or quote expansion).
-# Host/port are spliced in afterwards via unique placeholders.
+# The two profile FILES the wrappers below select between were already written
+# by `ferry opencode` in step 3 — this block only installs the wrappers.
 #
-# MECHANISM NOTE: opencode takes config via OPENCODE_CONFIG (a FILE PATH), not
-# an env var holding JSON — an invented OPENCODE_CONFIG_CONTENT is silently
-# ignored and every wrapper silently runs whatever the default config is. So
-# each pair gets a real config file written here, and the wrappers point
-# OPENCODE_CONFIG at it.
-mkdir -p "$HOME/.config/ferry"
-OC_DIR="$HOME/.config/ferry"
-python3 - "$OC_DIR" "$HOST_NAME" "$HOST_PORT" <<'PYEOF'
-import json, sys
-oc_dir, host, port = sys.argv[1], sys.argv[2], sys.argv[3]
-base = f"http://{host}:{port}/v1"
-# opencode model limits: the local lanes cap KV at 131072 (128k) tokens, so a
-# 100k-token prompt + opencode's 32k output reservation tips over into a clean
-# 400 (max_tokens is reserved against the KV budget). 8k output keeps prompts
-# up to ~123k admissible; compact summaries never need 32k anyway.
-local_limit = {"limit": {"context": 131072, "output": 8192}}
-provs = {
-    "opencode-cloud.json": {
-        "provider": {"ferry": {"npm": "@ai-sdk/openai-compatible",
-                               "options": {"baseURL": base, "apiKey": "local"},
-                               "models": {"orch": {}, "flash": {}}}},
-        "model": "ferry/orch", "small_model": "ferry/flash",
-    },
-    "opencode-local.json": {
-        "provider": {"ferry": {"npm": "@ai-sdk/openai-compatible",
-                               "options": {"baseURL": base, "apiKey": "local"},
-                               "models": {"local-orch": local_limit,
-                                          "local-sub": local_limit}}},
-        "model": "ferry/local-orch", "small_model": "ferry/local-sub",
-        "agent": {"build": {"model": "ferry/local-orch"},
-                  "plan": {"model": "ferry/local-orch"},
-                  "general": {"model": "ferry/local-sub"},
-                  "explore": {"model": "ferry/local-sub"},
-                  "scout": {"model": "ferry/local-sub"}},
-    },
-}
-for name, cfg in provs.items():
-    with open(f"{oc_dir}/{name}", "w") as f:
-        json.dump(cfg, f)
-PYEOF
-
+# QUOTED heredoc: the body is written VERBATIM (no $, backtick, or quote
+# expansion), which is what keeps the $HOME/$@ inside the functions intact.
 cat <<'EOF' >> "$ZSHRC"
 # >>> ferry opencode profiles >>>
 # Defensive: an alias with a function's name anywhere earlier in the file (or in
@@ -274,8 +267,8 @@ opencode() {
 }
 
 # opencode-cloud: the CLOUD pair — orch drives (build/plan), flash runs the
-# fan-out (general/explore/scout). Nothing touches the host GPU. Sets the
-# bare-`opencode` default.
+# fan-out and the housekeeping models (general/explore/title/summary/compaction).
+# Nothing touches the host GPU. Sets the bare-`opencode` default.
 opencode-cloud() {
   mkdir -p "$HOME/.config/ferry" && printf 'cloud\n' > "$HOME/.config/ferry/last-lane"
   OPENCODE_CONFIG="$HOME/.config/ferry/opencode-cloud.json" command opencode "$@"

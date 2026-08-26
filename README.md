@@ -101,7 +101,7 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 
 `ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint (cloud pair as the persistent default), and adds a `host-code` shell shortcut. It also installs two opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
 
-- `opencode-cloud` — the **cloud pair**: `orch` drives (build/plan), `flash` runs the fan-out (general/explore/scout).
+- `opencode-cloud` — the **cloud pair**: `orch` drives (build/plan), `flash` runs the fan-out and the background models (general/explore/title/summary/compaction).
 - `opencode-local` — the **GPU pair**: `local-orch` drives, `local-sub` runs the fan-out. Nothing leaves the host.
 - bare `opencode` — whichever pair you used **last** (cloud until you first run `opencode-local`; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
@@ -191,20 +191,45 @@ A **ChatGPT Plus/Pro subscription** can serve a fallback hop too, via LiteLLM's 
 ```yaml
 router_settings:
   model_group_alias:
-    orchestrator:     {model: "orch",  hidden: true}
-    gemini-3.7-flash: {model: "flash", hidden: true}
+    orchestrator:     {model: "orch",  hidden: true}   # legacy
+    gemini-3.7-flash: {model: "flash", hidden: true}   # legacy — a name that now lies
+    super-flash:      {model: "flash", hidden: true}   # neutral role name
 ```
+
+**Never let a real model id become the name clients type.** `gemini-3.7-flash` above is the cautionary case: the worker lane later moved from Gemini 3.7 Flash to GLM 5.3 Flash, so a client still sending that id gets a different vendor's model under Google's name — and because the alias is `hidden`, nothing in `/v1/models` reveals the discrepancy. Alias to a *role* (`super-flash`), which survives the model behind it changing. `ferry opencode` enforces the same rule from the client side: it writes only lane names, never a model id.
 
 **Add models with Claude Code.** This repo bundles two skills — [`add-fallback-orchestrator`](.claude/skills/add-fallback-orchestrator/SKILL.md) and [`add-worker-model`](.claude/skills/add-worker-model/SKILL.md) — that walk Claude through editing your `litellm.yaml` correctly: the strict-failover-chain vs. load-balanced-pool distinction, the independent-capacity rule for fallbacks, and the per-project-quota gotcha **plus the Google ToS line a worker-key pool must not cross**. Just ask Claude Code to "add a fallback orchestrator" or "add another worker key."
 
 > LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to a driving lane (`orch` or `local-orch`) and the subagent model to its cheap partner (`flash` or `local-sub`).
 
-**opencode auto-wiring.** On a client, `ferry opencode` wires opencode to the host — it detects the served lanes and sets up the driver/subagent split, merges non-destructively into your existing config, and backs up the old one first. It also **pins opencode's built-in agents** — `build`/`plan` to the driving lane, and the `general`/`explore`/`scout` subagents to the cheap lane — so the fan-out actually uses the cheap lane. Add `--local` to pick the GPU pair instead of the cloud pair:
+**opencode auto-wiring.** On a client, `ferry opencode` takes opencode's config over so **every** agent routes through the host. Add `--local` to pick the GPU pair instead of the cloud pair:
 
 ```bash
 ferry opencode            # orch drives, flash fans out
 ferry opencode --local    # local-orch drives, local-sub fans out
 ```
+
+It is a **surgical takeover, not a merge**. Four keys belong to ferry and are replaced outright; everything else in your config — `mcp`, `lsp`, `theme`, `command`, your own keys — is left exactly as it was:
+
+| key | becomes |
+|---|---|
+| `model` | `ferry/<driver>` |
+| `small_model` | `ferry/<worker>` |
+| `permission` | `"allow"` |
+| `agent` | all seven built-ins pinned (below) |
+
+`plugin` is *appended* to, never replaced — [`@prevalentware/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin) is added if it isn't already there.
+
+All seven of opencode's built-in agents get pinned, so nothing silently escapes to a model you aren't paying for on purpose:
+
+- **`build`, `plan`** → the driving lane (`orch` / `local-orch`)
+- **`general`, `explore`, `title`, `summary`, `compaction`** → the cheap worker lane (`flash` / `local-sub`)
+
+`title`, `summary` and `compaction` matter more than they look: they fire constantly in the background, and an unpinned `compaction` sends your *entire transcript* to whatever the default model is.
+
+**`agent` is replaced wholesale rather than merged**, which is the point — a stale per-agent pin is exactly the drift this ends. Before every write, the previous config is copied to `<name>.<UTC-timestamp>.jsonc` beside it (last 10 kept, `--keep N` to change), so a takeover is always reversible and any custom agent you had is recoverable. The `.jsonc` extension is deliberate: opencode's schema allows comments, and the snapshot is where they survive the rewrite.
+
+Only the **lane pair** is ever declared as a model — never the served catalogue. The host also advertises the fallback deployments (`flash-gem`, `flash-or`, `orch-deepseek`, …), but those are reached by the *router* on overflow, not by a client picking one out of a menu.
 
 ## The local GPU lanes
 

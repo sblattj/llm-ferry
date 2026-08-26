@@ -117,9 +117,32 @@ PYEOF
     LAUNCH_MODE="stack"
   else
     LAUNCH_MODE="cloud"
-    CLOUD_PROVIDER="gemini"
     CLOUD_MODEL="$chosen_model"
+    CLOUD_PROVIDER="$(_ferry_cloud_provider "$CLOUD_MODEL")"
   fi
+}
+
+# --- Single-model passthrough: which provider, and which key does it need? ---
+# `--cloud` / `--model` run a BARE litellm on one model id, so the provider is
+# whatever prefixes that id — there is no route config to look it up in. These
+# used to be hardcoded to gemini, which meant `ferry serve --model zai/...`
+# still demanded GEMINI_API_KEY and refused to start without it.
+_ferry_cloud_provider() {
+  print -r -- "${1%%/*}"
+}
+
+# Empty result = no preflight check (a provider we don't know the key name for;
+# litellm will say so itself rather than us guessing wrong and blocking a start).
+_ferry_cloud_key_var() {
+  case "$1" in
+    gemini)       print -r -- "GEMINI_API_KEY" ;;
+    openrouter)   print -r -- "OPENROUTER_API_KEY" ;;
+    zai)          print -r -- "GLM_API_KEY" ;;
+    fireworks_ai) print -r -- "FIREWORKS_API_KEY" ;;
+    anthropic)    print -r -- "ANTHROPIC_API_KEY" ;;
+    openai)       print -r -- "OPENAI_API_KEY" ;;
+    *)            print -r -- "" ;;
+  esac
 }
 
 # ---- Stack helpers ---------------------------------------------------------
@@ -346,8 +369,8 @@ cmd_up() {
           ;;
         -c|--cloud)
           LAUNCH_MODE="cloud"
-          CLOUD_PROVIDER="gemini"
-          CLOUD_MODEL="$DEFAULT_GEMINI"
+          CLOUD_MODEL="$DEFAULT_CLOUD_MODEL"
+          CLOUD_PROVIDER="$(_ferry_cloud_provider "$CLOUD_MODEL")"
           skip_catalog=1
           shift
           ;;
@@ -360,11 +383,7 @@ cmd_up() {
           LAUNCH_MODE="cloud"
           CLOUD_MODEL="$2"
           skip_catalog=1
-          if [[ "$CLOUD_MODEL" == gemini/* ]]; then
-            CLOUD_PROVIDER="gemini"
-          else
-            CLOUD_PROVIDER="generic"
-          fi
+          CLOUD_PROVIDER="$(_ferry_cloud_provider "$CLOUD_MODEL")"
           shift 2
           ;;
         -p|--port)
@@ -505,9 +524,13 @@ cmd_up() {
       exit 1
     fi
 
-    # Verify key is present
-    if [[ -z "${GEMINI_API_KEY:-}" ]]; then
-      echo "Error: GEMINI_API_KEY is not set in your environment or ~/.config/ferry/secrets.env."
+    # Verify the key this MODEL needs is present — not, as it used to be,
+    # whatever key Gemini needed regardless of which model was asked for.
+    local cloud_key_var
+    cloud_key_var="$(_ferry_cloud_key_var "$CLOUD_PROVIDER")"
+    if [[ -n "$cloud_key_var" && -z "${(P)cloud_key_var:-}" ]]; then
+      echo "Error: $cloud_key_var is not set in your environment or ~/.config/ferry/secrets.env."
+      echo "       ($CLOUD_MODEL is a '$CLOUD_PROVIDER' model.)"
       exit 1
     fi
 

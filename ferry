@@ -174,8 +174,19 @@ LOCAL_SUB_MAX_SEQS="${LOCAL_SUB_MAX_SEQS:-$LOCAL_MAX_SEQS}"
 LOCAL_SUB_APC_BLOCKS="${LOCAL_SUB_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
 MDNS_NAME="$(detect_mdns_name)"
 
-# Default cloud model associations
-DEFAULT_GEMINI="gemini/gemini-3.7-flash"
+# Default cloud model for `ferry serve --cloud`.
+#
+# This one HAS to be a real provider/model id, not a lane name: --cloud runs a
+# bare `litellm --model "$DEFAULT_CLOUD_MODEL"` with no route config at all, so
+# there is no lane table to resolve against. It rides OpenRouter deliberately —
+# one env var (OPENROUTER_API_KEY) and the stock api_base, whereas the Z.ai
+# coding endpoint that backs the `flash` lane needs a custom api_base the bare
+# `litellm --model` form has nowhere to put.
+#
+# Was `gemini/gemini-3.7-flash` (as DEFAULT_GEMINI) until v1.8.4. v1.8.0 retired
+# the multi-project Gemini key pool, so `--cloud` had been defaulting to a key
+# the host no longer holds and failing its own preflight check.
+DEFAULT_CLOUD_MODEL="openrouter/z-ai/glm-5.3-flash"
 
 # Route mode: serve multiple models (orchestrator + failover workers) from a litellm config
 DEFAULT_ROUTE_CONFIG="$HOME/.config/ferry/litellm.yaml"
@@ -274,7 +285,7 @@ Options for 'up':
                        [macOS / Apple Silicon only]
   -o, --orch         Alias of --local-orch. NOTE: the orchestrator lane is now Qwen;
                        Nemotron moved to --local-sub.
-  -c, --cloud        Proxy to default cloud model ($DEFAULT_GEMINI)
+  -c, --cloud        Proxy to default cloud model ($DEFAULT_CLOUD_MODEL)
   -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
   -r, --route        Serve only the CLOUD lanes (orch + flash) from the litellm config
                        Uses ~/.config/ferry/litellm.yaml (seeded from template on first run)
@@ -564,9 +575,32 @@ PYEOF
     LAUNCH_MODE="stack"
   else
     LAUNCH_MODE="cloud"
-    CLOUD_PROVIDER="gemini"
     CLOUD_MODEL="$chosen_model"
+    CLOUD_PROVIDER="$(_ferry_cloud_provider "$CLOUD_MODEL")"
   fi
+}
+
+# --- Single-model passthrough: which provider, and which key does it need? ---
+# `--cloud` / `--model` run a BARE litellm on one model id, so the provider is
+# whatever prefixes that id — there is no route config to look it up in. These
+# used to be hardcoded to gemini, which meant `ferry serve --model zai/...`
+# still demanded GEMINI_API_KEY and refused to start without it.
+_ferry_cloud_provider() {
+  print -r -- "${1%%/*}"
+}
+
+# Empty result = no preflight check (a provider we don't know the key name for;
+# litellm will say so itself rather than us guessing wrong and blocking a start).
+_ferry_cloud_key_var() {
+  case "$1" in
+    gemini)       print -r -- "GEMINI_API_KEY" ;;
+    openrouter)   print -r -- "OPENROUTER_API_KEY" ;;
+    zai)          print -r -- "GLM_API_KEY" ;;
+    fireworks_ai) print -r -- "FIREWORKS_API_KEY" ;;
+    anthropic)    print -r -- "ANTHROPIC_API_KEY" ;;
+    openai)       print -r -- "OPENAI_API_KEY" ;;
+    *)            print -r -- "" ;;
+  esac
 }
 
 # ---- Stack helpers ---------------------------------------------------------
@@ -793,8 +827,8 @@ cmd_up() {
           ;;
         -c|--cloud)
           LAUNCH_MODE="cloud"
-          CLOUD_PROVIDER="gemini"
-          CLOUD_MODEL="$DEFAULT_GEMINI"
+          CLOUD_MODEL="$DEFAULT_CLOUD_MODEL"
+          CLOUD_PROVIDER="$(_ferry_cloud_provider "$CLOUD_MODEL")"
           skip_catalog=1
           shift
           ;;
@@ -807,11 +841,7 @@ cmd_up() {
           LAUNCH_MODE="cloud"
           CLOUD_MODEL="$2"
           skip_catalog=1
-          if [[ "$CLOUD_MODEL" == gemini/* ]]; then
-            CLOUD_PROVIDER="gemini"
-          else
-            CLOUD_PROVIDER="generic"
-          fi
+          CLOUD_PROVIDER="$(_ferry_cloud_provider "$CLOUD_MODEL")"
           shift 2
           ;;
         -p|--port)
@@ -952,9 +982,13 @@ cmd_up() {
       exit 1
     fi
 
-    # Verify key is present
-    if [[ -z "${GEMINI_API_KEY:-}" ]]; then
-      echo "Error: GEMINI_API_KEY is not set in your environment or ~/.config/ferry/secrets.env."
+    # Verify the key this MODEL needs is present — not, as it used to be,
+    # whatever key Gemini needed regardless of which model was asked for.
+    local cloud_key_var
+    cloud_key_var="$(_ferry_cloud_key_var "$CLOUD_PROVIDER")"
+    if [[ -n "$cloud_key_var" && -z "${(P)cloud_key_var:-}" ]]; then
+      echo "Error: $cloud_key_var is not set in your environment or ~/.config/ferry/secrets.env."
+      echo "       ($CLOUD_MODEL is a '$CLOUD_PROVIDER' model.)"
       exit 1
     fi
 
@@ -1821,19 +1855,31 @@ PYEOF
 }
 
 cmd_opencode() {
-  # [Client] Wire this laptop's opencode config to route through the host's ferry endpoint.
-  # Auto-detects the host's served LANES and sets up the driver/subagent split:
-  # `orch` drives (build/plan) and `flash` runs the fan-out (general/explore/scout).
-  # `--local` picks the GPU pair (`local-orch` + `local-sub`) instead, for an
-  # all-on-the-host-GPU session. Falls back to whatever single lane the host serves.
-  # Non-destructive: backs up and merges.
+  # [Client] Take this machine's opencode config over so EVERY agent routes
+  # through the host's ferry endpoint, addressed by LANE NAME only.
+  #
+  # A ferry client knows exactly two models: a DRIVER lane and a WORKER lane.
+  # `orch` + `flash` in the cloud, `local-orch` + `local-sub` on the host GPU
+  # (--local). A real model id (`gemini-3.7-flash`, `glm-5.3-flash`, ...) must
+  # NEVER reach a client config: the host re-points a lane whenever the
+  # economics change, and a client that named the model would silently keep
+  # asking for something the catalogue no longer advertises.
+  #
+  # TAKEOVER, not merge. Four keys are ferry's and get replaced outright:
+  #   permission  -> "allow"
+  #   model       -> ferry/<driver>
+  #   small_model -> ferry/<worker>
+  #   agent       -> all seven built-ins pinned (see the AGENTS lists below)
+  # `plugin` gets the goal plugin appended if absent. Every OTHER key in the
+  # file is left exactly as it was, and the whole original is snapshotted to
+  # <name>.<UTC>.jsonc first, so a takeover is always reversible.
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
   # opencode resolves its config from $OPENCODE_CONFIG when that is set, so
   # honour it here too. Writing the hardcoded default on a machine that sets
   # OPENCODE_CONFIG edits a file opencode never reads: the command reports
   # success, and nothing changes.
   local oc_config="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
-  local force_model="" force_small="" set_default=1 prefer_local=0 force_write=0
+  local force_model="" force_small="" set_default=1 prefer_local=0 force_write=0 keep_snaps=10
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1842,8 +1888,12 @@ cmd_opencode() {
       --config)       oc_config="$2"; shift 2 ;;
       --model)        force_model="$2"; shift 2 ;;
       --small-model)  force_small="$2"; shift 2 ;;
+      --keep)         keep_snaps="$2"; shift 2 ;;
       --no-default)   set_default=0; shift ;;
       --local)        prefer_local=1; shift ;;
+      # Retained for compatibility: --force used to bypass a refusal to rewrite
+      # a commented (JSONC) config. That refusal is gone — the snapshot keeps the
+      # original verbatim, comments included — so the flag is now a no-op.
       --force)        force_write=1; shift ;;
       --cloud)        prefer_local=0; shift ;;
       *) echo "Unknown option for 'ferry opencode': $1"; exit 1 ;;
@@ -1866,47 +1916,89 @@ cmd_opencode() {
     echo "    own proxy at http://127.0.0.1:$oc_port/v1."
   fi
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" <<'PYEOF'
-import json, os, re, sys, shutil, urllib.request
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" <<'PYEOF'
+import datetime, json, os, re, sys, shutil, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
-set_default = sys.argv[6] == "1"
+set_default  = sys.argv[6] == "1"
 prefer_local = sys.argv[7] == "1"
-force_write = sys.argv[8] == "1"
+force_write  = sys.argv[8] == "1"   # no-op; see the --force note above
+keep_snaps   = int(sys.argv[9])
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
-# --- Discover what the host is serving ---
+SCHEMA = "https://opencode.ai/config.json"
+GOAL_PLUGIN = "@prevalentware/opencode-goal-plugin"
+
+# opencode 1.18.23 ships SEVEN built-in agents. Verified two ways so a future
+# rename gets caught: the published schema's $defs.Config.properties.agent names
+# exactly plan/build/general/explore/title/summary/compaction, and the installed
+# binary contains each of those strings. `scout` is in NEITHER (0 occurrences in
+# the 144MB binary) — ferry pinned it for months and the pin did nothing, because
+# an unknown key just lands in `agent`'s additionalProperties and is never read.
+DRIVER_AGENTS = ("build", "plan")          # primary agents -> the driver lane
+WORKER_AGENTS = ("general", "explore",     # subagents + the housekeeping models
+                 "title", "summary", "compaction")
+
+# --- The lane pair. Two, always, and never a real model id. ---
+# The local lanes cap KV at 131072 (128k) tokens, so a 100k-token prompt plus
+# opencode's 32k output reservation tips over into a clean 400 (max_tokens is
+# reserved against the KV budget). 8k output keeps prompts up to ~123k
+# admissible; a compaction summary never needs 32k anyway.
+if prefer_local:
+    driver, worker = "local-orch", "local-sub"
+    limits = {"limit": {"context": 131072, "output": 8192}}
+else:
+    driver, worker = "orch", "flash"
+    limits = {}
+driver = force_model or driver
+worker = force_small or worker
+
+# --- Validate the pair against the host catalogue; never populate FROM it. ---
+# The catalogue also advertises the fallback deployments (flash-gem, orch-deepseek,
+# ...). Those are reached by the ROUTER on overflow, not by a client picking one
+# out of a menu, so they stay out of the config.
 served = []
 try:
     with urllib.request.urlopen(f"{base}/models", timeout=4) as r:
         served = [m.get("id") for m in json.load(r).get("data", []) if m.get("id")]
 except Exception as e:
-    print(f"    (Could not query {base}/models: {e}; wiring from flags/defaults)")
+    print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
+if served:
+    missing = [l for l in (driver, worker) if l not in served]
+    if missing:
+        print(f"    WARNING: host does not serve {', '.join(missing)}.")
+        print(f"    Catalogue: {', '.join(served)}")
 
-# --- Decide the driver lane + the subagent lane ---
-# Lane names are the stable contract; the model behind a lane can change on the
-# host without any client edit. `--local` prefers the GPU pair, otherwise cloud.
-# Each preference falls through to the other pair, then to the first served lane,
-# so a host running only half the stack still wires up correctly.
-LANE_PAIRS = [("local-orch", "local-sub"), ("orch", "flash")]
-if not prefer_local:
-    LANE_PAIRS.reverse()
+# --- Snapshot: the whole original, verbatim, before we touch anything. ---
+# .jsonc because opencode's schema sets allowComments/allowTrailingCommas, so a
+# hand-maintained config legitimately carries comments that json.dump cannot
+# round-trip. The snapshot is where they survive.
+SNAP_RE_TPL = r"^{stem}\.\d{{8}}T\d{{6}}Z(-\d+)?\.jsonc$"
 
-main, small = "", ""
-for driver, sub in LANE_PAIRS:
-    if driver in served:
-        main = driver
-        small = sub if sub in served else ""
-        break
+def snapshot(path, keep):
+    if not os.path.exists(path):
+        return None
+    d = os.path.dirname(path) or "."
+    stem = os.path.splitext(os.path.basename(path))[0]
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    snap = os.path.join(d, f"{stem}.{ts}.jsonc")
+    n = 1
+    while os.path.exists(snap):     # two runs inside one second must not collide
+        snap = os.path.join(d, f"{stem}.{ts}-{n}.jsonc")
+        n += 1
+    shutil.copy2(path, snap)
+    if keep > 0:
+        # Match only OUR snapshots: the timestamp shape, anchored to this stem.
+        # A plain "{stem}.*.jsonc" glob would happily delete a user's own
+        # opencode.notes.jsonc sitting in the same directory.
+        pat = re.compile(SNAP_RE_TPL.format(stem=re.escape(stem)))
+        olds = sorted(f for f in os.listdir(d) if pat.match(f))
+        for old in olds[:-keep]:
+            os.remove(os.path.join(d, old))
+    return snap
 
-main = force_model or main or (served[0] if served else "orch")
-small = force_small or small
-
-model_ids = list(dict.fromkeys(served + [main] + ([small] if small else [])))
-models = {mid: {} for mid in model_ids}
-
-# --- Load existing opencode config (JSONC-tolerant; back up + reset if unparseable) ---
+# --- Load whatever is there (JSONC-tolerant). ---
 cfg = None
 if os.path.exists(cfg_path):
     raw = open(cfg_path).read()
@@ -1916,62 +2008,75 @@ if os.path.exists(cfg_path):
         stripped = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/',
                           lambda m: m.group(1) or '', raw, flags=re.S)
         stripped = re.sub(r',\s*([}\]])', r'\1', stripped)
-        if not force_write:
-            print("    REFUSING to rewrite a COMMENTED config:")
-            print(f"      {cfg_path}")
-            print("    This file has comments (JSONC). Writing it back would DROP every")
-            print("    one of them - json.dump cannot round-trip comments - so a")
-            print("    hand-maintained config would come back stripped of its notes.")
-            print("    Either edit it by hand (see the lane names in /v1/models), or")
-            print("    re-run with --force to overwrite it anyway.")
-            sys.exit(2)
         try:
             cfg = json.loads(stripped)
-            print("    (Existing opencode config had JSONC comments; parsed tolerantly)")
+            print("    (config is JSONC; its comments survive in the snapshot, not in the rewrite)")
         except json.JSONDecodeError as e:
-            shutil.copy(cfg_path, cfg_path + ".bak")
-            print(f"    WARNING: existing config unparseable ({e}); backed up to {cfg_path}.bak")
+            print(f"    WARNING: existing config is unparseable ({e}); starting from a fresh one.")
+            print("    The original is preserved verbatim in the snapshot below.")
             cfg = None
 
+snap = snapshot(cfg_path, keep_snaps)
 if cfg is None:
-    cfg = {"$schema": "https://opencode.ai/config.json"}
-elif os.path.exists(cfg_path):
-    shutil.copy(cfg_path, cfg_path + ".bak")   # keep a backup before we rewrite
+    cfg = {}
+cfg.setdefault("$schema", SCHEMA)
 
-# --- Merge the ferry provider (preserving everything else) ---
+# --- provider.ferry: ours to own. Exactly the two lanes. ---
 prov = cfg.setdefault("provider", {})
 prov["ferry"] = {
     "npm": "@ai-sdk/openai-compatible",
     "name": f"Ferry ({host})",
     "options": {"baseURL": base, "apiKey": "local"},
-    "models": models,
+    "models": {driver: dict(limits), worker: dict(limits)},
 }
 
 if set_default:
-    cfg["model"] = f"ferry/{main}"
-    if small:
-        cfg["small_model"] = f"ferry/{small}"
-    # Pin opencode's built-in agents so the fan-out uses the cheap worker:
-    #   primary build/plan -> the driver lane (main); subagents general/explore/scout -> the
-    #   subagent lane (small), so a fan-out spends the cheap lane, not the expensive one.
-    # setdefault preserves any existing per-agent prompt/permissions; we only set model.
-    agents = cfg.setdefault("agent", {})
-    for a in ("build", "plan"):
-        agents.setdefault(a, {})["model"] = f"ferry/{main}"
-    if small:
-        for a in ("general", "explore", "scout"):
-            agents.setdefault(a, {})["model"] = f"ferry/{small}"
+    # --- The takeover. Four keys replaced outright, one appended to. ---
+    cfg["permission"] = "allow"          # schema: PermissionConfig accepts the
+                                         # bare enum "ask" | "allow" | "deny"
+    cfg["model"] = f"ferry/{driver}"
+    cfg["small_model"] = f"ferry/{worker}"
 
-os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
-json.dump(cfg, open(cfg_path, "w"), indent=2)
+    # Replaced WHOLESALE, not merged: a stale pin left behind here (a compaction
+    # agent still naming a retired model id, say) is exactly the drift this
+    # command exists to end. Anything custom is recoverable from the snapshot.
+    agent = {a: {"model": f"ferry/{driver}"} for a in DRIVER_AGENTS}
+    agent.update({a: {"model": f"ferry/{worker}"} for a in WORKER_AGENTS})
+    cfg["agent"] = agent
+
+    # Additive — a plugin list belongs to the user; we only ensure ours is in it.
+    plugins = cfg.get("plugin")
+    if not isinstance(plugins, list):
+        plugins = []
+
+    def pkg_name(entry):
+        if isinstance(entry, list) and entry:      # the ["pkg", {opts}] form
+            entry = entry[0]
+        if not isinstance(entry, str):
+            return None
+        # Strip a trailing @version without eating the leading scope @.
+        return entry.rsplit("@", 1)[0] if entry.count("@") > 1 else entry
+
+    if not any(pkg_name(e) == GOAL_PLUGIN for e in plugins):
+        plugins.append(GOAL_PLUGIN)
+    cfg["plugin"] = plugins
+
+os.makedirs(os.path.dirname(cfg_path) or ".", exist_ok=True)
+with open(cfg_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
 
 print(f"    Wired opencode -> {base}")
-print(f"    Provider: ferry   Served models: {', '.join(served) if served else '(none detected)'}")
-print(f"    Default model:       ferry/{main}")
-if set_default and small:
-    print(f"    Default small_model: ferry/{small}")
+print(f"    Provider: ferry   Lanes: {driver} (driver), {worker} (worker)")
 if set_default:
-    print(f"    Pinned agents:       build/plan -> ferry/{main}" + (f"; general/explore/scout -> ferry/{small}" if small else ""))
+    print(f"    model={cfg['model']}  small_model={cfg['small_model']}  permission=allow")
+    print(f"    Agents pinned:  {'/'.join(DRIVER_AGENTS)} -> ferry/{driver}")
+    print(f"                    {'/'.join(WORKER_AGENTS)} -> ferry/{worker}")
+    print(f"    Plugin:         {GOAL_PLUGIN}")
+else:
+    print("    --no-default: provider wired; permission/model/agent left alone.")
+if snap:
+    print(f"    Snapshot:       {snap}")
 print(f"    Config written: {cfg_path}")
 PYEOF
 }

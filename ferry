@@ -1858,12 +1858,22 @@ cmd_opencode() {
   # [Client] Take this machine's opencode config over so EVERY agent routes
   # through the host's ferry endpoint, addressed by LANE NAME only.
   #
-  # A ferry client knows exactly two models: a DRIVER lane and a WORKER lane.
-  # `orch` + `flash` in the cloud, `local-orch` + `local-sub` on the host GPU
-  # (--local). A real model id (`gemini-3.7-flash`, `glm-5.3-flash`, ...) must
-  # NEVER reach a client config: the host re-points a lane whenever the
-  # economics change, and a client that named the model would silently keep
-  # asking for something the catalogue no longer advertises.
+  # A ferry client knows three ROLES, never a model:
+  #
+  #   driver       build / plan                      orch        local-orch
+  #   worker       general / explore                 flash       local-sub
+  #   housekeeper  title / summary / compaction      super-flash local-sub
+  #
+  # The housekeeper is split out because those three agents behave nothing like a
+  # fan-out: they fire on their own schedule, and a compaction call carries the
+  # ENTIRE transcript. Pointing them at the worker lane makes them queue behind
+  # whatever the fan-out is doing, on the lane least likely to have headroom.
+  # On the GPU pair there is no third lane, so the housekeeper shares local-sub.
+  #
+  # A real model id must NEVER reach a client config. The host re-points a lane
+  # whenever the economics change; a client that named the model would keep
+  # asking for something the catalogue no longer advertises. Which model sits
+  # behind a lane is the host's business and is not discoverable from here.
   #
   # TAKEOVER, not merge. Four keys are ferry's and get replaced outright:
   #   permission  -> "allow"
@@ -1879,7 +1889,7 @@ cmd_opencode() {
   # OPENCODE_CONFIG edits a file opencode never reads: the command reports
   # success, and nothing changes.
   local oc_config="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
-  local force_model="" force_small="" set_default=1 prefer_local=0 force_write=0 keep_snaps=10
+  local force_model="" force_small="" force_house="" set_default=1 prefer_local=0 force_write=0 keep_snaps=10
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1888,6 +1898,7 @@ cmd_opencode() {
       --config)       oc_config="$2"; shift 2 ;;
       --model)        force_model="$2"; shift 2 ;;
       --small-model)  force_small="$2"; shift 2 ;;
+      --housekeeper)  force_house="$2"; shift 2 ;;
       --keep)         keep_snaps="$2"; shift 2 ;;
       --no-default)   set_default=0; shift ;;
       --local)        prefer_local=1; shift ;;
@@ -1916,7 +1927,7 @@ cmd_opencode() {
     echo "    own proxy at http://127.0.0.1:$oc_port/v1."
   fi
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" <<'PYEOF'
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" <<'PYEOF'
 import datetime, json, os, re, sys, shutil, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
@@ -1924,6 +1935,7 @@ set_default  = sys.argv[6] == "1"
 prefer_local = sys.argv[7] == "1"
 force_write  = sys.argv[8] == "1"   # no-op; see the --force note above
 keep_snaps   = int(sys.argv[9])
+force_house  = sys.argv[10]
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
@@ -1936,23 +1948,25 @@ GOAL_PLUGIN = "@prevalentware/opencode-goal-plugin"
 # binary contains each of those strings. `scout` is in NEITHER (0 occurrences in
 # the 144MB binary) — ferry pinned it for months and the pin did nothing, because
 # an unknown key just lands in `agent`'s additionalProperties and is never read.
-DRIVER_AGENTS = ("build", "plan")          # primary agents -> the driver lane
-WORKER_AGENTS = ("general", "explore",     # subagents + the housekeeping models
-                 "title", "summary", "compaction")
+DRIVER_AGENTS = ("build", "plan")                        # primary -> driver lane
+WORKER_AGENTS = ("general", "explore")                   # fan-out -> worker lane
+HOUSE_AGENTS  = ("title", "summary", "compaction")       # background -> housekeeper
 
-# --- The lane pair. Two, always, and never a real model id. ---
+# --- The three lanes. Never a real model id. ---
 # The local lanes cap KV at 131072 (128k) tokens, so a 100k-token prompt plus
 # opencode's 32k output reservation tips over into a clean 400 (max_tokens is
 # reserved against the KV budget). 8k output keeps prompts up to ~123k
 # admissible; a compaction summary never needs 32k anyway.
 if prefer_local:
-    driver, worker = "local-orch", "local-sub"
+    # No third GPU lane exists — the housekeeper shares the worker.
+    driver, worker, house = "local-orch", "local-sub", "local-sub"
     limits = {"limit": {"context": 131072, "output": 8192}}
 else:
-    driver, worker = "orch", "flash"
+    driver, worker, house = "orch", "flash", "super-flash"
     limits = {}
 driver = force_model or driver
 worker = force_small or worker
+house  = force_house or house
 
 # --- Validate the pair against the host catalogue; never populate FROM it. ---
 # The catalogue also advertises the fallback deployments (flash-gem, orch-deepseek,
@@ -1965,6 +1979,10 @@ try:
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
 if served:
+    # Only the driver and worker are checked. The housekeeper is expected to be a
+    # HIDDEN alias — model_group_alias entries marked `hidden: true` resolve on a
+    # request but are deliberately absent from /v1/models, so testing it against
+    # the catalogue would warn on a correct setup every single time.
     missing = [l for l in (driver, worker) if l not in served]
     if missing:
         print(f"    WARNING: host does not serve {', '.join(missing)}.")
@@ -2027,7 +2045,9 @@ prov["ferry"] = {
     "npm": "@ai-sdk/openai-compatible",
     "name": f"Ferry ({host})",
     "options": {"baseURL": base, "apiKey": "local"},
-    "models": {driver: dict(limits), worker: dict(limits)},
+    # dict.fromkeys: on the GPU pair the housekeeper IS the worker, and declaring
+    # the same lane twice would be a duplicate key.
+    "models": {lane: dict(limits) for lane in dict.fromkeys((driver, worker, house))},
 }
 
 if set_default:
@@ -2035,13 +2055,18 @@ if set_default:
     cfg["permission"] = "allow"          # schema: PermissionConfig accepts the
                                          # bare enum "ask" | "allow" | "deny"
     cfg["model"] = f"ferry/{driver}"
-    cfg["small_model"] = f"ferry/{worker}"
+    # small_model follows the HOUSEKEEPER, not the worker. opencode's own schema
+    # describes it as "small model to use for tasks like title generation", which
+    # is the housekeeping role exactly; leaving it on the worker would send every
+    # small task opencode has not got a named agent for to the fan-out lane.
+    cfg["small_model"] = f"ferry/{house}"
 
     # Replaced WHOLESALE, not merged: a stale pin left behind here (a compaction
     # agent still naming a retired model id, say) is exactly the drift this
     # command exists to end. Anything custom is recoverable from the snapshot.
     agent = {a: {"model": f"ferry/{driver}"} for a in DRIVER_AGENTS}
     agent.update({a: {"model": f"ferry/{worker}"} for a in WORKER_AGENTS})
+    agent.update({a: {"model": f"ferry/{house}"} for a in HOUSE_AGENTS})
     cfg["agent"] = agent
 
     # Additive — a plugin list belongs to the user; we only ensure ours is in it.
@@ -2067,11 +2092,12 @@ with open(cfg_path, "w") as f:
     f.write("\n")
 
 print(f"    Wired opencode -> {base}")
-print(f"    Provider: ferry   Lanes: {driver} (driver), {worker} (worker)")
+print(f"    Provider: ferry   Lanes: {driver} (driver), {worker} (worker), {house} (housekeeper)")
 if set_default:
     print(f"    model={cfg['model']}  small_model={cfg['small_model']}  permission=allow")
     print(f"    Agents pinned:  {'/'.join(DRIVER_AGENTS)} -> ferry/{driver}")
     print(f"                    {'/'.join(WORKER_AGENTS)} -> ferry/{worker}")
+    print(f"                    {'/'.join(HOUSE_AGENTS)} -> ferry/{house}")
     print(f"    Plugin:         {GOAL_PLUGIN}")
 else:
     print("    --no-default: provider wired; permission/model/agent left alone.")

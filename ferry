@@ -650,7 +650,7 @@ _ferry_require_route_config() {
       echo ">>> Seeded route config from template:"
       echo "    $FERRY_ROUTE_CONFIG"
       echo "    Edit it (set your model ids), export the keys it references"
-      echo "    (e.g. GLM_API_KEY, GEMINI_API_KEY, GEMINI_API_KEY_2), then re-run."
+      echo "    (e.g. GLM_API_KEY, GEMINI_API_KEY), then re-run."
       exit 0
     fi
     echo "Error: No route config at $FERRY_ROUTE_CONFIG and no template at $ROUTE_TEMPLATE."
@@ -663,8 +663,7 @@ _ferry_require_route_config() {
 _ferry_warn_missing_keys() {
   local missing=()
   [[ -z "${GLM_API_KEY:-}" ]]      && missing+=("GLM_API_KEY (orch primary)")
-  [[ -z "${GEMINI_API_KEY:-}" ]]   && missing+=("GEMINI_API_KEY (flash pool)")
-  [[ -z "${GEMINI_API_KEY_2:-}" ]] && missing+=("GEMINI_API_KEY_2 (flash pool)")
+  [[ -z "${GEMINI_API_KEY:-}" ]]   && missing+=("GEMINI_API_KEY (flash)")
   if (( ${#missing[@]} > 0 )); then
     echo ">>> WARNING: these env vars are unset; lanes that need them will 401:"
     for m in "${missing[@]}"; do echo "      - $m"; done

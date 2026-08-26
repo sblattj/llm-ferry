@@ -17,14 +17,14 @@
         "label": "Model",
         "description": "Backend model the proxy actually dispatched to (the `model` log field). Multi-select; All matches every log line via LogsQL `in(*)`.",
         "type": "custom",
-        "query": "glm-5.3,gemini-3.7-flash,deepseek-v4-pro-0813,glm-5p2,gpt-5.6-sol,k3-256k,Qwen3.8-27B-nvfp4,NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+        "query": "glm-5.3,gemini-3.7-flash,deepseek-v4-pro-0813,glm-5p2,gpt-5.6-sol,k3,Qwen3.8-27B-nvfp4,NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
         "options": [
           { "selected": false, "text": "glm-5.3", "value": "glm-5.3" },
           { "selected": false, "text": "gemini-3.7-flash", "value": "gemini-3.7-flash" },
           { "selected": false, "text": "deepseek-v4-pro-0813", "value": "deepseek-v4-pro-0813" },
           { "selected": false, "text": "glm-5p2", "value": "glm-5p2" },
           { "selected": false, "text": "gpt-5.6-sol", "value": "gpt-5.6-sol" },
-          { "selected": false, "text": "k3-256k", "value": "k3-256k" }
+          { "selected": false, "text": "k3", "value": "k3" }
         ],
         "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
         "multi": true,

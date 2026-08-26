@@ -17,3 +17,7 @@ litellm.yaml
 # Ignore editor/agent scratch + worktrees, but DO ship the bundled Claude Code skills
 .claude/*
 !.claude/skills/
+
+# Local-only docs that must never be published (handoffs, retros, incident notes)
+docs/HANDOFF-*
+docs/stack-retro/

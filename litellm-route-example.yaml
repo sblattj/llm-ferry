@@ -13,19 +13,27 @@
 #   orch-fallback -> an INDEPENDENT model litellm reroutes to when `orch` fails;
 #                    chain several for depth (example: Fireworks DeepSeek V4 Pro
 #                    first, GLM 5.2 last)
-#   flash         -> cheap high-volume worker lane, pooled across MULTIPLE keys
+#   flash         -> cheap high-volume worker lane (single Gemini key; a pool is
+#                    for separate PROVIDERS/accounts only — see the ToS note)
 #   local-orch    -> the host GPU's "smart" model, via mlx_vlm.server on :8092
 #   local-sub     -> the host GPU's cheap fan-out model, via mlx_vlm.server on :8093
 #
-# Multi-key pool: the identical `flash` deployments below form one pool.
+# Multi-key pool: identical `flash` deployments form one pool.
 # `usage-based-routing-v2` sends each call to the least-used key (proactive even
 # split); on a 429/error litellm retries on another key and cools the failed one
 # out for `cooldown_time`.
 #
-# IMPORTANT: Gemini quota is per-GCP-PROJECT, not per-key — so each key only
-# adds real headroom if it lives in its OWN Google Cloud project. Two keys in
-# one project share the same quota. Add or remove deployments to match how many
-# independent-project keys you actually have.
+# IMPORTANT — the ToS line, learned the hard way: Gemini quota is per-GCP-PROJECT,
+# so N keys in N projects really do multiply throughput, and doing that is
+# PROHIBITED — it is circumvention under Google APIs ToS §2.d ("you will not
+# attempt to circumvent such limitations"; beyond-limit use requires Google's
+# express consent). On 2026-08-25 Google suspended nine burst-created projects
+# for exactly this in one night and restricted the account's OAuth APIs.
+# ONE Google project, ONE key. More throughput: raise the paid tier on the
+# project (Tier 3 = 20M TPM for Gemini 3.7 Flash) or ask Google for a quota
+# increase. A pool of deployments is legitimate only across genuinely separate
+# PROVIDERS or ACCOUNTS (e.g. Gemini + Fireworks, or work + personal Google
+# accounts) — a second billing account under the same account buys nothing.
 #
 # Orchestrator fallback (strict failover): the `orch-fallback` deployment is a
 # SEPARATE model_name, reached ONLY via router_settings.fallbacks when `orch`
@@ -91,53 +99,24 @@ model_list:
   #     reasoning_effort: max
   #     timeout: 600
 
-  # -- flash: worker pool across N keys (each in its OWN project) --------------
-  # model_info.id gives each deployment a STABLE, human-readable id. litellm stamps
-  # it onto the `model_id` label of the per-deployment metrics, so the Grafana
-  # per-key failure panels can say "gemini-key-3 is 429ing" instead of an opaque
-  # hash (the hash also changes whenever a key value changes, so it's useless for
-  # tracking one key over time). Ids must be unique across the whole model_list.
+  # -- flash: worker lane. ONE Google project, ONE key. ------------------------
+  # model_info.id gives the deployment a STABLE, human-readable id. litellm stamps
+  # it onto the `model_id` label of the per-deployment metrics, so Grafana panels
+  # can name the key instead of an opaque hash (which also changes whenever the
+  # key value changes). Ids must be unique across the whole model_list.
+  #
+  # Why ONE deployment and not a pool of six? Because the old template shipped a
+  # `# project #1 … # project #6` pool and that pattern is a Google APIs ToS §2.d
+  # violation — limits are per-project, pooling projects to multiply them is
+  # circumvention (nine projects suspended in one night, 2026-08-25; OAuth APIs
+  # restricted). Duplicate this block ONLY for a genuinely separate provider or
+  # account, never another project of the same Google account.
   - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY        # project #1
+      api_key: os.environ/GEMINI_API_KEY
     model_info:
       id: gemini-key-1
-
-  - model_name: flash
-    litellm_params:
-      model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY_2      # project #2
-    model_info:
-      id: gemini-key-2
-
-  - model_name: flash
-    litellm_params:
-      model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY_3      # project #3
-    model_info:
-      id: gemini-key-3
-  - model_name: flash
-    litellm_params:
-      model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY_4      # project #4
-    model_info:
-      id: gemini-key-4
-  - model_name: flash
-    litellm_params:
-      model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY_5      # project #5
-    model_info:
-      id: gemini-key-5
-  # Scale the pool to however many independent-project keys you have — add or
-  # delete deployments to match. Each key MUST live in its own Google Cloud
-  # project to add real headroom (Gemini quota is per-project, not per-key).
-  - model_name: flash
-    litellm_params:
-      model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY_6      # project #6
-    model_info:
-      id: gemini-key-6
 
   # -- LOCAL GPU lanes: the host's own MLX models, addressable by name ---------
   # `ferry up` launches one mlx_vlm.server per lane on an internal loopback port

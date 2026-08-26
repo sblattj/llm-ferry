@@ -101,11 +101,23 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 
 `ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint (cloud pair as the persistent default), and adds a `host-code` shell shortcut. It also installs two opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
 
-- `opencode-cloud` — the **cloud pair**: `orch` drives (build/plan), `flash` runs the fan-out and the background models (general/explore/title/summary/compaction).
+- `opencode-cloud` — the **cloud pair**: `orch` drives (build/plan), `flash` runs the fan-out (general/explore), `super-flash` handles the background models (title/summary/compaction).
 - `opencode-local` — the **GPU pair**: `local-orch` drives, `local-sub` runs the fan-out. Nothing leaves the host.
 - bare `opencode` — whichever pair you used **last** (cloud until you first run `opencode-local`; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
 Both need `ferry up` on the host, which serves all four lanes at once.
+
+#### Catching a client up later
+
+When the host changes — new lanes, a re-pointed alias, a newer `ferry` — an already-bootstrapped client catches up with:
+
+```bash
+curl -fsSL http://your-mac.local:8095/client-reset.sh | zsh
+```
+
+It re-pulls the CLI and re-applies the opencode takeover to all three configs. It does **not** touch `~/.zshrc`, rewrite `client.json`, or prompt for anything — it reuses the profile the bootstrap left behind. Re-run the bootstrap instead if the machine is new or the shell wrappers need refreshing.
+
+**Why the CLI is re-pulled first, always:** `ferry opencode` is what performs the takeover, so an out-of-date CLI quietly does the *old* thing and reports success either way. The download is validated (shebang, `cmd_opencode` present, `zsh -n` clean) before it replaces the working binary, so a share server that is down cannot leave you with an HTML error page named `ferry`.
 
 Then:
 

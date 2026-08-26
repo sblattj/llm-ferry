@@ -54,7 +54,7 @@ Options for 'up':
                        [macOS / Apple Silicon only]
   -o, --orch         Alias of --local-orch. NOTE: the orchestrator lane is now Qwen;
                        Nemotron moved to --local-sub.
-  -c, --cloud        Proxy to default cloud model ($DEFAULT_GEMINI)
+  -c, --cloud        Proxy to default cloud model ($DEFAULT_CLOUD_MODEL)
   -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
   -r, --route        Serve only the CLOUD lanes (orch + flash) from the litellm config
                        Uses ~/.config/ferry/litellm.yaml (seeded from template on first run)

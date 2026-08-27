@@ -10,7 +10,7 @@
 #   ferry down                   # [Host] Stop all relay servers, proxies, and shares
 #   ferry status                 # [Dual] View active status, LAN IPs, and test connections
 #   ferry share                  # [Host] Expose client-bootstrap.sh over LAN
-#   ferry msg <text>             # [Client] Send a direct text message to host's client_logs.txt
+#   ferry msg <text>             # [Client] Send a direct text message to host's ~/.config/ferry/client_logs.txt
 #   ferry log                    # [Client] Pipe stdin log stream directly back to host
 #   ferry offer <path>...        # [Host] Offer files/dirs for clients to fetch over the LAN
 #   ferry pull <model-id>        # [Client] Pull a model from the host cache (http|hf|nc transports)

@@ -51,6 +51,14 @@ else:
 # Ferry transfer locations: the host's HuggingFace cache and the offered-files manifest.
 HF_HUB = os.path.expanduser("~/.cache/huggingface/hub")
 OFFERED = os.path.expanduser("~/.config/ferry/offered.json")
+# Client telemetry (`ferry msg` / `ferry log`) lands here, NOT under the serving
+# directory. `directory` is whatever tree the server was launched from, captured
+# once at startup: a checkout that later moves or is deleted — a git worktree
+# removed after the share server was started from it — turns every /hq POST into
+# an unhandled exception and a bare 500. The client sees a failed send, the host
+# sees nothing, and the message is gone. Observed 2026-08-26, two messages lost.
+# Same stable-path treatment as OFFERED above, so telemetry outlives any checkout.
+CLIENT_LOG = os.path.expanduser("~/.config/ferry/client_logs.txt")
 
 class DynamicHandler(SimpleHTTPRequestHandler):
     def _tar_stream(self, root, arcname):
@@ -134,9 +142,9 @@ class DynamicHandler(SimpleHTTPRequestHandler):
                 content_length = int(self.headers.get('Content-Length', 0))
                 post_data = self.rfile.read(content_length).decode('utf-8')
                 
-                # Append client logs to host workspace
-                log_file_path = os.path.join(self.directory, "client_logs.txt")
-                with open(log_file_path, "a", encoding="utf-8") as lf:
+                # Append client telemetry to the stable host-side log.
+                os.makedirs(os.path.dirname(CLIENT_LOG), exist_ok=True)
+                with open(CLIENT_LOG, "a", encoding="utf-8") as lf:
                     lf.write(f"=== CLIENT LOG ENTRY ===\n{post_data}\n\n")
                 
                 self.send_response(200)

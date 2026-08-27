@@ -17,7 +17,7 @@ Commands:
                        ferry dash --grafana [--open]                  # full Grafana+VictoriaMetrics stack (localhost:3001)
                        ferry dash --grafana --down                    # stop the Grafana stack
   share              [Host] Expose client-bootstrap.sh over LAN for other laptops to curl
-  msg <text>         [Client] Send a direct text message to host's client_logs.txt
+  msg <text>         [Client] Send a direct text message to host's ~/.config/ferry/client_logs.txt
   log                [Client] Pipe stdin log stream directly back to host
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]

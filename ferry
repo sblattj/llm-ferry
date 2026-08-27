@@ -15,7 +15,7 @@
 #   ferry down                   # [Host] Stop all relay servers, proxies, and shares
 #   ferry status                 # [Dual] View active status, LAN IPs, and test connections
 #   ferry share                  # [Host] Expose client-bootstrap.sh over LAN
-#   ferry msg <text>             # [Client] Send a direct text message to host's client_logs.txt
+#   ferry msg <text>             # [Client] Send a direct text message to host's ~/.config/ferry/client_logs.txt
 #   ferry log                    # [Client] Pipe stdin log stream directly back to host
 #   ferry offer <path>...        # [Host] Offer files/dirs for clients to fetch over the LAN
 #   ferry pull <model-id>        # [Client] Pull a model from the host cache (http|hf|nc transports)
@@ -248,7 +248,7 @@ Commands:
                        ferry dash --grafana [--open]                  # full Grafana+VictoriaMetrics stack (localhost:3001)
                        ferry dash --grafana --down                    # stop the Grafana stack
   share              [Host] Expose client-bootstrap.sh over LAN for other laptops to curl
-  msg <text>         [Client] Send a direct text message to host's client_logs.txt
+  msg <text>         [Client] Send a direct text message to host's ~/.config/ferry/client_logs.txt
   log                [Client] Pipe stdin log stream directly back to host
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
@@ -1240,6 +1240,14 @@ else:
 # Ferry transfer locations: the host's HuggingFace cache and the offered-files manifest.
 HF_HUB = os.path.expanduser("~/.cache/huggingface/hub")
 OFFERED = os.path.expanduser("~/.config/ferry/offered.json")
+# Client telemetry (`ferry msg` / `ferry log`) lands here, NOT under the serving
+# directory. `directory` is whatever tree the server was launched from, captured
+# once at startup: a checkout that later moves or is deleted — a git worktree
+# removed after the share server was started from it — turns every /hq POST into
+# an unhandled exception and a bare 500. The client sees a failed send, the host
+# sees nothing, and the message is gone. Observed 2026-08-26, two messages lost.
+# Same stable-path treatment as OFFERED above, so telemetry outlives any checkout.
+CLIENT_LOG = os.path.expanduser("~/.config/ferry/client_logs.txt")
 
 class DynamicHandler(SimpleHTTPRequestHandler):
     def _tar_stream(self, root, arcname):
@@ -1323,9 +1331,9 @@ class DynamicHandler(SimpleHTTPRequestHandler):
                 content_length = int(self.headers.get('Content-Length', 0))
                 post_data = self.rfile.read(content_length).decode('utf-8')
                 
-                # Append client logs to host workspace
-                log_file_path = os.path.join(self.directory, "client_logs.txt")
-                with open(log_file_path, "a", encoding="utf-8") as lf:
+                # Append client telemetry to the stable host-side log.
+                os.makedirs(os.path.dirname(CLIENT_LOG), exist_ok=True)
+                with open(CLIENT_LOG, "a", encoding="utf-8") as lf:
                     lf.write(f"=== CLIENT LOG ENTRY ===\n{post_data}\n\n")
                 
                 self.send_response(200)

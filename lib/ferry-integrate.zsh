@@ -1,3 +1,39 @@
+# _ferry_install_opencode_guardrails — put the local-lane guardrails where
+# opencode will actually read them: the /fan-out command and the
+# spawning-subagents skill.
+#
+# These shipped ONLY in client-bootstrap.sh, so every CLIENT got them and the
+# HOST never did — even though `ferry opencode` deliberately wires the host to
+# its own endpoint, so the host drives local lanes exactly like a client does.
+# On this host that meant the documented mitigation for malformed/looping `task`
+# calls had never been installed on the machine reporting the problem.
+#
+# opencode documents these as `~/.config/opencode/command(s)/<name>.md` and
+# `~/.config/opencode/skill(s)/<name>/SKILL.md` — both spellings are accepted,
+# and both are GLOBAL paths, independent of $OPENCODE_CONFIG. So this installs
+# to the stock location even on a host whose config lives elsewhere.
+#
+# Source of truth is the repo (opencode/command, opencode/skills). On a client
+# there is no checkout, so this no-ops and client-bootstrap.sh's embedded copies
+# remain the client path.
+_ferry_install_opencode_guardrails() {
+  local src_cmd="$APP_DIR/opencode/command/fan-out.md"
+  local src_skill="$APP_DIR/opencode/skills/spawning-subagents/SKILL.md"
+  if [[ ! -f "$src_cmd" || ! -f "$src_skill" ]]; then
+    return 0   # no checkout here (a client) — nothing to install from
+  fi
+  local dst_cmd="$HOME/.config/opencode/command"
+  local dst_skill="$HOME/.config/opencode/skill/spawning-subagents"
+  mkdir -p "$dst_cmd" "$dst_skill"
+  cp "$src_cmd"   "$dst_cmd/fan-out.md"
+  cp "$src_skill" "$dst_skill/SKILL.md"
+  echo ">>> opencode guardrails installed:"
+  echo "    $dst_cmd/fan-out.md"
+  echo "    $dst_skill/SKILL.md"
+  echo "    (the recipe must ride in the USER message — that is what /fan-out does;"
+  echo "     putting it in system instructions measured WORSE.)"
+}
+
 cmd_env() {
   # Emit shell 'export' lines so a client routes its downloads through the host's
   # forward proxy (see 'ferry serve-proxy'). Designed for:  eval "$(ferry env ...)".

@@ -132,6 +132,10 @@ cmd_install() {
     echo "      sudo apt install iproute2"
   fi
 
+  # The local-lane opencode guardrails. Clients get these from
+  # client-bootstrap.sh; before this the host got them from nowhere at all.
+  _ferry_install_opencode_guardrails
+
   # Link globally to ~/.local/bin/ferry (+ the ferry-dash companion)
   echo ">>> Creating global symlinks in ~/.local/bin (ferry, ferry-dash)..."
   mkdir -p "$HOME/.local/bin"

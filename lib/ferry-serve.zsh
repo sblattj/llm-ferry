@@ -690,7 +690,14 @@ cmd_status() {
           if [[ -n "$served" ]]; then
             echo "    Lanes served: \033[1;32m$served\033[0m"
             local first=${served%% *}
-            echo "    Test with: curl -fsS -H \"Content-Type: application/json\" -d '{\"model\":\"$first\",\"messages\":[{\"role\":\"user\",\"content\":\"Say Hello!\"}],\"max_tokens\":10}' http://$MDNS_NAME:$p/v1/chat/completions"
+            # max_tokens 256, not 10. Every lane on this endpoint is now a
+            # REASONING model, and reasoning tokens are drawn from the same
+            # budget as the answer: at 10 the whole allowance is spent thinking
+            # and the response comes back finish_reason=length with
+            # content=null. The one command status hands you to prove the stack
+            # is alive then reads as a dead lane. Measured on the orch lane
+            # 2026-08-26: reasoning_tokens 7, text_tokens 3, content None.
+            echo "    Test with: curl -fsS -H \"Content-Type: application/json\" -d '{\"model\":\"$first\",\"messages\":[{\"role\":\"user\",\"content\":\"Say Hello!\"}],\"max_tokens\":256}' http://$MDNS_NAME:$p/v1/chat/completions"
           fi
         fi
       fi

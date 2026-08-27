@@ -39,6 +39,9 @@ except ImportError:  # pragma: no cover
     YAML_PATH = None
 
 
+_UNSET = object()
+
+
 def read_script():
     with open(SCRIPT) as f:
         return f.read()
@@ -55,12 +58,24 @@ def embedded_python(index):
     return blocks[index]
 
 
-def run_python(source, argv, home=None):
+def run_python(source, argv, home=None, opencode_config=_UNSET):
+    """Run an extracted block. `opencode_config` is EXPLICIT on purpose.
+
+    The verifier reads $OPENCODE_CONFIG to find the host's live config, so a
+    test that merely inherits the ambient environment silently checks the
+    author's real config instead of its fixture -- and then passes or fails for
+    reasons that have nothing to do with the code under test. (It really did:
+    these cases were green while reading a live dotfiles config.) Default is
+    UNSET; a case that wants the variable must say so.
+    """
     with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as f:
         f.write(source)
         path = f.name
     try:
         env = dict(os.environ)
+        env.pop("OPENCODE_CONFIG", None)
+        if opencode_config is not _UNSET and opencode_config is not None:
+            env["OPENCODE_CONFIG"] = opencode_config
         if home:
             env["HOME"] = home
             if YAML_PATH:
@@ -229,8 +244,23 @@ class VerifierCase(unittest.TestCase):
                           "title": {"model": f"ferry/{house}"}},
             }))
 
-    def verify(self, port):
-        return run_python(self.src, [port, self.cfg, 9992, 9993], home=self.home)
+    def verify(self, port, opencode_config=_UNSET):
+        return run_python(self.src, [port, self.cfg, 9992, 9993],
+                          home=self.home, opencode_config=opencode_config)
+
+    def test_verifier_follows_opencode_config_when_set(self):
+        # The host path: the live config lives OUTSIDE ~/.config/opencode, named
+        # only by the env var. The verifier must follow it there.
+        for n in ("cloud", "local"):
+            self.write_oc(n, ("orch", "flash", "super-flash"))
+        live = os.path.join(self.home, "elsewhere", "opencode.jsonc")
+        os.makedirs(os.path.dirname(live))
+        with open(live, "w") as f:
+            f.write(json.dumps({"model": "ferry/renamed-away-lane", "agent": {}}))
+        r = self.verify(self.serve(["orch", "flash", "flash-gem"]), opencode_config=live)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("renamed-away-lane", r.stderr,
+                      "verifier ignored $OPENCODE_CONFIG and checked the stock path")
 
     def test_a_missing_config_is_a_failure(self):
         self.write_oc("default", ("orch", "flash", "super-flash"))
@@ -377,13 +407,63 @@ class ScriptShapeCase(unittest.TestCase):
         self.assertIn("ferry-dash", self.text)
         self.assertIn("stale COPY", self.text)
 
-    def test_neutralises_an_inherited_opencode_config(self):
+    def test_the_default_target_honours_opencode_config(self):
+        # THE v1.8.7 BUG. host-reset copied client-reset's `env -u
+        # OPENCODE_CONFIG` onto every target. On a client that is right: a fresh
+        # machine reads the stock path, and stripping the variable stops a stray
+        # export collapsing three writes onto one file. On a HOST that variable
+        # is frequently the whole mechanism - exported from a dotfiles repo to a
+        # config outside ~/.config/opencode entirely - so stripping it wrote the
+        # takeover to a file opencode never reads, printed "Config written", and
+        # changed nothing. Found on the author's own host.
+        self.assertIn('oc_default="${OPENCODE_CONFIG:-', self.text)
+        self.assertRegex(
+            self.text,
+            r'"\$FERRY_BIN" opencode --host 127\.0\.0\.1 --port "\$PORT" --config "\$oc_default"',
+            "the default target must be written WITHOUT env -u")
+
+    def test_the_explicit_profiles_still_strip_it(self):
+        # The two ferry profiles are addressed by absolute path on purpose, so an
+        # inherited OPENCODE_CONFIG could only redirect them onto each other.
         self.assertIn("env -u OPENCODE_CONFIG", self.text)
+        loop = self.text[self.text.index("for oc_target in"):]
+        self.assertIn("env -u OPENCODE_CONFIG", loop)
+
+    def test_the_default_target_is_not_written_twice(self):
+        # If OPENCODE_CONFIG happens to point AT one of the ferry profiles, the
+        # loop would write it a second time and snapshot it twice per run.
+        self.assertIn('[[ "$oc_path" == "$oc_default" ]] && continue', self.text)
+
+    def test_the_verifier_checks_the_live_config_not_the_stock_path(self):
+        # v1.8.7's verifier read the three paths it had just written, so it went
+        # green over an untouched live config. A check that can only confirm its
+        # own output is not a check.
+        self.assertIn('os.environ.get("OPENCODE_CONFIG") or', self.text)
 
     def test_passes_the_host_explicitly(self):
         # client-reset.sh learned this the hard way: never let the config's
         # baseURL be decided by an inference about which machine this is.
         self.assertIn('--host 127.0.0.1 --port "$PORT"', self.text)
+
+    def test_installs_the_opencode_guardrails(self):
+        # The /fan-out command and spawning-subagents skill shipped ONLY in
+        # client-bootstrap.sh, so every client got them and the host never did -
+        # while `ferry opencode` deliberately wires the host to its own endpoint,
+        # so the host drives local lanes exactly like a client. The documented
+        # mitigation for malformed/looping `task` calls had therefore never been
+        # installed on the machine reporting the problem.
+        self.assertIn("opencode/command/fan-out.md", self.text)
+        self.assertIn("spawning-subagents", self.text)
+        self.assertLess(self.text.index("fan-out.md"),
+                        self.text.index("Re-applying the opencode takeover"),
+                        "guardrails must be installed before the takeover reports success")
+
+    def test_the_guardrails_go_to_the_global_opencode_paths(self):
+        # command/ and skill/ are GLOBAL locations, independent of
+        # $OPENCODE_CONFIG. Deriving them from the config's directory would put
+        # them somewhere opencode never looks on exactly the hosts that need it.
+        self.assertIn('$HOME/.config/opencode/command', self.text)
+        self.assertIn('$HOME/.config/opencode/skill/spawning-subagents', self.text)
 
     def test_covers_all_three_opencode_targets(self):
         for target in ("opencode/opencode.json",

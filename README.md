@@ -136,13 +136,31 @@ ferry up             # THE STACK: all four lanes on one endpoint (port 8090)
 ferry up --route     # cloud lanes only — no GPU weights resident
 ferry up --local-orch # just the local-orch GPU lane, alone on 8090
 ferry up --local-sub  # just the local-sub GPU lane, alone on 8090
-ferry up -c          # cloud proxy to the default Gemini model, on port 8090
+ferry up -c          # cloud proxy to the default cloud model, on port 8090
 ferry up -m <id>     # cloud proxy for a specific LiteLLM model id
 ferry up -i          # interactive catalog (queries Gemini's live model list)
 ferry dash --open    # live route-proxy dashboard at http://localhost:8091
 ferry status         # per-lane health, memory, and served lane names
 ferry down           # stop all servers, proxies, and share servers
 ```
+
+#### Catching the host up
+
+The host's counterpart to `client-reset.sh`, and deliberately not its mirror — the host has nothing to download, because `~/.local/bin/ferry` is a symlink into the checkout. Its staleness comes from somewhere else: `ferry` out of sync with `lib/`, a `litellm.yaml` edit the running proxy never picked up, or a symlink that decayed into a plain copy.
+
+```bash
+./host-reset.sh            # fast-forward, rebuild, re-link, bounce the proxy   (seconds)
+./host-reset.sh --full     # ...and reload the GPU lanes                        (minutes)
+./host-reset.sh --no-pull  # skip the git fast-forward (offline, or a dirty tree)
+```
+
+By default the MLX lanes are **left running** — `ferry up --route` re-reads the same `litellm.yaml` the stack uses, and litellm reaches the GPU lanes over HTTP on loopback, so a lane does not care that its front door restarted. Only `--full` reloads ~33GB of weights.
+
+**The route config is validated before anything live is touched.** litellm does not check its config beyond parsing it, so a duplicate key, a dangling `model_group_alias`, a fallback naming a lane that does not exist, or an unset `os.environ/…` reference all start cleanly and then fail at request time, on one lane, looking exactly like a provider outage. `host-reset.sh` checks all four while the old proxy is still serving and aborts without restarting anything, so a bad edit costs a failed reset rather than an endpoint.
+
+It then re-applies the opencode takeover to the host's own three configs — wiring the host to its own endpoint is the point of running one — and verifies against the live catalogue that every lane those configs name actually resolves. Hidden aliases are counted as resolvable (they never appear in `/v1/models` by design), and the local backends are probed **directly** on their own ports, because litellm lists `local-orch`/`local-sub` whether or not an MLX server is behind them.
+
+`git pull --ff-only` runs first and never rebases or merges — divergence and uncommitted changes to tracked files stop the run, since both are decisions for a human. Being offline only warns.
 
 ---
 
@@ -424,7 +442,7 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `serve-hf [--port P]` | host | Start the experimental HuggingFace pass-through proxy (default `8096`) |
 | `serve-proxy [--port P]` | host | Start the general HTTP(S) download forward proxy (default `8097`) |
 | `env [--host H] [--proxy-port P] [--hf-port P2] [--write]` | client | Emit shell exports so this laptop routes downloads via the host proxy |
-| `opencode [--host H] [--port P] [--model M] [--small-model SM] [--config PATH] [--no-default]` | client | Auto-wire opencode to the host endpoint (detects served models; pins agent lanes) |
+| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--model M] [--small-model SM] [--housekeeper HK] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, `model`, `small_model`, and all seven built-in agents, pinned to lane names. Snapshots the original first |
 
 Run `ferry --help` for the built-in usage banner.
 
@@ -438,6 +456,19 @@ Run `ferry --help` for the built-in usage banner.
 ```
 
 Commit both `lib/` and the regenerated `ferry`; don't hand-edit `ferry` (the sync guard will flag it).
+
+### Tests
+
+Stdlib `unittest`, no dependencies, each suite runnable on its own:
+
+```bash
+python3 lib/ferry-serve.test.py       # lane ports, launch flags, KV governor
+python3 lib/ferry-integrate.test.py   # the opencode takeover: scope, lane split, snapshots
+python3 lib/ferry-share.test.py       # share server + client-script placeholder injection
+python3 lib/ferry-hostreset.test.py   # host-reset: route-config validation, endpoint verify
+```
+
+The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.
 
 ## License
 

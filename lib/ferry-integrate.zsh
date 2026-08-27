@@ -298,15 +298,48 @@ if cfg is None:
     cfg = {}
 cfg.setdefault("$schema", SCHEMA)
 
-# --- provider.ferry: ours to own. Exactly the two lanes. ---
+# --- provider.ferry: the WIRING is ours; the picker's contents are not. ---
+# npm/options/limits are rewritten every run — that is the drift this command
+# exists to end. Two things here are NOT ours, and survive a takeover:
+#
+#   1. Extra lanes. A host config typically declares local-orch/local-sub too, so
+#      the GPU pair is selectable from the picker without a hand edit. Rebuilding
+#      `models` wholesale deleted them, and the deletion was invisible: the
+#      command still reported success, and the lanes still resolved if you typed
+#      one — they were just gone from the menu.
+#   2. A hand-written `name` on any lane. It is the label a human reads in the
+#      status bar, and /v1/models carries only the lane id, so ferry has no
+#      better one to offer: never invented, never overwritten.
+#
+# A label naming the MODEL behind a lane goes stale by design — the whole point
+# of the lane-name contract is that the model swaps host-side without touching a
+# client config — so a label should name the lane's ROLE.
 prov = cfg.setdefault("provider", {})
+prev_ferry = prov.get("ferry") if isinstance(prov.get("ferry"), dict) else {}
+prev_models = prev_ferry.get("models") if isinstance(prev_ferry.get("models"), dict) else {}
+
+# dict.fromkeys: on the GPU pair the housekeeper IS the worker, and declaring
+# the same lane twice would be a duplicate key.
+models = {}
+for lane in dict.fromkeys((driver, worker, house)):
+    spec = dict(limits)
+    prev_name = (prev_models.get(lane) or {}).get("name")
+    if isinstance(prev_name, str) and prev_name:
+        spec["name"] = prev_name
+    models[lane] = spec
+for lane, spec in prev_models.items():
+    if lane not in models and isinstance(spec, dict):
+        models[lane] = spec
+extra_lanes = [l for l in models if l not in (driver, worker, house)]
+
 prov["ferry"] = {
     "npm": "@ai-sdk/openai-compatible",
+    # Regenerated, not preserved: this one is DERIVED from --host, and a name
+    # carried over from a previous host would label the picker with a box the
+    # baseURL no longer points at.
     "name": f"Ferry ({host})",
     "options": {"baseURL": base, "apiKey": "local"},
-    # dict.fromkeys: on the GPU pair the housekeeper IS the worker, and declaring
-    # the same lane twice would be a duplicate key.
-    "models": {lane: dict(limits) for lane in dict.fromkeys((driver, worker, house))},
+    "models": models,
 }
 
 if set_default:
@@ -352,6 +385,8 @@ with open(cfg_path, "w") as f:
 
 print(f"    Wired opencode -> {base}")
 print(f"    Provider: ferry   Lanes: {driver} (driver), {worker} (worker), {house} (housekeeper)")
+if extra_lanes:
+    print(f"    Kept in picker: {', '.join(extra_lanes)} (declared in the config, not pinned by ferry)")
 if set_default:
     print(f"    model={cfg['model']}  small_model={cfg['small_model']}  permission=allow")
     print(f"    Agents pinned:  {'/'.join(DRIVER_AGENTS)} -> ferry/{driver}")

@@ -154,6 +154,45 @@ class TestTakeoverScope(FerryOpencodeCase):
             self.assertEqual(cfg[key], self.USER_CONFIG[key],
                              f"takeover clobbered the user's {key!r}")
 
+    def test_extra_lanes_stay_in_the_picker(self):
+        # A host config declares the GPU pair so it is selectable without a hand
+        # edit. Rebuilding provider.ferry.models wholesale deleted them, and the
+        # deletion was invisible — the command still reported success, and the
+        # lanes still resolved if you typed one, they were just gone from the UI.
+        with open(self.cfg, "w") as f:
+            json.dump({**self.USER_CONFIG, "provider": {"ferry": {"models": {
+                "orch": {}, "local-orch": {}, "local-sub": {},
+            }}}}, f)
+        out = self.run_ferry()
+        models = self.read()["provider"]["ferry"]["models"]
+        self.assertEqual(set(models),
+                         {"orch", "flash", "super-flash", "local-orch", "local-sub"})
+        self.assertIn("Kept in picker", out)
+
+    def test_a_hand_written_lane_label_is_preserved(self):
+        # The label is the human's, on a lane ferry pins and on one it does not.
+        # /v1/models carries only the lane id, so ferry has no better label to
+        # offer and must never overwrite one.
+        with open(self.cfg, "w") as f:
+            json.dump({**self.USER_CONFIG, "provider": {"ferry": {"models": {
+                "orch": {"name": "orch - driver"},
+                "local-sub": {"name": "local-sub - this GPU"},
+            }}}}, f)
+        self.run_ferry()
+        models = self.read()["provider"]["ferry"]["models"]
+        self.assertEqual(models["orch"]["name"], "orch - driver")
+        self.assertEqual(models["local-sub"]["name"], "local-sub - this GPU")
+
+    def test_the_provider_name_tracks_the_host(self):
+        # DERIVED from --host, so unlike a lane label it is regenerated: one
+        # carried over would label the picker with a box the baseURL no longer
+        # points at.
+        with open(self.cfg, "w") as f:
+            json.dump({**self.USER_CONFIG,
+                       "provider": {"ferry": {"name": "Ferry (some-other-box)"}}}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["provider"]["ferry"]["name"], "Ferry (127.0.0.1)")
+
     def test_permission_becomes_the_bare_allow_enum(self):
         # opencode's schema: PermissionConfig is anyOf[PermissionActionConfig,
         # {read,edit,bash,...}], and PermissionActionConfig is the bare enum.

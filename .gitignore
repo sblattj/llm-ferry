@@ -21,3 +21,8 @@ litellm.yaml
 # Local-only docs that must never be published (handoffs, retros, incident notes)
 docs/HANDOFF-*
 docs/stack-retro/
+# The architecture page renders THIS host's live routing: every lane's real model,
+# provider, and per-token price. Lane names are the public contract; what sits
+# behind them is not, and a rendered page is the easiest way to leak the whole map
+# at once. Keep it local.
+docs/ferry-arch.*

@@ -156,5 +156,28 @@ class TestShippedLaunchLines(unittest.TestCase):
         self.assertIn("while", body.group(1))
 
 
+class TestStatusTestCommand(unittest.TestCase):
+    """The curl line `ferry status` prints must work when pasted."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FERRY) as f:
+            cls.src = f.read()
+
+    def test_suggested_max_tokens_clears_the_reasoning_floor(self):
+        # Every lane on this endpoint is a REASONING model, and reasoning tokens
+        # come out of the same budget as the answer. At max_tokens 10 the whole
+        # allowance is spent thinking: the reply is finish_reason=length with
+        # content=null, so the one command status hands you to prove the stack is
+        # alive reads as a dead lane. Measured live on the orch lane 2026-08-26
+        # (reasoning_tokens 7, text_tokens 3, content None).
+        m = re.search(r'Test with: curl.*?max_tokens\\":(\d+)', self.src)
+        self.assertIsNotNone(m, "no suggested test command found in cmd_status")
+        self.assertGreaterEqual(
+            int(m.group(1)), 64,
+            "suggested max_tokens is below the reasoning floor; the command it "
+            "prints returns content=null on a healthy lane")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

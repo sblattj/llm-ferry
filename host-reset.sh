@@ -360,25 +360,72 @@ done
 ok "endpoint answering (${waited}s)"
 
 # --- 6. Re-apply the opencode takeover to the HOST's own configs ------------
-# Same three targets a client gets. Wiring the host to its own endpoint is the
-# point of running one: every tool on this box then shares the lanes, the
-# fallback chain, and the observability, and none of them needs its own key.
+# Wiring the host to its own endpoint is the point of running one: every tool on
+# this box then shares the lanes, the fallback chain, and the observability, and
+# none of them needs its own key.
 #
-# --host/--port are passed explicitly for the reason client-reset.sh passes them:
-# never let the config's baseURL be decided by an inference about which machine
-# this is. env -u OPENCODE_CONFIG because `ferry opencode` honours that variable
-# as its default target, so a shell exporting one would redirect all three writes
-# onto a single file.
+# THE DEFAULT TARGET IS $OPENCODE_CONFIG WHEN SET, NOT THE HARDCODED PATH.
+# This is the one place host-reset must NOT copy client-reset. A client is a
+# fresh machine whose opencode reads the stock location, so client-reset strips
+# OPENCODE_CONFIG to stop a stray export redirecting all three writes onto one
+# file. A HOST is a machine someone develops on, and here that variable is
+# frequently the whole mechanism: exported globally from a dotfiles repo to a
+# config that lives outside ~/.config/opencode entirely.
+#
+# Stripping it there does not neutralise a stray value, it discards the only
+# pointer to the live config - so the takeover lands on a file opencode never
+# reads, prints "Config written", and changes nothing. Shipped that way in
+# v1.8.7 and found on this very host, where OPENCODE_CONFIG points into a
+# dotfiles adapter directory. cmd_opencode's own comment warns about exactly
+# this; the warning just did not survive the copy from client-reset.
+#
+# The two ferry PROFILES still go through `env -u`: they are addressed by
+# absolute path on purpose, and an inherited OPENCODE_CONFIG could only redirect
+# them onto each other.
+#
+# --host/--port stay explicit for client-reset's reason: never let the config's
+# baseURL be decided by an inference about which machine this is.
+# The local-lane guardrails, which clients get from client-bootstrap.sh and the
+# host previously got from nowhere. Installed here as well as in `ferry install`
+# because this is the catch-up path: a host provisioned before they existed will
+# never re-run the installer.
+echo ""
+say ">>> Installing the opencode local-lane guardrails..."
+# Copied straight from the checkout rather than routed through the CLI: this
+# script always runs from a checkout, so there is no version coupling and no
+# flag that an older `ferry` on PATH might not have.
+#
+# Both are GLOBAL opencode paths (`~/.config/opencode/command(s)/…`,
+# `~/.config/opencode/skill(s)/…`), independent of $OPENCODE_CONFIG — so they
+# land correctly even on a host whose config lives outside ~/.config/opencode.
+if [[ -f "$APP_DIR/opencode/command/fan-out.md" ]]; then
+  mkdir -p "$HOME/.config/opencode/command" "$HOME/.config/opencode/skill/spawning-subagents"
+  cp "$APP_DIR/opencode/command/fan-out.md" "$HOME/.config/opencode/command/fan-out.md"
+  cp "$APP_DIR/opencode/skills/spawning-subagents/SKILL.md" \
+     "$HOME/.config/opencode/skill/spawning-subagents/SKILL.md"
+  ok "/fan-out + spawning-subagents installed"
+else
+  warn "no opencode/ in the checkout - guardrails not installed."
+fi
+
 echo ""
 say ">>> Re-applying the opencode takeover (host -> its own endpoint)..."
 RESET_FAILED=0
+
+oc_default="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
+if [[ -n "${OPENCODE_CONFIG:-}" ]]; then
+  echo "    (default target from \$OPENCODE_CONFIG - this host does not use the stock path)"
+fi
+echo "    -> $oc_default"
+"$FERRY_BIN" opencode --host 127.0.0.1 --port "$PORT" --config "$oc_default" || RESET_FAILED=1
+
 for oc_target in \
-  "$HOME/.config/opencode/opencode.json|" \
   "$HOME/.config/ferry/opencode-cloud.json|" \
   "$HOME/.config/ferry/opencode-local.json|--local"
 do
   oc_path="${oc_target%%|*}"
   oc_flag="${oc_target#*|}"
+  [[ "$oc_path" == "$oc_default" ]] && continue   # already written above
   echo "    -> $oc_path"
   if ! env -u OPENCODE_CONFIG "$FERRY_BIN" opencode \
         --host 127.0.0.1 --port "$PORT" --config "$oc_path" $oc_flag; then
@@ -427,7 +474,12 @@ if aliases:
 # Every lane the host's own opencode configs name must be reachable. This is the
 # check that would have caught a lane rename landing in ferry but not in the
 # config, or the reverse.
-CONFIGS = ["~/.config/opencode/opencode.json",
+# The DEFAULT config is wherever this host actually reads it from, which is
+# $OPENCODE_CONFIG when that is exported. Verifying the stock path instead would
+# check a file the writer may not even have touched - a verifier confirming its
+# own output rather than the live end state, which is how v1.8.7 reported three
+# green ticks over an untouched config.
+CONFIGS = [os.environ.get("OPENCODE_CONFIG") or "~/.config/opencode/opencode.json",
            "~/.config/ferry/opencode-cloud.json",
            "~/.config/ferry/opencode-local.json"]
 failed = False

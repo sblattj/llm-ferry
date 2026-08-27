@@ -218,6 +218,93 @@ class TestShippedClientScripts(unittest.TestCase):
         self.assertIn("--local", text)
 
 
+class TestClientTelemetryLogPath(unittest.TestCase):
+    """`ferry msg` / `ferry log` must outlive the checkout the server started in.
+
+    The handler used to build its path from the serving directory, captured once
+    at startup. A share server launched from a git worktree that was later
+    removed turned every /hq POST into an unhandled exception and a bare 500:
+    the client saw a failed send, the host logged nothing a human reads, and the
+    message was gone. Observed 2026-08-26 — two messages lost that way.
+    """
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="ferry-hqhome-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        # The tree the server is launched from — deliberately separate from HOME,
+        # and deliberately deletable.
+        self.serve = tempfile.mkdtemp(prefix="ferry-hqserve-")
+        self.addCleanup(shutil.rmtree, self.serve, True)
+
+        server_py = os.path.join(self.home, "_server.py")
+        with open(server_py, "w") as f:
+            f.write(extract_embedded_server())
+
+        self.port = free_port()
+        self.proc = subprocess.Popen(
+            [sys.executable, server_py, str(self.port), self.serve, "ferry-share-marker"],
+            env=dict(os.environ, HOME=self.home),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(self._stop)
+
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{self.port}/manifest", timeout=1).read()
+                return
+            except Exception:
+                if self.proc.poll() is not None:
+                    raise AssertionError(f"share server died:\n{self.proc.stdout.read()}")
+                time.sleep(0.15)
+        raise AssertionError("share server never came up")
+
+    def _stop(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=10)
+        if self.proc.stdout and not self.proc.stdout.closed:
+            self.proc.stdout.close()
+
+    def post_hq(self, text):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}/hq",
+                                     data=text.encode(), method="POST")
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status
+
+    @property
+    def log_path(self):
+        return os.path.join(self.home, ".config", "ferry", "client_logs.txt")
+
+    def test_telemetry_lands_outside_the_serving_directory(self):
+        self.assertEqual(self.post_hq("hello from a client"), 200)
+        self.assertTrue(os.path.exists(self.log_path),
+                        "client telemetry did not reach ~/.config/ferry/client_logs.txt")
+        with open(self.log_path) as f:
+            self.assertIn("hello from a client", f.read())
+        self.assertFalse(os.path.exists(os.path.join(self.serve, "client_logs.txt")),
+                         "telemetry was written into the serving directory")
+
+    def test_the_directory_is_created_if_absent(self):
+        # A fresh host may never have run anything that makes ~/.config/ferry.
+        self.assertFalse(os.path.exists(os.path.dirname(self.log_path)))
+        self.assertEqual(self.post_hq("first ever message"), 200)
+        self.assertTrue(os.path.exists(self.log_path))
+
+    def test_a_deleted_serving_directory_does_not_lose_the_message(self):
+        # The actual regression: the checkout the server was launched from goes
+        # away (a removed worktree), and every send after that 500s.
+        self.assertEqual(self.post_hq("before"), 200)
+        shutil.rmtree(self.serve, ignore_errors=True)
+        self.assertEqual(self.post_hq("after the checkout vanished"), 200)
+        with open(self.log_path) as f:
+            body = f.read()
+        self.assertIn("before", body)
+        self.assertIn("after the checkout vanished", body)
+
+
 if __name__ == "__main__":
     if not os.path.exists(FERRY):
         sys.exit("built ./ferry not found — run ./build.zsh first")

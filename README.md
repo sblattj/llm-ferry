@@ -420,7 +420,7 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 
 ## Privacy
 
-Everything runs on your own hardware and network. Client↔host traffic stays on your **private LAN as plain HTTP**; cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the keys**. Inbound client telemetry (`ferry msg` / `ferry log`) is appended to `client_logs.txt` on the host, which is **gitignored**. The observability stack binds to `127.0.0.1` only.
+Everything runs on your own hardware and network. Client↔host traffic stays on your **private LAN as plain HTTP**; cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the keys**. Inbound client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host — outside any checkout, so it survives a repo that moves or a worktree that is removed. The observability stack binds to `127.0.0.1` only.
 
 ## Command reference
 
@@ -432,8 +432,8 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |
 | `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`) |
-| `msg <text>` | client | Send a text note to the host's `client_logs.txt` |
-| `log` | client | Pipe stdin straight to the host's `client_logs.txt` |
+| `msg <text>` | client | Send a text note to the host's `~/.config/ferry/client_logs.txt` |
+| `log` | client | Pipe stdin straight to the host's `~/.config/ferry/client_logs.txt` |
 | `offer <path>...` | host | Record files/dirs in `offered.json` for clients to fetch |
 | `pull <model-id> [--host H] [--port P] [--transport http\|hf\|nc] [--to DIR]` | client | Pull a model from the host cache (three transports) |
 | `get <name> [--host H] [--port P] [--to DIR]` | client | Fetch an offered file/dir by basename |

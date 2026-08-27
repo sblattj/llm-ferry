@@ -202,13 +202,55 @@ _ferry_reset_log() {
 # write, so a port check alone reports "free" while the process is still writing —
 # and the launch that follows then truncates that log underneath it (see
 # _ferry_reset_log). Callers run this BEFORE touching the log path.
+# ── The lane-catalogue front ─────────────────────────────────────────────────
+# litellm advertises EVERY deployment on /v1/models, fallback hops included, and
+# offers no way to hide one (`hidden` is honoured for model_group_alias only —
+# see front/ferry_front.py). A client that picks a hop out of that list gets a
+# single provider with no failover behind it.
+#
+# So the config-driven launches serve litellm's own app through a thin ASGI
+# wrapper that trims the listing to the lanes marked `model_info: {public: true}`.
+# It is NOT a second process and NOT a reverse proxy: same interpreter, same app,
+# and every request that is not the model listing is handed to litellm untouched,
+# so nothing sits between a client and a streamed token.
+#
+# The `--model` launch has no config to read markers from and stays on the CLI.
+
+# The interpreter that owns litellm. `litellm` is installed as a uv tool, so its
+# venv python is the only one that can import litellm AND uvicorn.
+_ferry_front_python() {
+  local bin real py
+  bin="$(command -v litellm 2>/dev/null)" || return 1
+  [[ -n "$bin" ]] || return 1
+  real="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$bin" 2>/dev/null)" || return 1
+  py="${real:h}/python"
+  [[ -x "$py" ]] || return 1
+  print -r -- "$py"
+}
+
+# Start the filtered front. Returns non-zero WITHOUT starting anything if the
+# front is unusable, so the caller can fall back to the plain CLI: a visible
+# fallback hop is a wart, a dead endpoint is an outage.
+_ferry_launch_front() {
+  local config="$1" port="$2" log="$3" py front
+  front="$APP_DIR/front/ferry_front.py"
+  [[ -f "$front" ]] || return 1
+  py="$(_ferry_front_python)" || return 1
+  "$py" -c 'import uvicorn, yaml, litellm' >/dev/null 2>&1 || return 1
+  nohup "$py" "$front" \
+    --config "$config" \
+    --port "$port" \
+    --host 0.0.0.0 >> "$log" 2>&1 & disown
+  return 0
+}
+
 _ferry_stop_litellm() {
   local port="${1:-}" waited=0 pat label
   if [[ -n "$port" ]]; then
-    pat="litellm .*--port ${port}( |$)"
+    pat="(litellm|ferry_front\.py) .*--port ${port}( |$)"
     label="the litellm proxy on :$port"
   else
-    pat="litellm --(config|model) "
+    pat="(litellm --(config|model) |ferry_front\.py --config )"
     label="every litellm proxy"
   fi
 
@@ -477,10 +519,14 @@ cmd_up() {
     echo "        port   :$target_port"
     echo "        log    $cloud_log"
     _ferry_reset_log "$cloud_log"
-    nohup litellm \
-      --config "$FERRY_ROUTE_CONFIG" \
-      --port "$target_port" \
-      --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
+    if ! _ferry_launch_front "$FERRY_ROUTE_CONFIG" "$target_port" "$cloud_log"; then
+      echo "        note: catalogue filter unavailable — serving litellm directly"
+      echo "              (/v1/models will advertise the fallback hops too)"
+      nohup litellm \
+        --config "$FERRY_ROUTE_CONFIG" \
+        --port "$target_port" \
+        --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
+    fi
 
     echo ">>> Waiting for lanes (MLX loads ~33GB of weights — that is the slow part)..."
     _ferry_wait_http "http://127.0.0.1:$target_port/v1/models"       "front"      120 || true
@@ -562,10 +608,14 @@ cmd_up() {
     echo "    Port:   $target_port"
 
     _ferry_reset_log "$cloud_log"
-    nohup litellm \
-      --config "$FERRY_ROUTE_CONFIG" \
-      --port "$target_port" \
-      --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
+    if ! _ferry_launch_front "$FERRY_ROUTE_CONFIG" "$target_port" "$cloud_log"; then
+      echo "    note: catalogue filter unavailable — serving litellm directly"
+      echo "          (/v1/models will advertise the fallback hops too)"
+      nohup litellm \
+        --config "$FERRY_ROUTE_CONFIG" \
+        --port "$target_port" \
+        --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
+    fi
 
     echo ">>> Route proxy running in background. Log: $cloud_log"
     echo "    Served lanes:  curl -s http://127.0.0.1:$target_port/v1/models"

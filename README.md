@@ -107,6 +107,27 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 
 Both need `ferry up` on the host, which serves all four lanes at once.
 
+#### How much of opencode it takes over
+
+The default above assumes the client's opencode is yours to wire. On a laptop that already has its own opencode setup, narrow the scope — the flag goes after `zsh -s --`:
+
+```bash
+curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh -s -- --profiles-only
+curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh -s -- --no-opencode
+```
+
+| Scope | Writes | Leaves alone |
+|---|---|---|
+| *(default)* | `~/.config/opencode/opencode.json`, both ferry profiles, all three `~/.zshrc` wrappers, the guardrail files | — |
+| `--profiles-only` | `~/.config/ferry/opencode-{cloud,local}.json`, the two **named** wrappers, `host-code` → `opencode-cloud` | everything under `~/.config/opencode`; bare `opencode` keeps your config |
+| `--no-opencode` | the `ferry` CLI and `~/.config/ferry/client.json`, nothing else | every opencode file, ferry's own profiles included |
+
+Under `--profiles-only` the lanes are opt-in per invocation — `opencode-cloud` / `opencode-local`, or `OPENCODE_CONFIG=~/.config/ferry/opencode-cloud.json opencode …` without the wrappers.
+
+The local-lane guardrails (`/fan-out` and the `spawning-subagents` skill) live in `~/.config/opencode/`, so they follow the scope: on by default, off in the two narrow modes. They only *add* files, so `--with-guardrails` opts back into them, and `--no-guardrails` out.
+
+The chosen scope is recorded in `client.json` as `opencode_mode`, which is what keeps the catch-up below from silently re-widening the machine.
+
 #### Catching a client up later
 
 When the host changes — new lanes, a re-pointed alias, a newer `ferry` — an already-bootstrapped client catches up with:
@@ -115,7 +136,9 @@ When the host changes — new lanes, a re-pointed alias, a newer `ferry` — an 
 curl -fsSL http://your-mac.local:8095/client-reset.sh | zsh
 ```
 
-It re-pulls the CLI and re-applies the opencode takeover to all three configs. It does **not** touch `~/.zshrc`, rewrite `client.json`, or prompt for anything — it reuses the profile the bootstrap left behind. Re-run the bootstrap instead if the machine is new or the shell wrappers need refreshing.
+It re-pulls the CLI and re-applies the opencode takeover. It does **not** touch `~/.zshrc`, rewrite `client.json`, or prompt for anything — it reuses the profile the bootstrap left behind. Re-run the bootstrap instead if the machine is new or the shell wrappers need refreshing.
+
+**It re-applies the scope, not the maximum.** `opencode_mode` from `client.json` decides which configs get written: `full` (or a profile from before the key existed) does all three, `profiles` does only ferry's own two, `none` re-pulls the CLI and writes no config at all. The same three flags override it for one run — `client-reset.sh --profiles-only` — without rewriting the profile, so an override can't quietly redefine the machine.
 
 **Why the CLI is re-pulled first, always:** `ferry opencode` is what performs the takeover, so an out-of-date CLI quietly does the *old* thing and reports success either way. The download is validated (shebang, `cmd_opencode` present, `zsh -n` clean) before it replaces the working binary, so a share server that is down cannot leave you with an HTML error page named `ferry`.
 
@@ -405,7 +428,7 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 **Known issues on the `local-sub` (Nemotron) lane (measured 2026-08-25):**
 
 - **`nemotron_h` continuous-batching crash (mlx-vlm) — patched automatically.** The batching engine passes both `input_ids` and `inputs_embeds`; the `nemotron_h` `LanguageModel.__call__` forwards both to a backbone that requires exactly one → `ValueError: Provide exactly one of inputs or inputs_embeds` on **every** request. `ferry install` and `host-bootstrap.sh` now apply the two-line fix to `.../site-packages/mlx_vlm/models/nemotron_h/language.py` after installing mlx-vlm. The patch is idempotent and no-ops once upstream fixes the call site — but note that **any manual `uv tool install mlx-vlm --force` wipes it**, so re-run `ferry install` after upgrading mlx-vlm yourself.
-- **Flaky `task`-tool calls.** Nemotron frequently emits malformed task calls (hallucinated `task_id`, missing `description`) that opencode rejects *before the tool runs* — the model then silently retries the identical broken call (measured: 444 consecutive errors; also 22 identical 38-token retries). Fix shipped: `client-bootstrap.sh` installs a `/fan-out` command and a `spawning-subagents` skill into `~/.config/opencode/`. The recipe must sit in the **user message** (`/fan-out` does this); placing it in system instructions made failures worse. With it: 3/3 valid parallel task calls, zero schema errors. This matters less now that Nemotron is the *subagent* lane rather than the driver — but it still applies to whatever small local model is driving.
+- **Flaky `task`-tool calls.** Nemotron frequently emits malformed task calls (hallucinated `task_id`, missing `description`) that opencode rejects *before the tool runs* — the model then silently retries the identical broken call (measured: 444 consecutive errors; also 22 identical 38-token retries). Fix shipped: `client-bootstrap.sh` installs a `/fan-out` command and a `spawning-subagents` skill into `~/.config/opencode/` (in the default scope; a `--profiles-only` / `--no-opencode` client opts in with `--with-guardrails`). The recipe must sit in the **user message** (`/fan-out` does this); placing it in system instructions made failures worse. With it: 3/3 valid parallel task calls, zero schema errors. This matters less now that Nemotron is the *subagent* lane rather than the driver — but it still applies to whatever small local model is driving.
 - **Residual model limits.** Bare tool calls (read/write/bash) are reliable; single delegation works. Complex multi-brief orchestration exceeds the 30B model — it duplicates briefs or stops to ask clarifying questions instead of integrating. This is exactly why it sits on `local-sub` and `local-orch` (Qwen) drives.
 - **Headless-run doom signature.** Watch the *server* log (opencode's `--format json` stream lags and misses in-flight loops): 3+ consecutive requests with identical generated-token counts and `finish_reason=tool_calls` = kill it.
 
@@ -468,9 +491,13 @@ python3 lib/ferry-serve.test.py       # lane ports, launch flags, KV governor
 python3 lib/ferry-integrate.test.py   # the opencode takeover: scope, lane split, snapshots
 python3 lib/ferry-share.test.py       # share server + client-script placeholder injection
 python3 lib/ferry-hostreset.test.py   # host-reset: route-config validation, endpoint verify
+python3 lib/ferry-front.test.py       # the front door: /v1/models advertises lanes only
+python3 lib/ferry-clientbootstrap.test.py  # client scope: --profiles-only / --no-opencode
 ```
 
 The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.
+
+The client-scope suite goes further: it runs `client-bootstrap.sh` and `client-reset.sh` end-to-end against a throwaway `$HOME` and a stub host that serves `/v1/models` and the repo's own `ferry`. The property it defends is an *absence* — that the narrow scopes never create `~/.config/opencode` — and an absence is only proved by looking.
 
 ## License
 

@@ -3,8 +3,64 @@
 # Installs the 'ferry' CLI on the client and wires opencode to the host. Fully
 # non-interactive when the host is reachable (the only prompt is the host-name
 # fallback when the initial probe fails).
+#
+#   curl -fsSL http://<host>:<share-port>/client-bootstrap.sh | zsh
+#   curl -fsSL http://<host>:<share-port>/client-bootstrap.sh | zsh -s -- --profiles-only
+#   curl -fsSL http://<host>:<share-port>/client-bootstrap.sh | zsh -s -- --no-opencode
+#
+# HOW MUCH OF OPENCODE THIS TOUCHES is a flag, because the answer is not the same
+# on a laptop that already has an opencode setup of its own. Three modes:
+#
+#   full (default)   the whole integration: the takeover of opencode's own
+#                    ~/.config/opencode/opencode.json, both ferry lane profiles,
+#                    the ~/.zshrc wrappers INCLUDING the bare-`opencode`
+#                    override, and the local-lane guardrail files under
+#                    ~/.config/opencode/.
+#   --profiles-only  ferry keeps to its own directory. Writes only
+#                    ~/.config/ferry/opencode-{cloud,local}.json and the two
+#                    NAMED wrappers (opencode-cloud / opencode-local). Bare
+#                    `opencode` is left alone, and nothing under
+#                    ~/.config/opencode is read or written.
+#   --no-opencode    installs the ferry CLI and ~/.config/ferry/client.json and
+#                    stops. No opencode file of any kind, ferry's own included.
+#
+# The chosen mode is recorded in client.json as "opencode_mode", so a later
+# `client-reset.sh` catches this machine up without silently re-widening it.
 
 set -eu
+
+# --- Flags ------------------------------------------------------------------
+# Piped invocations pass these after `zsh -s --`.
+OC_MODE="full"
+GUARDRAILS=""   # empty = follow the mode; 1/0 = explicit --with/--no-guardrails
+
+usage() {
+  sed -n '2,28p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+  echo ""
+  echo "Flags: --profiles-only | --no-opencode | --full-opencode"
+  echo "       --with-guardrails | --no-guardrails   (the /fan-out command and the"
+  echo "         spawning-subagents skill, which live in ~/.config/opencode/;"
+  echo "         on by default in full mode, off in the other two)"
+  echo "       -h | --help"
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-opencode)     OC_MODE="none" ;;
+    --profiles-only)   OC_MODE="profiles" ;;
+    --full-opencode)   OC_MODE="full" ;;
+    --with-guardrails) GUARDRAILS=1 ;;
+    --no-guardrails)   GUARDRAILS=0 ;;
+    -h|--help)         usage; exit 0 ;;
+    *) echo "Unknown flag: $arg"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --with-guardrails, --no-guardrails, --help"; exit 1 ;;
+  esac
+done
+
+# Guardrails default off outside full mode: both files land in ~/.config/opencode,
+# which is exactly what the narrower modes exist to leave alone.
+if [[ -z "$GUARDRAILS" ]]; then
+  [[ "$OC_MODE" == "full" ]] && GUARDRAILS=1 || GUARDRAILS=0
+fi
 
 # Fallback defaults — can be overridden via env vars or dynamically injected by the host-share server
 HOST_NAME="${HOST_NAME:-HOST_MDNS_PLACEHOLDER}"
@@ -30,6 +86,11 @@ echo "================================================================="
 echo "            BOOTSTRAPPING CLIENT LAPTOP FOR LLM-FERRY"
 echo "================================================================="
 echo "Target Host Server: http://$HOST_NAME:$HOST_PORT"
+case "$OC_MODE" in
+  full)     echo "opencode: FULL integration (default config taken over + wrappers)" ;;
+  profiles) echo "opencode: PROFILES ONLY — ~/.config/opencode is not touched" ;;
+  none)     echo "opencode: NOT CONFIGURED — ferry CLI only" ;;
+esac
 echo "================================================================="
 
 # 1. Resolve the host. Try, in order, WITHOUT ever prompting first:
@@ -104,11 +165,15 @@ fi
 # Write local client JSON config profile
 echo ">>> Creating client configuration profile..."
 mkdir -p "$HOME/.config/ferry"
+# opencode_mode is written for client-reset.sh, which re-applies the takeover
+# later and must not re-widen a machine that was deliberately bootstrapped
+# narrow. Absent (a profile from before this key existed) reads as "full".
 cat <<EOF > "$HOME/.config/ferry/client.json"
 {
   "host": "$HOST_NAME",
   "port": "$HOST_PORT",
-  "share_port": "$SHARE_PORT"
+  "share_port": "$SHARE_PORT",
+  "opencode_mode": "$OC_MODE"
 }
 EOF
 echo "    Successfully saved profile: ~/.config/ferry/client.json"
@@ -134,39 +199,68 @@ echo "    Successfully saved profile: ~/.config/ferry/client.json"
 # scratch instead, which silently ate any agent, permission, mcp or command
 # block the user had added to them on every re-run.
 echo ""
-echo ">>> Auto-configuring 'opencode' to route through the host..."
-mkdir -p "$HOME/.config/ferry"
 OC_FAILED=0
-# target|extra-flags — the two ferry profiles the wrappers select between, plus
-# opencode's own default config for a bare `command opencode` or a non-zsh shell.
-for oc_target in \
-  "$HOME/.config/opencode/opencode.json|" \
-  "$HOME/.config/ferry/opencode-cloud.json|" \
-  "$HOME/.config/ferry/opencode-local.json|--local"
-do
-  oc_path="${oc_target%%|*}"
-  oc_flag="${oc_target#*|}"
-  echo "    -> $oc_path"
-  # Unset OPENCODE_CONFIG for the call: `ferry opencode` honours it as the
-  # default target, and a bootstrap that inherited one from the caller's shell
-  # would write the same file three times.
-  if ! env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" opencode \
-        --host "$HOST_NAME" --port "$HOST_PORT" --config "$oc_path" $oc_flag; then
-    OC_FAILED=1
+if [[ "$OC_MODE" == "none" ]]; then
+  echo ">>> Skipping opencode configuration (--no-opencode)."
+  echo "    Nothing under ~/.config/opencode or ~/.config/ferry/opencode-*.json was"
+  echo "    written. To route an OpenAI-compatible client at the host by hand:"
+  echo "      baseURL http://$HOST_NAME:$HOST_PORT/v1, apiKey 'local', and a LANE"
+  echo "      NAME from http://$HOST_NAME:$HOST_PORT/v1/models."
+else
+  echo ">>> Auto-configuring 'opencode' to route through the host..."
+  mkdir -p "$HOME/.config/ferry"
+  # target|extra-flags. The two ferry profiles the wrappers select between are
+  # always written — they are ferry's own files. opencode's OWN default config
+  # is in the list only in full mode: --profiles-only exists precisely so that
+  # a laptop with its own opencode setup keeps it.
+  oc_targets=(
+    "$HOME/.config/ferry/opencode-cloud.json|"
+    "$HOME/.config/ferry/opencode-local.json|--local"
+  )
+  if [[ "$OC_MODE" == "full" ]]; then
+    oc_targets=("$HOME/.config/opencode/opencode.json|" "${oc_targets[@]}")
   fi
-done
+  for oc_target in "${oc_targets[@]}"; do
+    oc_path="${oc_target%%|*}"
+    oc_flag="${oc_target#*|}"
+    echo "    -> $oc_path"
+    # Unset OPENCODE_CONFIG for the call: `ferry opencode` honours it as the
+    # default target, and a bootstrap that inherited one from the caller's shell
+    # would write the same file three times.
+    if ! env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" opencode \
+          --host "$HOST_NAME" --port "$HOST_PORT" --config "$oc_path" $oc_flag; then
+      OC_FAILED=1
+    fi
+  done
+  if [[ "$OC_MODE" == "profiles" ]]; then
+    echo "    --profiles-only: ~/.config/opencode/opencode.json was NOT read or written."
+  fi
+fi
 if [[ $OC_FAILED -eq 1 ]]; then
   echo "    WARNING: 'ferry opencode' failed for at least one target. Wire opencode"
   echo "    manually: an openai-compatible provider with baseURL=http://$HOST_NAME:$HOST_PORT/v1,"
   echo "    apiKey=local, and a LANE NAME from http://$HOST_NAME:$HOST_PORT/v1/models."
 fi
 
-# Setup shell alias in .zshrc
-echo ">>> Configuring terminal 'host-code' shortcut in ~/.zshrc..."
+# Setup shell alias in .zshrc. In full mode `host-code` rides on the bare
+# `opencode` wrapper; in profiles mode there IS no bare wrapper, so it points at
+# the named cloud one instead. In --no-opencode mode it would be a shortcut to
+# the user's own unrelated opencode, so it is not installed at all.
 ZSHRC="$HOME/.zshrc"
-ALIAS_LINE="alias host-code='opencode'"
+if [[ "$OC_MODE" == "none" ]]; then
+  echo ">>> Skipping the 'host-code' shortcut (--no-opencode)."
+  ALIAS_LINE=""
+elif [[ "$OC_MODE" == "profiles" ]]; then
+  echo ">>> Configuring terminal 'host-code' shortcut (-> opencode-cloud) in ~/.zshrc..."
+  ALIAS_LINE="alias host-code='opencode-cloud'"
+else
+  echo ">>> Configuring terminal 'host-code' shortcut in ~/.zshrc..."
+  ALIAS_LINE="alias host-code='opencode'"
+fi
 
-if [[ -f "$ZSHRC" ]]; then
+if [[ -z "$ALIAS_LINE" ]]; then
+  :
+elif [[ -f "$ZSHRC" ]]; then
   if grep -q "^alias host-code=" "$ZSHRC" 2>/dev/null; then
     # Update existing alias
     sed -i '' "s|^alias host-code=.*|$ALIAS_LINE|" "$ZSHRC" 2>/dev/null || \
@@ -200,9 +294,20 @@ else
   echo "$PATH_LINE" > "$ZSHRC"
 fi
 
-# Ensure opencode profile functions (opencode-cloud, opencode-local) are in ~/.zshrc
-echo ">>> Configuring opencode profile functions in ~/.zshrc..."
+# Ensure opencode profile functions (opencode-cloud, opencode-local) are in ~/.zshrc.
+# --no-opencode installs none of them and, deliberately, does not remove a block
+# an earlier run left behind either: silently deleting shell functions the user
+# may still be using is its own surprise. It says so instead.
 ZSHRC="$HOME/.zshrc"
+if [[ "$OC_MODE" == "none" ]]; then
+  echo ">>> Skipping the opencode shell wrappers (--no-opencode)."
+  if [[ -f "$ZSHRC" ]] && grep -q '# >>> ferry opencode profiles >>>' "$ZSHRC" 2>/dev/null; then
+    echo "    NOTE: an earlier bootstrap's wrapper block is still in ~/.zshrc, so bare"
+    echo "    'opencode' is still being redirected to a ferry profile. Delete the block"
+    echo "    marked '# >>> ferry opencode profiles >>>', or run client-cleanup.sh."
+  fi
+else
+echo ">>> Configuring opencode profile functions in ~/.zshrc..."
 touch "$ZSHRC"
 
 # Strip any existing ferry opencode profiles block before re-adding, and remove
@@ -210,9 +315,9 @@ touch "$ZSHRC"
 # from older hand-wired setups: an alias defined above a function definition
 # makes zsh expand it inside `name() {` -> "defining function based on alias"
 # -> "parse error near ()" on every future `source ~/.zshrc`.
-python3 - "$ZSHRC" "# >>> ferry opencode profiles >>>" "# <<< ferry opencode profiles <<<" <<'PYEOF'
+python3 - "$ZSHRC" "# >>> ferry opencode profiles >>>" "# <<< ferry opencode profiles <<<" "$OC_MODE" <<'PYEOF'
 import sys
-rc, start, end = sys.argv[1], sys.argv[2], sys.argv[3]
+rc, start, end, mode = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 with open(rc) as f:
     lines = f.readlines()
 out, skip = [], False
@@ -226,12 +331,14 @@ for ln in lines:
         continue
     if not skip:
         out.append(ln)
-# legacy aliases collide with the function names below
+# Legacy aliases collide with the function names below — but only with the
+# functions we are about to DEFINE. In profiles mode no bare `opencode` function
+# is written, so a user's own `alias opencode=...` is theirs to keep.
 def is_legacy_alias(l):
     t = l.lstrip()
-    return (t.startswith("alias opencode-cloud=")
-            or t.startswith("alias opencode-local=")
-            or t.startswith("alias opencode="))
+    if t.startswith("alias opencode-cloud=") or t.startswith("alias opencode-local="):
+        return True
+    return mode == "full" and t.startswith("alias opencode=")
 out = [l for l in out if not is_legacy_alias(l)]
 while out and out[-1].strip() == "":
     out.pop()
@@ -246,6 +353,31 @@ PYEOF
 #
 # QUOTED heredoc: the body is written VERBATIM (no $, backtick, or quote
 # expansion), which is what keeps the $HOME/$@ inside the functions intact.
+if [[ "$OC_MODE" == "profiles" ]]; then
+cat <<'EOF' >> "$ZSHRC"
+# >>> ferry opencode profiles >>>
+# --profiles-only: the two NAMED wrappers and nothing else. There is deliberately
+# no bare `opencode` function here, so plain `opencode` keeps using whatever
+# config this machine already had — ferry is opt-in, per invocation.
+unalias opencode-cloud opencode-local 2>/dev/null
+
+# opencode-cloud: the CLOUD pair — orch drives (build/plan), flash runs the
+# fan-out and the housekeeping models. Nothing touches the host GPU.
+opencode-cloud() {
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-cloud.json" command opencode "$@"
+}
+
+# opencode-local: the GPU pair — local-orch drives, local-sub runs the fan-out.
+# Nothing leaves the host.
+opencode-local() {
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-local.json" command opencode "$@"
+}
+
+# <<< ferry opencode profiles <<<
+EOF
+echo "    Added opencode-cloud / opencode-local to ~/.zshrc."
+echo "    Bare 'opencode' was NOT wrapped (--profiles-only)."
+else
 cat <<'EOF' >> "$ZSHRC"
 # >>> ferry opencode profiles >>>
 # Defensive: an alias with a function's name anywhere earlier in the file (or in
@@ -285,6 +417,8 @@ opencode-local() {
 # <<< ferry opencode profiles <<<
 EOF
 echo "    Successfully added opencode profile functions to ~/.zshrc."
+fi
+fi
 
 # Install the local-lane opencode guardrails: /fan-out command + spawning-subagents
 # skill (global dirs — opencode picks them up automatically). Keep the heredoc
@@ -294,7 +428,16 @@ echo "    Successfully added opencode profile functions to ~/.zshrc."
 # calls (hallucinated task_id, missing description) that are rejected before
 # the tool runs, causing silent retry doom loops. The recipe injected as the
 # USER message (what /fan-out does) is the empirically working fix.
-if command -v opencode >/dev/null 2>&1; then
+#
+# Both files land under ~/.config/opencode/, so they follow the mode: on in full,
+# off in --profiles-only / --no-opencode unless --with-guardrails asks for them.
+if [[ $GUARDRAILS -eq 0 ]]; then
+  echo ">>> Skipping the local-lane guardrails (they live in ~/.config/opencode/)."
+  echo "    They are two NEW files — /fan-out and the spawning-subagents skill — and"
+  echo "    modify nothing existing. Add them with: --with-guardrails"
+elif ! command -v opencode >/dev/null 2>&1; then
+  echo ">>> opencode is not on PATH — skipping the local-lane guardrails."
+else
   echo ">>> Installing opencode local-lane guardrails (/fan-out + spawning-subagents skill)..."
   mkdir -p "$HOME/.config/opencode/command" "$HOME/.config/opencode/skills/spawning-subagents"
 
@@ -390,11 +533,32 @@ echo "    - Send Quick Msg to Host:    \033[1;32mferry msg \"Everything is worki
 echo "    - Stream terminal logs:      \033[1;32mopencode run \"...\" 2>&1 | ferry log\033[0m"
 echo ""
 
-echo ">>> OPENCODE CLI INSTANT ACCESS:"
-echo "    You can now call the host model using standard commands:"
-echo "    \033[1;32mhost-code run \"Build a snake game in Python\"\033[0m"
-echo "    opencode-cloud   -> cloud pair: orch drives, flash fans out"
-echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
-echo "    bare 'opencode'  -> whichever pair you used LAST (cloud until you first"
-echo "                       run opencode-local)"
+case "$OC_MODE" in
+  full)
+    echo ">>> OPENCODE CLI INSTANT ACCESS:"
+    echo "    You can now call the host model using standard commands:"
+    echo "    \033[1;32mhost-code run \"Build a snake game in Python\"\033[0m"
+    echo "    opencode-cloud   -> cloud pair: orch drives, flash fans out"
+    echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
+    echo "    bare 'opencode'  -> whichever pair you used LAST (cloud until you first"
+    echo "                       run opencode-local)"
+    ;;
+  profiles)
+    echo ">>> OPENCODE, OPT-IN PER INVOCATION:"
+    echo "    opencode-cloud   -> cloud pair: orch drives, flash fans out"
+    echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
+    echo "    bare 'opencode'  -> UNCHANGED. Your own config, exactly as it was."
+    echo "    Without the wrappers, the same thing by hand:"
+    echo "      OPENCODE_CONFIG=~/.config/ferry/opencode-cloud.json opencode ..."
+    echo "    Widen later with:  --full-opencode    Narrow further with: --no-opencode"
+    ;;
+  none)
+    echo ">>> OPENCODE WAS NOT CONFIGURED (--no-opencode)."
+    echo "    Point any OpenAI-compatible client at the host yourself:"
+    echo "      baseURL http://$HOST_NAME:$HOST_PORT/v1   apiKey local"
+    echo "      model   a LANE NAME from http://$HOST_NAME:$HOST_PORT/v1/models"
+    echo "    Or re-run this script with --profiles-only for ferry-owned opencode"
+    echo "    profiles that leave ~/.config/opencode alone."
+    ;;
+esac
 echo ""

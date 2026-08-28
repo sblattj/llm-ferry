@@ -4,10 +4,12 @@
 Run:  python3 lib/ferry-clientbootstrap.test.py
 
 client-bootstrap.sh has three scopes — full (the default), --profiles-only and
---no-opencode — and client-reset.sh re-applies whichever one the bootstrap
-recorded in client.json. The narrow scopes exist for a laptop that already has
-an opencode setup of its own, so the property under test is an ABSENCE: that
-~/.config/opencode is not read, written, or snapshotted.
+--no-opencode — client-reset.sh re-applies whichever one the bootstrap recorded
+in client.json, and client-cleanup.sh removes whatever any of them left. The
+narrow scopes exist for a laptop that already has an opencode setup of its own,
+so the property under test is an ABSENCE: that ~/.config/opencode is not read,
+written, or snapshotted. Cleanup's version of the same property is the mirror
+image — it must take ferry's provider out and leave everything else standing.
 
 An absence is only proved by looking, so these tests run the REAL scripts
 end-to-end against a throwaway $HOME and a stub host server that serves
@@ -27,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOOTSTRAP = os.path.join(REPO, "client-bootstrap.sh")
 RESET = os.path.join(REPO, "client-reset.sh")
+CLEANUP = os.path.join(REPO, "client-cleanup.sh")
 FERRY = os.path.join(REPO, "ferry")
 
 # The lane names the takeover checks against the catalogue. Serving them keeps
@@ -60,7 +63,9 @@ class StubHost(BaseHTTPRequestHandler):
         pass
 
 
-class ClientScopeTest(unittest.TestCase):
+class ClientHarness(unittest.TestCase):
+    """Shared fixture: a stub host, a throwaway $HOME, a stub `opencode` on PATH."""
+
     @classmethod
     def setUpClass(cls):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), StubHost)
@@ -123,6 +128,10 @@ class ClientScopeTest(unittest.TestCase):
         self.assertFalse(os.path.exists(d),
                          f"{d} exists; the narrow scope wrote into opencode's own directory: "
                          f"{os.listdir(d) if os.path.isdir(d) else ''}")
+
+
+class ClientScopeTest(ClientHarness):
+    """What each bootstrap scope is allowed to write."""
 
     # --- --no-opencode ------------------------------------------------------
     def test_no_opencode_installs_the_cli_and_nothing_else(self):
@@ -277,6 +286,133 @@ class ClientScopeTest(unittest.TestCase):
         p = self.run_script(RESET, expect_ok=False)
         self.assertNotEqual(p.returncode, 0)
         self.assertIn("unrecognised opencode_mode", p.stdout + p.stderr)
+
+
+class ClientCleanupTest(ClientHarness):
+    """What client-cleanup.sh takes away — and, more importantly, what it leaves."""
+
+    def test_it_undoes_a_full_bootstrap(self):
+        self.run_script(BOOTSTRAP)
+        self.assertTrue(os.path.exists(self.path(".local", "bin", "ferry")))
+
+        self.run_script(CLEANUP)
+
+        self.assertFalse(os.path.exists(self.path(".local", "bin", "ferry")))
+        self.assertFalse(os.path.exists(self.path(".config", "ferry")))
+        for gone in (("command", "fan-out.md"),
+                     ("skills", "spawning-subagents", "SKILL.md")):
+            self.assertFalse(os.path.exists(self.path(".config", "opencode", *gone)), gone)
+        rc = self.zshrc()
+        self.assertNotIn("ferry opencode profiles", rc)
+        self.assertNotIn("alias host-code=", rc)
+        self.assertNotIn("opencode-cloud()", rc)
+
+    def test_it_removes_the_singular_skill_spelling_too(self):
+        """`ferry opencode` installs to skill/, the bootstrap to skills/. Both go."""
+        self.run_script(BOOTSTRAP)
+        singular = self.path(".config", "opencode", "skill", "spawning-subagents")
+        os.makedirs(singular)
+        with open(os.path.join(singular, "SKILL.md"), "w") as f:
+            f.write("---\nname: spawning-subagents\n---\n")
+
+        self.run_script(CLEANUP)
+
+        self.assertFalse(os.path.exists(os.path.join(singular, "SKILL.md")))
+
+    def test_it_strips_ferrys_provider_and_leaves_the_rest_of_the_config(self):
+        self.run_script(BOOTSTRAP)
+        cfg_path = self.path(".config", "opencode", "opencode.json")
+        cfg = self.read_json(".config", "opencode", "opencode.json")
+        # A key ferry never wrote, and a second provider that is not ferry's.
+        cfg["mcp"] = {"mine": {"command": ["true"]}}
+        cfg["provider"]["someprovider"] = {"options": {"apiKey": "placeholder"}}
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+
+        self.run_script(CLEANUP)
+
+        after = self.read_json(".config", "opencode", "opencode.json")
+        self.assertNotIn("ferry", after.get("provider", {}))
+        self.assertIn("someprovider", after["provider"])
+        self.assertEqual(after["mcp"], {"mine": {"command": ["true"]}})
+
+    def test_a_config_with_no_ferry_provider_is_left_alone(self):
+        """The --profiles-only case: nothing of ours is in there to remove."""
+        cfg_dir = self.path(".config", "opencode")
+        os.makedirs(cfg_dir)
+        cfg = os.path.join(cfg_dir, "opencode.json")
+        original = json.dumps({"model": "someprovider/some-model"}, indent=2) + "\n"
+        with open(cfg, "w") as f:
+            f.write(original)
+        self.run_script(BOOTSTRAP, "--profiles-only")
+
+        self.run_script(CLEANUP)
+
+        with open(cfg) as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(sorted(os.listdir(cfg_dir)), ["opencode.json"])
+        # ...while ferry's own files are gone.
+        self.assertFalse(os.path.exists(self.path(".config", "ferry")))
+
+    def test_dry_run_changes_nothing(self):
+        self.run_script(BOOTSTRAP)
+        before = {
+            "ferry_bin": os.path.exists(self.path(".local", "bin", "ferry")),
+            "profiles": sorted(os.listdir(self.path(".config", "ferry"))),
+            "zshrc": self.zshrc(),
+            "opencode": sorted(os.listdir(self.path(".config", "opencode"))),
+        }
+
+        out = self.run_script(CLEANUP, "--dry-run").stdout
+        self.assertIn("DRY RUN", out)
+
+        self.assertEqual(before["ferry_bin"], os.path.exists(self.path(".local", "bin", "ferry")))
+        self.assertEqual(before["profiles"], sorted(os.listdir(self.path(".config", "ferry"))))
+        self.assertEqual(before["zshrc"], self.zshrc())
+        self.assertEqual(before["opencode"], sorted(os.listdir(self.path(".config", "opencode"))))
+
+    def test_full_refuses_without_yes_and_keeps_the_session_store(self):
+        """--full deletes chat history, so a piped fat-finger must not reach it."""
+        store = self.path(".local", "share", "opencode")
+        os.makedirs(store)
+        with open(os.path.join(store, "sessions.db"), "w") as f:
+            f.write("not really a database")
+        self.run_script(BOOTSTRAP)
+
+        p = self.run_script(CLEANUP, "--full", expect_ok=False)
+
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("Refusing --full without --yes", p.stdout + p.stderr)
+        self.assertTrue(os.path.exists(os.path.join(store, "sessions.db")))
+        # The refusal is a full stop, not a partial run.
+        self.assertTrue(os.path.exists(self.path(".local", "bin", "ferry")))
+
+    def test_default_scope_keeps_the_session_store(self):
+        store = self.path(".local", "share", "opencode")
+        os.makedirs(store)
+        with open(os.path.join(store, "sessions.db"), "w") as f:
+            f.write("not really a database")
+        self.run_script(BOOTSTRAP)
+
+        out = self.run_script(CLEANUP).stdout
+
+        self.assertTrue(os.path.exists(os.path.join(store, "sessions.db")))
+        self.assertIn("Keeping it", out)
+
+    def test_full_with_yes_removes_the_session_store(self):
+        store = self.path(".local", "share", "opencode")
+        os.makedirs(store)
+        with open(os.path.join(store, "sessions.db"), "w") as f:
+            f.write("not really a database")
+        self.run_script(BOOTSTRAP)
+
+        self.run_script(CLEANUP, "--full", "--yes")
+
+        self.assertFalse(os.path.exists(store))
+
+    def test_it_runs_clean_on_a_machine_that_was_never_bootstrapped(self):
+        p = self.run_script(CLEANUP)
+        self.assertIn("Not installed", p.stdout)
 
 
 class ScriptContractTest(unittest.TestCase):

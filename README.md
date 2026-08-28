@@ -142,6 +142,19 @@ It re-pulls the CLI and re-applies the opencode takeover. It does **not** touch 
 
 **Why the CLI is re-pulled first, always:** `ferry opencode` is what performs the takeover, so an out-of-date CLI quietly does the *old* thing and reports success either way. The download is validated (shebang, `cmd_opencode` present, `zsh -n` clean) before it replaces the working binary, so a share server that is down cannot leave you with an HTML error page named `ferry`.
 
+#### Removing it from a client
+
+```bash
+curl -fsSL http://your-mac.local:8095/client-cleanup.sh | zsh -s -- --dry-run   # print, change nothing
+curl -fsSL http://your-mac.local:8095/client-cleanup.sh | zsh                   # apply
+```
+
+The inverse of the bootstrap, and scope-agnostic: it removes whatever is actually there, so it undoes a default install, a `--profiles-only` one, and a `--no-opencode` one without being told which. Out go the `ferry` CLI, `~/.config/ferry` (profile, lane profiles, snapshots, telemetry), the `~/.zshrc` wrapper block and `host-code` alias, and the guardrail files — under both the `skill/` and `skills/` spellings, since the two installers disagree.
+
+It edits `~/.config/opencode/opencode.json` **surgically**: only a provider ferry wrote (`apiKey: "local"`) is removed, the file is snapshotted to `.<UTC>.jsonc` first, and a config with no ferry provider in it is left byte-identical. Your own providers, MCP servers and commands survive.
+
+Two things it deliberately keeps: the `opencode` binary (not ferry's to uninstall) and `~/.local/share/opencode`, your session history — `--full --yes` is the only way to delete that, and `--full` without `--yes` is refused outright so a piped fat-finger can't wipe it.
+
 Then:
 
 ```bash
@@ -492,12 +505,12 @@ python3 lib/ferry-integrate.test.py   # the opencode takeover: scope, lane split
 python3 lib/ferry-share.test.py       # share server + client-script placeholder injection
 python3 lib/ferry-hostreset.test.py   # host-reset: route-config validation, endpoint verify
 python3 lib/ferry-front.test.py       # the front door: /v1/models advertises lanes only
-python3 lib/ferry-clientbootstrap.test.py  # client scope: --profiles-only / --no-opencode
+python3 lib/ferry-clientbootstrap.test.py  # client scope: bootstrap / reset / cleanup
 ```
 
 The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.
 
-The client-scope suite goes further: it runs `client-bootstrap.sh` and `client-reset.sh` end-to-end against a throwaway `$HOME` and a stub host that serves `/v1/models` and the repo's own `ferry`. The property it defends is an *absence* — that the narrow scopes never create `~/.config/opencode` — and an absence is only proved by looking.
+The client-scope suite goes further: it runs `client-bootstrap.sh`, `client-reset.sh` and `client-cleanup.sh` end-to-end against a throwaway `$HOME` and a stub host that serves `/v1/models` and the repo's own `ferry`. The property it defends is an *absence* — that the narrow scopes never create `~/.config/opencode`, and that cleanup leaves everything that isn't ferry's standing — and an absence is only proved by looking.
 
 ## License
 

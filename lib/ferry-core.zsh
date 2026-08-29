@@ -219,6 +219,14 @@ LOCAL_ORCH_LOG="$LOG_DIR/local-orch-$LOCAL_ORCH_PORT.log"
 LOCAL_SUB_LOG="$LOG_DIR/local-sub-$LOCAL_SUB_PORT.log"
 SHARE_LOG="$LOG_DIR/share-$SHARE_PORT.log"
 
+# Client telemetry (`ferry msg` / `ferry log` -> the share server's /hq) lands here.
+# NOT under $LOG_DIR: this one must outlive the checkout the share server was
+# launched from and the temp dir the lane logs live in, so `ferry inbox` can still
+# read it after a worktree is removed (v1.8.10). The share server's embedded handler
+# carries this same path as a literal, because it runs as its own process — a test
+# pins the two spellings together.
+HQ_LOG="$HOME/.config/ferry/client_logs.txt"
+
 # Load local secrets if present (e.g. GEMINI_API_KEY). Export the variable in your
 # shell, or drop it in ~/.config/ferry/secrets.env — never commit real API keys.
 if [[ -f "$HOME/.config/ferry/secrets.env" ]]; then

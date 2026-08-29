@@ -165,6 +165,28 @@ some-command 2>&1 | ferry log    # stream logs/errors back to the host
 
 That's it — every editor and CLI on the client now talks to one endpoint on the host.
 
+#### Reading what the clients sent
+
+On the **host**:
+
+```bash
+ferry inbox            # index the 20 most recent entries, dated and attributed
+ferry inbox -n 3       # the last three, in full
+ferry inbox -f         # follow new ones as they land
+ferry inbox --all      # every entry
+ferry inbox --path     # the two files this reads
+```
+
+The answer lives in two files and neither holds all of it. `~/.config/ferry/client_logs.txt` has every body verbatim, append-only — but the `/hq` handler writes a delimiter and the body, **no timestamp and no client IP**. The share server's access log has both, and is **truncated on every `ferry share` restart**. So `ferry inbox` aligns them from the *end*: the receipts still in the access log belong to the most recent entries, and everything older is printed as `—` rather than given a borrowed date.
+
+Two details that would otherwise skew it: a `POST /hq` that returned non-200 means the handler raised and **no entry was written**, so those are counted separately (`WARNING: N POST(s) … returned an error`) instead of consuming a slot; and every `share-*.log` is read, not just the default port's, because `ferry share` scans upward when its port is taken.
+
+```
+ 11  28/Aug 17:47  192.168.1.12     ########## HANDOFF FILE: prxref-HANDOFF.md ##########
+ 12  28/Aug 17:47  192.168.1.12     ########## HANDOFF FILE: reverse-expose-handoff.md ##
+ 13  28/Aug 17:50  127.0.0.1        self-test
+```
+
 ### More host commands
 
 ```bash
@@ -472,6 +494,7 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`) |
 | `msg <text>` | client | Send a text note to the host's `~/.config/ferry/client_logs.txt` |
 | `log` | client | Pipe stdin straight to the host's `~/.config/ferry/client_logs.txt` |
+| `inbox [-n N] [-f] [--all] [--path]` | host | Read that file back, dated and attributed from the share server's access log where the receipt still exists |
 | `offer <path>...` | host | Record files/dirs in `offered.json` for clients to fetch |
 | `pull <model-id> [--host H] [--port P] [--transport http\|hf\|nc] [--to DIR]` | client | Pull a model from the host cache (three transports) |
 | `get <name> [--host H] [--port P] [--to DIR]` | client | Fetch an offered file/dir by basename |
@@ -506,6 +529,7 @@ python3 lib/ferry-share.test.py       # share server + client-script placeholder
 python3 lib/ferry-hostreset.test.py   # host-reset: route-config validation, endpoint verify
 python3 lib/ferry-front.test.py       # the front door: /v1/models advertises lanes only
 python3 lib/ferry-clientbootstrap.test.py  # client scope: bootstrap / reset / cleanup
+python3 lib/ferry-inbox.test.py       # inbox: the receipt/entry join, host-only guard
 ```
 
 The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.

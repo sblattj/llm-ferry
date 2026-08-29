@@ -34,7 +34,7 @@ FERRY = os.path.join(REPO, "ferry")
 
 # The lane names the takeover checks against the catalogue. Serving them keeps
 # the run free of "host does not serve ..." warnings that would mask a real one.
-LANES = ("orch", "flash", "local-orch", "local-sub")
+LANES = ("heavy", "flash", "local-orch", "local-sub")
 
 
 class StubHost(BaseHTTPRequestHandler):
@@ -172,7 +172,7 @@ class ClientScopeTest(ClientHarness):
         self.assertEqual(cloud["provider"]["ferry"]["options"]["baseURL"], base)
         self.assertEqual(local["provider"]["ferry"]["options"]["baseURL"], base)
         # The lane split is the point of having two profiles at all.
-        self.assertEqual(cloud["model"], "ferry/orch")
+        self.assertEqual(cloud["model"], "ferry/heavy")
         self.assertEqual(local["model"], "ferry/local-orch")
 
     def test_profiles_only_does_not_wrap_bare_opencode(self):

@@ -12,6 +12,11 @@ Commands:
   up                 [Host] Start local GPU server or cloud API proxy (boots Catalog by default)
   down               [Host] Stop all running servers (local, cloud, sharing)
   status             [Dual] Show server listeners, active models, and client test commands
+  update             [Dual] Catch this machine up. Detects host vs client from
+                       ~/.config/ferry/client.json and runs that role's reset:
+                       a host rebuilds from its checkout, a client re-pulls
+                       the CLI from its host
+                       ferry update [--full] [--host|--client] [--dry-run]
   dash               [Host] Live dashboard for the route proxy
                        ferry dash [--open] [--port P] [--ferry URL]   # lightweight stdlib page (localhost:8091)
                        ferry dash --grafana [--open]                  # full Grafana+VictoriaMetrics stack (localhost:3001)

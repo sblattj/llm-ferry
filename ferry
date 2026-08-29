@@ -264,6 +264,11 @@ Commands:
   up                 [Host] Start local GPU server or cloud API proxy (boots Catalog by default)
   down               [Host] Stop all running servers (local, cloud, sharing)
   status             [Dual] Show server listeners, active models, and client test commands
+  update             [Dual] Catch this machine up. Detects host vs client from
+                       ~/.config/ferry/client.json and runs that role's reset:
+                       a host rebuilds from its checkout, a client re-pulls
+                       the CLI from its host
+                       ferry update [--full] [--host|--client] [--dry-run]
   dash               [Host] Live dashboard for the route proxy
                        ferry dash [--open] [--port P] [--ferry URL]   # lightweight stdlib page (localhost:8091)
                        ferry dash --grafana [--open]                  # full Grafana+VictoriaMetrics stack (localhost:3001)
@@ -2845,7 +2850,7 @@ if prefer_local:
     driver, worker, house = "local-orch", "local-sub", "local-sub"
     limits = {"limit": {"context": 131072, "output": 8192}}
 else:
-    driver, worker, house = "orch", "flash", "super-flash"
+    driver, worker, house = "heavy", "flash", "super-flash"
     limits = {}
 driver = force_model or driver
 worker = force_small or worker
@@ -2862,10 +2867,16 @@ try:
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
 if served:
-    # Only the driver and worker are checked. The housekeeper is expected to be a
-    # HIDDEN alias — model_group_alias entries marked `hidden: true` resolve on a
-    # request but are deliberately absent from /v1/models, so testing it against
-    # the catalogue would warn on a correct setup every single time.
+    # Only the driver and worker are checked. The housekeeper is deliberately
+    # absent from /v1/models, so testing it against the catalogue would warn on a
+    # correct setup every single time.
+    #
+    # It used to be absent because it was a `model_group_alias` marked
+    # `hidden: true`. It is a real `model_name` as of 2026-08-29 — an alias
+    # silently loses its whole fallback chain (litellm looks fallbacks up by the
+    # raw client string before resolving aliases, router.py:6411), and a failed
+    # compaction drops the entire transcript. It stays out of the catalogue by
+    # omitting `model_info: {public: true}`, which ferry_front.py filters on.
     missing = [l for l in (driver, worker) if l not in served]
     if missing:
         print(f"    WARNING: host does not serve {', '.join(missing)}.")
@@ -3071,6 +3082,105 @@ cmd_dash() {
   fi
   exec python3 "$dash" "$@"
 }
+# ----------------- UPDATE -----------------
+# `ferry update` — catch this machine up, whichever end of the wire it is on.
+#
+# It owns NO update logic. Both catch-up paths already existed and are the
+# tested ones; what was missing was a single command that picks the right one,
+# so nobody has to remember which half of the stack they are standing on:
+#
+#   host    ->  ./host-reset.sh      rebuild the CLI from lib/, re-link it,
+#                                    validate the route config, bounce the proxy
+#   client  ->  curl .../client-reset.sh | zsh
+#                                    re-pull the CLI from the host, re-apply the
+#                                    opencode takeover
+#
+# They are deliberately NOT mirrors of each other (see host-reset.sh's header): a
+# client is stale because the HOST has a newer CLI to download, while a host is
+# stale because its own `ferry` drifted from its own lib/. Same word, two
+# different repairs — which is exactly why guessing wrong is easy and why this
+# command exists.
+#
+# ROLE DETECTION IS NOT NEW HERE. ferry has always decided host-vs-client on the
+# presence of ~/.config/ferry/client.json (ferry-core.zsh sets CLIENT_MODE from
+# it, and ferry-hostreset.test.py pins that rule). This reuses that flag rather
+# than inventing a second, divergent notion of role.
+cmd_update() {
+  local dry_run=0 full=0 forced=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run=1; shift ;;
+      --full)    full=1; shift ;;
+      --host)    forced="host"; shift ;;
+      --client)  forced="client"; shift ;;
+      -h|--help)
+        echo "Usage: ferry update [--full] [--host|--client] [--dry-run]"
+        echo
+        echo "  Catches this machine up. Detects host vs client from"
+        echo "  ~/.config/ferry/client.json; --host/--client override it."
+        echo "  --full    [Host] also reload the GPU lanes (minutes, not seconds)"
+        echo "  --dry-run print the command that would run, and stop"
+        return 0
+        ;;
+      *)
+        echo "Error: unknown option for 'ferry update': $1" >&2
+        echo "       ferry update [--full] [--host|--client] [--dry-run]" >&2
+        return 1
+        ;;
+    esac
+  done
+
+  local role
+  if [[ -n "$forced" ]]; then
+    role="$forced"
+  elif (( CLIENT_MODE )); then
+    role="client"
+  else
+    role="host"
+  fi
+
+  local cmd
+  if [[ "$role" == "client" ]]; then
+    # --full reloads the GPU lanes, which live on the host. Refusing beats
+    # silently dropping the flag: a user who passed it believes something extra
+    # happened, and on a client nothing extra can.
+    if (( full )); then
+      echo "Error: --full applies to the host (it reloads the GPU lanes)." >&2
+      echo "       A client has none; drop the flag." >&2
+      return 1
+    fi
+    # CLIENT_HOST is empty both when there is no profile at all (--client forced
+    # on a host) and when the profile omits `host`. Either way there is nothing
+    # to curl, and an unguarded template would dial the literal "http:///".
+    if [[ -z "$CLIENT_HOST" ]]; then
+      echo "Error: no host to update from — ~/.config/ferry/client.json is" >&2
+      echo "       missing or has no 'host' key." >&2
+      echo "       Bootstrap this client first:" >&2
+      echo "         curl -fsSL http://<host>:8095/client-bootstrap.sh | zsh" >&2
+      return 1
+    fi
+    cmd="curl -fsSL http://$CLIENT_HOST:$CLIENT_SHARE_PORT/client-reset.sh | zsh"
+  else
+    local reset="$APP_DIR/host-reset.sh"
+    if [[ ! -f "$reset" ]]; then
+      echo "Error: host-reset.sh not found next to the CLI ($reset)." >&2
+      echo "       On a host, ~/.local/bin/ferry should symlink into the checkout." >&2
+      return 1
+    fi
+    cmd="zsh $reset"
+    (( full )) && cmd="$cmd --full"
+  fi
+
+  if (( dry_run )); then
+    echo ">>> ferry update — detected role: $role"
+    echo "    would run: $cmd"
+    return 0
+  fi
+
+  echo ">>> ferry update — $role mode"
+  eval "$cmd"
+}
 
 # ----------------- PARSER -----------------
 
@@ -3101,6 +3211,7 @@ case "$COMMAND" in
   serve-proxy)   cmd_serve_proxy "$@" ;;
   env)           cmd_env "$@" ;;
   opencode)      cmd_opencode "$@" ;;
+  update)        cmd_update "$@" ;;
   dash)          cmd_dash "$@" ;;
   --help|-h)     usage ;;
   *)             echo "Unknown command: $COMMAND"; usage ;;

@@ -220,13 +220,34 @@ router_settings:
   # a different model under the old name — and `hidden: true` means /v1/models
   # shows nothing amiss. Alias to a ROLE; a role survives the model changing.
   #
-  # A hidden alias is also how you hand one class of traffic its own lane without
-  # advertising it: `super-flash` below is the housekeeping lane that
-  # `ferry opencode` pins title/summary/compaction to. Because it is an alias and
-  # not a `model_name`, it stays out of the catalogue every LAN client can read.
+  # ⚠ AN ALIAS HAS NO FALLBACK CHAIN. Use one ONLY for a lane you are content to
+  # see hard-fail. litellm reads the fallbacks map with the RAW model string the
+  # client sent, BEFORE resolving aliases —
+  #
+  #     router.py:6411   model_group = kwargs.get("model")      # "orchestrator"
+  #     router.py:6345   get_fallback_model_group(fallbacks, model_group)
+  #     router.py:6357   fallback_model_group is None -> raise original_exception
+  #
+  # while alias -> target resolution lives at router.py:9278, on the
+  # deployment-selection path the lookup above never reaches. So an aliased lane
+  # matches no entry, and its primary's error goes straight to the client with the
+  # whole chain skipped. Verified 2026-08-28 on a live stack whose primary was
+  # quota-blocked: the alias returned 500, the real `model_name` returned 200 from
+  # the second hop.
+  #
+  # This bit hardest on the housekeeping lane. Aliasing `super-flash` looked free
+  # and cost it every fallback it appeared to have — and a failed compaction call
+  # does not just retry, it drops the whole transcript.
+  #
+  # So: give a lane a real `model_name` and its own `fallbacks:` entry. To keep it
+  # out of the catalogue, just OMIT `model_info: {public: true}` — ferry_front.py
+  # advertises only the marked lanes, which is why the "no supported way to hide a
+  # real model_name" caveat above applies to raw litellm and not to `ferry up`.
+  # A legacy name is duplicated the same way: a real deployment plus its own
+  # identical fallbacks entry, never an alias.
+  #
   # model_group_alias:
-  #   orchestrator: {model: "orch",  hidden: true}   # legacy name, still resolves
-  #   super-flash:  {model: "flash", hidden: true}   # a role, not a model
+  #   old-name: {model: "orch", hidden: true}   # resolves, but WITHOUT orch's chain
 
   # Strict failover chain: a failed `orch` reroutes to the fallback list in order
   # (fast model first, last resort last).

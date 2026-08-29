@@ -221,7 +221,7 @@ if prefer_local:
     driver, worker, house = "local-orch", "local-sub", "local-sub"
     limits = {"limit": {"context": 131072, "output": 8192}}
 else:
-    driver, worker, house = "orch", "flash", "super-flash"
+    driver, worker, house = "heavy", "flash", "super-flash"
     limits = {}
 driver = force_model or driver
 worker = force_small or worker
@@ -238,10 +238,16 @@ try:
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
 if served:
-    # Only the driver and worker are checked. The housekeeper is expected to be a
-    # HIDDEN alias — model_group_alias entries marked `hidden: true` resolve on a
-    # request but are deliberately absent from /v1/models, so testing it against
-    # the catalogue would warn on a correct setup every single time.
+    # Only the driver and worker are checked. The housekeeper is deliberately
+    # absent from /v1/models, so testing it against the catalogue would warn on a
+    # correct setup every single time.
+    #
+    # It used to be absent because it was a `model_group_alias` marked
+    # `hidden: true`. It is a real `model_name` as of 2026-08-29 — an alias
+    # silently loses its whole fallback chain (litellm looks fallbacks up by the
+    # raw client string before resolving aliases, router.py:6411), and a failed
+    # compaction drops the entire transcript. It stays out of the catalogue by
+    # omitting `model_info: {public: true}`, which ferry_front.py filters on.
     missing = [l for l in (driver, worker) if l not in served]
     if missing:
         print(f"    WARNING: host does not serve {', '.join(missing)}.")

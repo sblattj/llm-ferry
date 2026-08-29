@@ -17,6 +17,8 @@ case "$COMMAND" in
   msg)           cmd_msg "$@" ;;
   log)           cmd_log ;;
   inbox)         cmd_inbox "$@" ;;
+  relay)         cmd_relay "$@" ;;
+  expose)        cmd_expose "$@" ;;
   offer)         cmd_offer "$@" ;;
   pull)          cmd_pull "$@" ;;
   get)           cmd_get "$@" ;;

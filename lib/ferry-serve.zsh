@@ -663,6 +663,13 @@ cmd_down() {
   # Terminate the general HTTP(S) download forward proxy (tagged with its sentinel arg).
   pkill -f "ferry-proxy-marker" || true
 
+  # Terminate the reverse-expose relay. Killing it drops every control connection,
+  # which is what makes each client's published port close with it — an exposure
+  # must not survive the thing that was supposed to be publishing it.
+  if pkill -f "ferry-relay-marker" 2>/dev/null; then
+    rm -f "$RELAY_STATE_FILE"
+  fi
+
   echo ">>> Success: All servers stopped."
 }
 
@@ -765,6 +772,28 @@ cmd_status() {
   # General HTTP(S) download forward proxy (only reported when running).
   if lsof -nP -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     echo ">>> HTTP download proxy is \033[1;32mONLINE\033[0m (port $PROXY_PORT)"
+  fi
+
+  # Reverse-expose relay, and — the part that matters — every port a client has
+  # published through it. A port opened on this machine on someone else's behalf
+  # must be visible here, or nobody can answer "what is this host serving?".
+  if lsof -nP -iTCP:"$RELAY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> Reverse relay is \033[1;32mONLINE\033[0m (control port $RELAY_PORT)"
+    if [[ -f "$RELAY_STATE_FILE" ]]; then
+      python3 - "$RELAY_STATE_FILE" <<'PYEOF' || true
+import json, sys
+try:
+    pub = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+if not pub:
+    print("    No ports published right now.")
+for port, info in sorted(pub.items(), key=lambda kv: int(kv[0])):
+    label = f" ({info['label']})" if info.get("label") else ""
+    print(f"    Published {info.get('bind', '?')}:{port} for {info.get('client', '?')}{label}"
+          f"  since {info.get('since', '?')}")
+PYEOF
+    fi
   fi
 
   # Offered files manifest (from `ferry offer`).

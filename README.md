@@ -64,6 +64,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 - 📊 **Observability, new in v1.5** — a zero-dependency stdlib live page **and** a full Grafana + VictoriaMetrics + VictoriaLogs stack (per-model requests/tokens/spend/latency, a Failures & Fallbacks view, searchable logs).
 - 📦 **Ferry models & files across the LAN** — stream whole models from the host's HuggingFace cache, offer/fetch arbitrary files, or push over netcat.
 - 🕳️ **Forward proxy for offline clients** — route a client's uv/PyPI/HuggingFace/git downloads through the host's connection.
+- 🔄 **Reverse tunnel for locked-down clients** — publish one of a client's own local ports through the host, with the client only ever dialling out (`ferry relay` on the host, `ferry expose <port>` on the client).
 - 🪶 **Single-file CLI** — `zsh` + `python3` **standard library** only; `litellm`/`mlx` installed via `uv` only when you actually serve inference. Clients fetch the CLI as one script over the LAN.
 
 ## Quickstart
@@ -232,6 +233,7 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 - [Ports](#ports)
 - [Ferrying models & files across the LAN](#ferrying-models--files-across-the-lan)
 - [Route a client's downloads through the host](#route-a-clients-downloads-through-the-host)
+- [Reverse expose: publish a client's port through the host](#reverse-expose-publish-a-clients-port-through-the-host)
 - [Local models](#local-models)
 - [Platform support](#platform-support)
 - [Privacy](#privacy)
@@ -369,6 +371,7 @@ Stands up a full **Grafana + VictoriaMetrics + VictoriaLogs** observability stac
 | **8095** | LAN share server — client bootstrap, model/file ferry routes, client telemetry | `ferry share` |
 | **8096** | HuggingFace pass-through proxy (experimental) | `ferry serve-hf` |
 | **8097** | General HTTP(S) download forward proxy | `ferry serve-proxy` |
+| **8098** | Reverse-relay control port — a client dials this to register, then publishes one of its own local ports through the host | `ferry relay` |
 | **9099** | Default netcat port for direct `ferry send` / `ferry receive` | `ferry send` / `ferry receive` |
 | **3001 / 8429 / 9428 / 9092** | Grafana / VictoriaMetrics / VictoriaLogs / metrics exporter (localhost only) | `ferry dash --grafana` |
 
@@ -446,6 +449,36 @@ uvx whosaid ...            # uv/PyPI, huggingface_hub, git, curl — now downloa
 
 `ferry env` prints the `HTTP(S)_PROXY` / `HF_ENDPOINT` / `NO_PROXY` exports on stdout so it stays `eval`-able (add `--write` to persist them into `~/.zshrc`). The proxy handles HTTPS via `CONNECT` tunneling and plain HTTP by forwarding, and covers **anything that honors the standard proxy env vars**. It routes each request straight through **the host's own connection with no caching** — the host just needs internet. Stop it with `ferry down`.
 
+## Reverse expose: publish a client's port through the host
+
+Every other feature in `ferry` pushes **host → client**: inference, files, the forward proxy. This is the missing direction. A locked-down laptop — a managed firewall that resets inbound connections, a corporate proxy that blocks tunnel services and MITMs TLS — can only make **outbound** connections. Nothing on it is reachable from a phone or another machine, not even over the same Wi-Fi. Reverse expose fixes that by having the client dial the host and letting the host do the listening.
+
+```bash
+# host
+ferry relay                                  # accept registrations, publish ports
+
+# client
+ferry expose 4290 --as 4290 --token <token>  # serve 127.0.0.1:4290 from the host
+```
+
+`ferry relay --token` prints the shared token without starting anything; the client saves it to `~/.config/ferry/relay-token` after its first successful run, so only the first `expose` needs `--token` spelled out.
+
+**How the bytes move.** Two kinds of connection, both **dialled by the client**, so nothing ever connects into it:
+
+- **control** — one long-lived connection carrying `{"op":"register"}`, then one `{"op":"open","id":N}` from the relay for every inbound visitor.
+- **data** — one new connection per visitor, opened by the client the moment it sees an `open`.
+
+The relay accepts a public connection, parks the raw socket keyed by id, and sends `open` down control. The client dials back with `{"op":"data","id":N}` on a fresh connection; the relay matches it to the parked socket and splices the two — from then on it just pumps bytes in both directions.
+
+**Lifetime and teardown.** The exposure lives exactly as long as the client does. `ferry expose` `exec`s its tunnel in place rather than running it as a child, so killing the process kills the tunnel outright — nothing lingers behind a dead supervisor. On the relay side, a read that returns empty on the control connection *is* the disconnect signal: the listener and every socket still parked behind it close immediately. And because a laptop can vanish without ever closing anything — lid shut, Wi-Fi gone — the relay sets TCP keepalive on the control connection, so an absent client is eventually reaped instead of leaving a port published for nobody.
+
+**Security.** The token authenticates the client that *registers* — it says nothing about whoever connects to the published port afterward. Expose something with its own auth. Ferry's own ports (the endpoint, dashboard, share server, and friends) are refused as publish targets outright. Published ports bind `0.0.0.0` — the LAN — by default; pass `--bind 127.0.0.1` to `ferry relay` to keep an exposure local to the host only.
+
+```bash
+ferry status    # lists every published port, its client, and when it started
+ferry down      # tears down the relay and everything published through it
+```
+
 ## Local models
 
 The two GPU lanes and how to swap their models are covered in [The local GPU lanes](#the-local-gpu-lanes). This section is the operational detail.
@@ -480,7 +513,7 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 
 ## Privacy
 
-Everything runs on your own hardware and network. Client↔host traffic stays on your **private LAN as plain HTTP**; cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the keys**. Inbound client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host — outside any checkout, so it survives a repo that moves or a worktree that is removed. The observability stack binds to `127.0.0.1` only.
+Everything runs on your own hardware and network. Client↔host traffic stays on your **private LAN as plain HTTP**; cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the keys**. Inbound client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host — outside any checkout, so it survives a repo that moves or a worktree that is removed. The observability stack binds to `127.0.0.1` only. A port published with `ferry relay` binds on the **host** (the LAN by default) and is reachable by anything that can reach the host on that port — the relay authenticates only the client that registers it, so whatever you `ferry expose` must carry its own authentication.
 
 ## Command reference
 
@@ -495,6 +528,8 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `msg <text>` | client | Send a text note to the host's `~/.config/ferry/client_logs.txt` |
 | `log` | client | Pipe stdin straight to the host's `~/.config/ferry/client_logs.txt` |
 | `inbox [-n N] [-f] [--all] [--path]` | host | Read that file back, dated and attributed from the share server's access log where the receipt still exists |
+| `relay [--port P] [--bind ADDR] [--foreground] [--token]` | host | Accept reverse-expose registrations so a client can publish one of its own local ports through this host (control port `8098`) |
+| `expose <port> [--as PUBLIC] [--host H] [--port P] [--token T]` | client | Publish this client's `127.0.0.1:<port>` from the host, dialling only outbound |
 | `offer <path>...` | host | Record files/dirs in `offered.json` for clients to fetch |
 | `pull <model-id> [--host H] [--port P] [--transport http\|hf\|nc] [--to DIR]` | client | Pull a model from the host cache (three transports) |
 | `get <name> [--host H] [--port P] [--to DIR]` | client | Fetch an offered file/dir by basename |
@@ -530,6 +565,7 @@ python3 lib/ferry-hostreset.test.py   # host-reset: route-config validation, end
 python3 lib/ferry-front.test.py       # the front door: /v1/models advertises lanes only
 python3 lib/ferry-clientbootstrap.test.py  # client scope: bootstrap / reset / cleanup
 python3 lib/ferry-inbox.test.py       # inbox: the receipt/entry join, host-only guard
+python3 lib/ferry-relay.test.py       # reverse tunnel: byte round-trip, teardown on disconnect, refusals
 ```
 
 The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.

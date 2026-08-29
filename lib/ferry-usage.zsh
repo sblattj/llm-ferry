@@ -22,6 +22,12 @@ Commands:
   inbox              [Host] Read what clients sent — dated and attributed where the
                        share log still has the receipt
                        ferry inbox [-n N] [-f] [--all] [--path]
+  relay              [Host] Accept reverse-expose registrations so a client can
+                       publish one of ITS local ports through this host
+                       ferry relay [--port P] [--bind ADDR] [--token] [--foreground]
+  expose <port>      [Client] Publish 127.0.0.1:<port> from the host, dialling only
+                       outbound — for a laptop that cannot accept inbound at all
+                       ferry expose <port> [--as PUBLIC] [--host H] [--token T]
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
   opencode           [Client] Auto-wire opencode to route through the host (detects served models)

@@ -25,6 +25,10 @@
 set -eu
 
 APP_DIR="$(dirname "${0:A}")"
+# The script's own resolved path, captured HERE at load time: inside a function
+# `$0` is the function's name, so a command that needs to re-invoke ferry (the
+# relay backgrounding itself) cannot compute this for itself.
+FERRY_BIN_PATH="${0:A}"
 
 # ---- OS detection & portable host helpers (macOS + Linux) ----
 case "$(uname -s)" in
@@ -95,6 +99,7 @@ PORT="8090"               # litellm front door — the single LAN endpoint
 SHARE_PORT="8095"
 HF_PORT="8096"
 PROXY_PORT="8097"
+RELAY_PORT="8098"         # reverse-expose control port — clients dial IN to publish OUT
 LOCAL_ORCH_PORT="8092"    # MLX backend for the `local-orch` lane
 LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # NOTE: 8091 is deliberately skipped — `ferry dash` binds it. The stack and the
@@ -226,6 +231,14 @@ SHARE_LOG="$LOG_DIR/share-$SHARE_PORT.log"
 # carries this same path as a literal, because it runs as its own process — a test
 # pins the two spellings together.
 HQ_LOG="$HOME/.config/ferry/client_logs.txt"
+
+# Reverse-expose state. The token is the only thing separating "a client of yours"
+# from "anything that can reach the LAN", so it is 0600 and never logged. The
+# published-ports file is what `ferry status` reads, written atomically by the
+# relay so a status read never catches it half-written.
+RELAY_TOKEN_FILE="$HOME/.config/ferry/relay-token"
+RELAY_STATE_FILE="$HOME/.config/ferry/relay-published.json"
+RELAY_LOG="$LOG_DIR/relay-$RELAY_PORT.log"
 
 # Load local secrets if present (e.g. GEMINI_API_KEY). Export the variable in your
 # shell, or drop it in ~/.config/ferry/secrets.env — never commit real API keys.

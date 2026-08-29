@@ -16,6 +16,7 @@ case "$COMMAND" in
   share)         cmd_share ;;
   msg)           cmd_msg "$@" ;;
   log)           cmd_log ;;
+  inbox)         cmd_inbox "$@" ;;
   offer)         cmd_offer "$@" ;;
   pull)          cmd_pull "$@" ;;
   get)           cmd_get "$@" ;;

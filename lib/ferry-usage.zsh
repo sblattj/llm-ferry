@@ -19,6 +19,9 @@ Commands:
   share              [Host] Expose client-bootstrap.sh over LAN for other laptops to curl
   msg <text>         [Client] Send a direct text message to host's ~/.config/ferry/client_logs.txt
   log                [Client] Pipe stdin log stream directly back to host
+  inbox              [Host] Read what clients sent — dated and attributed where the
+                       share log still has the receipt
+                       ferry inbox [-n N] [-f] [--all] [--path]
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
   opencode           [Client] Auto-wire opencode to route through the host (detects served models)

@@ -182,8 +182,8 @@ The answer lives in two files and neither holds all of it. `~/.config/ferry/clie
 Two details that would otherwise skew it: a `POST /hq` that returned non-200 means the handler raised and **no entry was written**, so those are counted separately (`WARNING: N POST(s) … returned an error`) instead of consuming a slot; and every `share-*.log` is read, not just the default port's, because `ferry share` scans upward when its port is taken.
 
 ```
- 11  28/Aug 17:47  192.168.1.12     ########## HANDOFF FILE: prxref-HANDOFF.md ##########
- 12  28/Aug 17:47  192.168.1.12     ########## HANDOFF FILE: reverse-expose-handoff.md ##
+ 11  28/Aug 17:47  192.168.1.42     ########## HANDOFF FILE: prxref-HANDOFF.md ##########
+ 12  28/Aug 17:47  192.168.1.42     ########## HANDOFF FILE: reverse-expose-handoff.md ##
  13  28/Aug 17:50  127.0.0.1        self-test
 ```
 

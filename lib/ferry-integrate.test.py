@@ -48,7 +48,7 @@ FERRY = os.path.join(REPO, "ferry")
 # fallback deployments that sit behind them. Only the roles may reach a config.
 # `super-flash` is deliberately ABSENT — it is a hidden alias, so a real host
 # does not advertise it either, and the housekeeper must wire up anyway.
-CATALOGUE = ["orch", "orch-fallback-1", "orch-fallback-2", "orch-fallback-3",
+CATALOGUE = ["heavy", "orch-fallback-1", "orch-fallback-2", "orch-fallback-3",
              "flash", "flash-fallback-1", "flash-fallback-2", "flash-fallback-3",
              "local-orch", "local-sub"]
 
@@ -166,7 +166,8 @@ class TestTakeoverScope(FerryOpencodeCase):
         out = self.run_ferry()
         models = self.read()["provider"]["ferry"]["models"]
         self.assertEqual(set(models),
-                         {"orch", "flash", "super-flash", "local-orch", "local-sub"})
+                         {"heavy", "flash", "super-flash", "orch",
+                          "local-orch", "local-sub"})
         self.assertIn("Kept in picker", out)
 
     def test_a_hand_written_lane_label_is_preserved(self):
@@ -175,12 +176,12 @@ class TestTakeoverScope(FerryOpencodeCase):
         # offer and must never overwrite one.
         with open(self.cfg, "w") as f:
             json.dump({**self.USER_CONFIG, "provider": {"ferry": {"models": {
-                "orch": {"name": "orch - driver"},
+                "heavy": {"name": "heavy - driver"},
                 "local-sub": {"name": "local-sub - this GPU"},
             }}}}, f)
         self.run_ferry()
         models = self.read()["provider"]["ferry"]["models"]
-        self.assertEqual(models["orch"]["name"], "orch - driver")
+        self.assertEqual(models["heavy"]["name"], "heavy - driver")
         self.assertEqual(models["local-sub"]["name"], "local-sub - this GPU")
 
     def test_the_provider_name_tracks_the_host(self):
@@ -202,7 +203,7 @@ class TestTakeoverScope(FerryOpencodeCase):
     def test_model_and_small_model_are_lane_names(self):
         self.run_ferry()
         cfg = self.read()
-        self.assertEqual(cfg["model"], "ferry/orch")
+        self.assertEqual(cfg["model"], "ferry/heavy")
         # small_model follows the HOUSEKEEPER. opencode's schema calls it the
         # model "for tasks like title generation" — the housekeeping role, not
         # the fan-out one.
@@ -227,7 +228,7 @@ class TestTakeoverScope(FerryOpencodeCase):
         self.run_ferry()
         agent = self.read()["agent"]
         for a in DRIVER_AGENTS:
-            self.assertEqual(agent[a]["model"], "ferry/orch")
+            self.assertEqual(agent[a]["model"], "ferry/heavy")
         for a in WORKER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/flash")
         for a in HOUSE_AGENTS:
@@ -248,7 +249,7 @@ class TestLaneNamesOnly(FerryOpencodeCase):
     def test_only_the_three_roles_are_declared(self):
         self.run_ferry()
         models = self.read()["provider"]["ferry"]["models"]
-        self.assertEqual(set(models), {"orch", "flash", "super-flash"})
+        self.assertEqual(set(models), {"heavy", "flash", "super-flash"})
 
     def test_hidden_housekeeper_does_not_warn(self):
         # A hidden model_group_alias resolves on a request but is deliberately

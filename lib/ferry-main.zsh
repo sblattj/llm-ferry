@@ -28,6 +28,7 @@ case "$COMMAND" in
   serve-proxy)   cmd_serve_proxy "$@" ;;
   env)           cmd_env "$@" ;;
   opencode)      cmd_opencode "$@" ;;
+  update)        cmd_update "$@" ;;
   dash)          cmd_dash "$@" ;;
   --help|-h)     usage ;;
   *)             echo "Unknown command: $COMMAND"; usage ;;

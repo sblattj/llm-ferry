@@ -523,6 +523,7 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `up [--local-orch\|--local-sub\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | **No args → the full stack**: `orch` + `flash` (cloud) and `local-orch` + `local-sub` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub` → one GPU lane alone; `-c`/`-m` → a single cloud model; `-i` → interactive catalog |
 | `down` | host | Stop all servers, cloud proxies, and share/proxy servers |
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
+| `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up. Detects the role from `~/.config/ferry/client.json` and runs that side's reset: a **host** rebuilds the CLI from its own checkout, re-links it, and bounces the proxy; a **client** re-pulls the CLI from its host. `--full` also reloads the GPU lanes (host only) |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |
 | `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`) |
 | `msg <text>` | client | Send a text note to the host's `~/.config/ferry/client_logs.txt` |

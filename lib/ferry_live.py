@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 
 # ── topology → what the view draws ─────────────────────────────────────────
@@ -77,6 +78,152 @@ def sse_frame(record):
     desynchronise the client for the rest of the stream.
     """
     return b"data: " + json.dumps(record, separators=(",", ":")).encode() + b"\n\n"
+
+
+DEFAULT_RULES_PATH = os.path.expanduser("~/.config/ferry/event-rules.json")
+
+# Every state except `healthy` and `unknown` is a claim about a specific
+# provider's behaviour. `unknown` exists so an unrecognised failure is never
+# silently reported as healthy, which is how a real outage hides behind a green
+# dashboard.
+STATES = ("healthy", "rate_limited", "quota_exhausted", "auth_dead",
+          "unreachable", "unknown")
+
+# A quota does not clear on the decay that suits a rate limit — a weekly limit
+# outlives any timer worth setting — so quota_exhausted and auth_dead are
+# STICKY: only a success on that same deployment clears them.
+STICKY = ("quota_exhausted", "auth_dead")
+
+
+def load_rules(path=None):
+    """Read the classifier table from host config.
+
+    The table is DATA, not code, for two reasons. Adding a provider should not
+    mean editing this repo; and this repo is public, so a vendor's name, its
+    error wording and its plan terms belong in the operator's own gitignored
+    config. A missing or corrupt file yields no rules — every failure then
+    classifies as `unknown`, which is visible, rather than as healthy.
+    """
+    path = path or DEFAULT_RULES_PATH
+    empty = {"version": 0, "rules": [], "ttl": {}}
+    try:
+        with open(path) as handle:
+            loaded = json.load(handle)
+        if not isinstance(loaded, dict):
+            return empty
+        rules = [r for r in (loaded.get("rules") or []) if isinstance(r, dict)]
+        ttl = loaded.get("ttl") if isinstance(loaded.get("ttl"), dict) else {}
+        return {"version": loaded.get("version", 0), "rules": rules, "ttl": ttl}
+    except Exception:
+        return empty
+
+
+def classify(rules, code, err_type, message):
+    """First matching rule wins; no match is `unknown`, never `healthy`."""
+    code_s = str(code or "").strip()
+    text = (message or "").lower()
+    typ = (err_type or "")
+    for rule in rules.get("rules") or []:
+        wanted = [str(s) for s in (rule.get("status") or [])]
+        if wanted and code_s not in wanted:
+            continue
+        needles = rule.get("message_contains") or []
+        if needles and not any(str(n).lower() in text for n in needles):
+            continue
+        types = rule.get("type_contains") or []
+        if types and not any(str(t) in typ for t in types):
+            continue
+        if not wanted and not needles and not types:
+            continue                    # a rule matching everything is a bug
+        state = rule.get("state")
+        if state in STATES:
+            return state
+    return "unknown"
+
+
+class ExhaustionState:
+    """Per-deployment health, derived from the event stream.
+
+    Per DEPLOYMENT is the point. `ferry-dash` kept a single `last_event`, so any
+    new backend event overwrote a still-live outage on a different backend; one
+    lane's transient 429 could erase another lane's exhausted quota from the
+    display entirely.
+    """
+
+    def __init__(self, rules, now=None):
+        self.rules = rules if isinstance(rules, dict) else {"rules": [], "ttl": {}}
+        self._now = now or time.time
+        self._state = {}
+
+    def observe(self, record, chain=None):
+        """Fold one event in.
+
+        The event's `deployment` is the one that SUCCEEDED. The entries in
+        `hop_errors` belong to the hops tried BEFORE it, in order, so `chain`
+        maps them back to deployments.
+
+        NOTE, stated as an assumption rather than a fact: that hop_errors[i]
+        corresponds to chain[i] is taken from the order litellm appends them and
+        has not been traced end to end. Without a `chain` the failures are
+        counted but not attributed, which is the safe direction — a wrong
+        attribution would blame a healthy backend.
+        """
+        if not isinstance(record, dict):
+            return
+        now = self._now()
+
+        for index, hop in enumerate(record.get("hop_errors") or []):
+            if not isinstance(hop, dict):
+                continue
+            if not chain or index >= len(chain):
+                continue
+            state = classify(self.rules, hop.get("code"), hop.get("type"),
+                             hop.get("message"))
+            self._set(chain[index], state, now, hop.get("message") or "",
+                      str(hop.get("code") or ""))
+
+        served = record.get("deployment")
+        if not served:
+            return
+        status = int(record.get("status") or 0)
+        if 200 <= status < 300:
+            self._set(served, "healthy", now, "", "")
+        else:
+            state = classify(self.rules, status, "", "")
+            self._set(served, state, now, "", str(status))
+
+    def _set(self, deployment, state, now, detail, code):
+        prev = self._state.get(deployment)
+        if prev and prev["state"] == state:
+            prev["last"] = now          # `since` stays the first moment
+            if detail:
+                prev["detail"] = detail
+            return
+        self._state[deployment] = {"state": state, "since": now, "last": now,
+                                   "detail": detail, "code": code}
+
+    def snapshot(self):
+        """Current state per deployment, with non-sticky states decayed.
+
+        A deployment never seen is ABSENT rather than assumed healthy: this
+        knows only what traffic has shown it.
+        """
+        now = self._now()
+        ttl = self.rules.get("ttl") or {}
+        out = {}
+        for deployment, entry in self._state.items():
+            state = entry["state"]
+            if state not in STICKY and state != "healthy":
+                window = ttl.get(state)
+                if window and (now - entry["last"]) > float(window):
+                    state = "healthy"
+            out[deployment] = {
+                "state": state,
+                "since": entry["since"] if state == entry["state"] else now,
+                "detail": entry["detail"] if state == entry["state"] else "",
+                "code": entry["code"] if state == entry["state"] else "",
+            }
+        return out
 
 
 class EventTail:

@@ -2748,7 +2748,7 @@ cmd_opencode() {
   #
   # A ferry client knows three ROLES, never a model:
   #
-  #   driver       build / plan                      orch        local-orch
+  #   driver       build / plan                      heavy       local-orch
   #   worker       general / explore                 flash       local-sub
   #   housekeeper  title / summary / compaction      super-flash local-sub
   #
@@ -2768,7 +2768,9 @@ cmd_opencode() {
   #   model       -> ferry/<driver>
   #   small_model -> ferry/<worker>
   #   agent       -> all seven built-ins pinned (see the AGENTS lists below)
-  # `plugin` gets the goal plugin appended if absent. Every OTHER key in the
+  # `plugin` gets the goal plugin appended only when no entry already IS that
+  # plugin - which includes a LOCAL PATH to a fork of it, since opencode accepts
+  # a filesystem path and a private fork can only be named that way. Every OTHER key in the
   # file is left exactly as it was, and the whole original is snapshotted to
   # <name>.<UTC>.jsonc first, so a takeover is always reversible.
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
@@ -2829,6 +2831,13 @@ base = f"http://{host}:{port}/v1"
 
 SCHEMA = "https://opencode.ai/config.json"
 GOAL_PLUGIN = "@prevalentware/opencode-goal-plugin"
+# The package's own directory name, used to recognise a LOCAL PATH pointing at
+# the same plugin. opencode accepts a filesystem path as a plugin entry, and Bun
+# cannot resolve a PRIVATE repo over `github:` - so a hard fork of this plugin
+# can only be named by path. A path never equals the npm name, so a presence
+# check on the name alone re-appended upstream on EVERY run, leaving opencode
+# loading both the fork and the very package the fork exists to replace.
+GOAL_PLUGIN_DIR = GOAL_PLUGIN.rsplit("/", 1)[-1]
 
 # opencode 1.18.23 ships SEVEN built-in agents. Verified two ways so a future
 # rename gets caught: the published schema's $defs.Config.properties.agent names
@@ -3009,8 +3018,24 @@ if set_default:
         # Strip a trailing @version without eating the leading scope @.
         return entry.rsplit("@", 1)[0] if entry.count("@") > 1 else entry
 
-    if not any(pkg_name(e) == GOAL_PLUGIN for e in plugins):
+    def is_goal_plugin(entry):
+        name = pkg_name(entry)
+        if not isinstance(name, str):
+            return False
+        if name == GOAL_PLUGIN:
+            return True
+        # Match the package's directory name as a whole PATH SEGMENT, with or
+        # without a file extension, so ".../opencode-goal-plugin/dist/server.js"
+        # and ".../opencode-goal-plugin.js" both count as present while a
+        # neighbouring ".../opencode-goal-plugin-extras/..." does not.
+        segs = [s for s in name.split("/") if s]
+        return GOAL_PLUGIN_DIR in segs or GOAL_PLUGIN_DIR in (
+            os.path.splitext(s)[0] for s in segs)
+
+    goal_entry = next((e for e in plugins if is_goal_plugin(e)), None)
+    if goal_entry is None:
         plugins.append(GOAL_PLUGIN)
+        goal_entry = GOAL_PLUGIN
     cfg["plugin"] = plugins
 
 os.makedirs(os.path.dirname(cfg_path) or ".", exist_ok=True)
@@ -3027,7 +3052,13 @@ if set_default:
     print(f"    Agents pinned:  {'/'.join(DRIVER_AGENTS)} -> ferry/{driver}")
     print(f"                    {'/'.join(WORKER_AGENTS)} -> ferry/{worker}")
     print(f"                    {'/'.join(HOUSE_AGENTS)} -> ferry/{house}")
-    print(f"    Plugin:         {GOAL_PLUGIN}")
+    # Report the entry that actually SATISFIES the requirement, not the package
+    # we would have added. Printing GOAL_PLUGIN unconditionally claimed an
+    # install that never happened whenever a local fork was already present.
+    label = goal_entry[0] if isinstance(goal_entry, list) and goal_entry else goal_entry
+    print(f"    Plugin:         {label}")
+    if label != GOAL_PLUGIN:
+        print(f"                    (counts as {GOAL_PLUGIN}; upstream not added)")
 else:
     print("    --no-default: provider wired; permission/model/agent left alone.")
 if snap:

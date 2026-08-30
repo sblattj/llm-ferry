@@ -95,6 +95,35 @@ def load_topology(path):
     return topo
 
 
+def _provider_rule():
+    """The provider derivation from lib/ferry_events.py, or a safe stand-in.
+
+    Loaded by path because the sibling has no importable dotted name. Falls back
+    to returning "" rather than a SECOND implementation of the rule: a divergent
+    copy would join against events almost-but-not-quite, which is worse than an
+    obviously empty field.
+    """
+    global _PROVIDER_RULE
+    if _PROVIDER_RULE is None:
+        try:
+            import importlib.machinery
+            import importlib.util
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib", "ferry_events.py")
+            spec = importlib.util.spec_from_loader(
+                "ferry_events",
+                importlib.machinery.SourceFileLoader("ferry_events", path))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _PROVIDER_RULE = module.provider_for
+        except Exception:
+            _PROVIDER_RULE = lambda _model, _base: ""      # noqa: E731
+    return _PROVIDER_RULE
+
+
+_PROVIDER_RULE = None
+
+
 def parse_topology_text(text):
     """The line scanner, split out of load_topology so the WRITER validates
     against exactly the same view of the config the dashboard renders.
@@ -121,14 +150,42 @@ def parse_topology_text(text):
             m = re.match(r"^\s*-\s*model_name:\s*(\S+)", ln)
             if m:
                 cur = m.group(1)
-                g = topo["groups"].setdefault(cur, {"count": 0, "models": []})
+                g = topo["groups"].setdefault(
+                    cur, {"count": 0, "models": [], "ids": [], "public": False,
+                          "providers": [], "api_bases": []})
                 g["count"] += 1
+                # One slot per deployment, so ids/models/providers stay index-
+                # aligned even when a deployment omits a key.
+                g["ids"].append("")
+                g["api_bases"].append("")
                 if cur not in topo["order"]:
                     topo["order"].append(cur)
                 continue
             m = re.match(r"^\s*model:\s*(\S+)", ln)
             if m and cur:
                 topo["groups"][cur]["models"].append(m.group(1))
+                continue
+            # ── additive, for the live view ────────────────────────────────
+            # `model_info.id` is what x-litellm-model-id carries on a response,
+            # so it is the ONLY key that joins a live event back to a configured
+            # deployment. An unset id leaves the slot empty rather than guessing:
+            # litellm then generates a hash, which cannot be matched to config,
+            # and saying so beats silently failing to join.
+            m = re.match(r"^\s*api_base:\s*(\S+)", ln)
+            if m and cur and topo["groups"][cur]["api_bases"]:
+                topo["groups"][cur]["api_bases"][-1] = m.group(1)
+                continue
+            m = re.match(r"^\s*id:\s*(\S+)", ln)
+            if m and cur and topo["groups"][cur]["ids"]:
+                topo["groups"][cur]["ids"][-1] = m.group(1)
+                continue
+            # A trailing comment is the NORMAL shape in this config
+            # (`public: true      # advertised in /v1/models`), so anchoring on
+            # end-of-line after the value finds nothing at all. Caught by
+            # parsing the real config instead of only the fixture.
+            m = re.match(r"^\s*public:\s*(true|True|yes|Yes)\s*(#.*)?$", ln)
+            if m and cur:
+                topo["groups"][cur]["public"] = True
         elif section == "router":
             m = re.match(r"^\s*fallbacks:\s*(.+)$", ln)
             if m:
@@ -141,6 +198,17 @@ def parse_topology_text(text):
             m = re.match(r"^\s*(routing_strategy|allowed_fails|cooldown_time|num_retries):\s*(\S+)", ln)
             if m:
                 topo["routing"][m.group(1)] = m.group(2)
+
+    # Providers come from the SAME rule an event uses. Two derivations of the
+    # same fact would silently fail to match, and the live view joins topology
+    # to events on exactly this value.
+    provider_for = _provider_rule()
+    for g in topo["groups"].values():
+        bases = g.get("api_bases") or []
+        g["providers"] = [
+            provider_for(model, bases[i] if i < len(bases) else "")
+            for i, model in enumerate(g.get("models") or [])
+        ]
     return topo
 
 

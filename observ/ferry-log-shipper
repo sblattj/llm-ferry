@@ -22,7 +22,13 @@ What it emits — one JSON object per log line, POSTed as JSON-lines to
      "status": "200",                            # HTTP code, "" if not an access line
      "model":  "zai/glm-5.3",                    # backend model, "" if absent
      "requested_model": "orchestrator",          # model group asked for, "" if absent
+     "attribution": "request" | "mention",       # did this line SERVE, or merely name?
      "client_ip": "1.2.3.4"}                     # "" if not an access line
+
+`model` answers "which model does this line name", which is not the same
+question as "which model served a request" — litellm names models at startup
+too. `attribution` separates them, so a per-lane panel can filter
+`attribution:request` instead of trusting every mention.
 
 `_time` is INGEST time, not the line's own clock: uvicorn access lines carry
 no timestamp at all and litellm's `15:51:27 - LiteLLM:WARNING` prefix carries
@@ -145,6 +151,45 @@ KNOWN_MODEL = re.compile(
 KNOWN_GROUP = re.compile(
     r"(?<![\w.-])((?:local-)?orch(?:estrator)?(?:-[\w.-]+)?|local-sub|flash)")
 
+# A line that NAMES a model and a line that reports a model SERVING A REQUEST
+# are different facts, and `model` alone cannot tell them apart. litellm names
+# models at startup (`register_model:`, the cost-map warnings, the catalogue
+# dump) and those captures are deliberate — see the tests — but the Grafana
+# `$model` filter reads the field as routing truth. Observed 2026-08-29: the
+# newest record carrying a populated `model` was a `register_model:` cost-map
+# warning, and its neighbour was a bare indented model name from a catalogue
+# dump. Neither describes a request. `attribution` is the field that says which
+# kind of line this was, so a per-lane panel can ask for the request ones.
+#
+# Evidence a line concerns a real call: an access line's HTTP status (handled by
+# the caller), a versioned API path, a litellm call id, or one of the routing
+# events that only happen mid-request.
+REQUEST_SCOPED = re.compile(
+    r"/v\d+/(?:chat/completions|completions|messages|responses|embeddings)"
+    r"|litellm_call_id|x-litellm-call-id"
+    r"|[Ff]allback|cool(?:ed|ing)?[ _]?down|RESOURCE_EXHAUSTED|[Rr]ate ?limit"
+    r"|selected .* for this call")
+
+# Startup and catalogue lines: they name models without serving anything.
+NON_REQUEST = re.compile(
+    r"register_model|cost map|cache cost fields|model_cost"
+    r"|Proxy initialized|Loaded config|Set models:")
+
+
+def attribution_for(text, status):
+    """"request" | "mention" — whether this line describes a served call.
+
+    Deliberately NOT a filter on `model`: the loose id scan is load-bearing and
+    tested, so the model fields keep their existing meaning. This only labels
+    which kind of line produced them.
+    """
+    if status:
+        return "request"
+    if NON_REQUEST.search(text):
+        return "mention"
+    return "request" if REQUEST_SCOPED.search(text) else "mention"
+
+
 # Captures that are grammar, not identity ("model not in built-in cost map").
 _STOPWORDS = {"model", "name", "group", "none", "null", "not", "in", "the",
               "id", "info", "is", "for", "to", "and", "a", "an", "with",
@@ -232,6 +277,7 @@ def parse_line(line):
         "status": status,
         "model": find_model(text),
         "requested_model": find_requested_model(text),
+        "attribution": attribution_for(text, status),
         "client_ip": client_ip,
     }
 

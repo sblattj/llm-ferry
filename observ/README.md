@@ -59,6 +59,36 @@ e.g. `tailscale serve --bg --https=3443 http://127.0.0.1:3001`, or launch Grafan
 | **ferry-backends** | Topology (worker-pool size, deployments, fallback-chain length, config mtime) + an "LLM internals" row fed by litellm-native metrics + a **"Failures & Fallbacks"** row (failures by model/reason, cooldowns, fallbacks fired). |
 | **ferry-models** | Per-model request rate, tokens, spend, latency, success/failure — from litellm-native metrics. |
 | **ferry-logs** | Searchable per-model proxy logs from VictoriaLogs; errors & fallbacks view. |
+| **ferry-lanes** | Every hop of every fallback chain, the pools, per-deployment health with the state it is in and how long it has held it, per-lane request rate, and the fallback edges traffic actually took. The lane half reads `litellm.yaml`; the event half needs the front-door tap (below). |
+
+### The front-door event tap (`ferry-lanes` and `ferry dash`'s live view)
+
+The proxy access log records **no model at all** — measured over 13,182 real
+records — so nothing derived from it can say which deployment served a request.
+The tap is what supplies that: an ASGI middleware on the inference path reads
+litellm's own response headers (`x-litellm-model-group`, `x-litellm-model-id`,
+`x-litellm-attempted-fallbacks`, `x-litellm-fallback-errors`) and appends one
+NDJSON line per request. It is **off by default** and forwards every message
+unmodified when on.
+
+```bash
+FERRY_EVENTS=on ferry up                   # arm the tap
+ferry dash                                 # live view: lanes, chains, per-request feed
+ferry-metrics-exporter                     # picks the stream up at its default path
+```
+
+Both readers default to `${TMPDIR}/ferry-logs/ferry-events.ndjson`; override with
+`--events`. The writer is bounded (64MB with rotation, a 2048-deep non-blocking
+queue) and announces any drop in the stream itself, which the exporter surfaces
+as `ferry_events_dropped_total` — a silently overflowing tap would make every
+other number on the lanes dashboard an undercount.
+
+**Per-deployment health needs a classifier table you write yourself.** Copy
+`event-rules.example.json` to `~/.config/ferry/event-rules.json` and replace the
+placeholder wording with what your providers actually say; it is data rather
+than code so a vendor's name, its error wording and its plan terms stay out of
+this repo. With no table every failure classifies as `unknown` — visible, never
+silently `healthy`.
 
 ## Halt
 

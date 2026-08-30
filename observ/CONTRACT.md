@@ -135,6 +135,7 @@ until the user enables it. Never make a ferry_* panel depend on these.
 | **dash-overview** | `observ/grafana/dashboards/ferry-overview.json` |
 | **dash-traffic** | `observ/grafana/dashboards/ferry-traffic.json` |
 | **dash-backends** | `observ/grafana/dashboards/ferry-backends.json` |
+| **dash-lanes** | `observ/grafana/dashboards/ferry-lanes.json` (uid `ferry-lanes`) |
 | **alerting** | `observ/grafana/provisioning/alerting/{rules.yml,contactpoints.yml,policies.yml}` |
 | **bringup** | `observ/bringup.sh`, `observ/teardown.sh`, `observ/verify.sh`, `observ/victoriametrics/scrape.yml`, `observ/README.md` |
 | **cli-wiring** | `lib/ferry-dash.zsh` (edit existing), `lib/ferry-usage.zsh` (edit the `dash` help line only), `README.md` (repo root — edit the Dashboard section only) |

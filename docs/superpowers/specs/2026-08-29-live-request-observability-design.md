@@ -149,10 +149,11 @@ wire.
   predates `ferry-log-shipper`, `ferry-logs.json`, `ferry-models.json` and
   `provisioning/datasources/ferry-vlogs.yml`, none of which it lists. This work
   claims a new `live-events` seat rather than assuming an existing owner.
-- **A concurrent agent owns the `ferry dash` Routes panel**
-  (`docs/superpowers/specs/2026-08-29-ferry-route-editor-design.md`, approved,
-  not yet implemented). Both features need the same lane/hop/pool model. The
-  resolution is the shared module below, not two parsers.
+- **The Routes panel shipped in v1.15.0** and `ferry dash` can now edit a lane's
+  chain, not just draw it. That work is finished, so this is no longer a
+  concurrency problem — but it is a compatibility one: `parse_topology_text` is
+  now load-bearing for a *writer*, and this design reads the same structure. See
+  *Topology* below.
 
 ## Design
 
@@ -214,31 +215,37 @@ inside `try/except`; repeated failures disable the tap for the process. A
 request is never failed, delayed, or altered because event capture broke.
 Kill switch: `FERRY_EVENTS=off`.
 
-### Shared topology module
+### Topology — reuse, do not rebuild
 
-New `ferrylib/topology.py`, standard library only:
+**This section was rewritten after v1.15.0 shipped.** An earlier draft specified a
+new `ferrylib/topology.py`. That would now be a second parser competing with a
+working one: the route editor split the scanner out as `parse_topology_text`
+(`ferry-dash`), explicitly so "the WRITER validates against exactly the same view
+of the config the dashboard renders", and it already draws the distinction this
+design needs — `groups[name]["count"] > 1` is a **pool**, `fallbacks[name]` is an
+ordered **chain**, and a chain hop may itself be a pooled name.
 
-```
-Lane{name, public, hops:[Hop]}
-Hop{name, deployments:[Deployment], is_pool}
-Deployment{model_name, model, model_id, provider, api_base}
-```
+So the live view consumes `parse_topology_text` as-is. `observ/ferry-metrics-exporter`
+already reaches it through `importlib`, so that path exists too.
 
-A hop is one name. A name is one deployment, **or several deployments sharing
-that name** — which is the pool. Ordered chains come from
-`router_settings.fallbacks`; pools come from repeated `model_name` in
-`model_list`. The two compose: any hop in a chain may fan out into a pool. This
-is the same model the route-editor spec defines, so the editor writes it and
-this design renders it.
+It is extended, not replaced, with the three fields the live view needs and the
+editor does not currently parse: `model_info.id` (the `x-litellm-model-id` an
+event carries, and therefore the only key that joins an event to a deployment),
+`model_info.public` (which lanes render by default), and a provider derived from
+the model prefix.
 
-`ferry-dash` keeps a `load_topology` shim delegating to the module, because
-`observ/ferry-metrics-exporter` imports that function out of `ferry-dash` by
-`importlib` and the route editor references it.
+**Extending it is a shared-surface change**: the route editor validates writes
+against this same structure, so the extension is additive — new keys alongside
+the existing ones, no key renamed or removed — and `lib/ferry-dashroutes.test.py`
+(19 tests) must stay green as the control proving the editor's view is intact.
 
 ### Live view
 
-New `ferrylib/live.py`. `ferry-dash` gains an import, two routes, and a mount
-point — a deliberately small diff, since another agent is editing that file.
+New `lib/ferry_live.py` (an importable name — `ferry-dash`'s own hyphen is why
+the exporter has to reach it through `importlib`, and there is no reason to
+inflict that on a second consumer). `ferry-dash` gains an import, two routes, and
+a mount point — a deliberately small diff into a file that now carries the route
+editor.
 
 - `GET /events` — SSE, tailing the NDJSON from EOF
 - `GET /topology` — parsed lanes plus per-deployment state
@@ -410,8 +417,8 @@ Claims a new `live-events` seat, since `observ/CONTRACT.md`'s table is stale.
 | File | Note |
 |---|---|
 | `front/ferry_front.py` | the tap |
-| `ferrylib/topology.py` | new, shared with the route editor |
-| `ferrylib/live.py` | new |
+| `ferry-dash` `parse_topology_text` | **extended additively** — the editor validates writes against it |
+| `lib/ferry_live.py` | new — the SSE feed and the topology view |
 | `observ/ferry-metrics-exporter` | new metric families |
 | `observ/ferry-log-shipper` | structured events replace regex guessing |
 | `observ/grafana/dashboards/ferry-routes.json` | new |

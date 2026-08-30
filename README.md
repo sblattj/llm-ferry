@@ -360,6 +360,19 @@ ferry dash --grafana --down      # tear it down
 
 Stands up a full **Grafana + VictoriaMetrics + VictoriaLogs** observability stack on `http://localhost:3001` (login `admin` / `ferry-observ`) — request-rate, error-rate, and latency dashboards, backend/fallback topology, per-model usage (requests, tokens, spend, latency, success/failure), a **Failures & Fallbacks** view (failures by model/reason, cooldowns, fallbacks fired), and searchable per-model proxy logs — backed by metrics and log history that persist across sessions. It runs as local `nohup` daemons under `~/.config/ferry/observ/` (Grafana `:3001`, VictoriaMetrics `:8429`, VictoriaLogs `:9428`, a metrics exporter `:9092`). All OSS, $0, localhost-only. See [`observ/README.md`](observ/README.md) for setup, ports, and what each dashboard covers.
 
+**Live per-request attribution — `FERRY_EVENTS=on` (new in v1.16):**
+
+```bash
+FERRY_EVENTS=on ferry up          # arm the front-door event tap
+ferry dash --open                 # live lane view + per-request feed
+```
+
+The proxy access log records **no model at all** — measured over 13,182 real records — so nothing derived from it can say which deployment served a request. The tap is what supplies that: an ASGI middleware on the inference path reads litellm's own response headers and appends one NDJSON line per request. It is **off by default**, never reads a request body, forwards every message unmodified, and drops rather than ever blocking a response.
+
+With it on, `ferry dash` gains a **Live traffic** panel — every public lane drawn as its chain of hops, the served hop lit green, the hops it walked past lit red with the status code that pushed it on, per-deployment health, and a feed of the last 200 requests — and Grafana gains a **Ferry — Lanes & Fallbacks** dashboard plus three alerts, including `Lane chain exhausted`: *every* deployment in a lane is down at once, which is the outage the old metrics could not name.
+
+Per-deployment health (`rate_limited` / `quota_exhausted` / `auth_dead` / `unreachable`) is inferred against a classifier table you own: copy [`event-rules.example.json`](event-rules.example.json) to `~/.config/ferry/event-rules.json` and fill in what your providers actually say. **With no table every failure reads `unknown`** — visible, never silently `healthy`.
+
 ## Ports
 
 | Port | Purpose | Started by |

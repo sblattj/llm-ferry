@@ -525,6 +525,7 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up. Detects the role from `~/.config/ferry/client.json` and runs that side's reset: a **host** rebuilds the CLI from its own checkout, re-links it, and bounces the proxy; a **client** re-pulls the CLI from its host. `--full` also reloads the GPU lanes (host only) |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |
+| — | — | The dashboard's **Routes** panel edits each lane's failover chain in place: reorder, add or remove hops, preview the exact YAML diff, then apply. A timestamped snapshot is written first, only the `fallbacks:` line is rewritten (every comment in your config is left as-is), and the proxy picks the change up on the next `ferry update` |
 | `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`) |
 | `msg <text>` | client | Send a text note to the host's `~/.config/ferry/client_logs.txt` |
 | `log` | client | Pipe stdin straight to the host's `~/.config/ferry/client_logs.txt` |

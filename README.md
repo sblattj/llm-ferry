@@ -102,11 +102,11 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 
 `ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint (cloud pair as the persistent default), and adds a `host-code` shell shortcut. It also installs two opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
 
-- `opencode-cloud` — the **cloud pair**: `orch` drives (build/plan), `flash` runs the fan-out (general/explore), `super-flash` handles the background models (title/summary/compaction).
+- `opencode-cloud` — the **cloud pair**: `heavy` drives (build/plan), `flash` runs the fan-out (general/explore), `super-flash` handles the background models (title/summary/compaction).
 - `opencode-local` — the **GPU pair**: `local-orch` drives, `local-sub` runs the fan-out. Nothing leaves the host.
 - bare `opencode` — whichever pair you used **last** (cloud until you first run `opencode-local`; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
-Both need `ferry up` on the host, which serves all four lanes at once.
+Both need `ferry up` on the host, which serves all five lanes at once.
 
 #### How much of opencode it takes over
 
@@ -191,7 +191,7 @@ Two details that would otherwise skew it: a `POST /hq` that returned non-200 mea
 ### More host commands
 
 ```bash
-ferry up             # THE STACK: all four lanes on one endpoint (port 8090)
+ferry up             # THE STACK: all five lanes on one endpoint (port 8090)
 ferry up --route     # cloud lanes only — no GPU weights resident
 ferry up --local-orch # just the local-orch GPU lane, alone on 8090
 ferry up --local-sub  # just the local-sub GPU lane, alone on 8090
@@ -227,7 +227,7 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 
 ## Contents
 
-- [The stack — four lanes on one endpoint](#the-stack--four-lanes-on-one-endpoint)
+- [The stack — five lanes on one endpoint](#the-stack--five-lanes-on-one-endpoint)
 - [The local GPU lanes](#the-local-gpu-lanes)
 - [Dashboards & observability](#dashboards--observability)
 - [Ports](#ports)
@@ -241,19 +241,20 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 - [Development](#development)
 - [License](#license)
 
-## The stack — four lanes on one endpoint
+## The stack — five lanes on one endpoint
 
-`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: four named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus two local MLX servers.
+`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: five named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus two local MLX servers.
 
 | Lane | Where it runs | What it is |
 |---|---|---|
-| **`orch`** | cloud | The big driving model, with a strict **fallback chain** to independent providers |
-| **`flash`** | cloud | Cheap high-volume worker, **pooled across many API keys** |
+| **`heavy`** | cloud | The big driving model, with a strict **fallback chain** to independent providers |
+| **`flash`** | cloud | Cheap high-volume worker, **pooled across several model ids on one key** |
+| **`super-flash`** | cloud | Housekeeping — `title`, `summary`, `compaction`, on their own chain |
 | **`local-orch`** | host GPU | The smart local model (Qwen 3.8-27B nvfp4 + MTP speculative draft) |
 | **`local-sub`** | host GPU | The cheap local fan-out model (Nemotron 3 Nano 30B A3B NVFP4) |
 
 ```bash
-ferry up      # all four, on http://<host>.local:8090/v1
+ferry up      # all five, on http://<host>.local:8090/v1
 ```
 
 A lane **name is the contract**. The model behind it is swappable on the host without editing a single client — that is why the lanes are named for their *role* rather than for a model id. Clients just name a lane:
@@ -268,37 +269,53 @@ curl -s http://your-mac.local:8090/v1/chat/completions \
 
 The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — set your model ids and export the keys it references (`KIMI_API_KEY`, `GEMINI_API_KEY`, `FIREWORKS_API_KEY`, in your shell or `~/.config/ferry/secrets.env`) — then re-run.
 
-**Worker pool (load-balanced).** The `flash` lane can be **several identical `flash` deployments** in the yaml: `usage-based-routing-v2` sends each call to the least-used key (proactive even split), and on a `429` it cools the dead key out (`cooldown_time`) and rolls traffic to another. **One Google project, one key.** Gemini quota is per-GCP-project, so a pool of projects really would multiply throughput — which is exactly why it's prohibited: Google APIs ToS §2.d bars circumventing per-API limits (nine burst-created projects were suspended for it in one night, 2026-08-25). Grow the pool only with keys from genuinely separate **providers or accounts**, and get more Gemini capacity by raising the paid tier on the one project (Tier 3 = 20M TPM) instead.
+**Worker pool (load-balanced).** The `flash` lane is **several deployments sharing the `flash` model_name**: `usage-based-routing-v2` sends each call to the least-used one (proactive even split), and on a `429` it cools the dead deployment out (`cooldown_time`) and rolls traffic to another. **Widen it with model ids, never with keys.** Google says it plainly — *"Rate limits are applied per project, not per API key"* — so a second key in the same project shares one bucket and buys nothing, and a second *project* to multiply the limit is circumvention under Google APIs ToS §2.d (nine burst-created projects suspended in one night, 2026-08-25, and the account's OAuth APIs restricted). But the limit is per-project-**per-model**: every model id carries its own RPM/TPM/RPD bucket, so pooling `gemini-3.7-flash` + `gemini-3.5-flash` + `gemini-3.1-flash-lite` on **one** key is three independent buckets and nothing to circumvent. Pick members that are interchangeable for the lane's *role*, so a caller cannot tell which one answered. The other sanctioned lever is raising the paid tier on that one project (Tier 3 = 20M TPM).
 
-**Only lanes are advertised.** `/v1/models` lists the lanes you mark `model_info: {public: true}` and nothing else. That matters more than it sounds: `router_settings.fallbacks` is keyed by model group, so `orch` has a chain and `orch-fallback` does not — a client that picks a fallback hop out of a model list gets a single provider with **no failover at all**, and only finds out when that hop is down, which is the case the chain exists for. litellm has no setting for this (`hidden` applies to `model_group_alias` entries only), so `ferry up` serves litellm's own app through a small ASGI filter (`front/ferry_front.py`) that trims the listing. It is not a second process and not a reverse proxy — every request that is not the model listing goes to litellm untouched, so nothing sits between a client and a streamed token. Hiding is not removing: an unadvertised hop is still callable by name if you ask for it. If the filter cannot start, ferry says so and serves litellm directly rather than leaving the endpoint down.
+**Only lanes are advertised.** `/v1/models` lists the lanes you mark `model_info: {public: true}` and nothing else. That matters more than it sounds: `router_settings.fallbacks` is keyed by model group, so `heavy` has a chain and `heavy-fallback` does not — a client that picks a fallback hop out of a model list gets a single provider with **no failover at all**, and only finds out when that hop is down, which is the case the chain exists for. litellm has no setting for this (`hidden` applies to `model_group_alias` entries only), so `ferry up` serves litellm's own app through a small ASGI filter (`front/ferry_front.py`) that trims the listing. It is not a second process and not a reverse proxy — every request that is not the model listing goes to litellm untouched, so nothing sits between a client and a streamed token. Hiding is not removing: an unadvertised hop is still callable by name if you ask for it. If the filter cannot start, ferry says so and serves litellm directly rather than leaving the endpoint down.
 
-**Orchestrator fallback (strict chain).** The `orch` lane gets an *ordered* fallback chain: `orch-fallback` deployments (example: **Fireworks DeepSeek V4 Pro** first, **GLM 5.2** as last resort, via `FIREWORKS_API_KEY`) that `router_settings.fallbacks` reroutes to **in order, only** when `orch` errors — a `429`, a `5xx`, or a hard quota `403`. Choose fallbacks whose capacity is **independent** of the primary (a different provider or account): one that shares a rate-limit bucket with your primary — or with your own interactive use of that same account — will `429` exactly when you need it. A pay-per-token API like Fireworks has its own capacity and bills only when a hop actually fires. Put the fast model first, and keep `num_retries` low so a hard-down primary falls through quickly instead of burning retry-backoff first.
+**Driver fallback (strict chain).** The `heavy` lane gets an *ordered* fallback chain: `heavy-fallback` deployments (example: **Fireworks DeepSeek V4 Pro** first, **GLM 5.2** as last resort, via `FIREWORKS_API_KEY`) that `router_settings.fallbacks` reroutes to **in order, only** when `heavy` errors — a `429`, a `5xx`, or a hard quota `403`. Choose fallbacks whose capacity is **independent** of the primary (a different provider or account): one that shares a rate-limit bucket with your primary — or with your own interactive use of that same account — will `429` exactly when you need it. A pay-per-token API like Fireworks has its own capacity and bills only when a hop actually fires. Put the fast model first, and keep `num_retries` low so a hard-down primary falls through quickly instead of burning retry-backoff first.
 
 A **ChatGPT Plus/Pro subscription** can serve a fallback hop too, via LiteLLM's `chatgpt/` provider (device-code login, not an API key) — though in litellm 1.97.0 it's **streaming-only** (a non-streamed call falls through to the next hop, which is harmless in a chain).
 
-**The local lanes are deliberately outside every fallback chain.** The whole point of naming `local-orch` or `local-sub` is that the request stays on your machine — so a stopped GPU lane surfaces as an error rather than quietly spending a cloud quota. (`flash` pool overflow still spills to `orch`, which is a cloud-to-cloud hop.)
+**The local lanes are deliberately outside every fallback chain.** The whole point of naming `local-orch` or `local-sub` is that the request stays on your machine — so a stopped GPU lane surfaces as an error rather than quietly spending a cloud quota. (`flash` pool overflow still spills to `heavy`, which is a cloud-to-cloud hop.)
 
-**Renaming a lane without breaking clients.** `router_settings.model_group_alias` maps an old name onto a new one, and `hidden: true` keeps the alias out of `/v1/models` so the catalog advertises only the real lanes:
+**⚠ An alias has no fallback chain.** `router_settings.model_group_alias` looks like the way to keep an old client-facing name working, and it does resolve — for *deployment selection* only. litellm reads the fallbacks map with the **raw model string the client sent, before any alias is resolved**:
 
-```yaml
-router_settings:
-  model_group_alias:
-    orchestrator: {model: "orch",  hidden: true}   # legacy name, still resolves
-    super-flash:  {model: "flash", hidden: true}   # a role, not a model
+```
+router.py:6411   model_group = kwargs.get("model")      # "orchestrator"
+router.py:6345   get_fallback_model_group(fallbacks, model_group)
+router.py:6357   fallback_model_group is None -> raise original_exception
 ```
 
-**Never let a real model id become the name clients type.** It is tempting to alias a lane to the model currently behind it, and it goes wrong the first time you re-point that lane: clients keep sending a vendor's model name and get someone else's model back, while `hidden: true` means nothing in `/v1/models` reveals the discrepancy. Name the *role* instead — a role survives the model behind it changing, which is the entire reason clients address lanes. `ferry opencode` enforces the same rule from the client side: it writes only lane names, never a model id.
+Alias → target resolution lives at `router.py:9278`, on the deployment-selection path that lookup never reaches. So an aliased lane matches no `fallbacks:` entry, its primary's error goes straight to the client, and the entire chain is skipped — silently, because the config and `/v1/models` both look correct. Verified 2026-08-28 against a live stack whose primary was quota-blocked: the alias returned `500`; the real `model_name` returned `200` from the second hop.
 
-A `hidden` alias is also how you give a lane to one class of traffic without advertising it. `super-flash` above is the **housekeeping** lane — `ferry opencode` points opencode's `title`/`summary`/`compaction` agents at it — and because it is an alias rather than a `model_name`, it never appears in the catalogue that every client on the LAN can read.
+**Duplicate the deployment instead.** To keep a legacy name alive, give it a real `model_name` plus its **own identical `fallbacks:` entry** — one extra block, and it actually fails over:
+
+```yaml
+model_list:
+  - model_name: heavy            # the current name
+    litellm_params: {model: anthropic/k3, api_key: os.environ/KIMI_API_KEY}
+    model_info: {public: true, id: kimi-k3-heavy}
+  - model_name: orchestrator     # the legacy name: same model, its OWN entry
+    litellm_params: {model: anthropic/k3, api_key: os.environ/KIMI_API_KEY}
+    model_info: {id: kimi-k3-legacy}        # no public: true — not advertised
+
+router_settings:
+  fallbacks: [{"heavy": ["heavy-fallback"]}, {"orchestrator": ["heavy-fallback"]}]
+```
+
+**Never let a real model id become the name clients type.** It is tempting to name a lane after the model currently behind it, and it goes wrong the first time you re-point that lane: clients keep sending a vendor's model name and get someone else's model back, and nothing in `/v1/models` reveals the discrepancy. Name the *role* instead — a role survives the model behind it changing, which is the entire reason clients address lanes. `ferry opencode` enforces the same rule from the client side: it writes only lane names, never a model id.
+
+**Keeping a lane out of the catalogue is a separate control** — the one an alias only appeared to offer. Omit `model_info: {public: true}` and `front/ferry_front.py` leaves the lane out of `/v1/models` while it still routes *and still keeps its chain*. Use it sparingly: an unlisted lane is invisible to everything that reads the catalogue, including ferry's own `host-reset.sh` verifier, which will report it as not served while calls to it keep succeeding. `super-flash` — the **housekeeping** lane `ferry opencode` points `title`/`summary`/`compaction` at — is a real and *advertised* `model_name` for exactly that reason: it carries compaction, and a failed compaction does not retry, it drops the whole transcript.
 
 **Add models with Claude Code.** This repo bundles two skills — [`add-fallback-orchestrator`](.claude/skills/add-fallback-orchestrator/SKILL.md) and [`add-worker-model`](.claude/skills/add-worker-model/SKILL.md) — that walk Claude through editing your `litellm.yaml` correctly: the strict-failover-chain vs. load-balanced-pool distinction, the independent-capacity rule for fallbacks, and the per-project-quota gotcha **plus the Google ToS line a worker-key pool must not cross**. Just ask Claude Code to "add a fallback orchestrator" or "add another worker key."
 
-> LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to a driving lane (`orch` or `local-orch`) and the subagent model to its cheap partner (`flash` or `local-sub`).
+> LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to a driving lane (`heavy` or `local-orch`) and the subagent model to its cheap partner (`flash` or `local-sub`).
 
 **opencode auto-wiring.** On a client, `ferry opencode` takes opencode's config over so **every** agent routes through the host. Add `--local` to pick the GPU pair instead of the cloud pair:
 
 ```bash
-ferry opencode            # orch drives, flash fans out
+ferry opencode            # heavy drives, flash fans out
 ferry opencode --local    # local-orch drives, local-sub fans out
 ```
 
@@ -317,7 +334,7 @@ All seven of opencode's built-in agents get pinned across **three roles**, so no
 
 | role | agents | cloud | GPU |
 |---|---|---|---|
-| driver | `build`, `plan` | `orch` | `local-orch` |
+| driver | `build`, `plan` | `heavy` | `local-orch` |
 | worker | `general`, `explore` | `flash` | `local-sub` |
 | housekeeper | `title`, `summary`, `compaction` | `super-flash` | `local-sub` |
 
@@ -533,7 +550,7 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | Command | Mode | What it does |
 |---|---|---|
 | `install` | host | Install `uv`, `litellm` (+ `mlx-vlm` & default models on macOS), link `ferry` globally |
-| `up [--local-orch\|--local-sub\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | **No args → the full stack**: `orch` + `flash` (cloud) and `local-orch` + `local-sub` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub` → one GPU lane alone; `-c`/`-m` → a single cloud model; `-i` → interactive catalog |
+| `up [--local-orch\|--local-sub\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | **No args → the full stack**: `heavy` + `flash` (cloud) and `local-orch` + `local-sub` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub` → one GPU lane alone; `-c`/`-m` → a single cloud model; `-i` → interactive catalog |
 | `down` | host | Stop all servers, cloud proxies, and share/proxy servers |
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up. Detects the role from `~/.config/ferry/client.json` and runs that side's reset: a **host** rebuilds the CLI from its own checkout, re-links it, and bounces the proxy; a **client** re-pulls the CLI from its host. `--full` also reloads the GPU lanes (host only) |

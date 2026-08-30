@@ -295,5 +295,195 @@ class TestShippedConfigTemplate(unittest.TestCase):
             )
 
 
+import ferry_front as FF  # noqa: E402
+
+
+class TestEventTap(unittest.TestCase):
+    """The tap reads attribution headers off the response.
+
+    `test_the_inference_path_is_handed_the_original_send` above stays true and
+    unmodified: with the tap OFF — the default — the wrapped app still gets the
+    caller's own send by identity. When the tap is ON the wrapper does exist,
+    and the property that has to survive is no longer "no wrapper" but "the
+    bytes are identical". The equivalence test below is what proves that, and it
+    is the rollout gate: if it fails, the tap does not ship enabled.
+    """
+
+    ATTRIB = [
+        (b"content-type", b"text/event-stream"),
+        (b"x-litellm-model-group", b"flash"),
+        (b"x-litellm-model-id", b"flash-alt-1"),
+        (b"x-litellm-model-name", b"someprovider/some-model"),
+        (b"x-litellm-attempted-fallbacks", b"1"),
+        (b"x-litellm-fallback-errors",
+         b'[{"message":"m","type":"RateLimitError","param":null,"code":"429"}]'),
+    ]
+
+    def setUp(self):
+        self._prev = os.environ.get("FERRY_EVENTS")
+        self._dir = tempfile.mkdtemp()
+        self.path = os.path.join(self._dir, "ferry-events.ndjson")
+
+    def tearDown(self):
+        FF.reset_tap(None)
+        if self._prev is None:
+            os.environ.pop("FERRY_EVENTS", None)
+        else:
+            os.environ["FERRY_EVENTS"] = self._prev
+
+    def _app(self):
+        return RecordingApp(headers=list(self.ATTRIB),
+                            chunks=[b"a", b"bb", b"ccc"])
+
+    def _drive(self, enabled, path="/v1/chat/completions"):
+        os.environ["FERRY_EVENTS"] = "on" if enabled else "off"
+        FF.reset_tap(self.path if enabled else None)
+        app = self._app()
+        sent, send = asyncio.run(drive(LaneCatalogueFilter(app, LANES), path))
+        return app, sent, send
+
+    # ── the gate ───────────────────────────────────────────────────────────
+    def test_the_byte_stream_is_identical_with_and_without_the_tap(self):
+        _, with_tap, _ = self._drive(True)
+        _, without, _ = self._drive(False)
+        self.assertEqual(with_tap, without)
+
+    def test_chunk_boundaries_and_more_body_survive(self):
+        _, sent, _ = self._drive(True)
+        bodies = [(m.get("body"), m.get("more_body")) for m in sent
+                  if m["type"] == "http.response.body"]
+        self.assertEqual(bodies, [(b"a", True), (b"bb", True), (b"ccc", False)])
+
+    def test_headers_are_not_rewritten_on_the_hot_path(self):
+        _, sent, _ = self._drive(True)
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        self.assertEqual(start["headers"], list(self.ATTRIB))
+        self.assertNotIn(b"content-length", dict(start["headers"]))
+
+    def test_tap_off_still_hands_over_the_original_send(self):
+        app, _, send = self._drive(False)
+        self.assertIs(app.seen_send, send)
+
+    def test_tap_on_wraps_send_and_that_is_the_deliberate_trade(self):
+        # The converse of the test above, so neither can pass by the middleware
+        # being inert. A wrapper exists when the tap is on; the equivalence test
+        # is what makes that acceptable.
+        app, _, send = self._drive(True)
+        self.assertIsNot(app.seen_send, send)
+
+    # ── what it captures ───────────────────────────────────────────────────
+    def test_an_event_carries_the_lane_deployment_and_hop_errors(self):
+        self._drive(True)
+        FF.tap_flush()
+        rec = json.loads(open(self.path).readline())
+        self.assertEqual(rec["lane"], "flash")
+        self.assertEqual(rec["deployment"], "flash-alt-1")
+        self.assertEqual(rec["fallbacks"], 1)
+        self.assertEqual(rec["hop_errors"][0]["code"], "429")
+        self.assertEqual(rec["status"], 200)
+
+    def test_one_event_per_request_not_one_per_chunk(self):
+        self._drive(True)
+        FF.tap_flush()
+        lines = [l for l in open(self.path) if l.strip()]
+        self.assertEqual(len(lines), 1)
+
+    def test_disabled_writes_nothing(self):
+        self._drive(False)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_the_model_listing_path_is_not_tapped(self):
+        # The catalogue path has its own wrapper and is not a served inference
+        # request; an event there would be noise in every per-lane view.
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+        app = RecordingApp(body("orch", "orch-deepseek"))
+        asyncio.run(drive(LaneCatalogueFilter(app, LANES), "/v1/models"))
+        FF.tap_flush()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_the_listing_is_untapped_even_with_no_public_lanes(self):
+        # With an empty public set the catalogue path falls into the SAME branch
+        # as inference, so excluding it has to be explicit. Every other test here
+        # uses a populated lane set and would miss this.
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+        app = RecordingApp(body("orch"))
+        asyncio.run(drive(LaneCatalogueFilter(app, frozenset()), "/v1/models"))
+        FF.tap_flush()
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_inference_is_still_tapped_with_no_public_lanes(self):
+        # The converse, so the exclusion above cannot pass by disabling the tap.
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+        asyncio.run(drive(LaneCatalogueFilter(self._app(), frozenset()),
+                          "/v1/chat/completions"))
+        FF.tap_flush()
+        self.assertTrue(os.path.exists(self.path))
+
+    def test_the_app_is_wrapped_when_the_tap_is_on_but_no_lane_is_public(self):
+        # The defect a live run found: build_app returned the RAW litellm app
+        # whenever no lane was marked public, so the tap was installed nowhere
+        # and captured nothing. Every other test here builds the middleware by
+        # hand and therefore cannot see it.
+        os.environ["FERRY_EVENTS"] = "on"
+        self.assertTrue(FF.should_wrap(frozenset()))
+
+    def test_the_app_is_not_wrapped_when_there_is_nothing_to_do(self):
+        # The control: with no public lanes AND no tap, plain litellm is handed
+        # back untouched, which is the behaviour that predates this change.
+        os.environ["FERRY_EVENTS"] = "off"
+        self.assertFalse(FF.should_wrap(frozenset()))
+
+    def test_the_app_is_wrapped_for_filtering_even_with_the_tap_off(self):
+        os.environ["FERRY_EVENTS"] = "off"
+        self.assertTrue(FF.should_wrap(frozenset({"flash"})))
+
+    def test_health_and_metrics_paths_are_never_tapped(self):
+        # Caught by a live run: /health/liveliness produced a lane:"unknown"
+        # event, and both ferry-dash and the exporter poll it every 5s.
+        for path in ("/health/liveliness", "/health", "/metrics", "/metrics/",
+                     "/v1/models", "/models", "/"):
+            self.assertFalse(FF.is_inference_path(path), path)
+
+    def test_every_inference_shape_is_tapped(self):
+        for path in ("/v1/chat/completions", "/chat/completions",
+                     "/v1/messages", "/v1/responses", "/v1/embeddings",
+                     "/v1/chat/completions?stream=true"):
+            self.assertTrue(FF.is_inference_path(path), path)
+
+    def test_a_health_request_writes_no_event(self):
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+        asyncio.run(drive(LaneCatalogueFilter(self._app(), LANES),
+                          "/health/liveliness"))
+        FF.tap_flush()
+        self.assertFalse(os.path.exists(self.path))
+
+    # ── fail-open ──────────────────────────────────────────────────────────
+    def test_a_raising_tap_does_not_disturb_the_response(self):
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+        app = self._app()
+        mw = LaneCatalogueFilter(app, LANES)
+
+        def boom(_rec):
+            raise RuntimeError("tap exploded")
+
+        FF._tap().offer = boom
+        sent, _ = asyncio.run(drive(mw, "/v1/chat/completions"))
+        self.assertEqual([m["type"] for m in sent],
+                         ["http.response.start"] + ["http.response.body"] * 3)
+
+    def test_a_non_http_scope_is_never_tapped(self):
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+        app = RecordingApp(b"")
+        _, send = asyncio.run(
+            drive(LaneCatalogueFilter(app, LANES), "/v1/models", scope_type="websocket"))
+        self.assertIs(app.seen_send, send)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

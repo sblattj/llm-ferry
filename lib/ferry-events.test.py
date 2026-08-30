@@ -76,6 +76,24 @@ class TestRecord(unittest.TestCase):
             "", "/v1/chat/completions", 200)
         self.assertEqual(r["provider"], "someprovider")
 
+    def test_a_dialect_prefix_on_its_own_provider_host_keeps_the_prefix(self):
+        # Native use of a provider: litellm fills in that provider's own host,
+        # so the dialect prefix was honest. A live run labelled genuine OpenAI
+        # traffic "api.openai.com" before this case existed.
+        r = E.record_from_headers(
+            hdrs(**{"x_litellm_model_name": "openai/some-model",
+                    "x_litellm_model_api_base": "https://api.openai.com"}),
+            "", "/v1/chat/completions", 200)
+        self.assertEqual(r["provider"], "openai")
+
+    def test_a_dialect_prefix_on_a_foreign_host_yields_the_host(self):
+        # The control: same prefix, an endpoint that merely speaks the dialect.
+        r = E.record_from_headers(
+            hdrs(**{"x_litellm_model_name": "openai/some-model",
+                    "x_litellm_model_api_base": "https://api.example.invalid/v1"}),
+            "", "/v1/chat/completions", 200)
+        self.assertEqual(r["provider"], "api.example.invalid")
+
     def test_fallback_errors_are_parsed_into_hops(self):
         r = E.record_from_headers(
             hdrs(**{"x_litellm_attempted_fallbacks": 1,

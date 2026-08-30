@@ -321,6 +321,61 @@ class TestGoalPlugin(FerryOpencodeCase):
         self.run_ferry()
         self.assertEqual(len(self.read()["plugin"]), 1)
 
+    # ── a LOCAL fork of the same plugin ───────────────────────────────────
+    LOCAL_FORK = "/Users/someone/code/opencode-goal-plugin/dist/server.js"
+
+    def test_a_local_path_to_the_same_plugin_counts_as_present(self):
+        """opencode also accepts a filesystem path, and Bun cannot resolve a
+        PRIVATE repo over `github:` - so a hard fork of this plugin can only be
+        named by path. Matching the npm name alone re-appended upstream on every
+        run, and opencode then loaded the fork AND the broken package the fork
+        exists to replace. Found live in this host's own config, 2026-08-30."""
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.LOCAL_FORK]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.LOCAL_FORK])
+
+    def test_a_near_miss_path_still_gets_the_plugin(self):
+        """Control. If a path that merely RESEMBLES the plugin also counted as
+        present, the assertion above would pass by matching everything, and
+        ferry would quietly stop installing its own plugin."""
+        near = "/Users/someone/code/opencode-goal-plugin-extras/dist/server.js"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [near]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [near, self.PLUGIN])
+
+    def test_a_single_file_named_for_the_plugin_counts_as_present(self):
+        entry = "/Users/someone/plugins/opencode-goal-plugin.js"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [entry]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [entry])
+
+    def test_a_local_fork_in_the_tuple_form_counts_as_present(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [[self.LOCAL_FORK, {"enabled": True}]]}, f)
+        self.run_ferry()
+        self.assertEqual(len(self.read()["plugin"]), 1)
+
+    def test_the_status_line_reports_what_actually_satisfies_the_check(self):
+        """It printed GOAL_PLUGIN unconditionally, so a run that appended nothing
+        still read as 'installed @prevalentware/...' - the operator's only
+        on-screen evidence, and it disagreed with the file."""
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.LOCAL_FORK]}, f)
+        out = self.run_ferry()
+        self.assertIn(self.LOCAL_FORK, out)
+        self.assertIn("upstream not added", out)
+
+    def test_the_status_line_names_the_package_when_it_does_install_it(self):
+        """Control for the pair above: on a config with no plugin at all the
+        line must still name what ferry added, or the assertion above could pass
+        by the line never mentioning the package under any circumstances."""
+        out = self.run_ferry()
+        self.assertIn(self.PLUGIN, out)
+        self.assertNotIn("upstream not added", out)
+
 
 class TestSnapshots(FerryOpencodeCase):
     JSONC = (

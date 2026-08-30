@@ -15,6 +15,7 @@ dashboard (loaded via importlib — that file has no .py extension):
   * find_log(port) — proxy-log auto-discovery (incl. macOS /var/folders TMPDIR)
   * load_topology  — the tiny litellm.yaml topology parser (no PyYAML dep)
   * http_json      — the passive /health + /v1/models caller
+  * ferry_live     — lanes(), chains(), EventTail, ExhaustionState
 
 so the log regex, discovery, and topology parse are single-sourced with the
 dashboard. The exporter EXTENDS Activity (JointActivity) to also track the
@@ -25,6 +26,7 @@ Usage:
   ferry-metrics-exporter                      # serve on http://127.0.0.1:9092
   ferry-metrics-exporter --port 9092 --ferry http://127.0.0.1:8090
   ferry-metrics-exporter --config ~/.config/ferry/litellm.yaml --key local
+  ferry-metrics-exporter --events ~/…/ferry-events.ndjson --rules ~/…/event-rules.json
 
 Endpoints:
   GET /metrics  -> Prometheus text; Content-Type text/plain; version=0.0.4
@@ -77,6 +79,11 @@ http_json = _FD.http_json
 load_topology = _FD.load_topology
 find_log = _FD.find_log
 Activity = _FD.Activity
+# lib/ferry_live.py, reached through ferry-dash's own loader so the lane
+# resolution and the lane->deployment-id map are single-sourced with the
+# dashboard. None when the module is absent: every event family then has zero
+# samples and omits itself, and the rest of the scrape is untouched.
+live_mod = _FD._live()
 
 
 # ── traffic: extend the dashboard's tailer with the joint + event counters ──
@@ -205,19 +212,58 @@ class Family:
 
 # ── collector ───────────────────────────────────────────────────────────────
 class Collector:
-    def __init__(self, ferry, key, config_path, activity, started=None):
+    def __init__(self, ferry, key, config_path, activity, started=None,
+                 events_path=None, rules_path=None):
         self.ferry = ferry.rstrip("/")
         self.key = key
         self.config_path = config_path
         self.activity = activity
         self.started = started if started is not None else time.time()
         self.poll_interval = POLL_INTERVAL_SECONDS
+        # -- the event half: everything below is optional ------------------
+        # No events file, or no lib/ferry_live.py, means every event family has
+        # zero samples and omits itself. The topology and traffic halves are
+        # untouched, so an exporter running against a proxy with the tap off
+        # exports exactly what it did before this feature existed.
+        self._live = live_mod
+        self._tail = None
+        self._exhaustion = None
+        if events_path and self._live and os.path.exists(events_path):
+            try:
+                # From EOF, not from the start: a 64MB backlog replayed into a
+                # cumulative counter on every restart would be pure fiction.
+                # These counters mean "since exporter start", exactly like
+                # ferry_requests_total.
+                self._tail = self._live.EventTail(events_path)
+                self._exhaustion = self._live.ExhaustionState(
+                    self._live.load_rules(rules_path))
+            except Exception:
+                self._tail = None
+                self._exhaustion = None
+        self._events = {}       # (lane, deployment, provider, outcome) -> n
+        self._edges = {}        # (lane, from, to, code) -> n
+        self._dropped = 0
+        # one topology parse per scrape, shared by three blocks
+        self._topo = None
+        self._topo_ts = None
         # litellm poll cache (refreshed at most every poll_interval)
         self._llm_lock = threading.Lock()
         self._llm_ts = 0.0
         self._ferry_up = False
         self._health_ms = None
         self._models = []
+
+    def topology(self, now):
+        """The litellm.yaml parse for THIS scrape.
+
+        Three blocks read it; `now` is identical across them within one
+        render(), so the file is parsed once and never cached across scrapes —
+        a config edit is visible on the very next one.
+        """
+        if self._topo_ts != now or self._topo is None:
+            self._topo = load_topology(self.config_path)
+            self._topo_ts = now
+        return self._topo
 
     # -- litellm health/serving, cached so a fast scrape can't hammer :8090 --
     def refresh_litellm(self, now=None, force=False):
@@ -254,7 +300,8 @@ class Collector:
                       "Seconds since the exporter started.", "gauge").add(
                           int(now - self.started)).render()
         # -- dynamic sources; each guarded so one failure can't drop others --
-        for block in (self._health_block, self._traffic_block, self._topology_block):
+        for block in (self._health_block, self._traffic_block, self._topology_block,
+                      self._lanes_block, self._events_block):
             try:
                 out += block(now)
             except Exception as e:
@@ -308,7 +355,7 @@ class Collector:
 
     # -- topology (parse litellm.yaml) ------------------------------------
     def _topology_block(self, now):
-        topo = load_topology(self.config_path)
+        topo = self.topology(now)
         out = []
         groups = topo.get("groups") or {}
         if not topo.get("error"):
@@ -346,6 +393,177 @@ class Collector:
                       "Modification time (unix seconds) of litellm.yaml.", "gauge").add(
                           mtime).render()
         return out
+
+
+    # -- lanes: the chain and the pools, with labels -----------------------
+    def _lanes_block(self, now):
+        """Every hop of every lane as its own series.
+
+        `ferry_worker_pool_size` and `ferry_fallback_chain_length` are NOT
+        replaced by these — ferry-backends.json panels 1-2 and the alert rules
+        read the unlabelled scalars, and they keep their exact meaning. These
+        add the dimensions the scalars cannot carry: which lane, which position,
+        which deployment.
+        """
+        topo = self.topology(now)
+        if topo.get("error") or not self._live:
+            return []
+        hop_fam = Family(
+            "ferry_lane_hop",
+            "One series per deployment sitting at a position in a lane's chain.",
+            "gauge")
+        length = Family(
+            "ferry_lane_chain_length",
+            "Hops in a lane's chain, counting the primary (1 = no fallbacks).",
+            "gauge")
+        pool = Family(
+            "ferry_pool_size",
+            "Deployments sharing one model_name — a pool litellm load-balances "
+            "across, not an ordered chain it walks. 0 means the hop is named by "
+            "a chain but defined nowhere.",
+            "gauge")
+        sizes = {}
+        for lane in self._live.lanes(topo):
+            length.add(len(lane["hops"]), [("lane", lane["name"])])
+            for position, hop in enumerate(lane["hops"]):
+                sizes[hop["name"]] = hop["pool_size"]
+                for d in hop["deployments"]:
+                    hop_fam.add(1, [
+                        ("lane", lane["name"]),
+                        ("position", str(position)),
+                        ("hop", hop["name"]),
+                        # An unset model_info.id cannot be joined to an event.
+                        # Saying "unknown" makes the gap visible; omitting the
+                        # series would hide a deployment that really is routed to.
+                        ("deployment", d["id"] or "unknown"),
+                        ("model", d["model"]),
+                        ("provider", d["provider"]),
+                        ("pool_size", str(hop["pool_size"])),
+                    ])
+        for name in sorted(sizes):
+            pool.add(sizes[name], [("hop", name)])
+        return hop_fam.render() + length.render() + pool.render()
+
+    # -- events: per-request truth from the front-door tap -----------------
+    def _events_block(self, now):
+        """Fold every event appended since the last scrape, then render.
+
+        The tap's stream is the ONLY place a request is joined to the
+        deployment that served it — the proxy access log carries no model at
+        all — so these families exist for facts nothing else in the stack can
+        report.
+        """
+        if not self._tail:
+            return []
+        topo = self.topology(now)
+        chains, provider_of = {}, {}
+        if not topo.get("error"):
+            try:
+                chains = self._live.chains(topo)
+                for lane in self._live.lanes(topo):
+                    for hop in lane["hops"]:
+                        for d in hop["deployments"]:
+                            if d["id"]:
+                                provider_of[d["id"]] = d["provider"]
+            except Exception:
+                chains, provider_of = {}, {}
+
+        for rec in self._tail.read_new():
+            self._fold_event(rec, chains)
+
+        out = []
+        ev = Family("ferry_events_total",
+                    "Requests seen by the front-door tap, by lane, serving "
+                    "deployment, provider and outcome. Cumulative since "
+                    "exporter start.", "counter")
+        for (lane, dep, provider, outcome), n in self._events.items():
+            ev.add(n, [("lane", lane), ("deployment", dep),
+                       ("provider", provider), ("outcome", outcome)])
+        out += ev.render()
+
+        ed = Family("ferry_fallback_edges_total",
+                    "Times a lane moved from one deployment to the next, with "
+                    "the status code that caused it. Cumulative since exporter "
+                    "start.", "counter")
+        for (lane, frm, to, code), n in self._edges.items():
+            ed.add(n, [("lane", lane), ("from_deployment", frm),
+                       ("to_deployment", to), ("code", code)])
+        out += ed.render()
+
+        snap = self._exhaustion.snapshot() if self._exhaustion else {}
+        state = Family("ferry_deployment_state",
+                       "1 for the state a deployment is in RIGHT NOW; a state "
+                       "it has left emits nothing, so an alert clears when the "
+                       "outage does.", "gauge")
+        since = Family("ferry_deployment_state_since_seconds",
+                       "Seconds the deployment has held its current state.",
+                       "gauge")
+        for dep in sorted(snap):
+            info = snap[dep]
+            state.add(1, [("deployment", dep),
+                          ("provider", provider_of.get(dep, "unknown")),
+                          ("state", info["state"])])
+            since.add(int(max(0, now - info["since"])), [("deployment", dep)])
+        out += state.render()
+        out += since.render()
+
+        # Always emitted once a tap is being read, including at 0: a counter
+        # that only appears after the first drop cannot be rate()'d, and an
+        # overflowing tap makes every other number on this page an undercount.
+        out += Family("ferry_events_dropped_total",
+                      "Events the tap's bounded queue dropped rather than "
+                      "block a response, as announced in the stream.",
+                      "counter").add(self._dropped).render()
+        return out
+
+    def _fold_event(self, rec, chains):
+        """One record into the cumulative counters and the exhaustion state."""
+        if not isinstance(rec, dict):
+            return
+        if rec.get("notice") == "dropped":
+            # A different shape from a request record, discriminated on one key
+            # rather than guessed from missing fields. `n` is cumulative in the
+            # writing process, so the newest notice carries the true total and a
+            # proxy restart reads as an ordinary counter reset.
+            try:
+                self._dropped = max(self._dropped, int(rec.get("n") or 0))
+            except Exception:
+                pass
+            return
+
+        raw_lane = rec.get("lane")
+        lane = raw_lane or "unknown"
+        served = rec.get("deployment") or "unknown"
+        provider = rec.get("provider") or "unknown"
+        try:
+            status = int(rec.get("status") or 0)
+        except Exception:
+            status = 0
+        outcome = "ok" if 200 <= status < 300 else "error"
+        key = (lane, served, provider, outcome)
+        self._events[key] = self._events.get(key, 0) + 1
+
+        chain = chains.get(raw_lane) or []
+        for i, hop in enumerate(rec.get("hop_errors") or []):
+            if not isinstance(hop, dict):
+                continue
+            frm = chain[i] if i < len(chain) else ""
+            to = chain[i + 1] if i + 1 < len(chain) else ""
+            if not to:
+                to = rec.get("deployment") or ""
+            # A hop with no configured model_info.id leaves an empty slot, and
+            # an edge with an unknown end would attribute a failure to a
+            # backend that may be healthy. Counting nothing beats counting the
+            # wrong thing. Likewise a non-zero `fallbacks` with no hop_errors
+            # yields no edge: without a code and both ends there is no edge.
+            if not frm or not to:
+                continue
+            code = str(hop.get("code") or "")
+            ekey = (lane, frm, to, code)
+            self._edges[ekey] = self._edges.get(ekey, 0) + 1
+
+        if self._exhaustion:
+            self._exhaustion.observe(rec, chain=chain or None)
 
 
 # ── HTTP server ─────────────────────────────────────────────────────────────
@@ -390,7 +608,9 @@ def build_collector(args, started=None):
     ferry_port = args.ferry.rsplit(":", 1)[-1].split("/")[0]
     logpath = args.log or find_log(ferry_port)
     activity = JointActivity(logpath)
-    collector = Collector(args.ferry, args.key, args.config, activity, started=started)
+    collector = Collector(args.ferry, args.key, args.config, activity, started=started,
+                          events_path=getattr(args, "events", None),
+                          rules_path=getattr(args, "rules", None))
     return collector, logpath
 
 
@@ -403,6 +623,14 @@ def parse_args(argv=None):
                     help="litellm.yaml route config path")
     ap.add_argument("--log", default=None, help="proxy log path (auto-discovered if omitted)")
     ap.add_argument("--key", default="local", help="proxy auth bearer (default 'local')")
+    # Same defaults as ferry-dash, so both read the one stream the tap writes.
+    ap.add_argument("--events", default=os.path.join(
+        (os.environ.get("TMPDIR") or "/tmp").rstrip("/"),
+        "ferry-logs", "ferry-events.ndjson"),
+        help="per-request event stream written by the front-door tap")
+    ap.add_argument("--rules", default=os.path.expanduser(
+        "~/.config/ferry/event-rules.json"),
+        help="exhaustion classifier table (see event-rules.example.json)")
     return ap.parse_args(argv)
 
 
@@ -415,8 +643,9 @@ def main(argv=None):
         raise SystemExit("ferry-metrics-exporter: cannot bind 127.0.0.1:%d (%s). Try --port."
                          % (args.port, e))
     print("ferry-metrics-exporter -> http://127.0.0.1:%d/metrics   "
-          "(ferry %s, config %s, log %s)"
-          % (args.port, collector.ferry, args.config, logpath or "not found"))
+          "(ferry %s, config %s, log %s, events %s)"
+          % (args.port, collector.ferry, args.config, logpath or "not found",
+             args.events if collector._tail else "off"))
     print("Ctrl-C to stop.")
     try:
         srv.serve_forever()

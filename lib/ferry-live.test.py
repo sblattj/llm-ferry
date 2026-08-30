@@ -153,6 +153,48 @@ class TestLanes(unittest.TestCase):
         self.assertTrue(ghost["missing"])
 
 
+class TestChains(unittest.TestCase):
+    """The lane -> ordered-deployment-id map.
+
+    This is what attributes an event's hop_errors back to the backends that
+    produced them, so it lives in ONE place: `ferry-dash` renders from it and
+    `observ/ferry-metrics-exporter` counts fallback edges from it. Two
+    derivations that drifted apart would blame a healthy backend, which is
+    worse than saying nothing.
+    """
+
+    def test_each_lane_maps_to_the_ids_of_its_hops_in_order(self):
+        c = L.chains(D.parse_topology_text(CONFIG))
+        self.assertEqual(c["flash"], ["flash-a", "backup-1"])
+        self.assertEqual(c["local-sub"], ["local-sub-mlx"])
+
+    def test_a_pool_hop_contributes_only_its_first_deployment(self):
+        # litellm splits a pool across its members rather than trying them in
+        # order, so there is no "next" member to attribute a hop error to. The
+        # first id stands for the hop; anything finer would be invented.
+        c = L.chains(D.parse_topology_text(CONFIG))
+        self.assertEqual(c["flash"][0], "flash-a")
+
+    def test_a_hop_with_no_configured_id_leaves_an_empty_slot(self):
+        # An empty slot stops attribution at that hop instead of shifting every
+        # later hop onto the wrong backend.
+        t = D.parse_topology_text(
+            "model_list:\n"
+            "  - model_name: a\n    litellm_params:\n      model: p/m\n"
+            "  - model_name: b\n    litellm_params:\n      model: p/n\n"
+            "    model_info:\n      id: b-1\n"
+            'router_settings:\n  fallbacks: [{"a": ["b"]}]\n')
+        self.assertEqual(L.chains(t)["a"], ["", "b-1"])
+
+    def test_a_missing_hop_still_occupies_its_position(self):
+        t = D.parse_topology_text(
+            "model_list:\n"
+            "  - model_name: a\n    litellm_params:\n      model: p/m\n"
+            "    model_info:\n      id: a-1\n"
+            'router_settings:\n  fallbacks: [{"a": ["ghost"]}]\n')
+        self.assertEqual(L.chains(t)["a"], ["a-1", ""])
+
+
 class TestEventTail(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp()

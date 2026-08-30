@@ -164,6 +164,59 @@ class TestEventLog(unittest.TestCase):
         self.assertEqual(log.dropped, 4)
         log.close()
 
+    def test_a_drop_is_announced_in_the_stream_so_a_reader_can_see_it(self):
+        """A silently overflowing tap makes the whole live view lie.
+
+        `dropped` lives in the writing process's memory, and every reader is a
+        different process, so the only channel is the stream itself. The notice
+        is a DIFFERENT SHAPE from a request record - it carries `notice`, never
+        the record contract's keys - so a consumer discriminates on one key
+        rather than guessing from missing fields.
+        """
+        log = self._log(max_queue=2)
+        log.pause()
+        for i in range(6):
+            log.offer({"lane": "flash", "i": i})
+        self.assertEqual(log.dropped, 4)
+        log.close()                       # drains the two that were accepted
+        lines = [json.loads(l) for l in open(log.path) if l.strip()]
+        notices = [l for l in lines if l.get("notice") == "dropped"]
+        self.assertEqual(len(notices), 1, "expected exactly one drop notice")
+        self.assertEqual(notices[0]["n"], 4)
+        self.assertIn("t", notices[0])
+        # The notice precedes the record that triggered it, and that record is
+        # unchanged - the drop count never rides on the record contract.
+        self.assertEqual(lines[0]["notice"], "dropped")
+        self.assertEqual(lines[1]["i"], 0)
+        # Only ONE of the two accepted records lands: close() is a stop, not a
+        # flush. It sets the stop flag before the writer's next loop check, so
+        # whatever is still queued is lost - the deliberate trade against ever
+        # blocking a response, and the reason flush() exists separately.
+        self.assertEqual([l["i"] for l in lines if "i" in l], [0])
+
+    def test_no_drops_means_no_notice_line(self):
+        log = self._log()
+        log.offer({"lane": "flash"})
+        log.flush()
+        log.close()
+        lines = [json.loads(l) for l in open(log.path) if l.strip()]
+        self.assertEqual([l.get("notice") for l in lines], [None])
+
+    def test_the_notice_is_emitted_once_per_new_drop_not_once_per_record(self):
+        # Re-announcing the same total on every subsequent record would bury the
+        # stream in notices the moment the queue overflows once.
+        log = self._log(max_queue=2)
+        log.pause()
+        for i in range(6):
+            log.offer({"lane": "flash", "i": i})
+        log.close()
+        log2 = E.EventLog(log.path, max_queue=8)
+        log2.offer({"lane": "flash", "i": 9})
+        log2.flush()
+        log2.close()
+        lines = [json.loads(l) for l in open(log.path) if l.strip()]
+        self.assertEqual(len([l for l in lines if l.get("notice")]), 1)
+
     def test_an_unwritable_path_disables_the_log_and_never_raises(self):
         log = E.EventLog("/proc/nonexistent/ferry-events.ndjson")
         log.offer({"lane": "flash"})     # must not raise

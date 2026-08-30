@@ -124,6 +124,40 @@ router_settings:
 """
 
 
+# A lane fixture with the two things YAML_FIXTURE_LANES lacks: explicit
+# model_info ids (the only key that joins a live event back to a deployment)
+# and a chain long enough to have a middle. lane-b is a pool of two.
+YAML_FIXTURE_IDS = """\
+model_list:
+  - model_name: lane-a
+    litellm_params:
+      model: someprovider/model-one
+    model_info:
+      id: a-1
+      public: true
+  - model_name: lane-b
+    litellm_params:
+      model: otherprovider/model-two
+    model_info:
+      id: b-1
+  - model_name: lane-b
+    litellm_params:
+      model: otherprovider/model-three
+    model_info:
+      id: b-2
+  - model_name: lane-c
+    litellm_params:
+      model: openai/some-local-model
+      api_base: http://127.0.0.1:8093/v1
+    model_info:
+      id: c-1
+
+router_settings:
+  routing_strategy: usage-based-routing-v2
+  fallbacks: [{"lane-a": ["lane-b", "lane-c"]}]
+"""
+
+
 def parse_metrics(text):
     """Return (types, samples). types: name->typ. samples: list of (name, labels_str, value_str)."""
     types = {}
@@ -313,6 +347,180 @@ class TopologyTest(unittest.TestCase):
         self.assertIn("ferry_exporter_up 1", text)
         self.assertNotIn("ferry_worker_pool_size", text)
         self.assertNotIn("ferry_route_config_mtime_seconds", text)
+
+
+class LaneTopologyMetricsTest(unittest.TestCase):
+    """The labelled topology families, and the two legacy scalars they do NOT
+    replace — ferry-backends.json panels 1-2 and the alert rules read those."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = os.path.join(self.tmp, "litellm.yaml")
+        with open(self.cfg, "w") as f:
+            f.write(YAML_FIXTURE_IDS)
+        self.col = EXP.Collector("http://127.0.0.1:%d" % closed_port(),
+                                 "local", self.cfg, EXP.JointActivity(None))
+        self.text = self.col.render()
+
+    def test_every_hop_of_every_lane_is_one_series(self):
+        self.assertIn('ferry_lane_hop{lane="lane-a",position="0",hop="lane-a",'
+                      'deployment="a-1",model="someprovider/model-one",'
+                      'provider="someprovider",pool_size="1"} 1', self.text)
+        self.assertIn('ferry_lane_hop{lane="lane-a",position="1",hop="lane-b",'
+                      'deployment="b-1",model="otherprovider/model-two",'
+                      'provider="otherprovider",pool_size="2"} 1', self.text)
+        self.assertIn('ferry_lane_hop{lane="lane-a",position="2",hop="lane-c",'
+                      'deployment="c-1",model="openai/some-local-model",'
+                      'provider="local",pool_size="1"} 1', self.text)
+
+    def test_a_pooled_hop_emits_one_series_per_member(self):
+        # A pool is several DEPLOYMENTS sharing one model_name. Collapsing it to
+        # one series would hide exactly the member that went away.
+        self.assertIn('deployment="b-1",model="otherprovider/model-two",', self.text)
+        self.assertIn('deployment="b-2",model="otherprovider/model-three",', self.text)
+
+    def test_chain_length_counts_hops_including_the_primary(self):
+        self.assertIn('ferry_lane_chain_length{lane="lane-a"} 3', self.text)
+        self.assertIn('ferry_lane_chain_length{lane="lane-b"} 1', self.text)
+        self.assertIn('ferry_lane_chain_length{lane="lane-c"} 1', self.text)
+
+    def test_pool_size_is_per_hop(self):
+        self.assertIn('ferry_pool_size{hop="lane-a"} 1', self.text)
+        self.assertIn('ferry_pool_size{hop="lane-b"} 2', self.text)
+        self.assertIn('ferry_pool_size{hop="lane-c"} 1', self.text)
+
+    def test_the_legacy_scalars_are_retained_unchanged(self):
+        self.assertIn("ferry_worker_pool_size 2", self.text)      # largest pool
+        self.assertIn("ferry_fallback_chain_length 0", self.text)  # no orch lane here
+        self.assertIn("# TYPE ferry_worker_pool_size gauge", self.text)
+
+    def test_an_unreadable_config_omits_the_lane_families_entirely(self):
+        col = EXP.Collector("http://127.0.0.1:%d" % closed_port(), "local",
+                            os.path.join(self.tmp, "gone.yaml"), EXP.JointActivity(None))
+        text = col.render()
+        for name in ("ferry_lane_hop", "ferry_lane_chain_length", "ferry_pool_size"):
+            self.assertNotIn(name, text)      # no samples => no HELP/TYPE either
+        self.assertIn("ferry_exporter_up 1", text)
+
+
+class EventMetricsTest(unittest.TestCase):
+    """The event-derived families. Counters are cumulative since exporter
+    start, like ferry_requests_total — the tail opens at EOF, so a 64MB
+    backlog is never replayed into a counter on restart."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.cfg = os.path.join(self.tmp, "litellm.yaml")
+        with open(self.cfg, "w") as f:
+            f.write(YAML_FIXTURE_IDS)
+        self.events = os.path.join(self.tmp, "ferry-events.ndjson")
+        open(self.events, "w").close()        # exists + empty => tail starts at 0
+        self.rules = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "event-rules.example.json")
+        self.col = EXP.Collector("http://127.0.0.1:%d" % closed_port(), "local",
+                                 self.cfg, EXP.JointActivity(None),
+                                 events_path=self.events, rules_path=self.rules)
+
+    def _write(self, *records):
+        import json as _json
+        with open(self.events, "a") as f:
+            for r in records:
+                f.write(_json.dumps(r) + "\n")
+
+    def _event(self, **kw):
+        rec = {"t": "2026-08-30T12:00:00.000Z", "call_id": "c", "lane": "lane-a",
+               "deployment": "b-1", "model": "otherprovider/model-two",
+               "provider": "otherprovider", "api_base": "", "status": 200,
+               "fallbacks": 0, "retries": 0, "hop_errors": [],
+               "duration_ms": 100.0, "overhead_ms": 1.0, "cost": None,
+               "client_ip": "127.0.0.1", "path": "/v1/chat/completions"}
+        rec.update(kw)
+        return rec
+
+    def test_no_events_file_omits_every_event_family(self):
+        col = EXP.Collector("http://127.0.0.1:%d" % closed_port(), "local",
+                            self.cfg, EXP.JointActivity(None))
+        text = col.render()
+        for name in ("ferry_events_total", "ferry_fallback_edges_total",
+                     "ferry_deployment_state", "ferry_events_dropped_total"):
+            self.assertNotIn(name, text)
+        self.assertIn("ferry_exporter_up 1", text)   # the rest still renders
+
+    def test_an_event_counts_by_lane_deployment_provider_and_outcome(self):
+        self._write(self._event(), self._event(), self._event(status=500))
+        text = self.col.render()
+        self.assertIn('ferry_events_total{lane="lane-a",deployment="b-1",'
+                      'provider="otherprovider",outcome="ok"} 2', text)
+        self.assertIn('ferry_events_total{lane="lane-a",deployment="b-1",'
+                      'provider="otherprovider",outcome="error"} 1', text)
+        self.assertIn("# TYPE ferry_events_total counter", text)
+
+    def test_counters_accumulate_across_scrapes(self):
+        self._write(self._event())
+        self.col.render()
+        self._write(self._event())
+        text = self.col.render()
+        self.assertIn('provider="otherprovider",outcome="ok"} 2', text)
+
+    def test_a_fallback_becomes_an_edge_between_two_deployments(self):
+        # hop_errors[0] belongs to the hop tried BEFORE the one that answered,
+        # so the edge runs a-1 -> b-1 and carries the code that caused it.
+        self._write(self._event(fallbacks=1, hop_errors=[
+            {"code": 429, "type": "RateLimitError",
+             "message": "usage limit reached for this week"}]))
+        text = self.col.render()
+        self.assertIn('ferry_fallback_edges_total{lane="lane-a",'
+                      'from_deployment="a-1",to_deployment="b-1",code="429"} 1', text)
+
+    def test_a_failed_hop_becomes_a_deployment_state(self):
+        self._write(self._event(fallbacks=1, hop_errors=[
+            {"code": 429, "type": "RateLimitError",
+             "message": "usage limit reached for this week"}]))
+        text = self.col.render()
+        self.assertIn('ferry_deployment_state{deployment="a-1",'
+                      'provider="someprovider",state="quota_exhausted"} 1', text)
+        self.assertIn('ferry_deployment_state{deployment="b-1",'
+                      'provider="otherprovider",state="healthy"} 1', text)
+        self.assertIn('ferry_deployment_state_since_seconds{deployment="a-1"}', text)
+
+    def test_only_the_current_state_is_emitted_not_every_state_it_has_been(self):
+        # A lingering series for a state the deployment has left would keep an
+        # alert firing after the outage cleared.
+        self._write(self._event(fallbacks=1, hop_errors=[
+            {"code": 429, "message": "usage limit reached"}]))
+        self.col.render()
+        self._write(self._event(deployment="a-1", provider="someprovider",
+                                model="someprovider/model-one"))
+        text = self.col.render()
+        self.assertIn('ferry_deployment_state{deployment="a-1",'
+                      'provider="someprovider",state="healthy"} 1', text)
+        self.assertNotIn('deployment="a-1",provider="someprovider",'
+                         'state="quota_exhausted"', text)
+
+    def test_a_drop_notice_becomes_a_counter_so_an_overflowing_tap_is_visible(self):
+        self._write({"t": "2026-08-30T12:00:00.000Z", "notice": "dropped", "n": 4},
+                    self._event())
+        text = self.col.render()
+        self.assertIn("ferry_events_dropped_total 4", text)
+        self.assertIn("# TYPE ferry_events_dropped_total counter", text)
+        # and the notice is NOT counted as a request
+        self.assertIn('provider="otherprovider",outcome="ok"} 1', text)
+        self.assertNotIn('lane=""', text)
+
+    def test_an_unparseable_line_does_not_break_the_scrape(self):
+        with open(self.events, "a") as f:
+            f.write("{not json\n")
+        self._write(self._event())
+        text = self.col.render()
+        self.assertIn('provider="otherprovider",outcome="ok"} 1', text)
+
+    def test_every_value_is_still_a_plain_number(self):
+        self._write(self._event(fallbacks=1, hop_errors=[{"code": 429}]))
+        _, samples = parse_metrics(self.col.render())
+        for name, _labels, value in samples:
+            f = float(value)
+            self.assertEqual(f, f, "NaN in %s" % name)
 
 
 if __name__ == "__main__":

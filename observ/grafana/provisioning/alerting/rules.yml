@@ -431,6 +431,13 @@ groups:
       # NoData rather than as "not breaching". Threshold is `gt 0` because the product is
       # 1 only when both halves hold; note the evaluator set has no `gte`, which is the
       # other reason the comparison lives in the query.
+      #
+      # Re-pointed at ferry_pool_size{hop} (2026-08-30). The interim fix above used the
+      # GLOBAL max across every model_name, which could only ever say "some pool
+      # somewhere shrank"; the per-hop series says WHICH, and the `hop` label now rides
+      # through to the alert instance. `ferry_worker_pool_size` still exists and still
+      # means the largest pool — ferry-backends.json panel 1 reads it — it is simply the
+      # wrong series to alert on.
       - uid: ferry-key-pool-shrank
         title: "Key pool shrank"
         condition: C
@@ -444,7 +451,7 @@ groups:
             model:
               refId: A
               editorMode: code
-              expr: (ferry_worker_pool_size < bool 2) * (max_over_time(ferry_worker_pool_size[24h]) >= bool 2)
+              expr: (ferry_pool_size < bool 2) * (max_over_time(ferry_pool_size[24h]) >= bool 2)
               instant: true
               range: false
               intervalMs: 1000
@@ -503,7 +510,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "A pooled model_name that had 2+ deployments in the last 24h now has fewer than 2 — the pool has lost its rotation headroom. Breach flag: {{ $values.B.Value }} (1 = shrank; B is the 1/0 product, NOT the pool size — read ferry_worker_pool_size for that)."
+          summary: "Hop {{ $labels.hop }}: a pooled model_name that had 2+ deployments in the last 24h now has fewer than 2 — it has lost its rotation headroom and litellm has nothing left to balance across. Breach flag: {{ $values.B.Value }} (1 = shrank; B is the 1/0 product, NOT the pool size — read ferry_pool_size{hop=\"{{ $labels.hop }}\"} for that)."
 
       # 7. Health-check latency high — warning. The passive round-trip to /health/liveliness
       # (no token spend) is degraded.
@@ -737,3 +744,275 @@ groups:
           severity: warning
         annotations:
           summary: "sum(increase(litellm_deployment_cooled_down_total[5m])) > 0 — {{ $values.B.Value }} deployment cooldown event(s) in the last 5m (a backend was pulled out of rotation, e.g. on a 429/quota exception — check litellm_deployment_cooled_down_total's litellm_model_name/model_id/exception_status labels in Explore for which one)."
+
+      # 10. Deployment quota exhausted — warning. From the front-door event tap, not the
+      # proxy log: the log carries no model at all, so this is a fact nothing else in the
+      # stack can report. The classifier table that separates a quota from a rate limit is
+      # the OPERATOR's (~/.config/ferry/event-rules.json); with no table every failure
+      # classifies as `unknown` and this rule simply never fires — visible, never silently
+      # green.
+      #
+      # noDataState is OK, not NoData, and that is the whole design of this series:
+      # ferry_deployment_state emits ONLY the state a deployment is in right now, so
+      # "nothing is exhausted" is an EMPTY result, not a zero. NoData here would page on
+      # every healthy scrape. The exporter being gone is covered by "Exporter down".
+      #
+      # No `bool` and no `>=`: the series is 1 exactly when it exists, so `gt 0` on the
+      # raw value is already the right test.
+      - uid: ferry-deployment-quota-exhausted
+        title: "Deployment quota exhausted"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: max by (deployment) (ferry_deployment_state{state="quota_exhausted"})
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} is out of quota — a provider refused it with wording the operator's classifier table maps to quota_exhausted, not to an ordinary rate limit. This state is STICKY: only a success on that same deployment clears it, because a weekly limit does not come back on a timer. Traffic is still being served if the lane has a fallback left — check \"Lane chain exhausted\" for whether it does."
+
+      # 11. Lane chain exhausted — critical. THE outage condition this stack could not
+      # express before: not "a backend is down" but "this lane has run out of backends".
+      #
+      # The join. The left count is the deployments of a lane that currently hold a
+      # NON-healthy state; the right count is every deployment configured in that lane.
+      # Equal means all of them. `max by (lane,deployment)` collapses a deployment that
+      # appears at two positions of one chain so it is not counted twice.
+      #
+      # `deployment!="unknown"` drops hops whose litellm.yaml set no model_info.id: an
+      # event can never be joined to them, so their health is unknowable and including
+      # them would make the counts disagree forever.
+      #
+      # A deployment traffic has never touched has NO state series at all, so it lands in
+      # the right count and not the left, and the rule stays quiet. That is deliberate and
+      # conservative: this fires only when the whole chain has actually been tried and
+      # every hop failed.
+      #
+      # The `==` is deliberately NOT `== bool`: it FILTERS to the breaching lanes, one
+      # alert instance each with the `lane` label intact, and the value carried through to
+      # {{ $values.B.Value }} is the number of dead hops. A non-breaching lane vanishing
+      # from the result is exactly right here, and an all-healthy stack returns nothing at
+      # all — hence noDataState: OK, same reasoning as rule 10.
+      - uid: ferry-lane-chain-exhausted
+        title: "Lane chain exhausted"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: count by (lane) (max by (lane,deployment) (ferry_lane_hop{deployment!="unknown"}) and on(deployment) (ferry_deployment_state{state!="healthy"})) == count by (lane) (max by (lane,deployment) (ferry_lane_hop{deployment!="unknown"}))
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: OK
+        execErrState: Alerting
+        for: 2m
+        isPaused: false
+        labels:
+          severity: critical
+        annotations:
+          summary: "Lane {{ $labels.lane }} has NO healthy hop left — every deployment in its chain ({{ $values.B.Value }} of them) is in a non-healthy state at the same time. This is a total outage of that lane: the next request walks the whole chain and fails. The \"Deployment health\" table on the Ferry — Lanes dashboard names which backends and why."
+
+      # 12. Pool member lost — warning. Deliberately partitioned against "Key pool
+      # shrank" above so one config edit cannot fire both: this rule requires the hop to
+      # STILL have 2+ deployments (3 -> 2), and that rule requires it to have dropped
+      # BELOW 2 (2 -> 1). Overlapping alerts on one event are how an alert set stops being
+      # read.
+      #
+      # Both comparisons use `bool` so every hop's series survives as 1/0 — a bare `<`
+      # would filter, and a filtered-away hop reads as NoData rather than as "not
+      # breaching". The evaluator set has no `gte`, which is the other reason `>= 2` lives
+      # in the query rather than in the threshold.
+      #
+      # noDataState is NoData here, unlike rules 10-11: ferry_pool_size is emitted for
+      # every hop on every scrape whether or not anything is wrong, so its absence really
+      # does mean the exporter or the config parse is gone, not that all is well.
+      - uid: ferry-pool-member-lost
+        title: "Pool member lost"
+        condition: C
+        data:
+          - refId: A
+            queryType: ""
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: ferry-vm
+            model:
+              refId: A
+              editorMode: code
+              expr: (ferry_pool_size < bool max_over_time(ferry_pool_size[24h])) * (ferry_pool_size >= bool 2)
+              instant: true
+              range: false
+              intervalMs: 1000
+              maxDataPoints: 43200
+              datasource:
+                type: prometheus
+                uid: ferry-vm
+          - refId: B
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: C
+            queryType: ""
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    type: gt
+                    params:
+                      - 0
+                  operator:
+                    type: and
+                  query:
+                    params: []
+                  reducer:
+                    type: last
+                    params: []
+                  type: query
+              datasource:
+                type: __expr__
+                uid: __expr__
+              intervalMs: 1000
+              maxDataPoints: 43200
+        noDataState: NoData
+        execErrState: Alerting
+        for: 10m
+        isPaused: false
+        labels:
+          severity: warning
+        annotations:
+          summary: "Hop {{ $labels.hop }} has fewer deployments than it had in the last 24h, but still has 2 or more — a pool member was removed from litellm.yaml or its model_name changed. Rotation still works; it has less headroom. Read ferry_pool_size{hop=\"{{ $labels.hop }}\"} for the current size and the Pools panel for the whole set."

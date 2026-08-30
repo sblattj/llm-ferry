@@ -1,0 +1,101 @@
+{
+  "_README": [
+    "Classifier table for per-deployment exhaustion state in `ferry dash`.",
+    "",
+    "Copy to ~/.config/ferry/event-rules.json and replace the placeholder",
+    "wording with what YOUR providers actually say. This file is deliberately",
+    "data rather than code: adding a provider should not mean editing the ferry",
+    "repo, and the repo is public, so a vendor's name, its error wording and its",
+    "plan terms belong in your own config and not in version control.",
+    "",
+    "Every value here is a synthetic placeholder. Do not read it as a claim",
+    "about any real provider.",
+    "",
+    "HOW A RULE MATCHES. First rule that matches wins, so order matters: put the",
+    "specific ones above the general ones. A rule may test any combination of",
+    "  status           - HTTP status codes, as numbers",
+    "  message_contains - case-insensitive substrings of the provider's message",
+    "  type_contains    - substrings of the litellm exception class name",
+    "and every condition present must hold. A rule with none of the three is",
+    "ignored, because a rule that matches everything is a bug rather than a",
+    "catch-all.",
+    "",
+    "AN UNMATCHED FAILURE CLASSIFIES AS `unknown`, NEVER `healthy`. That is the",
+    "whole point: a failure you have not written a rule for should be visible as",
+    "unrecognised, not quietly reported as fine.",
+    "",
+    "STICKY vs DECAYING. `quota_exhausted` and `auth_dead` are sticky - only a",
+    "success on that same deployment clears them, because a weekly quota does",
+    "not come back on a timer. Everything else decays after its `ttl` seconds",
+    "without recurring.",
+    "",
+    "WHY THE MESSAGE MATTERS. The dashboard shows the provider's own words next",
+    "to the state it inferred. If a provider names its window ('weekly', 'per",
+    "day'), you see that because the provider said it - it is never guessed from",
+    "a status code."
+  ],
+
+  "version": 1,
+
+  "ttl": {
+    "rate_limited": 60,
+    "unreachable": 120,
+    "unknown": 300
+  },
+
+  "rules": [
+    {
+      "_why": "A quota is not a rate limit. Same 429, very different meaning: one clears in a minute, the other may not clear this week. The wording is the only thing that separates them, so this rule must sit above the plain-429 rule below.",
+      "state": "quota_exhausted",
+      "status": [429, 403],
+      "message_contains": [
+        "usage limit",
+        "quota",
+        "exceeded your current quota",
+        "insufficient balance",
+        "credits"
+      ]
+    },
+    {
+      "_why": "Payment required is unambiguous - no wording test needed.",
+      "state": "quota_exhausted",
+      "status": [402]
+    },
+    {
+      "_why": "A dead key looks like a provider outage until you read the status.",
+      "state": "auth_dead",
+      "status": [401]
+    },
+    {
+      "_why": "A 403 is overloaded: some providers use it for quota, some for a bad key. Wording decides, and the quota rule above gets first refusal.",
+      "state": "auth_dead",
+      "status": [403],
+      "message_contains": [
+        "invalid api key",
+        "unauthorized",
+        "permission",
+        "authentication"
+      ]
+    },
+    {
+      "_why": "Anything left on a 429 is an ordinary rate limit.",
+      "state": "rate_limited",
+      "status": [429]
+    },
+    {
+      "_why": "The endpoint never answered, so nothing can be said about quota or credentials.",
+      "state": "unreachable",
+      "type_contains": [
+        "APIConnectionError",
+        "Timeout",
+        "ConnectError",
+        "ServiceUnavailable"
+      ]
+    },
+    {
+      "_why": "A generic upstream 5xx: the provider is failing but not exhausted.",
+      "state": "unreachable",
+      "status": [502, 503, 504]
+    }
+  ]
+}

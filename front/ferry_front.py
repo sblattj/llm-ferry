@@ -37,10 +37,98 @@ unreadable config, no lane marked public, a body that is not the JSON we expect
 """
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
+import sys
 
 MODEL_LIST_PATHS = frozenset({"/v1/models", "/models"})
+
+# Only an actual inference call is an event. This is an ALLOWLIST on purpose: a
+# denylist of health/metrics paths would have to keep pace with litellm's route
+# table, and anything it missed becomes silent noise. Caught by a live run,
+# 2026-08-30 — /health/liveliness was producing a lane:"unknown" event, and both
+# ferry-dash and the exporter poll it every 5s, so the feed would have been
+# roughly 17k junk records a day.
+INFERENCE_PATH_PREFIXES = (
+    "/v1/chat/completions", "/chat/completions",
+    "/v1/completions", "/completions",
+    "/v1/messages", "/messages",
+    "/v1/responses", "/responses",
+    "/v1/embeddings", "/embeddings",
+)
+
+
+def is_inference_path(path: str) -> bool:
+    """Whether this path is a served model call worth an event."""
+    if not path or path in MODEL_LIST_PATHS:
+        return False
+    return any(path.startswith(p) for p in INFERENCE_PATH_PREFIXES)
+
+# ── the event tap ──────────────────────────────────────────────────────────
+# litellm returns the whole per-request attribution record in its RESPONSE
+# HEADERS, and nothing in ferry reads it. The proxy log cannot substitute:
+# measured 2026-08-29 over 13182 real records, not one of the 13076 lines that
+# describe a request names a model at all.
+#
+# So the tap wraps `send` on the hot path — which this module was written to
+# avoid — and the property that must survive is no longer "no wrapper" but "the
+# bytes are identical". `lib/ferry-front.test.py` asserts that equivalence
+# against a tap-disabled control, and that test is the rollout gate.
+#
+# `receive` is never wrapped: the lane comes from a RESPONSE header, so no
+# request body is ever read. Off unless FERRY_EVENTS says otherwise.
+_TAP = None
+_TAP_PATH = None
+
+
+def _events_module():
+    """Load lib/ferry_events.py by path — its sibling name has no dot form."""
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "lib", "ferry_events.py")
+    spec = importlib.util.spec_from_loader(
+        "ferry_events", importlib.machinery.SourceFileLoader("ferry_events", path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["ferry_events"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def tap_enabled() -> bool:
+    return (os.environ.get("FERRY_EVENTS") or "").strip().lower() in (
+        "1", "on", "true", "yes")
+
+
+def reset_tap(path=None) -> None:
+    """Test hook: drop any live tap so the next request builds a fresh one."""
+    global _TAP, _TAP_PATH
+    if _TAP is not None:
+        try:
+            _TAP.close()
+        except Exception:
+            pass
+    _TAP = None
+    _TAP_PATH = path
+
+
+def tap_flush() -> None:
+    if _TAP is not None:
+        _TAP.flush()
+
+
+def _tap():
+    """The process-wide EventLog, built lazily so import touches no disk."""
+    global _TAP
+    if _TAP is None:
+        try:
+            events = _events_module()
+            _TAP = events.EventLog(_TAP_PATH or events.default_path())
+            _TAP.record_from_headers = events.record_from_headers
+        except Exception:
+            return None
+    return _TAP
 
 
 def _public_lane_names(config_path: str) -> frozenset[str]:
@@ -110,13 +198,28 @@ class LaneCatalogueFilter:
 
     async def __call__(self, scope, receive, send):
         # The hot path: anything that is not the model listing is handed over
-        # untouched. No wrapper around `send`, so a streamed completion is
-        # byte-for-byte what litellm produced.
+        # untouched. With FERRY_EVENTS off — the default — there is no wrapper
+        # around `send` at all, so a streamed completion is byte-for-byte what
+        # litellm produced and the wrapped app receives the caller's own send by
+        # identity. With the tap on a wrapper does exist, but it forwards every
+        # message unmodified and only READS the header list on
+        # http.response.start; lib/ferry-front.test.py asserts the two are
+        # message-for-message equal.
         if (
             not self.public
             or scope.get("type") != "http"
             or scope.get("path") not in MODEL_LIST_PATHS
         ):
+            # Only inference paths are tapped. The catalogue is excluded
+            # explicitly because when NO lane is marked public this branch also
+            # handles /v1/models; health and metrics are excluded because they
+            # are polled every few seconds and are not served model calls.
+            if (
+                scope.get("type") == "http"
+                and is_inference_path(scope.get("path", ""))
+                and tap_enabled()
+            ):
+                return await self.app(scope, receive, self._tapped(scope, send))
             return await self.app(scope, receive, send)
 
         chunks: list[bytes] = []
@@ -137,6 +240,32 @@ class LaneCatalogueFilter:
 
         await self.app(scope, receive, capture)
 
+    def _tapped(self, scope, send):
+        """Wrap `send` to read attribution headers off http.response.start.
+
+        Every message is forwarded unmodified — no body is inspected, no header
+        is rewritten, no ordering is changed, and the only await is the
+        forwarded send. Fail-open in every branch: a broken tap must never fail,
+        delay, or alter a request.
+        """
+        async def tapped(message):
+            if message.get("type") == "http.response.start":
+                try:
+                    tap = _tap()
+                    if tap is not None:
+                        client = scope.get("client") or ("", 0)
+                        tap.offer(tap.record_from_headers(
+                            message.get("headers") or [],
+                            client[0] if client else "",
+                            scope.get("path", ""),
+                            message.get("status", 0),
+                        ))
+                except Exception:
+                    pass
+            return await send(message)
+
+        return tapped
+
     async def _flush(self, send, start_message, body: bytes) -> None:
         filtered = filter_catalogue(body, self.public)
         out = body if filtered is None else filtered
@@ -156,6 +285,22 @@ class LaneCatalogueFilter:
         await send({"type": "http.response.body", "body": out, "more_body": False})
 
 
+def should_wrap(public) -> bool:
+    """Whether the middleware has any job at all.
+
+    A non-empty public set means catalogue filtering. An enabled tap means
+    events. With neither, plain litellm is handed back untouched.
+
+    This exists as its own predicate because `build_app` used to return the raw
+    app whenever no lane was marked public — which silently disabled the event
+    tap on every config that does not use `model_info: {public: true}`. The unit
+    tests could not catch it: they construct LaneCatalogueFilter directly and
+    never call build_app, so the object worked while the app never installed it.
+    Caught by a live run under the real loader, 2026-08-30.
+    """
+    return bool(public) or tap_enabled()
+
+
 def build_app():
     """Import litellm's proxy app and wrap it. Used as the uvicorn app factory.
 
@@ -166,8 +311,8 @@ def build_app():
     from litellm.proxy.proxy_server import app as litellm_app
 
     public = _public_lane_names(os.environ.get("CONFIG_FILE_PATH", ""))
-    if not public:
-        # Nothing declared itself public — behave exactly like plain litellm.
+    if not should_wrap(public):
+        # Nothing to do — behave exactly like plain litellm.
         return litellm_app
     return LaneCatalogueFilter(litellm_app, public)
 

@@ -98,9 +98,16 @@ def provider_for(model, api_base):
     if host.split(":", 1)[0] in _LOCAL_HOSTS:
         return "local"
     prefix = model.split("/", 1)[0] if model and "/" in model else ""
-    if prefix and not (prefix in _DIALECTS and api_base):
+    if not prefix:
+        return host
+    if prefix not in _DIALECTS or not api_base:
         return prefix
-    return host or prefix
+    # A dialect prefix WITH an api_base is ambiguous: it is either native use of
+    # that provider (litellm fills in the provider's own host) or some other
+    # endpoint speaking the dialect. The host settles it — if the host is the
+    # provider's own domain, the prefix was honest. Caught by a live run,
+    # 2026-08-30: genuine OpenAI traffic was being labelled "api.openai.com".
+    return prefix if prefix in host else (host or prefix)
 
 
 def record_from_headers(headers, client_ip, path, status, now=None):

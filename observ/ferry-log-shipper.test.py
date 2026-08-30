@@ -200,6 +200,55 @@ class TestModelExtraction(unittest.TestCase):
         self.assertEqual(r["model"], "gemini/gemini-3.7-flash")
 
 
+class TestAttribution(unittest.TestCase):
+    """`model` says which model a line NAMES; `attribution` says whether the
+    line describes a served request. The Grafana `$model` filter reads the
+    first as if it meant the second, which is why the second field exists."""
+
+    def test_access_line_is_a_request(self):
+        self.assertEqual(S.parse_line(ACCESS_OK)["attribution"], "request")
+
+    def test_register_model_is_only_a_mention(self):
+        self.assertEqual(S.parse_line(REGISTER_GLM)["attribution"], "mention")
+
+    def test_catalogue_dump_is_only_a_mention(self):
+        line = "LiteLLM: Proxy initialized with Config, Set models: orchestrator-kimi"
+        self.assertEqual(S.parse_line(line)["attribution"], "mention")
+
+    def test_bare_indented_model_name_is_only_a_mention(self):
+        # The shape observed live on 2026-08-29: a catalogue line whose whole
+        # body is a model name. It carried a populated `model` field and
+        # described no request at all.
+        self.assertEqual(S.parse_line("    gemini-3.7-flash")["attribution"], "mention")
+
+    def test_fallback_is_a_request(self):
+        self.assertEqual(S.parse_line(FALLBACK)["attribution"], "request")
+
+    def test_cooldown_is_a_request(self):
+        self.assertEqual(S.parse_line(COOLDOWN)["attribution"], "request")
+
+    def test_resource_exhausted_is_a_request(self):
+        self.assertEqual(S.parse_line(RESOURCE_EXHAUSTED)["attribution"], "request")
+
+    def test_a_mention_still_keeps_its_model_field(self):
+        """The loose id scan is load-bearing and deliberately unchanged.
+
+        This is the control for the whole feature: if a future edit "fixes"
+        attribution by suppressing the model on startup lines instead of
+        labelling them, this test fails and says so.
+        """
+        r = S.parse_line(REGISTER_GLM)
+        self.assertEqual(r["model"], "zai/glm-5.3")
+        self.assertEqual(r["attribution"], "mention")
+
+    def test_every_line_is_labelled_one_or_the_other(self):
+        for line in (ACCESS_OK, ACCESS_MODELS, ACCESS_429, ACCESS_500,
+                     REGISTER_GLM, REGISTER_HASH, FALLBACK, COOLDOWN,
+                     RESOURCE_EXHAUSTED, TRACEBACK, EXCEPTION, BANNER, STARTUP):
+            self.assertIn(S.parse_line(line)["attribution"],
+                          ("request", "mention"), line)
+
+
 class TestLevels(unittest.TestCase):
     def test_litellm_warning_is_warn(self):
         self.assertEqual(S.parse_line(REGISTER_GLM)["level"], "warn")
@@ -228,7 +277,7 @@ class TestLevels(unittest.TestCase):
 
 class TestRecordShape(unittest.TestCase):
     FIELDS = {"_time", "_msg", "source", "level", "status", "model",
-              "requested_model", "client_ip"}
+              "requested_model", "attribution", "client_ip"}
 
     def test_every_contract_field_present_and_a_string(self):
         sh = S.Shipper("http://127.0.0.1:9428", dry_run=True)

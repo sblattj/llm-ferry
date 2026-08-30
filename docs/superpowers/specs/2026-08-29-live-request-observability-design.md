@@ -20,14 +20,30 @@ an aggregate counter sampled every 15s or a regex guess over log prose.
 
 ### Evidence
 
-**No per-request attribution exists.** The log shipper infers the `model` field
-by matching regexes against arbitrary log text (`observ/ferry-log-shipper`,
-`MODEL_PATTERNS` / `KNOWN_MODEL`). Queried live on 2026-08-29, the newest record
-carrying a populated `model` field has an `_msg` consisting of nothing but that
-same model name indented by four spaces, and its neighbours are litellm
-`register_model:` *startup warnings*. The field is scraping model names out of text that has
-nothing to do with a request. The underlying proxy access log is uvicorn's, whose
-lines carry client IP, method, path and status and **no model at all**.
+**No per-request attribution exists — measured, not estimated.** The log shipper
+infers the `model` field by matching regexes against arbitrary log text
+(`observ/ferry-log-shipper`, `MODEL_PATTERNS` / `KNOWN_MODEL`). Running the
+shipper over the real proxy log on 2026-08-29 — 13,182 records — and
+cross-tabulating each record by whether it describes a served call:
+
+| | names a model | names none |
+|---|---|---|
+| describes a request | **0** | 13,076 |
+| merely mentions one | 39 | 67 |
+
+Every line that names a model is a startup mention (`register_model:`, a
+cost-map warning, a catalogue dump). **Not one of the 13,076 request lines names
+a model at all.** The two categories are disjoint and exhaustive, so this is not
+a sampling artefact: the proxy access log is uvicorn's, and its lines carry
+client IP, method, path and status — never a model.
+
+The consequence is that the Grafana `$model` filter, applied to proxy logs, can
+only ever select boot noise, and **no amount of log parsing can fix it**, because
+the fact is not in the log. It is only in the response headers. That is what
+makes the header tap the design rather than one option among several.
+
+The `attribution` field, shipped alongside this spec, labels which kind of line
+produced each record so the distinction is queryable rather than assumed.
 
 **Exhaustion is one global slot.** `ferry-dash:172-180` matches two hardcoded
 substrings — `"permission_error"` + `"usage limit"` → `kimi_quota`, and
@@ -298,8 +314,15 @@ New alert rules:
   currently unalertable because no per-lane series exists
 - a pool member absent from a hop whose `pool_size` was previously higher
 
-`ferry-key-pool-shrank` is rewritten against `ferry_pool_size{hop}` so it
-measures a hop that actually shrank rather than the global maximum.
+`ferry-key-pool-shrank` was fixed ahead of this work, since it was firing
+continuously. It now requires a pool to have existed in the last 24h
+(`(ferry_worker_pool_size < bool 2) * (max_over_time(ferry_worker_pool_size[24h])
+>= bool 2)`, threshold `gt 0`) so the absence of a pool is no longer reported as
+the failure of one. Verified against live data: the new expression evaluates to 0
+where the old one fired, and a control with the second factor relaxed evaluates
+to 1, proving the suppression is doing the work rather than the expression being
+inert. Once `ferry_pool_size{hop}` exists it should be re-pointed at that, so it
+measures the hop that actually shrank rather than the global maximum.
 
 ## Hypotheses — verify before relying on
 

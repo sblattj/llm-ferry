@@ -15,7 +15,7 @@
       {
         "name": "model",
         "label": "Model",
-        "description": "Backend model the proxy actually dispatched to (the `model` log field). Multi-select; All matches every log line via LogsQL `in(*)`.",
+        "description": "Model NAMED by the log line (the `model` field) — not necessarily one that served a request: litellm names models at startup too. Measured 2026-08-29 over 13182 real records, every model-naming line was a startup mention and none of the 13076 request lines named a model, so pair this with `attribution` rather than reading it as routing truth. Multi-select; All matches every log line via LogsQL `in(*)`.",
         "type": "custom",
         "query": "glm-5.3,gemini-3.7-flash,deepseek-v4-pro-0813,glm-5p2,gpt-5.6-sol,k3,Qwen3.8-27B-nvfp4,NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
         "options": [
@@ -50,6 +50,23 @@
         "allValue": "*",
         "hide": 0,
         "skipUrlSync": false
+      },
+      {
+        "name": "attribution",
+        "label": "Attribution",
+        "description": "Did this line describe a SERVED request, or merely mention a model? `request` = an access line, a fallback, a cooldown, a rate-limit or another mid-call event. `mention` = startup registration, cost-map warnings, catalogue dumps. Defaults to All; pick `request` to see routing rather than boot noise. Records shipped before this field existed carry no value and appear only under All — verified 2026-08-29: `in(*)` matched all 120268 existing records, `in(request)` matched 0.",
+        "type": "custom",
+        "query": "request,mention",
+        "options": [
+          { "selected": false, "text": "request", "value": "request" },
+          { "selected": false, "text": "mention", "value": "mention" }
+        ],
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "multi": true,
+        "includeAll": true,
+        "allValue": "*",
+        "hide": 0,
+        "skipUrlSync": false
       }
     ]
   },
@@ -65,7 +82,7 @@
       "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
       "options": {
         "mode": "markdown",
-        "content": "### Ferry — Logs\nPer-model proxy logs for the **llm-ferry** LAN LLM relay — filter the live tail by backend `model` and `level`, and watch errors/fallbacks land in real time. Logs from VictoriaLogs via `ferry-log-shipper`; adjust LogsQL filters as needed.\n\nFields: `_msg` `_time` `source` `level` `status` `model` `requested_model` `client_ip`. Query language: **LogsQL**. Datasource: `victoriametrics-logs-datasource` (uid `ferry-vlogs`, VictoriaLogs :9428)."
+        "content": "### Ferry — Logs\nPer-model proxy logs for the **llm-ferry** LAN LLM relay — filter the live tail by backend `model` and `level`, and watch errors/fallbacks land in real time. Logs from VictoriaLogs via `ferry-log-shipper`; adjust LogsQL filters as needed.\n\nFields: `_msg` `_time` `source` `level` `status` `model` `requested_model` `attribution` `client_ip`. `attribution` separates a line that SERVED a request from one that merely NAMES a model — the proxy log carries no request→model mapping at all, so `model` alone is not routing truth. Query language: **LogsQL**. Datasource: `victoriametrics-logs-datasource` (uid `ferry-vlogs`, VictoriaLogs :9428)."
       },
       "transparent": true
     },
@@ -174,7 +191,7 @@
     {
       "id": 4,
       "type": "logs",
-      "title": "Proxy logs — model: $model · level: $level",
+      "title": "Proxy logs — model: $model · level: $level · $attribution",
       "description": "Live tail of the litellm proxy log, filtered by the Model and Level variables. LogsQL: `source:proxy AND model:in($model) AND level:in($level)` — the plugin expands a multi-value variable to `in(\"a\",\"b\")` and the All option to `in(*)`, which matches every log line.",
       "gridPos": { "h": 12, "w": 24, "x": 0, "y": 9 },
       "datasource": { "type": "victoriametrics-logs-datasource", "uid": "ferry-vlogs" },
@@ -184,7 +201,7 @@
           "refId": "A",
           "editorMode": "code",
           "queryType": "instant",
-          "expr": "source:proxy AND model:in($model) AND level:in($level)",
+          "expr": "source:proxy AND model:in($model) AND level:in($level) AND attribution:in($attribution)",
           "direction": "desc",
           "maxLines": 1000
         }

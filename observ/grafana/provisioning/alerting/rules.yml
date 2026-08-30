@@ -416,8 +416,21 @@ groups:
         annotations:
           summary: "increase(ferry_backend_events_total{kind=\"kimi_quota\"}[15m]) > 0 — a kimi_quota backend event fired in the last 15m. Current: {{ $values.B.Value }}."
 
-      # 6. Key pool shrank — warning. A healthy pool should have several keys; below 2 means
-      # near-zero headroom for a key rotation/outage.
+      # 6. Key pool shrank — warning. A pool that HAD several deployments and now has
+      # fewer than 2 has lost its headroom for a rotation/outage.
+      #
+      # `< 2` on its own was wrong, and provably so: a config with no pooled model_name
+      # at all pins ferry_worker_pool_size (the max group size) at 1, so the rule had no
+      # non-firing state to return to. Verified firing continuously on 2026-08-29 against
+      # a 19-deployment config in which every model_name is a single deployment — it was
+      # reporting the absence of a feature as the failure of one.
+      #
+      # The second factor is what makes it a SHRANK test: it requires a pool to have
+      # existed in the last 24h. Both comparisons use `bool` so every series is kept and
+      # mapped to 1/0 — a bare `<` would FILTER, and a filtered-away series reads as
+      # NoData rather than as "not breaching". Threshold is `gt 0` because the product is
+      # 1 only when both halves hold; note the evaluator set has no `gte`, which is the
+      # other reason the comparison lives in the query.
       - uid: ferry-key-pool-shrank
         title: "Key pool shrank"
         condition: C
@@ -431,7 +444,7 @@ groups:
             model:
               refId: A
               editorMode: code
-              expr: ferry_worker_pool_size
+              expr: (ferry_worker_pool_size < bool 2) * (max_over_time(ferry_worker_pool_size[24h]) >= bool 2)
               instant: true
               range: false
               intervalMs: 1000
@@ -467,9 +480,9 @@ groups:
               expression: B
               conditions:
                 - evaluator:
-                    type: lt
+                    type: gt
                     params:
-                      - 2
+                      - 0
                   operator:
                     type: and
                   query:
@@ -490,7 +503,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "ferry_worker_pool_size < 2 (metric: ferry_worker_pool_size, threshold: < 2) — the pooled-model key rotation has shrunk to near-zero headroom. Current: {{ $values.B.Value }}."
+          summary: "A pooled model_name that had 2+ deployments in the last 24h now has fewer than 2 — the pool has lost its rotation headroom. Breach flag: {{ $values.B.Value }} (1 = shrank; B is the 1/0 product, NOT the pool size — read ferry_worker_pool_size for that)."
 
       # 7. Health-check latency high — warning. The passive round-trip to /health/liveliness
       # (no token spend) is degraded.

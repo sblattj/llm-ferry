@@ -97,6 +97,23 @@ VM derives RPS = `rate(sum(ferry_requests_total))`, error rate = `sum(rate(ferry
 - `ferry_fallback_chain_length` — length of the `orch` lane's fallback chain (0 if none; the pre-rename `orchestrator` key is still accepted)
 - `ferry_route_config_mtime_seconds` — mtime of litellm.yaml (detects a config edit)
 
+### Lanes (same parse, with labels — ADDITIVE; the two scalars above keep their exact meaning)
+`ferry-backends.json` panels 1-2 and the alert rules read the unlabelled scalars, so these
+never replace them; they add the dimensions a scalar cannot carry.
+- `ferry_lane_hop{lane,position,hop,deployment,model,provider,pool_size}` = 1 — one series per deployment sitting at a position in a lane's chain. `position="0"` is the primary. `deployment="unknown"` means the config set no `model_info.id`, and that hop can therefore never be joined to a live event
+- `ferry_lane_chain_length{lane}` — hops in the lane's chain, **counting the primary** (1 = no fallbacks). Distinct from `ferry_fallback_chain_length`, which counts only the fallbacks and only for the driving lane
+- `ferry_pool_size{hop}` — deployments sharing one `model_name`. 0 = the hop is named by a chain but defined nowhere
+
+### Events (front-door tap NDJSON — CUMULATIVE since exporter start; the tail opens at EOF, so a restart never replays a backlog into a counter)
+The tap's stream is the only place a request is joined to the deployment that served it — the
+proxy access log carries no model at all. Absent tap ⇒ every family here has zero samples and
+omits itself; the rest of the scrape is unchanged.
+- `ferry_events_total{lane,deployment,provider,outcome}` — **counter**, outcome ∈ {ok, error}
+- `ferry_fallback_edges_total{lane,from_deployment,to_deployment,code}` — **counter**, one per observed hop-to-hop move. An edge with an unknown end is not counted: attributing a failure to a possibly-healthy backend is worse than attributing nothing
+- `ferry_deployment_state{deployment,provider,state}` = 1 — state ∈ {healthy, rate_limited, quota_exhausted, auth_dead, unreachable, unknown}. Only the CURRENT state emits, so a state the deployment has left disappears and its alert clears
+- `ferry_deployment_state_since_seconds{deployment}` — seconds held in that state
+- `ferry_events_dropped_total` — **counter**, events the tap's bounded queue dropped rather than block a response. Always emitted (including 0) once a tap is being read: a counter that only appears after the first drop cannot be `rate()`d
+
 ### litellm-native (OPT-IN — scraped by VM directly from `http://127.0.0.1:8090/metrics`, NOT emitted by our exporter)
 Off by default (callback disabled). The `ferry-backends` dashboard has a clearly-captioned
 "LLM internals — requires litellm prometheus (see observ/README.md)" row using best-effort

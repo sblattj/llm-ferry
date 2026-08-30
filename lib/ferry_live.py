@@ -69,6 +69,31 @@ def _hop(name, groups):
     }
 
 
+def chains(topology):
+    """lane name -> the ordered deployment ids of its hops.
+
+    This is what maps an event's `hop_errors` back to the deployments that
+    produced them, and it lives here rather than in either consumer because
+    `ferry-dash` draws from it and `observ/ferry-metrics-exporter` counts
+    fallback edges from it. Two derivations that drifted apart would attribute
+    a failure to a healthy backend, which is worse than attributing nothing.
+
+    A hop with no configured `model_info.id` contributes an EMPTY slot, so
+    attribution stops there instead of shifting every later hop onto the wrong
+    backend. A pool hop contributes only its first id: litellm splits a pool
+    across its members rather than trying them in order, so there is no "next
+    member" a hop error could belong to.
+    """
+    out = {}
+    for lane in lanes(topology):
+        ids = []
+        for hop in lane["hops"]:
+            deployments = hop.get("deployments") or []
+            ids.append(deployments[0]["id"] if deployments else "")
+        out[lane["name"]] = ids
+    return out
+
+
 # ── the event stream ───────────────────────────────────────────────────────
 def sse_frame(record):
     """One server-sent-events frame.

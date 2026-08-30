@@ -497,24 +497,15 @@ MAX_STREAMS = 8
 def _lane_chains():
     """lane name -> the ordered deployment ids of its hops.
 
-    This is what maps an event's hop_errors back to the deployments that
-    produced them. A hop with no configured model_info.id contributes an empty
-    slot, so attribution stops there rather than shifting every later hop onto
-    the wrong backend.
+    The derivation itself lives in lib/ferry_live.chains(), because the metrics
+    exporter counts fallback edges from the same map — two copies that drifted
+    apart would attribute a failure to a healthy backend.
     """
     live = _live()
     if live is None:
         return {}
     try:
-        topo = load_topology(CFG["config_path"])
-        out = {}
-        for lane in live.lanes(topo):
-            ids = []
-            for hop in lane["hops"]:
-                deployments = hop.get("deployments") or []
-                ids.append(deployments[0]["id"] if deployments else "")
-            out[lane["name"]] = ids
-        return out
+        return live.chains(load_topology(CFG["config_path"]))
     except Exception:
         return {}
 

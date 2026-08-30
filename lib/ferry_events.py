@@ -184,6 +184,7 @@ class EventLog:
         self.path = path
         self.max_bytes = max_bytes
         self.dropped = 0
+        self._announced = 0
         self.healthy = True
         self._q = queue.Queue(maxsize=max_queue)
         self._paused = threading.Event()
@@ -271,6 +272,19 @@ class EventLog:
                 self._idle.set()
                 continue
             try:
+                # `dropped` lives in this process's memory and every reader is a
+                # different process, so the stream is the only channel. The
+                # notice is a DIFFERENT SHAPE from a request record — it carries
+                # `notice`, never the record contract's keys — so a consumer
+                # discriminates on one key instead of guessing from what is
+                # missing. Emitted once per NEW drop: re-announcing the running
+                # total on every record would bury the stream the moment the
+                # queue overflows once.
+                if self.dropped > self._announced:
+                    self._fh.write(json.dumps(
+                        {"t": _utcnow(), "notice": "dropped", "n": self.dropped},
+                        separators=(",", ":")) + "\n")
+                    self._announced = self.dropped
                 self._fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
                 self._fh.flush()
                 self._rotate_if_needed()

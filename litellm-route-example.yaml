@@ -7,36 +7,63 @@
 #
 # A lane NAME is the contract clients bind to. The model behind a lane is
 # swappable HERE without touching a single client config, which is the whole
-# reason the names are roles (`orch`, `flash`) and not model ids.
+# reason the names are roles (`heavy`, `flash`) and not model ids.
 #
-#   orch          -> the "big" planning/driving model (example: Kimi K3)
-#   orch-fallback -> an INDEPENDENT model litellm reroutes to when `orch` fails;
-#                    chain several for depth (example: Fireworks DeepSeek V4 Pro
-#                    first, GLM 5.2 last)
-#   flash         -> cheap high-volume worker lane (single Gemini key; a pool is
-#                    for separate PROVIDERS/accounts only — see the ToS note)
-#   local-orch    -> the host GPU's "smart" model, via mlx_vlm.server on :8092
-#   local-sub     -> the host GPU's cheap fan-out model, via mlx_vlm.server on :8093
+#   heavy          -> DRIVER: the big planning/driving model (example: Kimi K3)
+#   heavy-fallback -> an INDEPENDENT model litellm reroutes to when `heavy` fails;
+#                     chain several for depth (example: Fireworks DeepSeek V4 Pro
+#                     first, GLM 5.2 last)
+#   flash          -> WORKER: cheap high-volume fan-out lane; a pool of DIFFERENT
+#                     Gemini MODEL IDS on ONE key (see the quota note below)
+#   super-flash    -> HOUSEKEEPER: title / summary / compaction only
+#   local-orch     -> the host GPU's "smart" model, via mlx_vlm.server on :8092
+#   local-sub      -> the host GPU's cheap fan-out model, via mlx_vlm.server on :8093
 #
-# Multi-key pool: identical `flash` deployments form one pool.
-# `usage-based-routing-v2` sends each call to the least-used key (proactive even
-# split); on a 429/error litellm retries on another key and cools the failed one
+# THREE cloud roles, not two. The housekeeper is split out from the worker
+# because those three agents behave nothing like a fan-out: they fire on their
+# own schedule, and a compaction call carries the ENTIRE transcript. Pointing
+# them at the worker lane makes them queue behind whatever the fan-out is doing,
+# on the lane least likely to have headroom. On the GPU pair there is no third
+# lane, so the housekeeper shares local-sub.
+#
+# Worker pool: several deployments sharing the `flash` model_name form one pool.
+# `usage-based-routing-v2` sends each call to the least-used deployment (proactive
+# even split); on a 429/error litellm retries on another and cools the failed one
 # out for `cooldown_time`.
 #
-# IMPORTANT — the ToS line, learned the hard way: Gemini quota is per-GCP-PROJECT,
-# so N keys in N projects really do multiply throughput, and doing that is
-# PROHIBITED — it is circumvention under Google APIs ToS §2.d ("you will not
-# attempt to circumvent such limitations"; beyond-limit use requires Google's
-# express consent). On 2026-08-25 Google suspended nine burst-created projects
-# for exactly this in one night and restricted the account's OAuth APIs.
-# ONE Google project, ONE key. More throughput: raise the paid tier on the
-# project (Tier 3 = 20M TPM for Gemini 3.7 Flash) or ask Google for a quota
-# increase. A pool of deployments is legitimate only across genuinely separate
-# PROVIDERS or ACCOUNTS (e.g. Gemini + Fireworks, or work + personal Google
-# accounts) — a second billing account under the same account buys nothing.
+# WHAT THE POOL MEMBERS MUST BE — read this before adding one. Google's rate-limit
+# docs put it verbatim: "Rate limits are applied per project, not per API key."
+# Two consequences, and the second one is the whole design of the block below:
 #
-# Orchestrator fallback (strict failover): the `orch-fallback` deployment is a
-# SEPARATE model_name, reached ONLY via router_settings.fallbacks when `orch`
+#   1. A second KEY in the same project buys ZERO extra throughput — it shares one
+#      bucket with the first. And a second PROJECT to multiply the limit is
+#      circumvention under Google APIs ToS §2.d ("you will not attempt to
+#      circumvent such limitations"; beyond-limit use requires Google's EXPRESS
+#      consent). Not theoretical: on 2026-08-25 Google Cloud Trust & Safety
+#      suspended nine burst-created projects for exactly this in one night,
+#      deleted them, and restricted the account's OAuth APIs. ONE project, ONE key.
+#
+#   2. But the limit is per-project-PER-MODEL: every model id carries its OWN
+#      independent RPM / TPM / RPD bucket. So you widen this lane by pooling
+#      DIFFERENT MODEL IDS on the SAME key — sanctioned, no second project, and it
+#      is what the `flash` block below actually does. Read off one Tier-2 project's
+#      rate-limit page (console -> API keys -> rate limits):
+#
+#          gemini-3.7-flash         2K RPM /  3M TPM / 100K RPD
+#          gemini-3.5-flash         2K RPM /  3M TPM / 100K RPD
+#          gemini-3.1-flash-lite   10K RPM / 10M TPM / 350K RPD
+#
+#      Three independent buckets, one key, one project. Add a model id and you add
+#      a bucket; add a key and you add nothing.
+#
+# The other sanctioned lever is RAISING THE PAID TIER on that one project, which
+# lifts every bucket at once (Tier 3 = 20M TPM for Gemini 3.7 Flash). Beyond that,
+# ask Google for a quota increase — ToS §2.d's own escape hatch. Deployments from a
+# genuinely different PROVIDER or ACCOUNT (Fireworks beside Gemini) are fine too; a
+# second billing account under the same Google account buys nothing.
+#
+# Driver fallback (strict failover): the `heavy-fallback` deployment is a
+# SEPARATE model_name, reached ONLY via router_settings.fallbacks when `heavy`
 # errors — a 429, a 5xx, or a hard quota 403. Pick a fallback whose capacity is
 # INDEPENDENT of the primary: a different provider or account.
 # (Lesson from the field: a fallback that shares a rate-limit bucket with your
@@ -53,39 +80,47 @@
 # ---------------------------------------------------------------------------
 
 model_list:
-  # -- orch: the driving model (example: Kimi K3, an Anthropic-compatible endpoint) --
+  # -- heavy: the driving model (example: Kimi K3, an Anthropic-compatible endpoint) --
   # Swap for any provider. For an Anthropic-format base, litellm appends
   # /v1/messages to api_base. For a plain OpenAI provider, drop api_base and use
   # e.g. `model: openai/<id>` with api_key: os.environ/OPENAI_API_KEY.
-  - model_name: orch
+  - model_name: heavy
     litellm_params:
       model: anthropic/k3
       api_key: os.environ/KIMI_API_KEY
       api_base: https://api.kimi.com/coding      # -> https://api.kimi.com/coding/v1/messages
       reasoning_effort: max        # drop_params:true below drops this where a provider rejects it
       timeout: 600
+    model_info:
+      public: true        # advertised in /v1/models - see the super-flash note
+      id: kimi-k3-heavy
 
-  # -- orch FALLBACK chain (example: Fireworks DeepSeek V4 Pro, GLM 5.2) -------
+  # -- heavy FALLBACK chain (example: Fireworks DeepSeek V4 Pro, GLM 5.2) -----
   # Separate model_names, NOT in any pool — reached only via the `fallbacks:`
-  # mapping below when `orch` fails, in the order listed there. Fireworks is a
+  # mapping below when `heavy` fails, in the order listed there. Fireworks is a
   # pay-per-token API with its OWN capacity, so it never contends with the
   # primary; billed only when a hop fires. Chain as many as you like, FAST model
   # first and a slower/cheaper one last. Swap for any independent provider/account.
-    model_info:
-      public: true        # advertised in /v1/models
 
-  - model_name: orch-fallback                # 1st fallback: fast
+  - model_name: heavy-fallback                # 1st fallback: fast
     litellm_params:
       model: fireworks_ai/accounts/fireworks/models/deepseek-v4-pro-0813
       api_key: os.environ/FIREWORKS_API_KEY
       reasoning_effort: max
       timeout: 600
-  - model_name: orch-fallback-2              # last resort: slower/cheaper
+    model_info:
+      # No `public: true` — a hop must stay out of the catalogue. It still wants
+      # an id: without one litellm labels its metrics with a hash that changes
+      # every time this file is edited, so a Grafana panel loses the series.
+      id: fw-deepseek-v4pro
+  - model_name: heavy-fallback-2              # last resort: slower/cheaper
     litellm_params:
       model: fireworks_ai/accounts/fireworks/models/glm-5p2
       api_key: os.environ/FIREWORKS_API_KEY
       reasoning_effort: max
       timeout: 600
+    model_info:
+      id: fw-glm-5p2
 
   # -- Alternative fallback: a ChatGPT SUBSCRIPTION (not pay-per-token) ---------
   # litellm's native `chatgpt/` provider routes to chatgpt.com/backend-api/codex
@@ -95,14 +130,14 @@ model_list:
   # /v1/chat/completions works (opencode streams), but a non-streamed call 500s
   # with "Unknown items in responses API response: []" and just rolls to the next
   # fallback. gpt-5.6-sol / gpt-5.4 work; codex-* ids are rejected for ChatGPT accounts.
-  # - model_name: orch-fallback
+  # - model_name: heavy-fallback
   #   litellm_params:
   #     model: chatgpt/responses/gpt-5.6-sol
   #     api_key: "chatgpt-oauth"     # placeholder; provider reads auth.json
   #     reasoning_effort: max
   #     timeout: 600
 
-  # -- flash: worker lane. ONE Google project, ONE key. ------------------------
+  # -- flash: worker lane. ONE Google project, ONE key, MANY models. -----------
   # model_info.id gives the deployment a STABLE, human-readable id. litellm stamps
   # it onto the `model_id` label of the per-deployment metrics, so Grafana panels
   # can name the key instead of an opaque hash (which also changes whenever the
@@ -116,19 +151,65 @@ model_list:
   # series — exactly the split those panels exist to show. Nothing warns you;
   # check /v1/model/info after any edit here.
   #
-  # Why ONE deployment and not a pool of six? Because the old template shipped a
-  # `# project #1 … # project #6` pool and that pattern is a Google APIs ToS §2.d
-  # violation — limits are per-project, pooling projects to multiply them is
-  # circumvention (nine projects suspended in one night, 2026-08-25; OAuth APIs
-  # restricted). Duplicate this block ONLY for a genuinely separate provider or
-  # account, never another project of the same Google account.
+  # Why three deployments on ONE api_key? Because rate limits are per-project and
+  # per-MODEL, never per-key (see the note at the top of this file). The old
+  # template shipped a `# project #1 … # project #6` pool of keys, one key minted
+  # per Google Cloud project — that bought real throughput and was a Google APIs
+  # ToS §2.d violation, and nine of those projects were suspended in one night on
+  # 2026-08-25. This pool buys the same kind of headroom the legitimate way: three
+  # DIFFERENT model ids, three independent RPM/TPM/RPD buckets, one key, one
+  # project, nothing to circumvent.
+  #
+  # Pick pool members that are interchangeable for the lane's ROLE — these are all
+  # cheap fast workers, so a caller cannot tell which one answered, which is the
+  # only reason a pool is allowed to round-robin across them at all. Do NOT pool a
+  # frontier model with a lite one just to add a bucket: the lane's behaviour would
+  # change per request. To ADD a bucket, add another model id here (verify it
+  # serves your key first — see the README) — never another project's key.
   - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY
+      api_key: os.environ/GEMINI_API_KEY      # ONE key for the whole pool
     model_info:
       public: true        # advertised in /v1/models
-      id: gemini-key-1
+      id: gemini-flash-37
+
+  - model_name: flash
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      api_key: os.environ/GEMINI_API_KEY      # same key — a separate model bucket
+    model_info:
+      id: gemini-flash-35
+
+  - model_name: flash
+    litellm_params:
+      model: gemini/gemini-3.1-flash-lite
+      api_key: os.environ/GEMINI_API_KEY      # same key — the widest bucket (10M TPM)
+    model_info:
+      id: gemini-flash-lite-31
+
+  # -- super-flash: the HOUSEKEEPER lane --------------------------------------
+  # title / summary / compaction only. It gets its own lane rather than sharing
+  # `flash` because those agents fire on their own schedule and a compaction call
+  # carries the whole transcript — they should not queue behind a fan-out. Any
+  # cheap fast model does; it need not match what `flash` runs.
+  #
+  # `public: true` is NOT decoration. Omit it and the lane still ROUTES perfectly,
+  # but it vanishes from /v1/models, because `ferry up` serves litellm through a
+  # filter (front/ferry_front.py) that trims the catalogue to the marked lanes.
+  # Every catalogue consumer then reports the lane missing while calls to it keep
+  # succeeding — a disagreement nothing reconciles for you. That happened on this
+  # host on 2026-08-30: host-reset.sh's verifier failed with "super-flash NOT
+  # served" for a lane that answered a probe correctly on the next line.
+  # Mark every LANE; never mark a fallback hop.
+  - model_name: super-flash
+    litellm_params:
+      model: openrouter/google/gemini-3.7-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+      timeout: 600
+    model_info:
+      public: true        # advertised in /v1/models
+      id: or-gemini-sf
 
   # -- LOCAL GPU lanes: the host's own MLX models, addressable by name ---------
   # `ferry up` launches one mlx_vlm.server per lane on an internal loopback port
@@ -247,18 +328,23 @@ router_settings:
   # identical fallbacks entry, never an alias.
   #
   # model_group_alias:
-  #   old-name: {model: "orch", hidden: true}   # resolves, but WITHOUT orch's chain
+  #   old-name: {model: "heavy", hidden: true}   # resolves, but WITHOUT heavy's chain
 
-  # Strict failover chain: a failed `orch` reroutes to the fallback list in order
+  # Strict failover chain: a failed `heavy` reroutes to the fallback list in order
   # (fast model first, last resort last).
   #
   # A worker POOL can have a fallback too: when every key in the `flash` pool is
   # cooled down (all on 429), overflow reroutes to the model(s) listed instead of
   # returning a raw 429 to the client. Point it at a lane with spare capacity (here
-  # `orch` itself). litellm fallbacks are single-hop (not transitive), so the
+  # `heavy` itself). litellm fallbacks are single-hop (not transitive), so the
   # fallback target's own fallback list is NOT chained in. Remove the second entry
   # if you want the pool to hard-fail rather than spill over.
   #
+  # GIVE THE HOUSEKEEPER A CHAIN TOO. `super-flash` carries compaction, and a
+  # failed compaction call does not merely retry — it drops the whole transcript.
+  # It is the lane where a missing chain costs the most and announces it least,
+  # which is why it is wired below rather than left to hard-fail.
+  #
   # Note what is ABSENT: neither local lane appears here. See the deployment
   # comments above for why that is deliberate.
-  fallbacks: [{"orch": ["orch-fallback", "orch-fallback-2"]}, {"flash": ["orch"]}]
+  fallbacks: [{"heavy": ["heavy-fallback", "heavy-fallback-2"]}, {"flash": ["super-flash", "heavy"]}, {"super-flash": ["flash", "heavy"]}]

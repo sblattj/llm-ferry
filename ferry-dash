@@ -95,6 +95,33 @@ def load_topology(path):
     return topo
 
 
+_LIVE = None
+
+
+def _live():
+    """lib/ferry_live.py, loaded by path. None if it cannot be loaded.
+
+    Every caller treats None as "no live view", so a dashboard whose sibling
+    module is missing still serves the pages that predate it.
+    """
+    global _LIVE
+    if _LIVE is None:
+        try:
+            import importlib.machinery
+            import importlib.util
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib", "ferry_live.py")
+            spec = importlib.util.spec_from_loader(
+                "ferry_live",
+                importlib.machinery.SourceFileLoader("ferry_live", path))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _LIVE = module
+        except Exception:
+            _LIVE = False
+    return _LIVE or None
+
+
 def _provider_rule():
     """The provider derivation from lib/ferry_events.py, or a safe stand-in.
 
@@ -419,14 +446,28 @@ def get_status():
         if m.get("ok"):
             models = [x["id"] for x in m.get("json", {}).get("data", [])]
     CFG["activity"].poll()
-    return {
+    topo = load_topology(CFG["config_path"])
+    live = _live()
+    out = {
         "ts": time.time(),
         "ferry": {"up": up, "base": ferry, "host": CFG["host"], "port": CFG["ferry_port"]},
         "models": models,
-        "topology": load_topology(CFG["config_path"]),
+        "topology": topo,
         "activity": CFG["activity"].snapshot(),
         "config_path": CFG["config_path"],
+        # The live half. `tap` reports whether events are being written at all,
+        # so the view can say "the tap is off" instead of drawing an empty graph
+        # that looks exactly like no traffic.
+        "lanes": live.lanes(topo) if live else [],
+        "deployments": CFG["exhaustion"].snapshot() if CFG.get("exhaustion") else {},
+        "tap": {
+            "path": CFG.get("events_path") or "",
+            "writing": bool(CFG.get("events_path")
+                            and os.path.exists(CFG["events_path"])),
+            "rules": bool((CFG.get("rules") or {}).get("rules")),
+        },
     }
+    return out
 
 
 def probe_backends():
@@ -448,6 +489,36 @@ def probe_backends():
     return out
 
 
+# A parked SSE client costs one thread. This bounds how many a forgotten set of
+# browser tabs can hold open.
+MAX_STREAMS = 8
+
+
+def _lane_chains():
+    """lane name -> the ordered deployment ids of its hops.
+
+    This is what maps an event's hop_errors back to the deployments that
+    produced them. A hop with no configured model_info.id contributes an empty
+    slot, so attribution stops there rather than shifting every later hop onto
+    the wrong backend.
+    """
+    live = _live()
+    if live is None:
+        return {}
+    try:
+        topo = load_topology(CFG["config_path"])
+        out = {}
+        for lane in live.lanes(topo):
+            ids = []
+            for hop in lane["hops"]:
+                deployments = hop.get("deployments") or []
+                ids.append(deployments[0]["id"] if deployments else "")
+            out[lane["name"]] = ids
+        return out
+    except Exception:
+        return {}
+
+
 # ── HTTP server ────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype):
@@ -465,8 +536,68 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(get_status()), "application/json")
         elif self.path.startswith("/probe"):
             self._send(200, json.dumps(probe_backends()), "application/json")
+        elif self.path.startswith("/api/events"):
+            self._stream_events()
         else:
             self._send(404, "not found", "text/plain")
+
+    def _stream_events(self):
+        """Server-sent events: one frame per request as it completes.
+
+        ThreadingHTTPServer gives every client its own thread, so a forgotten
+        browser tab is a parked thread rather than a stalled dashboard — but
+        only up to MAX_STREAMS, after which this refuses rather than growing
+        threads without bound.
+
+        Each event is also folded into the exhaustion state before it is sent,
+        so /status and the stream cannot disagree about a deployment's health.
+        """
+        live = _live()
+        if live is None or not CFG.get("events_path"):
+            self._send(503, "event tap unavailable", "text/plain")
+            return
+        with CFG["stream_lock"]:
+            if CFG["streams"] >= MAX_STREAMS:
+                self._send(503, "too many event streams", "text/plain")
+                return
+            CFG["streams"] += 1
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            # Some proxies buffer SSE into uselessness; this is the standard ask
+            # not to. Harmless when nothing is in front of us.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+
+            tail = live.EventTail(CFG["events_path"])
+            chains = _lane_chains()
+            last_beat = time.time()
+            while True:
+                records = tail.read_new()
+                for rec in records:
+                    if CFG.get("exhaustion"):
+                        CFG["exhaustion"].observe(
+                            rec, chain=chains.get(rec.get("lane")))
+                    self.wfile.write(live.sse_frame(rec))
+                if records:
+                    self.wfile.flush()
+                    last_beat = time.time()
+                elif time.time() - last_beat > 15:
+                    # A comment frame. Without it a dead client is only noticed
+                    # when the next request happens to arrive, which on a quiet
+                    # relay can be hours.
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_beat = time.time()
+                    chains = _lane_chains()      # pick up a rewired config
+                time.sleep(0.4)
+        except Exception:
+            pass                                  # client went away; not an error
+        finally:
+            with CFG["stream_lock"]:
+                CFG["streams"] -= 1
 
     # The ONLY write path in this file. It is reachable because the server binds
     # 127.0.0.1 literally (see main(); there is no flag to widen it), so this
@@ -589,6 +720,36 @@ PAGE = r"""<!doctype html>
   .full{grid-column:1/-1}
   footer{padding:6px 20px 22px;color:var(--dim);font-size:11px}
   a{color:var(--blue)}
+  /* live view */
+  .chain{display:flex;align-items:stretch;flex-wrap:wrap;margin:2px 0 6px}
+  .hopb{border:1px solid var(--line);border-radius:8px;padding:5px 9px;min-width:0}
+  .hopb.served{border-color:var(--green);background:color-mix(in srgb,var(--green) 14%,transparent)}
+  .hopb.failed{border-color:var(--red);background:color-mix(in srgb,var(--red) 14%,transparent)}
+  .hopb.missing{border-style:dashed;border-color:var(--red)}
+  .hopb b{font-weight:600;font-size:12px}
+  .hopb .pool{color:var(--dim);font-size:11px;margin-left:6px}
+  .edge{align-self:center;color:var(--dim);padding:0 8px;font-size:11px;white-space:nowrap}
+  .edge.failed{color:var(--red);font-weight:700}
+  .chips{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
+  .chip{font-size:11px;padding:1px 6px;border-radius:6px;border:1px solid var(--line);color:var(--dim)}
+  .chip.healthy{color:var(--green);border-color:var(--green)}
+  .chip.rate_limited,.chip.unknown{color:var(--amber);border-color:var(--amber)}
+  .chip.unreachable{color:var(--red);border-color:var(--red)}
+  .chip.quota_exhausted,.chip.auth_dead{color:var(--red);border-color:var(--red);font-weight:700}
+  .lanehdr{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .lanehdr:first-child{margin-top:0}
+  .lanehdr b{font-size:13px}
+  .toggle{margin-left:auto;font-size:11px;color:var(--dim);cursor:pointer;
+          border-bottom:1px dotted var(--line)}
+  .toggle:hover{color:var(--fg)}
+  .feed{max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:8px;
+        margin-top:6px;font-size:12px}
+  .fr{display:flex;gap:10px;padding:3px 10px;border-top:1px dashed var(--line);white-space:nowrap}
+  .fr:first-child{border-top:0}
+  .fr .t{color:var(--dim);flex:none}
+  .fr .st{flex:none;font-weight:700}
+  .fr .st.ok{color:var(--green)} .fr .st.bad{color:var(--red)}
+  .fr .w{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
 </style></head><body>
 <header>
   <h1>FERRY</h1>
@@ -598,6 +759,16 @@ PAGE = r"""<!doctype html>
   <span id="updated" class="muted"></span>
 </header>
 <main>
+  <section class="card full" id="live">
+    <h2>Live traffic <span class="muted" id="livemeta"></span></h2>
+    <div id="tapoff" class="event" style="display:none"></div>
+    <div id="livelanes" class="muted">loading&hellip;</div>
+    <div style="display:flex;align-items:center;margin-top:10px">
+      <span class="sub" id="feedmeta"></span>
+      <span class="toggle" id="showall">show all lanes</span>
+    </div>
+    <div class="feed" id="feed"></div>
+  </section>
   <section class="card" id="orch"><h2>Orchestrator</h2><div id="orchbody" class="muted">loading…</div></section>
   <section class="card" id="work"><h2>Workers</h2><div id="workbody" class="muted">loading…</div></section>
   <section class="card full" id="act"><h2>Recent activity <span class="muted" id="since"></span></h2>
@@ -821,6 +992,168 @@ function showDiff(d){
 }
 function msg(text,cls){ const m=$('#routesmsg'); m.className=cls||''; m.textContent=text||''; }
 
+// -- live view --------------------------------------------------------------
+// Fed by /api/events (per-request, sub-second) plus /status (topology and
+// per-deployment state). The server folds each event into the exhaustion state
+// before framing it, so the stream and the poll cannot disagree.
+const FEED_CAP=200;          // a long session must not grow the DOM without bound
+const FLASH_MS=6000;         // how long an edge stays lit after the request
+const STICKY=['quota_exhausted','auth_dead'];
+const LIVE={events:[], flash:{}, es:null, fails:0, showAll:false};
+
+const hhmm=sec=>{const d=new Date((sec||0)*1000);return isNaN(d)?'—':d.toTimeString().slice(0,5);};
+const clock=t=>{const d=new Date(t);return isNaN(d)?'--:--:--':d.toLocaleTimeString();};
+
+// Stats come from the feed buffer, so they describe what THIS page has seen
+// since it loaded - never a claim about history the dash does not have.
+function depStats(id){
+  if(!id) return {rpm:0,p50:null};
+  const now=Date.now(), rows=LIVE.events.filter(e=>e.deployment===id);
+  const durs=rows.slice(0,20).map(e=>e.duration_ms)
+                 .filter(v=>typeof v==='number').sort((a,b)=>a-b);
+  return {rpm:rows.filter(e=>now-e._ms<60000).length,
+          p50:durs.length?durs[Math.floor(durs.length/2)]:null};
+}
+
+// An event names the deployment that SUCCEEDED and, in hop_errors, the ones
+// tried before it. `fallbacks` is the count, and it can be non-zero while
+// hop_errors is empty (the header carrying the detail is not guaranteed), so
+// the count decides how many edges light and the codes fill in where they exist.
+function noteFlash(e){
+  const n=Math.max((e.hop_errors||[]).length, e.fallbacks||0), failed={};
+  for(let i=0;i<n;i++){
+    const h=(e.hop_errors||[])[i]||{};
+    failed[i]=h.code?String(h.code):'failed';
+  }
+  LIVE.flash[e.lane]={ts:Date.now(), served:e.deployment, failed:failed};
+}
+
+function depChip(d,st){
+  const info=(st.deployments||{})[d.id];
+  const state=info?info.state:'';
+  const c=el('span','chip'+(state?' '+state:''));
+  const s=depStats(d.id), bits=[shortModel(d.model||d.id||'?')];
+  if(state) bits.push(state.replace(/_/g,' '));
+  if(s.rpm) bits.push(s.rpm+'/min');
+  if(s.p50!=null) bits.push(Math.round(s.p50)+'ms');
+  if(info && info.code) bits.push(info.code);
+  if(info && STICKY.indexOf(state)>=0) bits.push('since '+hhmm(info.since));
+  c.textContent=bits.join(' · ');
+  c.title=[d.id||'', d.model||'', d.provider||'', (info&&info.detail)||'']
+            .filter(Boolean).join('\n');
+  return c;
+}
+
+function hopBox(lane,hop,i,st,fresh){
+  const b=el('div','hopb'), f=LIVE.flash[lane.name];
+  const ids=(hop.deployments||[]).map(d=>d.id).filter(Boolean);
+  if(hop.missing) b.classList.add('missing');
+  if(fresh){
+    if(f.served && ids.indexOf(f.served)>=0) b.classList.add('served');
+    else if(f.failed[i]!==undefined) b.classList.add('failed');
+  }
+  const head=el('div');
+  head.appendChild(el('b',null,hop.name));
+  if(hop.missing) head.appendChild(el('span','pool','not defined in the config'));
+  else if(hop.is_pool) head.appendChild(el('span','pool','pool ×'+hop.pool_size));
+  b.appendChild(head);
+  if((hop.deployments||[]).length){
+    const chips=el('div','chips');
+    hop.deployments.forEach(d=>chips.appendChild(depChip(d,st)));
+    b.appendChild(chips);
+  }
+  return b;
+}
+
+function renderLive(st){
+  const tap=st.tap||{}, lanes=st.lanes||[], off=$('#tapoff');
+  // Degrade honestly: an empty graph looks exactly like no traffic, so say
+  // which of the two this is.
+  if(!tap.path){
+    off.style.display='';
+    off.textContent='event tap is off — restart ferry with FERRY_EVENTS=on, and point the dash at the file with --events';
+  }else if(LIVE.fails>2){
+    off.style.display='';
+    off.textContent='event stream disconnected — the dash cannot read '+tap.path;
+  }else if(!tap.writing){
+    off.style.display='';
+    off.textContent='tap armed, nothing written yet — '+tap.path;
+  }else{ off.style.display='none'; }
+  $('#livemeta').textContent=tap.rules?'':'(no classifier table — every failure reads as "unknown")';
+
+  const box=$('#livelanes'); box.innerHTML=''; box.className='';
+  if(!lanes.length){ box.className='muted'; box.textContent='no lanes parsed from the config'; }
+  const shown=LIVE.showAll?lanes:lanes.filter(l=>l.public);
+  shown.forEach(l=>{
+    const f=LIVE.flash[l.name], fresh=!!f && Date.now()-f.ts<FLASH_MS;
+    const hdr=el('div','lanehdr');
+    hdr.appendChild(el('b',null,l.name));
+    hdr.appendChild(el('span','sub',l.public?'public':'internal'));
+    if(fresh) hdr.appendChild(el('span','tag active','live'));
+    box.appendChild(hdr);
+    const chain=el('div','chain');
+    l.hops.forEach((h,i)=>{
+      if(i){
+        const failed=fresh && f.failed[i-1]!==undefined;
+        chain.appendChild(el('span','edge'+(failed?' failed':''),
+                             failed?('→ '+f.failed[i-1]+' →'):'→'));
+      }
+      chain.appendChild(hopBox(l,h,i,st,fresh));
+    });
+    box.appendChild(chain);
+  });
+  const hidden=lanes.length-shown.length;
+  $('#showall').textContent=LIVE.showAll
+    ? 'public lanes only'
+    : (hidden?('show all lanes (+'+hidden+')'):'show all lanes');
+}
+
+function renderFeed(){
+  const box=$('#feed'); box.innerHTML='';
+  LIVE.events.forEach(e=>{
+    const r=el('div','fr'), ok=e.status>=200&&e.status<300;
+    r.appendChild(el('span','t',clock(e.t)));
+    r.appendChild(el('span','st '+(ok?'ok':'bad'),String(e.status||'—')));
+    const w=el('span','w');
+    w.textContent=(e.lane||'?')+' → '+shortModel(e.deployment||e.model)
+      +(e.provider?' ('+e.provider+')':'')
+      +(e.fallbacks?'  ↳ after '+e.fallbacks+' fallback'+(e.fallbacks>1?'s':''):'')
+      +(e.retries?'  ↻'+e.retries:'');
+    r.appendChild(w);
+    r.appendChild(el('span','t',e.duration_ms!=null?Math.round(e.duration_ms)+'ms':''));
+    box.appendChild(r);
+  });
+  const n=LIVE.events.length;
+  $('#feedmeta').textContent=n
+    ? (n+' request'+(n===1?'':'s')+' since this page loaded'+(n>=FEED_CAP?' (capped)':''))
+    : 'no requests seen since this page loaded';
+}
+
+function openStream(st){
+  if(LIVE.es || !((st.tap||{}).path)) return;
+  let es;
+  try{ es=new EventSource('/api/events'); }catch(err){ return; }
+  LIVE.es=es;
+  es.onopen=()=>{ LIVE.fails=0; };
+  es.onmessage=m=>{
+    let e; try{ e=JSON.parse(m.data); }catch(err){ return; }
+    e._ms=Date.parse(e.t)||Date.now();
+    LIVE.events.unshift(e);
+    if(LIVE.events.length>FEED_CAP) LIVE.events.length=FEED_CAP;
+    noteFlash(e); renderFeed();
+    if(LAST) renderLive(LAST);
+  };
+  es.onerror=()=>{
+    LIVE.fails++;
+    // EventSource reconnects on its own, but a tap that is off answers 503 to
+    // every attempt forever. Close after a few and let the 5s poll retry, so
+    // the failure shows up in the banner instead of hiding in a retry loop.
+    if(LIVE.fails>3){ try{es.close();}catch(err){} LIVE.es=null; }
+    if(LAST) renderLive(LAST);
+  };
+}
+$('#showall').onclick=()=>{ LIVE.showAll=!LIVE.showAll; if(LAST) renderLive(LAST); };
+
 let LAST=null;
 
 async function tick(){
@@ -833,7 +1166,8 @@ async function tick(){
     const pill=$('#uppill'); pill.className='pill '+(f.up?'up':'down'); pill.textContent=f.up?'● UP':'● DOWN';
     $('#updated').textContent='updated '+new Date(st.ts*1000).toLocaleTimeString();
     $('#foot').innerHTML='config <code>'+st.config_path+'</code> &nbsp;·&nbsp; log <code>'+((st.activity||{}).log||'—')+'</code> &nbsp;·&nbsp; auto-refresh 5s (no tokens)';
-    renderOrch(st); renderWork(st); renderAct(st);
+    renderOrch(st); renderWork(st); renderAct(st); renderLive(st);
+    openStream(st);
     // Only reseed the editor when the user has no unsaved edit. A 5s poll that
     // re-rendered mid-edit would drop a half-built chain and reset the Apply
     // button under the user's cursor.
@@ -880,7 +1214,7 @@ $('#applybtn').onclick=async()=>{
   }catch(e){ msg('apply failed: '+e,'err'); b.disabled=false; }
 };
 $('#resetbtn').onclick=()=>{ EDIT=null; showDiff(''); msg(''); tick(); };
-tick(); setInterval(tick, 5000);
+renderFeed(); tick(); setInterval(tick, 5000);
 </script>
 </body></html>
 """
@@ -918,12 +1252,30 @@ def main():
     ap.add_argument("--log", default=None, help="proxy log path (auto-discovered if omitted)")
     ap.add_argument("--key", default="local", help="proxy auth bearer (default 'local')")
     ap.add_argument("--open", action="store_true", help="open the dashboard in a browser")
+    ap.add_argument("--events", default=os.path.join(
+        (os.environ.get("TMPDIR") or "/tmp").rstrip("/"),
+        "ferry-logs", "ferry-events.ndjson"),
+        help="per-request event stream written by the front-door tap")
+    ap.add_argument("--rules", default=os.path.expanduser(
+        "~/.config/ferry/event-rules.json"),
+        help="exhaustion classifier table (see event-rules.example.json)")
     args = ap.parse_args()
 
     ferry_port = args.ferry.rsplit(":", 1)[-1].split("/")[0]
     logpath = args.log or find_log(ferry_port)
     CFG.update(ferry=args.ferry.rstrip("/"), key=args.key, config_path=args.config,
                host=lan_ip(), ferry_port=ferry_port, activity=Activity(logpath))
+
+    # ── the live half ──────────────────────────────────────────────────────
+    # All optional. If lib/ferry_live.py is missing, or the tap has never run,
+    # or there is no rules file, the dashboard still serves everything it did
+    # before — it just says the tap is off instead of drawing an empty graph.
+    live = _live()
+    CFG["streams"] = 0
+    CFG["stream_lock"] = threading.Lock()
+    CFG["events_path"] = args.events
+    CFG["rules"] = live.load_rules(args.rules) if live else {"rules": [], "ttl": {}}
+    CFG["exhaustion"] = live.ExhaustionState(CFG["rules"]) if live else None
 
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

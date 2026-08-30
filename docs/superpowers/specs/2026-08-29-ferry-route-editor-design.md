@@ -1,7 +1,7 @@
 # Ferry route editor — design
 
 **Date:** 2026-08-29
-**Status:** approved, not yet implemented
+**Status:** implemented in v1.15.0
 **Scope:** add lane-chain editing to `ferry dash`
 
 ## Problem
@@ -87,59 +87,83 @@ exists to surface.
 
 ### UI
 
-A **Routes** panel below the existing topology view. Per lane: an ordered list of
-hops, each showing model, provider, and the liveness the dash already collects.
-Drag to reorder. `+` adds a hop from the configured-backend catalogue; `×`
-removes one.
+A **Routes** panel below the existing topology view. Per lane: its primary, then
+the ordered hops, each showing the model and the deployment name. Per hop, `↑`
+`↓` to reorder and `remove` to drop it; a select adds a hop from the configured
+backends. A lane whose chain differs from the file is marked `modified`.
 
-**Apply** renders a unified diff of the YAML change and waits for confirmation.
-On confirm: snapshot, splice, restart, re-probe, report which lane names serve.
+**Reorder is buttons, not drag.** The first draft of this spec said drag. Buttons
+are unambiguous about where an item lands, work without a pointer, and can be
+asserted directly from a test — a dragged list is none of those, and this is the
+control surface for the config that routes every request.
+
+**Apply is reachable only through Preview**, which validates and renders the
+unified diff, so the diff on screen is always the diff that gets written. Apply
+then snapshots and splices.
+
+Two behaviours that are not obvious and are load-bearing:
+
+- The 5s status poll does not reseed the editor while an edit is in progress.
+  Re-rendering mid-edit would drop a half-built chain and reset the buttons under
+  the cursor.
+- The editor's "unsaved edits" comparison is against a server view built with the
+  SAME key set — a lane with no `fallbacks` entry is an empty chain, not a
+  missing one. Building it from the `fallbacks` keys alone made the panel claim
+  unsaved edits on load, which also froze the poll. Caught only by opening the
+  page; no unit test covered it.
+
+**After applying, the running proxy still has the old chains.** litellm has no
+reload for a file-backed config, so the response says to run `ferry update`.
 
 ### Writer
 
-Anchor-based line splicing with exactly three edit shapes:
+**ONE edit shape: rewrite the single `fallbacks:` line.** An earlier draft listed
+three, including inserting and deleting deployment blocks. Narrowing v1 to chain
+editing removed the need for the other two, and that is most of why this is safe:
+editing a chain cannot touch any other line, so the writer never has to reason
+about where a block begins or ends.
 
-1. delete a contiguous anchored block
-2. insert deployment blocks before an anchor line
-3. rewrite the single `fallbacks:` line
+Every other byte passes through untouched. The line is located by anchored regex
+(`^(\s*)fallbacks:\s*\[.*\]\s*$`), and the writer refuses rather than guessing
+when there is no match or more than one — a config it cannot locate exactly is a
+config it must not edit. Lanes absent from the submitted edit keep their existing
+entry, so editing one lane cannot silently drop another's failover.
 
-Every other line passes through byte-identical. Deployment blocks the writer
-creates carry a sentinel comment so it can find them again without parsing prose.
+Before every write: snapshot the whole original to a UTC-timestamped sibling
+(`shutil.copy2`), then write through a temp file and `os.replace`, so the config
+is never observed half-written.
 
-Before every write, snapshot via the existing helper
-(`lib/ferry-integrate.zsh:262 snapshot()`): `shutil.copy2` of the whole original
-to a UTC-timestamped sibling, with stem-anchored retention pruning.
-
-A prototype of this writer was used to apply the 2026-08-29 rewire. It preserved
-all 267 comment lines with 0 unexpected losses, and its preservation check was
-proven falsifiable by a control that deletes a kept comment and asserts the check
-flags it.
+Verified end-to-end 2026-08-30 against a copy of the real 459-line config: 279
+comment lines in, 279 out, exactly one line changed, the snapshot byte-identical
+to the pre-write file, and the result parsed by litellm's own loader.
 
 ### Applying
 
-`ferry up --route`. It stops litellm on the target port, waits, frees the port,
-and relaunches (`lib/ferry-serve.zsh:448-449`). It does not touch the MLX lanes
-on 8092/8093 — verified 2026-08-29: they held 2d15h uptime across a restart.
+Writing the file does not change what the proxy is serving; litellm has no reload
+for a file-backed config (see Constraints). The apply response says so and points
+at `ferry update` (v1.14.0), which on a host runs `host-reset.sh` — validate the
+route config, bounce the proxy — without touching the MLX lanes on 8092/8093.
 
 ## Validation
 
-Before any write, and again after the restart:
+Every rewire is validated before it is written, and a failed validation writes
+nothing at all (validation runs before the snapshot, so a rejected edit leaves no
+debris):
 
-- every `fallbacks` key and every hop resolves to a real `model_name`
-- no duplicate `model_name`
-- no duplicate `model_info.id`
-- no lane is reachable only via `model_group_alias`
-- **the file parses** — see below
+- every lane is a real `model_name` in this config — a lane reachable only by
+  alias silently gets no chain at all, which is the bug in Problem (1)
+- every hop is a real `model_name` — litellm skips an unknown hop silently
+- no lane lists itself as its own fallback
+- no hop appears twice in one chain
+- an empty chain is allowed: it means hard-fail rather than spill, which is what
+  the local GPU lanes deliberately do
 
-The parse check cannot run in `ferry-dash`'s own interpreter, which has no YAML
-library (see Constraints). It shells out to the interpreter that actually serves
-the config, resolved by the existing `_ferry_front_python()`
-(`lib/ferry-serve.zsh:221`) — the litellm venv, which has `pyyaml`.
-
-That is a feature, not a workaround: validating in the interpreter that will load
-the file is the only check that can prove the file is loadable. A parse that
-succeeds in some other Python proves the bytes are well-formed YAML, not that the
-proxy can start on them.
+Deliberately NOT validated in v1, because chain editing cannot change any of
+them: duplicate `model_name`, duplicate `model_info.id`, and whether the file
+parses as YAML. The written line is generated by `json.dumps` from names that
+already validated, so it cannot produce YAML this writer would otherwise accept.
+These become necessary the moment the editor can add or remove deployments —
+which is the v2 boundary.
 
 After the restart, probe each lane name and report which backend served. To prove
 a *chain* rather than a primary, run the probe against a throwaway instance with
@@ -153,6 +177,12 @@ a *chain* rather than a primary, run the probe against a throwaway instance with
 - each validation rule above, with a fixture that violates it
 - an alias-shaped lane is rejected with the reason
 - the writer refuses when an anchor does not match, rather than writing partially
+
+The unit suite covers the writer, not the page. Both UI defects found during
+implementation — the editor claiming unsaved edits on load, and diff file headers
+rendered as changed lines — were invisible to it and surfaced only by opening the
+page and driving it. Treat "the suite is green" as a statement about the writer
+alone, and open the dashboard before believing anything about the panel.
 
 ## v1 scope
 

@@ -433,6 +433,13 @@ do
   fi
 done
 
+# The shell wrappers that SELECT between the two files just written. These were
+# installed only by client-bootstrap.sh, so a host had the configs and no way to
+# pick one; see _ferry_install_host_wrappers for the marker-collision detail.
+if ! "$FERRY_BIN" opencode --wrappers; then
+  RESET_FAILED=1
+fi
+
 # --- 7. Verify against the running endpoint ---------------------------------
 # Nothing above proves the lanes answer. Ask the endpoint, then check the local
 # backends separately: litellm lists local-orch and local-sub whether or not an

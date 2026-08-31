@@ -34,6 +34,115 @@ _ferry_install_opencode_guardrails() {
   echo "     putting it in system instructions measured WORSE.)"
 }
 
+# _ferry_install_host_wrappers — put the `opencode-cloud` / `opencode-local`
+# shell functions in the HOST's ~/.zshrc.
+#
+# The same gap as the guardrails above, one layer out: the wrappers were written
+# ONLY by client-bootstrap.sh, so every client got them and the host never did.
+# Confirmed by absence rather than assumed — host-bootstrap.sh contains no
+# occurrence of "opencode" at all, and host-reset.sh writes the two profile JSONs
+# but never touches ~/.zshrc. So the host ended up with the FILES the wrappers
+# select between and no way to select between them.
+#
+# Marker discipline is the whole point. client-bootstrap.sh strips a previous
+# block by EXACT string compare on "# >>> ferry opencode profiles >>>", and
+# client-cleanup.sh compares the same way. Writing a host block under any other
+# marker means neither tool can see it, and the next client bootstrap appends a
+# SECOND block defining the same two functions (the later definition wins, so the
+# duplicate is invisible until the two disagree). This writes the canonical
+# marker for exactly that reason, and additionally absorbs the "(host)" variant
+# that hand-wiring produced before this function existed.
+#
+# Named wrappers only, no bare `opencode()`. This matches the client's
+# --profiles-only scope: a host that exports OPENCODE_CONFIG has chosen its
+# default deliberately, and wrapping bare `opencode` would fight that choice.
+FERRY_OC_MARK_START="# >>> ferry opencode profiles >>>"
+FERRY_OC_MARK_END="# <<< ferry opencode profiles <<<"
+
+_ferry_install_host_wrappers() {
+  local rc="$HOME/.zshrc"
+  touch "$rc"
+
+  # Strip the canonical block AND the legacy "(host)" variant, then re-add. Both
+  # spellings go, or absorbing the legacy one would just leave two again.
+  python3 - "$rc" "$FERRY_OC_MARK_START" "$FERRY_OC_MARK_END" <<'PYEOF'
+import sys
+rc, start, end = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# The hand-wired spelling this function exists to absorb. Neither
+# client-bootstrap.sh nor client-cleanup.sh can match it, because both compare
+# marker lines for exact equality.
+legacy_start = "# >>> ferry opencode profiles (host) >>>"
+legacy_end = "# <<< ferry opencode profiles (host) <<<"
+
+with open(rc) as f:
+    lines = f.readlines()
+
+out, skip = [], False
+for ln in lines:
+    s = ln.rstrip("\n")
+    if s in (start, legacy_start):
+        skip = True
+        continue
+    if s in (end, legacy_end):
+        skip = False
+        continue
+    if not skip:
+        out.append(ln)
+
+# A stray `alias opencode-cloud=` / `alias opencode-local=` ABOVE a function of
+# the same name makes zsh expand the alias inside `name() {`, which is a parse
+# error on every subsequent `source ~/.zshrc`. client-bootstrap.sh strips these
+# for the same reason.
+def is_legacy_alias(l):
+    t = l.lstrip()
+    return t.startswith("alias opencode-cloud=") or t.startswith("alias opencode-local=")
+
+out = [l for l in out if not is_legacy_alias(l)]
+
+while out and out[-1].strip() == "":
+    out.pop()
+with open(rc, "w") as f:
+    f.writelines(out)
+    if out:
+        f.write("\n")
+PYEOF
+  if (( $? != 0 )); then
+    echo "    WARNING: could not rewrite $rc; leaving the shell wrappers alone." >&2
+    return 1
+  fi
+
+  # QUOTED heredoc: written verbatim, so the $HOME and $@ inside the functions
+  # survive into the file instead of being expanded now.
+  cat <<'EOF' >> "$rc"
+# >>> ferry opencode profiles >>>
+# Installed by `ferry update` / host-reset.sh on the HOST. The two profile FILES
+# these select between are written by `ferry opencode` in the same pass.
+#
+# There is deliberately no bare `opencode` function: an explicit OPENCODE_CONFIG
+# is the host's own choice and ferry does not override it.
+unalias opencode-cloud opencode-local 2>/dev/null
+
+# opencode-cloud: the CLOUD pair — heavy drives (build/plan), flash runs the
+# fan-out, super-flash handles title/summary/compaction.
+opencode-cloud() {
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-cloud.json" command opencode "$@"
+}
+
+# opencode-local: the GPU pair — local-orch drives, local-sub runs the fan-out.
+# Nothing leaves this machine.
+opencode-local() {
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-local.json" command opencode "$@"
+}
+# <<< ferry opencode profiles <<<
+EOF
+
+  echo ">>> opencode shell wrappers installed in $rc:"
+  echo "    opencode-cloud   -> cloud pair: heavy drives, flash fans out"
+  echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
+  echo "    (bare 'opencode' is untouched — run: source $rc)"
+}
+
 cmd_env() {
   # Emit shell 'export' lines so a client routes its downloads through the host's
   # forward proxy (see 'ferry serve-proxy'). Designed for:  eval "$(ferry env ...)".
@@ -168,6 +277,10 @@ cmd_opencode() {
       # original verbatim, comments included — so the flag is now a no-op.
       --force)        force_write=1; shift ;;
       --cloud)        prefer_local=0; shift ;;
+      # Install the ~/.zshrc wrappers and nothing else. host-reset.sh calls this
+      # once, after writing the profile files the wrappers select between —
+      # doing it inside the normal path would re-run it once per config.
+      --wrappers)     _ferry_install_host_wrappers; return $? ;;
       *) echo "Unknown option for 'ferry opencode': $1"; exit 1 ;;
     esac
   done

@@ -24,6 +24,8 @@ case "$COMMAND" in
   get)           cmd_get "$@" ;;
   receive)       cmd_receive "$@" ;;
   send)          cmd_send "$@" ;;
+  drop)          cmd_drop "$@" ;;
+  pickup)        cmd_pickup "$@" ;;
   serve-hf)      cmd_serve_hf "$@" ;;
   serve-proxy)   cmd_serve_proxy "$@" ;;
   env)           cmd_env "$@" ;;

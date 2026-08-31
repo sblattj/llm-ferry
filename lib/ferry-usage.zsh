@@ -51,6 +51,15 @@ Ferrying models & files across the LAN:
   serve-hf           [Host] Start EXPERIMENTAL HuggingFace pass-through proxy [--port P] (default $HF_PORT)
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
 
+Encrypted transfer over an UNTRUSTED channel (no LAN required):
+  drop <file>|-      [Dual] Encrypt to a self-contained .ferrydrop blob + print a fresh
+                       passphrase. Move the blob however you like; it is safe on a
+                       channel ferry does not trust. Send the passphrase separately.
+                       ferry drop <file> [--to PATH]
+                       ferry drop --msg "text" [--to PATH]
+  pickup <blob>      [Dual] Verify and decrypt a .ferrydrop blob
+                       ferry pickup <blob> [--to PATH] [--pass-file FILE]
+
 Options for 'up':
   (no flags)         THE STACK — all four lanes on one endpoint (:$PORT):
                        orch        cloud  GLM 5.3 + strict fallback chain

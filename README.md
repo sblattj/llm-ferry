@@ -65,7 +65,8 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 - 📦 **Ferry models & files across the LAN** — stream whole models from the host's HuggingFace cache, offer/fetch arbitrary files, or push over netcat.
 - 🕳️ **Forward proxy for offline clients** — route a client's uv/PyPI/HuggingFace/git downloads through the host's connection.
 - 🔄 **Reverse tunnel for locked-down clients** — publish one of a client's own local ports through the host, with the client only ever dialling out (`ferry relay` on the host, `ferry expose <port>` on the client).
-- 🪶 **Single-file CLI** — `zsh` + `python3` **standard library** only; `litellm`/`mlx` installed via `uv` only when you actually serve inference. Clients fetch the CLI as one script over the LAN.
+- 🔐 **Encrypted drop for machines off the LAN, new in v1.17** — `ferry drop` writes an authenticated, self-contained blob you can move over any channel ferry doesn't trust; `ferry pickup` verifies and decrypts it. The passphrase, not the carrier, is the security boundary.
+- 🪶 **Single-file CLI** — `zsh` + `python3` **standard library** only; `litellm`/`mlx` installed via `uv` only when you actually serve inference (plus `openssl`, an OS-provided binary, for `drop`/`pickup`). Clients fetch the CLI as one script over the LAN.
 
 ## Quickstart
 
@@ -107,6 +108,15 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 - bare `opencode` — whichever pair you used **last** (cloud until you first run `opencode-local`; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
 Both need `ferry up` on the host, which serves all five lanes at once.
+
+**The host gets these too, as of v1.17.** `ferry opencode` deliberately wires the
+host to its own endpoint, so the host drives the local lanes exactly like a client
+does — but the wrappers were written only by `client-bootstrap.sh`, leaving a host
+with the two profile files and no way to select between them. `ferry install` and
+`ferry update` now install them (named wrappers only; bare `opencode` is left
+alone, since a host that exports `OPENCODE_CONFIG` chose that deliberately). They
+land under the same `# >>> ferry opencode profiles >>>` marker the client uses, so
+a hand-wired block from before this change is absorbed rather than duplicated.
 
 #### How much of opencode it takes over
 
@@ -390,6 +400,62 @@ With it on, `ferry dash` gains a **Live traffic** panel — every public lane dr
 
 Per-deployment health (`rate_limited` / `quota_exhausted` / `auth_dead` / `unreachable`) is inferred against a classifier table you own: copy [`event-rules.example.json`](event-rules.example.json) to `~/.config/ferry/event-rules.json` and fill in what your providers actually say. **With no table every failure reads `unknown`** — visible, never silently `healthy`.
 
+## Encrypted transfer off the LAN — `ferry drop` / `ferry pickup`
+
+Every other transport in this README assumes the private LAN. This pair is the
+exception, and it exists for the case the LAN posture cannot serve: getting a
+file to a machine that isn't on your network at all — a cloud desktop, a VDI, a
+locked-down work laptop that can only make outbound requests.
+
+```bash
+ferry drop brief.md                   # -> brief.md.ferrydrop + a fresh passphrase
+ferry drop --msg "the API is at :8090"
+cat notes.txt | ferry drop -
+
+# on the other machine, once the blob has arrived by any means at all
+ferry pickup brief.md.ferrydrop
+```
+
+**Ferry supplies confidentiality, not delivery.** `drop` writes a blob; you move
+it however you like (email, chat, a gist, object storage, a USB stick); `pickup`
+reads it. That's a deliberate limit — it keeps ferry free of any account,
+credential file, or third-party service, which is the same reason the rest of the
+tool is LAN-only.
+
+The blob is AES-256-CBC with PBKDF2 at 600k iterations, plus an **HMAC-SHA256
+over the header and the ciphertext**. `pickup` verifies that MAC *before* it
+invokes openssl, so a modified blob fails closed without ever entering the
+decrypt path. The MAC covers the header because the header names the output file
+— authenticating only the ciphertext would leave `name: ../../../.ssh/authorized_keys`
+as a write-anywhere primitive. Independently of the crypto, `pickup` reduces that
+name to a basename and refuses to write through a symlink.
+
+The header is plain ASCII, so a stray blob is identifiable:
+
+```
+FERRYDROP/1
+cipher: aes-256-cbc
+kdf: pbkdf2
+iter: 600000
+kind: file
+name: brief.md
+mac: 685bf67e…
+--
+U2FsdGVkX1…
+```
+
+**The passphrase is the entire security boundary**, so send it by a *different*
+channel than the blob. It's generated fresh per drop from openssl's CSPRNG and
+printed once; it's never written into the blob, a log, or `client_logs.txt`, and
+never passed in argv (`-pass pass:` would expose it to `ps`). Exit codes
+distinguish the cases: `3` means the passphrase was wrong *or* the blob was
+modified — those are indistinguishable to the verifier and both mean stop.
+
+`drop`/`pickup` need `openssl` on `PATH`. Stock macOS LibreSSL 3.3.6 and OpenSSL 3.x
+produce mutually decryptable blobs (verified, including that LibreSSL honours
+`-iter` rather than silently ignoring it). Without openssl both commands exit `5`
+with an explanation rather than a stack trace.
+
 ## Ports
 
 | Port | Purpose | Started by |
@@ -543,7 +609,7 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 
 ## Privacy
 
-Everything runs on your own hardware and network. Client↔host traffic stays on your **private LAN as plain HTTP**; cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the keys**. Inbound client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host — outside any checkout, so it survives a repo that moves or a worktree that is removed. The observability stack binds to `127.0.0.1` only. A port published with `ferry relay` binds on the **host** (the LAN by default) and is reachable by anything that can reach the host on that port — the relay authenticates only the client that registers it, so whatever you `ferry expose` must carry its own authentication.
+Everything runs on your own hardware and network. Client↔host traffic stays on your **private LAN as plain HTTP**; cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the keys**. The one transport built for an untrusted channel is `ferry drop` / `ferry pickup`, which encrypts before the data leaves the machine — everything else assumes the LAN. Inbound client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host — outside any checkout, so it survives a repo that moves or a worktree that is removed. The observability stack binds to `127.0.0.1` only. A port published with `ferry relay` binds on the **host** (the LAN by default) and is reachable by anything that can reach the host on that port — the relay authenticates only the client that registers it, so whatever you `ferry expose` must carry its own authentication.
 
 ## Command reference
 

@@ -155,6 +155,36 @@ class TestShippedLaunchLines(unittest.TestCase):
         self.assertIsNotNone(body)
         self.assertIn("while", body.group(1))
 
+    def test_launch_front_passes_workers(self):
+        body = re.search(r"_ferry_launch_front\(\) \{(.*?)\n\}", self.src, re.S)
+        self.assertIsNotNone(body, "_ferry_launch_front is missing from ferry")
+        self.assertIn('--workers "$workers"', body.group(1))
+        # 4th arg overrides, else the FERRY_WORKERS-derived default
+        self.assertIn('${4:-$FERRY_FRONT_WORKERS}', body.group(1))
+
+    def test_workers_default_is_a_small_pool_overridable_by_env(self):
+        # litellm's benchmark guidance is one worker per CPU; a LAN host needs
+        # only a small pool. 4 is the shipped default, FERRY_WORKERS overrides
+        # (1 restores the old single-process shape).
+        self.assertIn('FERRY_FRONT_WORKERS="${FERRY_WORKERS:-4}"', self.src)
+
+    def test_port_precedes_workers_on_the_launch_line(self):
+        # _ferry_stop_litellm reaps by `(litellm|ferry_front\.py) .*--port N( |$)`.
+        # --workers must come AFTER --port so the space in that pattern still
+        # matches the longer cmdline; if someone reorders the flags the reap
+        # silently misses the master and `ferry up` fights a zombie front.
+        body = re.search(r"_ferry_launch_front\(\) \{(.*?)\n\}", self.src, re.S)
+        text = body.group(1)
+        self.assertIn("--port", text)
+        self.assertIn("--workers", text)
+        self.assertLess(text.index("--port"), text.index("--workers"))
+
+    def test_plain_litellm_fallback_keeps_worker_parity(self):
+        # If the catalogue front is unavailable and ferry falls back to the raw
+        # `litellm` CLI, it must launch the SAME worker count, not silently
+        # drop to one process (the CLI flag is --num_workers, not --workers).
+        self.assertEqual(self.src.count('--num_workers "$FERRY_FRONT_WORKERS"'), 2)
+
 
 class TestStatusTestCommand(unittest.TestCase):
     """The curl line `ferry status` prints must work when pasted."""

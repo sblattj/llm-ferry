@@ -742,8 +742,18 @@ _ferry_front_python() {
 # Start the filtered front. Returns non-zero WITHOUT starting anything if the
 # front is unusable, so the caller can fall back to the plain CLI: a visible
 # fallback hop is a wart, a dead endpoint is an outage.
+#
+# Workers: litellm's benchmark guidance is one uvicorn worker per CPU (2 -> 4
+# instances halved median latency, P95 630ms -> 150ms), but a LAN host serving
+# a handful of agentic clients needs only a small pool — default 4, override
+# with FERRY_WORKERS=N (1 for the old single-process shape). ferry_front.py
+# sets PROMETHEUS_MULTIPROC_DIR when workers > 1 so /metrics still aggregates
+# (litellm 1.97.0 mounts a MultiProcessCollector when the env var is set);
+# without it each worker would answer a scrape with only its own counters and
+# the litellm_* dashboards would undercount by ~1/N.
+FERRY_FRONT_WORKERS="${FERRY_WORKERS:-4}"
 _ferry_launch_front() {
-  local config="$1" port="$2" log="$3" py front
+  local config="$1" port="$2" log="$3" workers="${4:-$FERRY_FRONT_WORKERS}" py front
   front="$APP_DIR/front/ferry_front.py"
   [[ -f "$front" ]] || return 1
   py="$(_ferry_front_python)" || return 1
@@ -751,7 +761,8 @@ _ferry_launch_front() {
   nohup "$py" "$front" \
     --config "$config" \
     --port "$port" \
-    --host 0.0.0.0 >> "$log" 2>&1 & disown
+    --host 0.0.0.0 \
+    --workers "$workers" >> "$log" 2>&1 & disown
   return 0
 }
 
@@ -1028,6 +1039,7 @@ cmd_up() {
     # fails on THAT lane only — the cloud lanes are servable immediately.
     echo ">>> [front] litellm --config $FERRY_ROUTE_CONFIG"
     echo "        port   :$target_port"
+    echo "        workers:$FERRY_FRONT_WORKERS"
     echo "        log    $cloud_log"
     _ferry_reset_log "$cloud_log"
     if ! _ferry_launch_front "$FERRY_ROUTE_CONFIG" "$target_port" "$cloud_log"; then
@@ -1036,6 +1048,7 @@ cmd_up() {
       nohup litellm \
         --config "$FERRY_ROUTE_CONFIG" \
         --port "$target_port" \
+        --num_workers "$FERRY_FRONT_WORKERS" \
         --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
     fi
 
@@ -1125,6 +1138,7 @@ cmd_up() {
       nohup litellm \
         --config "$FERRY_ROUTE_CONFIG" \
         --port "$target_port" \
+        --num_workers "$FERRY_FRONT_WORKERS" \
         --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
     fi
 

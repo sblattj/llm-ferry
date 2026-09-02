@@ -272,12 +272,30 @@ router_settings:
                                              # key OR the fallback) recovers fast; one 429
                                              # can't lock out the only path for a full minute
   num_retries: 1                             # retry a failed call once, THEN fall back.
-                                             # Keep low: if a hard-down primary returns an
-                                             # error litellm maps to a retryable class (e.g.
-                                             # a quota 403 -> APIConnectionError), a high
-                                             # num_retries adds retry-backoff latency before
-                                             # the fallback fires. 1 keeps a worker pool
-                                             # resilient to a blip without that penalty.
+                                              # Keep low: if a hard-down primary returns an
+                                              # error litellm maps to a retryable class (e.g.
+                                              # a quota 403 -> APIConnectionError), a high
+                                              # num_retries adds retry-backoff latency before
+                                              # the fallback fires. 1 keeps a worker pool
+                                              # resilient to a blip without that penalty.
+                                              # (litellm docs rank num_retries: request header
+                                              # > request body > deployment litellm_params >
+                                              # this litellm_settings default — so this value is
+                                              # what a naive config inherits; keep it low or a
+                                              # dead primary burns backoff before every hop.)
+
+  # Size the prompt LOCALLY before sending (litellm docs: pre-call checks).
+  # An over-context call is rejected or redirected in milliseconds instead of a
+  # full provider round-trip -> retry -> fallback chain on a 600s timeout.
+  # Enforced against `model_info.max_input_tokens` (litellm docs require both
+  # this flag AND the per-deployment cap — without the cap the check can't know
+  # the limit) plus litellm's built-in model map. Costs one local token-count
+  # pass per call; set the cap explicitly on every lane you want enforced.
+  enable_pre_call_checks: true
+  # Fires on ContextWindowExceededError (pre-call OR provider-raised): an
+  # oversized prompt reroutes down the chain, exactly like ordinary failures.
+  # Point it at fallbacks whose context is at least as large as the primary's.
+  context_window_fallbacks: [{"heavy": ["heavy-fallback", "heavy-fallback-2"]}]
 
   # Optional back-compat: if you rename a lane, alias the OLD name to the new one
   # so clients wired before the rename keep working. `hidden: true` keeps the alias

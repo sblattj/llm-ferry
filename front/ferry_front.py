@@ -317,12 +317,44 @@ def build_app():
     return LaneCatalogueFilter(litellm_app, public)
 
 
+def _prepare_multiproc_metrics(port: int) -> None:
+    """Point prometheus_client at a fresh multiprocess dir when workers > 1.
+
+    litellm's /metrics serves a MultiProcessCollector when (and only when)
+    PROMETHEUS_MULTIPROC_DIR is set (litellm/integrations/prometheus.py,
+    _mount_metrics_endpoint, verified 1.97.0). Without it, N workers each
+    answer a scrape with their OWN private counters — VictoriaMetrics would
+    sample one worker at random and the litellm_* dashboards would
+    undercount by ~1/N with counter values flapping between scrapes.
+
+    The dir must be EMPTY at start: stale .db files from a previous run make
+    dead series resurface. Cleared here, before uvicorn spawns workers.
+    """
+    import shutil
+    import tempfile
+
+    d = os.environ.get("PROMETHEUS_MULTIPROC_DIR") or os.path.join(
+        tempfile.gettempdir(), f"ferry-prom-multiproc-{port}"
+    )
+    shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = d
+
+
 def main(argv: list[str] | None = None) -> int:
     """Serve litellm's proxy with the catalogue filtered.
 
-    Deliberately accepts the same three flags ferry passes to the `litellm` CLI,
-    in the same shape, so `pgrep -f '--port N'` still finds this process and
-    `ferry down` keeps working.
+    Deliberately accepts the same three flags ferry passes to the `litellm`
+    CLI, in the same shape, so `pgrep -f '--port N'` still finds this process
+    and `ferry down` keeps working. `--workers` mirrors the `litellm` CLI's
+    `--num_workers`: litellm's own benchmark guidance is workers = CPU count
+    (2 -> 4 instances halved median latency, P95 630ms -> 150ms), but on a LAN
+    host a small pool is plenty — the default stays 1 unless ferry passes more.
+
+    Multi-worker state is per-process: cooldowns and usage-based-routing
+    counters live in each worker, which for one host is an acceptable blur.
+    The event tap's NDJSON appends stay line-atomic across writers; rotation
+    is already best-effort.
     """
     import argparse
 
@@ -330,9 +362,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args(argv)
 
     os.environ["CONFIG_FILE_PATH"] = args.config
+    if args.workers > 1:
+        _prepare_multiproc_metrics(args.port)
 
     import uvicorn
 
@@ -341,6 +376,7 @@ def main(argv: list[str] | None = None) -> int:
         factory=True,
         host=args.host,
         port=args.port,
+        workers=max(1, args.workers),
     )
     return 0
 

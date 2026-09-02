@@ -294,6 +294,34 @@ class TestShippedConfigTemplate(unittest.TestCase):
                 "public; a client selecting it gets no failover at all",
             )
 
+    def test_every_openrouter_deployment_sorts_providers_by_throughput(self):
+        """OpenRouter's default is price-weighted; the template asks for speed.
+
+        The knob is `extra_body.provider.sort: throughput` on the deployment,
+        forwarded verbatim by litellm's openrouter transform. It has to be on
+        EVERY openrouter/ deployment: a hop that lacks it silently lands on the
+        cheapest provider (Z.AI at 22 tok/s for GLM 5.3 Flash on 2026-09-02,
+        against 86-111 at the top), and nothing downstream can tell.
+        """
+        import yaml
+
+        path = os.path.join(REPO, "litellm-route-example.yaml")
+        with open(path) as handle:
+            cfg = yaml.safe_load(handle)
+        openrouter = [
+            m for m in cfg["model_list"]
+            if str(m.get("litellm_params", {}).get("model", "")).startswith("openrouter/")
+        ]
+        self.assertTrue(openrouter, "template has no openrouter/ deployment to check")
+        for m in openrouter:
+            provider = (m["litellm_params"].get("extra_body") or {}).get("provider") or {}
+            self.assertEqual(
+                provider.get("sort"), "throughput",
+                f"{m['model_name']!r} rides OpenRouter without "
+                "extra_body.provider.sort: throughput — it will be served by "
+                "the cheapest provider, not the fastest",
+            )
+
 
 import ferry_front as FF  # noqa: E402
 

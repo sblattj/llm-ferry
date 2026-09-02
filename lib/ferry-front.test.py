@@ -485,5 +485,83 @@ class TestEventTap(unittest.TestCase):
         self.assertIs(app.seen_send, send)
 
 
+class MainWorkersTest(unittest.TestCase):
+    """--workers: the uvicorn worker count and the multiproc metrics dir.
+
+    litellm's /metrics serves a MultiProcessCollector only when
+    PROMETHEUS_MULTIPROC_DIR is set (verified litellm 1.97.0). With workers > 1
+    and no such dir, each worker answers a scrape with its own private
+    counters and the litellm_* dashboards undercount by ~1/N. main() must set
+    the dir itself when asked for more than one worker, and leave the
+    environment untouched otherwise (single-worker /metrics needs no dir, and
+    an unwanted dir would switch litellm to a collector that has nothing to
+    collect from one process).
+
+    uvicorn is faked in sys.modules, so no server ever starts and no litellm
+    import happens (the app factory is passed as a string).
+    """
+
+    def _run_main(self, argv):
+        import types
+        captured = {}
+        fake = types.ModuleType("uvicorn")
+        fake.run = lambda *a, **kw: captured.update(kw)
+        sys.modules["uvicorn"] = fake
+        try:
+            rc = FF.main(argv)
+        finally:
+            sys.modules.pop("uvicorn", None)
+        return rc, captured
+
+    def setUp(self):
+        os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+        os.environ.pop("CONFIG_FILE_PATH", None)
+
+    def tearDown(self):
+        os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+        os.environ.pop("CONFIG_FILE_PATH", None)
+
+    def test_single_worker_sets_no_multiproc_dir(self):
+        rc, captured = self._run_main(["--config", "x.yaml", "--port", "8090"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["workers"], 1)
+        self.assertNotIn("PROMETHEUS_MULTIPROC_DIR", os.environ)
+
+    def test_multiple_workers_pass_through_and_set_the_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = os.path.join(tmp, "ferry-prom-multiproc-9911")
+            os.makedirs(stale)
+            open(os.path.join(stale, "dead-series.db"), "w").close()
+            # gettempdir() caches its first answer, so repoint the cache
+            # itself rather than the env var.
+            tempfile.tempdir = tmp
+            try:
+                rc, captured = self._run_main(
+                    ["--config", "x.yaml", "--port", "9911", "--workers", "3"])
+            finally:
+                tempfile.tempdir = None
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured["workers"], 3)
+            d = os.environ["PROMETHEUS_MULTIPROC_DIR"]
+            self.assertEqual(d, stale)          # derived per-port under TMPDIR
+            self.assertEqual(os.listdir(d), [])  # stale .db files cleared, not merged
+
+    def test_a_preset_multiproc_dir_is_honoured_and_cleared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            preset = os.path.join(tmp, "preset-dir")
+            os.makedirs(preset)
+            open(os.path.join(preset, "dead-series.db"), "w").close()
+            os.environ["PROMETHEUS_MULTIPROC_DIR"] = preset
+            try:
+                rc, captured = self._run_main(
+                    ["--config", "x.yaml", "--port", "8090", "--workers", "2"])
+                self.assertEqual(rc, 0)
+                self.assertEqual(os.environ["PROMETHEUS_MULTIPROC_DIR"], preset)
+                self.assertEqual(os.listdir(preset), [])
+            finally:
+                os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

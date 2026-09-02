@@ -95,6 +95,9 @@ def run_gemini(arm, prompt):
     deltas = 0; text_tok = reason_tok = None
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
+    # Gemini-native has no litellm in the path; keep the key present so the
+    # summary code can treat every arm uniformly (None = not measured).
+    overhead = None
     with urllib.request.urlopen(req, timeout=300) as r:
         for line in r:
             if not line.startswith(b"data: "):
@@ -113,13 +116,19 @@ def run_gemini(arm, prompt):
             if um.get("candidatesTokenCount") is not None:
                 text_tok = um.get("candidatesTokenCount")
                 reason_tok = um.get("thoughtsTokenCount", 0)  # trap 4: verify, don't trust the knob
-    return _finish(t0, t_text, t_thought, t_last, deltas, text_tok, reason_tok)
+    result = _finish(t0, t_text, t_thought, t_last, deltas, text_tok, reason_tok)
+    result["proxy_overhead_ms"] = None
+    return result
 
 
 def _consume_sse(req):
     t0 = time.perf_counter(); t_text = t_thought = t_last = None
     deltas = 0; text_tok = reason_tok = None
     with urllib.request.urlopen(req, timeout=300) as r:
+        # litellm proxies stamp this on every response: the proxy's own added
+        # latency. Present only on ferry-lane arms (direct APIs have no such
+        # header) — None means "not measured", never "zero".
+        overhead = r.headers.get("x-litellm-overhead-duration-ms")
         for line in r:
             if not line.startswith(b"data: "):
                 continue
@@ -140,7 +149,9 @@ def _consume_sse(req):
                 t_text = t_text or now; deltas += 1; t_last = now
             elif delta.get("reasoning_content") or delta.get("reasoning"):
                 t_thought = t_thought or now
-    return _finish(t0, t_text, t_thought, t_last, deltas, text_tok, reason_tok)
+    result = _finish(t0, t_text, t_thought, t_last, deltas, text_tok, reason_tok)
+    result["proxy_overhead_ms"] = float(overhead) if overhead else None
+    return result
 
 
 def _finish(t0, t_text, t_thought, t_last, deltas, text_tok, reason_tok):
@@ -179,11 +190,12 @@ def main():
                     time.sleep(3)
                     r = runners[ARMS[name]["kind"]](ARMS[name], prompt)
                 results[name][pname].append(r)
-                dec = f"{r['decode_tok_s']:6.1f}" if r["decode_tok_s"] else "  n/a "
+                dec = f"{r['decode_tok_s']:6.1f}" if r['decode_tok_s'] else "  n/a "
+                ov = f" proxy {r['proxy_overhead_ms']:.0f}ms" if r.get("proxy_overhead_ms") is not None else ""
                 print(f"r{rnd+1} {name:14s} {pname:5s} textTTFT "
                       f"{(r['text_ttft'] or 0):5.2f}s e2e {r['e2e']:6.2f}s "
                       f"text {r['text_tok']:4d} think {r['reason_tok']:4d} "
-                      f"decode {dec} e2etok/s {r['e2e_tok_s']:5.1f}", flush=True)
+                      f"decode {dec} e2etok/s {r['e2e_tok_s']:5.1f}{ov}", flush=True)
                 time.sleep(args.gap)
 
     print("\n=== MEDIANS ===")
@@ -195,11 +207,16 @@ def main():
         e2e = statistics.median(r["e2e"] for r in allr)
         dec = [r["decode_tok_s"] for r in allr if r["decode_tok_s"]]
         dec_s = f"{statistics.median(dec):6.1f}" if dec else "  n/a "
+        ovs = [r["proxy_overhead_ms"] for r in allr if r.get("proxy_overhead_ms") is not None]
+        ov_s = f"  proxy-median {statistics.median(ovs):5.1f}ms ({len(ovs)}/{len(allr)})" if ovs else ""
         print(f"{name:14s} textTTFT {ttft:5.2f}s  e2e {e2e:6.2f}s  "
               f"decode {dec_s} tok/s ({len(dec)}/{len(allr)} measurable)  "
               f"e2etok/s {statistics.median(r['e2e_tok_s'] for r in allr):5.1f}  "
-              f"think-median {statistics.median(r['reason_tok'] for r in allr):.0f}")
+              f"think-median {statistics.median(r['reason_tok'] for r in allr):.0f}{ov_s}")
     print("\nNOTE: think-median > 0 on an arm configured 'thinking off' = knob ignored (trap 4).")
+    print("NOTE: proxy-median = litellm's x-litellm-overhead-duration-ms; present only on arms")
+    print("      served through a litellm proxy (ferry lanes). It is the proxy's own added latency")
+    print("      — compare arms by it, and watch it drop when workers go up.")
     return 0
 
 

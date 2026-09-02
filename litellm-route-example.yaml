@@ -202,11 +202,36 @@ model_list:
   # host on 2026-08-30: host-reset.sh's verifier failed with "super-flash NOT
   # served" for a lane that answered a probe correctly on the next line.
   # Mark every LANE; never mark a fallback hop.
+  #
+  # OPENROUTER HOPS ROUTE BY THROUGHPUT. One OpenRouter model id is served by
+  # many providers (GLM 5.3 Flash by 22 on 2026-09-02, spanning 111 tok/s at
+  # the top and 17 at the bottom), and OpenRouter's DEFAULT picks among the
+  # cheapest of them weighted by inverse-square price — so with no preference
+  # stated the request lands on the cheapest provider, not the fastest. The
+  # `extra_body.provider` block below is OpenRouter's own provider-routing
+  # object, forwarded verbatim by litellm's openrouter transform
+  # (llms/openrouter/chat/transformation.py, `response.update(extra_body)`,
+  # verified 1.97.0). `sort: throughput` re-ranks every request by each
+  # provider's p50 tokens/s over a rolling 5-minute window, ON OPENROUTER'S
+  # SIDE — nothing here polls, caches, or pins a provider name, so a provider
+  # that is rate-limited or down this minute is simply not at the top this
+  # minute. (Verified 2026-09-02: pinning `order: ["Baseten"]` — the fastest
+  # provider on the page — returned 429 "temporarily rate-limited upstream";
+  # `sort: throughput` on the same model was served by Fireworks at once.)
+  #
+  # The trade: throughput sort ignores price. Where a discounted provider is
+  # the cheap one, this can land on a full-price one instead (GLM 5.3 Flash:
+  # $0.25/M out discounted vs $0.50/M full). Drop the block from a deployment
+  # you would rather run cheap than fast. On a single-provider model (Gemini
+  # via OpenRouter) it is inert either way.
   - model_name: super-flash
     litellm_params:
       model: openrouter/google/gemini-3.7-flash
       api_key: os.environ/OPENROUTER_API_KEY
       timeout: 600
+      extra_body:
+        provider:
+          sort: throughput    # fastest provider this minute, ranked by OpenRouter
     model_info:
       public: true        # advertised in /v1/models
       id: or-gemini-sf

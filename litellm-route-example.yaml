@@ -13,8 +13,9 @@
 #   heavy-fallback -> an INDEPENDENT model litellm reroutes to when `heavy` fails;
 #                     chain several for depth (example: Fireworks DeepSeek V4 Pro
 #                     first, GLM 5.2 last)
-#   flash          -> WORKER: cheap high-volume fan-out lane; a pool of DIFFERENT
-#                     Gemini MODEL IDS on ONE key (see the quota note below)
+#   flash          -> WORKER: cheap high-volume fan-out lane (example: Gemini 3.7
+#                     Flash); widen it with MORE MODEL IDS on the SAME key, never
+#                     with more keys (see the quota note below)
 #   super-flash    -> HOUSEKEEPER: title / summary / compaction only
 #   local-orch     -> the host GPU's "smart" model, via mlx_vlm.server on :8092
 #   local-sub      -> the host GPU's cheap fan-out model, via mlx_vlm.server on :8093
@@ -26,10 +27,11 @@
 # on the lane least likely to have headroom. On the GPU pair there is no third
 # lane, so the housekeeper shares local-sub.
 #
-# Worker pool: several deployments sharing the `flash` model_name form one pool.
-# `usage-based-routing-v2` sends each call to the least-used deployment (proactive
-# even split); on a 429/error litellm retries on another and cools the failed one
-# out for `cooldown_time`.
+# Worker pool: the template ships `flash` as ONE deployment. Add more deployments
+# sharing the `flash` model_name and they form a pool: `usage-based-routing-v2`
+# sends each call to the least-used deployment (proactive even split); on a
+# 429/error litellm retries on another and cools the failed one out for
+# `cooldown_time`. On a single deployment both are a harmless no-op.
 #
 # WHAT THE POOL MEMBERS MUST BE — read this before adding one. Google's rate-limit
 # docs put it verbatim: "Rate limits are applied per project, not per API key."
@@ -45,16 +47,18 @@
 #
 #   2. But the limit is per-project-PER-MODEL: every model id carries its OWN
 #      independent RPM / TPM / RPD bucket. So you widen this lane by pooling
-#      DIFFERENT MODEL IDS on the SAME key — sanctioned, no second project, and it
-#      is what the `flash` block below actually does. Read off one Tier-2 project's
-#      rate-limit page (console -> API keys -> rate limits):
+#      DIFFERENT MODEL IDS on the SAME key — sanctioned, no second project. Read
+#      off one Tier-2 project's rate-limit page (console -> API keys -> rate
+#      limits):
 #
 #          gemini-3.7-flash         2K RPM /  3M TPM / 100K RPD
 #          gemini-3.5-flash         2K RPM /  3M TPM / 100K RPD
 #          gemini-3.1-flash-lite   10K RPM / 10M TPM / 350K RPD
 #
-#      Three independent buckets, one key, one project. Add a model id and you add
-#      a bucket; add a key and you add nothing.
+#      Each id is its own bucket, one key, one project. Add a model id and you add
+#      a bucket; add a key and you add nothing. The template ships only the first
+#      id: the two older ones were dropped 2026-09-02 after a 3-round bench put
+#      3.5 Flash at 37 visible tok/s behind ~1000 reasoning tokens per reply.
 #
 # The other sanctioned lever is RAISING THE PAID TIER on that one project, which
 # lifts every bucket at once (Tier 3 = 20M TPM for Gemini 3.7 Flash). Beyond that,
@@ -151,42 +155,29 @@ model_list:
   # series — exactly the split those panels exist to show. Nothing warns you;
   # check /v1/model/info after any edit here.
   #
-  # Why three deployments on ONE api_key? Because rate limits are per-project and
-  # per-MODEL, never per-key (see the note at the top of this file). The old
-  # template shipped a `# project #1 … # project #6` pool of keys, one key minted
-  # per Google Cloud project — that bought real throughput and was a Google APIs
+  # ONE deployment, ONE api_key. To widen it, add more deployments with the SAME
+  # `flash` model_name and DIFFERENT model ids on this same key: rate limits are
+  # per-project and per-MODEL, never per-key (see the note at the top of this
+  # file), so each id is an independent RPM/TPM/RPD bucket. The old template
+  # shipped a `# project #1 … # project #6` pool of keys, one key minted per
+  # Google Cloud project — that bought real throughput and was a Google APIs
   # ToS §2.d violation, and nine of those projects were suspended in one night on
-  # 2026-08-25. This pool buys the same kind of headroom the legitimate way: three
-  # DIFFERENT model ids, three independent RPM/TPM/RPD buckets, one key, one
-  # project, nothing to circumvent.
+  # 2026-08-25. More model ids on one key is the legitimate route to the same
+  # headroom: nothing to circumvent.
   #
-  # Pick pool members that are interchangeable for the lane's ROLE — these are all
-  # cheap fast workers, so a caller cannot tell which one answered, which is the
-  # only reason a pool is allowed to round-robin across them at all. Do NOT pool a
-  # frontier model with a lite one just to add a bucket: the lane's behaviour would
-  # change per request. To ADD a bucket, add another model id here (verify it
-  # serves your key first — see the README) — never another project's key.
+  # Pick pool members that are interchangeable for the lane's ROLE — cheap fast
+  # workers, so a caller cannot tell which one answered, which is the only reason
+  # a pool is allowed to round-robin across them at all. Do NOT pool a frontier
+  # model with a lite one just to add a bucket: the lane's behaviour would change
+  # per request. Verify a new id serves your key first (see the README) — and
+  # never add another project's key.
   - model_name: flash
     litellm_params:
       model: gemini/gemini-3.7-flash
-      api_key: os.environ/GEMINI_API_KEY      # ONE key for the whole pool
+      api_key: os.environ/GEMINI_API_KEY      # ONE key, one project
     model_info:
       public: true        # advertised in /v1/models
       id: gemini-flash-37
-
-  - model_name: flash
-    litellm_params:
-      model: gemini/gemini-3.5-flash
-      api_key: os.environ/GEMINI_API_KEY      # same key — a separate model bucket
-    model_info:
-      id: gemini-flash-35
-
-  - model_name: flash
-    litellm_params:
-      model: gemini/gemini-3.1-flash-lite
-      api_key: os.environ/GEMINI_API_KEY      # same key — the widest bucket (10M TPM)
-    model_info:
-      id: gemini-flash-lite-31
 
   # -- super-flash: the HOUSEKEEPER lane --------------------------------------
   # title / summary / compaction only. It gets its own lane rather than sharing
@@ -376,12 +367,12 @@ router_settings:
   # Strict failover chain: a failed `heavy` reroutes to the fallback list in order
   # (fast model first, last resort last).
   #
-  # A worker POOL can have a fallback too: when every key in the `flash` pool is
-  # cooled down (all on 429), overflow reroutes to the model(s) listed instead of
+  # The worker lane has a fallback too: when every `flash` deployment is cooled
+  # down (all on 429), overflow reroutes to the model(s) listed instead of
   # returning a raw 429 to the client. Point it at a lane with spare capacity (here
   # `heavy` itself). litellm fallbacks are single-hop (not transitive), so the
   # fallback target's own fallback list is NOT chained in. Remove the second entry
-  # if you want the pool to hard-fail rather than spill over.
+  # if you want `flash` to hard-fail rather than spill over.
   #
   # GIVE THE HOUSEKEEPER A CHAIN TOO. `super-flash` carries compaction, and a
   # failed compaction call does not merely retry — it drops the whole transcript.

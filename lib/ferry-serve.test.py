@@ -22,6 +22,7 @@ Two halves:
 """
 import os
 import re
+import subprocess
 import tempfile
 import unittest
 
@@ -207,6 +208,157 @@ class TestStatusTestCommand(unittest.TestCase):
             int(m.group(1)), 64,
             "suggested max_tokens is below the reasoning floor; the command it "
             "prints returns content=null on a healthy lane")
+
+
+class TestMasterKeyProbes(unittest.TestCase):
+    """v1.22.0: the front door can sit behind general_settings.master_key.
+
+    Every probe that answers "is it up" must survive a 401, and every probe
+    that reads catalogue content must present LITELLM_MASTER_KEY when the host
+    has one — while a keyless LAN install (no template edit) probes exactly as
+    it did before, so the bearer is conditional everywhere.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FERRY) as f:
+            cls.src = f.read()
+
+    def wait_http_body(self):
+        m = re.search(r"_ferry_wait_http\(\) \{.*?\n\}", self.src, re.S)
+        self.assertIsNotNone(m, "_ferry_wait_http is missing from ferry")
+        return m.group(0)
+
+    def run_wait_http(self, mode, server_status, require_bearer=None,
+                      env_key=None, timeout="3"):
+        """Execute the REAL extracted function against a throwaway HTTP server."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        hit = {"auth": None}
+
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                hit["auth"] = self.headers.get("Authorization")
+                ok = require_bearer is None or hit["auth"] == f"Bearer {require_bearer}"
+                self.send_response(server_status if ok else 401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        url = f"http://127.0.0.1:{srv.server_address[1]}/probe"
+
+        with tempfile.NamedTemporaryFile("w", suffix=".zsh", delete=False) as f:
+            f.write("set -u\n" + self.wait_http_body() + "\n"
+                    f"_ferry_wait_http '{url}' probe {timeout} {mode}\n"
+                    "echo RC=$?\n")
+            path = f.name
+        env = dict(os.environ)
+        env.pop("LITELLM_MASTER_KEY", None)   # hermetic: author shells may export one
+        if env_key is not None:
+            env["LITELLM_MASTER_KEY"] = env_key
+        try:
+            r = subprocess.run(["zsh", path], capture_output=True, text=True,
+                               env=env, timeout=60)
+        finally:
+            os.unlink(path)
+        self.assertIn("RC=", r.stdout, r.stderr)
+        return int(r.stdout.strip().rsplit("RC=", 1)[1]), hit
+
+    def test_a_200_is_ready_in_both_modes(self):
+        rc, _ = self.run_wait_http("content", 200)
+        self.assertEqual(rc, 0)
+        rc, _ = self.run_wait_http("readiness", 200)
+        self.assertEqual(rc, 0)
+
+    def test_a_401_is_ready_only_in_readiness_mode(self):
+        # THE v1.22.0 case: a master_key front door answers 401; readiness must
+        # call that up. The content probe must still refuse it — a 401 on an
+        # MLX lane's /v1/models would NOT mean warm.
+        rc, _ = self.run_wait_http("readiness", 401)
+        self.assertEqual(rc, 0)
+        rc, _ = self.run_wait_http("content", 401)
+        self.assertEqual(rc, 1)
+
+    def test_the_bearer_is_sent_when_the_key_is_set(self):
+        rc, hit = self.run_wait_http("readiness", 200, require_bearer="sk-test",
+                                     env_key="sk-test")
+        self.assertEqual(rc, 0)
+        self.assertEqual(hit["auth"], "Bearer sk-test",
+                         "LITELLM_MASTER_KEY was not presented on the probe")
+
+    def test_keyless_probes_send_no_auth_header(self):
+        # LAN installs without the template edit: no var, no header — byte for
+        # byte the probes ferry sent before v1.22.0.
+        rc, hit = self.run_wait_http("content", 200)
+        self.assertEqual(rc, 0)
+        self.assertIsNone(hit["auth"], "a keyless install must not send an auth header")
+
+    def test_readiness_mode_accepts_401_even_with_a_wrong_key(self):
+        # Readiness asks "is the process up"; a rejected key still proves it is.
+        rc, _ = self.run_wait_http("readiness", 200, require_bearer="sk-right",
+                                   env_key="sk-wrong")
+        self.assertEqual(rc, 0)
+
+    # --- structural: the call sites and their modes ---------------------------
+    def test_front_wait_uses_the_public_liveliness_route_in_readiness_mode(self):
+        self.assertRegex(
+            self.src,
+            r'_ferry_wait_http "http://127\.0\.0\.1:\$target_port/health/liveliness"'
+            r' +"front" +120 readiness \|\| true')
+
+    def test_mlx_lane_waits_keep_the_catalogue_probe(self):
+        # The MLX backends are loopback-only and never authenticated, and their
+        # /v1/models 200 IS the weights-resident signal (the port does not
+        # accept connections until the weights are resident). Switching them to
+        # a litellm-only route would report every cold load NOT READY forever.
+        self.assertIn('_ferry_wait_http "http://127.0.0.1:$LOCAL_ORCH_PORT/v1/models"',
+                      self.src)
+        self.assertIn('_ferry_wait_http "http://127.0.0.1:$LOCAL_SUB_PORT/v1/models"',
+                      self.src)
+        for lane in ("$LOCAL_ORCH_PORT", "$LOCAL_SUB_PORT"):
+            for m in re.finditer(r'_ferry_wait_http "http://127\.0\.0\.1:' +
+                                 re.escape(lane) + r'[^"]*"', self.src):
+                line = self.src[m.start():self.src.find("\n", m.start())]
+                self.assertNotIn("readiness", line,
+                                 "MLX lane probes must stay strict content probes")
+
+    def test_wait_http_bearer_is_conditional(self):
+        body = self.wait_http_body()
+        self.assertIn('[[ -n "${LITELLM_MASTER_KEY:-}" ]] && hdr=', body)
+
+    def test_catalogue_curls_send_the_bearer_only_when_set(self):
+        # The stack-up banner, the client status listing, and the host status
+        # listing all read /v1/models CONTENT, so each presents the bearer via
+        # a guarded array — never an unconditional header.
+        for guard in ("banner_auth=()", "status_auth=()", "models_auth=()"):
+            self.assertRegex(
+                self.src,
+                re.escape(guard) + r"\n\s*\[\[ -n \"\$\{LITELLM_MASTER_KEY:-\}\" \]\] && " +
+                re.escape(guard[:-3]) + r'=\(-H "Authorization: Bearer \$LITELLM_MASTER_KEY"\)')
+
+    def test_client_connectivity_counts_401_as_online(self):
+        # A keyless client probing a keyed host must read ONLINE — the probe is
+        # readiness, not catalogue content.
+        segment = self.src[self.src.index(">>> Probing network connectivity"):
+                           self.src.index(">>> Connection Health")]
+        self.assertIn('== "401"', segment)
+
+    def test_printed_commands_reference_the_variable_never_the_value(self):
+        # The pasted-curl hints must resolve the key in the PASTING shell
+        # (\$LITELLM_MASTER_KEY stays literal in the output) — echoing the
+        # value would leak a front-door credential into scrollback.
+        self.assertIn(r'Bearer \$LITELLM_MASTER_KEY', self.src)
+        for m in re.finditer(r'echo[^\n]*Bearer \\\$LITELLM_MASTER_KEY[^\n]*', self.src):
+            line = m.group(0)
+            self.assertNotIn("sk-", line.replace("\\$LITELLM_MASTER_KEY", ""),
+                             "a printed command embeds a literal key value")
 
 
 if __name__ == "__main__":

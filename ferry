@@ -846,18 +846,39 @@ _ferry_launch_mlx() {
   nohup mlx_vlm.server "${mlargs[@]}" >> "$log" 2>&1 & disown
 }
 
-# _ferry_wait_http <url> <label> [timeout-seconds]
+# _ferry_wait_http <url> <label> [timeout-seconds] [mode]
 # Poll until <url> answers, so `ferry up` reports REAL readiness instead of
 # "launched". mlx_vlm preloads inside its FastAPI lifespan, so the port does not
-# accept connections until the weights are resident — any 200 here means the lane
+# accept connections until the weights are resident — a 200 here means the lane
 # is genuinely warm, never "listening but still loading". A cold 15-18GB lane
-# legitimately takes tens of seconds. Returns 1 on timeout; callers tolerate that
-# (the lane keeps loading in the background).
+# legitimately takes tens of seconds. Returns 1 on timeout; callers tolerate
+# that (the lane keeps loading in the background).
+#
+# mode (default "content"):
+#   content   — only a 2xx counts. The MLX lanes' /v1/models probes stay in
+#               this mode: their 200 IS the weights-resident signal, and those
+#               backends are loopback-only and never authenticated.
+#   readiness — process-up is the question, so a 401 also counts as READY
+#               ("up, but gated by auth"): v1.22.0 can put the front door
+#               behind general_settings.master_key, and a readiness wait must
+#               not then report a healthy proxy as never-ready. The front
+#               door's own wait uses the public /health/liveliness route and
+#               readiness mode, so it holds either way.
+# When LITELLM_MASTER_KEY is set (host shell or secrets.env via ferry-core) it
+# is presented on every probe; unset means no header at all, so keyless LAN
+# installs probe exactly as they did before.
 _ferry_wait_http() {
-  local url="$1" label="$2" timeout="${3:-600}" waited=0
+  local url="$1" label="$2" timeout="${3:-600}" mode="${4:-content}" waited=0 code
+  local -a hdr=()
+  [[ -n "${LITELLM_MASTER_KEY:-}" ]] && hdr=(-H "Authorization: Bearer $LITELLM_MASTER_KEY")
   while (( waited < timeout )); do
-    if curl -fsS -m 3 "$url" >/dev/null 2>&1; then
+    code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "${hdr[@]}" "$url" 2>/dev/null || true)"
+    if [[ "$code" == 2* ]]; then
       echo ">>> [$label] \033[1;32mREADY\033[0m (${waited}s)"
+      return 0
+    fi
+    if [[ "$mode" == "readiness" && "$code" == "401" ]]; then
+      echo ">>> [$label] \033[1;32mREADY\033[0m (${waited}s) — up; answering 401 (master_key auth on)"
       return 0
     fi
     sleep 3
@@ -1079,13 +1100,21 @@ cmd_up() {
     fi
 
     echo ">>> Waiting for lanes (MLX loads ~33GB of weights — that is the slow part)..."
-    _ferry_wait_http "http://127.0.0.1:$target_port/v1/models"       "front"      120 || true
+    # Front door: pure readiness, so probe the public liveliness route (it stays
+    # public under master_key) and let readiness mode accept a 401 as "up" for
+    # any litellm that gates it anyway. The MLX lanes keep their /v1/models
+    # probes: no litellm in front, no auth ever, and the 200 is the
+    # weights-resident signal the liveliness route cannot give.
+    _ferry_wait_http "http://127.0.0.1:$target_port/health/liveliness" "front"      120 readiness || true
     _ferry_wait_http "http://127.0.0.1:$LOCAL_ORCH_PORT/v1/models"   "local-orch" 900 || true
     _ferry_wait_http "http://127.0.0.1:$LOCAL_SUB_PORT/v1/models"    "local-sub"  900 || true
 
     echo "================================================================="
     echo ">>> Stack up. Lanes served on http://$MDNS_NAME:$target_port/v1 :"
-    curl -fsS -m 5 "http://127.0.0.1:$target_port/v1/models" 2>/dev/null \
+    # Catalogue content, so it needs the bearer when the front door is keyed.
+    local -a banner_auth=()
+    [[ -n "${LITELLM_MASTER_KEY:-}" ]] && banner_auth=(-H "Authorization: Bearer $LITELLM_MASTER_KEY")
+    curl -fsS -m 5 "${banner_auth[@]}" "http://127.0.0.1:$target_port/v1/models" 2>/dev/null \
       | python3 -c "import json,sys; [print('       ' + m['id']) for m in json.load(sys.stdin).get('data', [])]" 2>/dev/null \
       || echo "       (front door not answering yet — check $cloud_log)"
     echo "-----------------------------------------------------------------"
@@ -1169,7 +1198,13 @@ cmd_up() {
     fi
 
     echo ">>> Route proxy running in background. Log: $cloud_log"
-    echo "    Served lanes:  curl -s http://127.0.0.1:$target_port/v1/models"
+    # The printed command is meant to be pasted, so it references the variable
+    # (resolved by the pasting shell) rather than echoing the key itself.
+    if [[ -n "${LITELLM_MASTER_KEY:-}" ]]; then
+      echo "    Served lanes:  curl -s -H \"Authorization: Bearer \$LITELLM_MASTER_KEY\" http://127.0.0.1:$target_port/v1/models"
+    else
+      echo "    Served lanes:  curl -s http://127.0.0.1:$target_port/v1/models"
+    fi
   fi
 }
 
@@ -1235,11 +1270,21 @@ cmd_status() {
     echo "================================================================="
     
     echo ">>> Probing network connectivity to Host Mac..."
-    if curl -fsS -m 3 "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" >/dev/null 2>&1; then
+    # Connectivity is readiness, not catalogue content: under master_key
+    # (v1.22.0) the catalogue answers 401 to a keyless probe, and that still
+    # proves the host is reachable and serving, so count it ONLINE. Kept on
+    # /v1/models rather than /health/liveliness because the target may be a
+    # bare MLX lane (ferry up --local), which serves no liveliness route.
+    local probe_code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" 2>/dev/null || true)"
+    if [[ "$probe_code" == 2* ]] || [[ "$probe_code" == "401" ]]; then
       echo ">>> Connection Health: \033[1;32mONLINE\033[0m"
-      
-      # Query active model
-      local models=$(curl -fsS -m 2 "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" 2>/dev/null || echo "")
+      [[ "$probe_code" == "401" ]] && echo "    (front door is behind master_key auth — export LITELLM_MASTER_KEY to read the lane list)"
+
+      # Query active model. Catalogue content: send the bearer when this box
+      # has the host's key; without one this degrades to skipping the line.
+      local -a status_auth=()
+      [[ -n "${LITELLM_MASTER_KEY:-}" ]] && status_auth=(-H "Authorization: Bearer $LITELLM_MASTER_KEY")
+      local models=$(curl -fsS -m 2 "${status_auth[@]}" "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" 2>/dev/null || echo "")
       if [[ -n "$models" ]]; then
         local active=$(echo "$models" | python3 -c "import json,sys; d=json.load(sys.stdin).get('data',[]); print(d[0]['id'] if d else 'None')")
         echo "    Currently active model on Host: \033[1;32m$active\033[0m"
@@ -1292,7 +1337,11 @@ cmd_status() {
         echo "    (internal backend — address this lane as a lane name on :$PORT, not here)"
       elif [[ "$p" != "$SHARE_PORT" ]]; then
         # The front door: list every lane it serves, not just the first one.
-        local models=$(curl -fsS -m 3 "http://127.0.0.1:$p/v1/models" 2>/dev/null || echo "")
+        # Catalogue content, so under master_key (v1.22.0) the bearer is needed;
+        # without a key this degrades to no listing, exactly as before.
+        local -a models_auth=()
+        [[ -n "${LITELLM_MASTER_KEY:-}" ]] && models_auth=(-H "Authorization: Bearer $LITELLM_MASTER_KEY")
+        local models=$(curl -fsS -m 3 "${models_auth[@]}" "http://127.0.0.1:$p/v1/models" 2>/dev/null || echo "")
         if [[ -n "$models" ]]; then
           local served=$(echo "$models" | python3 -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "")
           if [[ -n "$served" ]]; then
@@ -1305,7 +1354,12 @@ cmd_status() {
             # content=null. The one command status hands you to prove the stack
             # is alive then reads as a dead lane. Measured on the orch lane
             # 2026-08-26: reasoning_tokens 7, text_tokens 3, content None.
-            echo "    Test with: curl -fsS -H \"Content-Type: application/json\" -d '{\"model\":\"$first\",\"messages\":[{\"role\":\"user\",\"content\":\"Say Hello!\"}],\"max_tokens\":256}' http://$MDNS_NAME:$p/v1/chat/completions"
+            # Under master_key the pasted command would 401, so the auth hint
+            # references the VARIABLE — the pasting shell resolves it, and the
+            # key value itself is never printed.
+            local auth_hint=""
+            [[ -n "${LITELLM_MASTER_KEY:-}" ]] && auth_hint=" -H \"Authorization: Bearer \$LITELLM_MASTER_KEY\""
+            echo "    Test with: curl -fsS${auth_hint} -H \"Content-Type: application/json\" -d '{\"model\":\"$first\",\"messages\":[{\"role\":\"user\",\"content\":\"Say Hello!\"}],\"max_tokens\":256}' http://$MDNS_NAME:$p/v1/chat/completions"
           fi
         fi
       fi

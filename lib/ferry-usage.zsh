@@ -63,7 +63,7 @@ Encrypted transfer over an UNTRUSTED channel (no LAN required):
 Options for 'up':
   (no flags)         THE STACK — all four lanes on one endpoint (:$PORT):
                        orch        cloud  GLM 5.3 + strict fallback chain
-                       flash       cloud  Gemini 3.7 Flash key pool
+                       flash       cloud  Gemini 3.8 Flash key pool
                        local-orch  GPU    $LOCAL_MODEL_ORCH
                        local-sub   GPU    $LOCAL_MODEL_SUB
                      The GPU lanes run on internal ports $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT;

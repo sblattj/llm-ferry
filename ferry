@@ -115,7 +115,7 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # swappable without touching a single client config.
 #
 #   orch        -> GLM 5.3 (Z.ai Coding Plan) + a 4-hop cloud fallback chain
-#   flash       -> Gemini 3.7 Flash across 10 per-project keys (load-balanced pool)
+#   flash       -> Gemini 3.8 Flash across 10 per-project keys (load-balanced pool)
 #   local-orch  -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
 #   local-sub   -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
 #
@@ -315,7 +315,7 @@ Encrypted transfer over an UNTRUSTED channel (no LAN required):
 Options for 'up':
   (no flags)         THE STACK — all four lanes on one endpoint (:$PORT):
                        orch        cloud  GLM 5.3 + strict fallback chain
-                       flash       cloud  Gemini 3.7 Flash key pool
+                       flash       cloud  Gemini 3.8 Flash key pool
                        local-orch  GPU    $LOCAL_MODEL_ORCH
                        local-sub   GPU    $LOCAL_MODEL_SUB
                      The GPU lanes run on internal ports $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT;
@@ -1000,7 +1000,7 @@ cmd_up() {
   if [[ "$LAUNCH_MODE" == "stack" ]]; then
     # ── THE STACK: one door, four lanes ────────────────────────────────────
     #   litellm on $target_port  ->  orch        (cloud: GLM 5.3 + fallback chain)
-    #                            ->  flash       (cloud: Gemini 3.7 Flash key pool)
+    #                            ->  flash       (cloud: Gemini 3.8 Flash key pool)
     #                            ->  local-orch  (MLX on :$LOCAL_ORCH_PORT)
     #                            ->  local-sub   (MLX on :$LOCAL_SUB_PORT)
     # The two MLX ports are INTERNAL plumbing — clients only ever talk to
@@ -1016,7 +1016,7 @@ cmd_up() {
     echo "   FERRY STACK — four lanes, one endpoint"
     echo "================================================================="
     echo "   orch         cloud   GLM 5.3 + strict fallback chain"
-    echo "   flash        cloud   Gemini 3.7 Flash key pool"
+    echo "   flash        cloud   Gemini 3.8 Flash key pool"
     echo "   local-orch   GPU     $LOCAL_MODEL_ORCH"
     echo "   local-sub    GPU     $LOCAL_MODEL_SUB"
     echo "================================================================="

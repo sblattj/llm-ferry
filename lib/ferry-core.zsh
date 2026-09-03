@@ -110,7 +110,7 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # swappable without touching a single client config.
 #
 #   orch        -> GLM 5.3 (Z.ai Coding Plan) + a 4-hop cloud fallback chain
-#   flash       -> Gemini 3.7 Flash across 10 per-project keys (load-balanced pool)
+#   flash       -> Gemini 3.8 Flash across 10 per-project keys (load-balanced pool)
 #   local-orch  -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
 #   local-sub   -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
 #

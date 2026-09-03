@@ -58,12 +58,12 @@ model_list:
   # (same-queue identical models; each key a separate provider or account)
   - model_name: flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
       api_key: os.environ/GEMINI_API_KEY        # the one Google project
 
   - model_name: flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
       api_key: os.environ/GEMINI_API_KEY_2      # a DIFFERENT Google account
 ```
 
@@ -75,7 +75,7 @@ Give it a fresh `model_name` (single deployment shown; repeat the block with mor
 ```yaml
   - model_name: flash-lite
     litellm_params:
-      model: gemini/gemini-3.7-flash-lite
+      model: gemini/gemini-3.5-flash-lite
       api_key: os.environ/GEMINI_API_KEY
 ```
 

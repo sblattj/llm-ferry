@@ -77,13 +77,13 @@ model_list:
       model: fireworks_ai/deepseek-v4
   - model_name: gemini-3.7-flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
   - model_name: gemini-3.7-flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
   - model_name: gemini-3.7-flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
 
 router_settings:
   routing_strategy: usage-based-routing-v2
@@ -102,13 +102,13 @@ model_list:
       model: fireworks_ai/deepseek-v4
   - model_name: flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
   - model_name: flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
   - model_name: flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
   - model_name: local-orch
     litellm_params:
       model: openai/mlx-community/Qwen3.8-27B-nvfp4
@@ -304,7 +304,7 @@ class TopologyTest(unittest.TestCase):
         # one deployment_info per unique (model_name, model)
         self.assertRegex(
             text,
-            r'ferry_deployment_info\{model_name="gemini-3\.7-flash",model="gemini/gemini-3\.7-flash"\} 1')
+            r'ferry_deployment_info\{model_name="gemini-3\.7-flash",model="gemini/gemini-3\.8-flash"\} 1')
         self.assertRegex(
             text,
             r'ferry_deployment_info\{model_name="orchestrator",model="anthropic/k3-256k"\} 1')
@@ -327,7 +327,7 @@ class TopologyTest(unittest.TestCase):
         self.assertIn("ferry_fallback_chain_length 2", text)     # orch chain of length 2
         self.assertRegex(
             text,
-            r'ferry_deployment_info\{model_name="flash",model="gemini/gemini-3\.7-flash"\} 1')
+            r'ferry_deployment_info\{model_name="flash",model="gemini/gemini-3\.8-flash"\} 1')
         self.assertRegex(
             text,
             r'ferry_deployment_info\{model_name="orch",model="zai/glm-5\.3"\} 1')

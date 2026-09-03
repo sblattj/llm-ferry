@@ -40,7 +40,7 @@ ARMS = {
         "kind": "openai",
         "url": "https://openrouter.ai/api/v1/chat/completions",
         "key_env": "OPENROUTER_API_KEY",
-        "model": "google/gemini-3.7-flash",
+        "model": "google/gemini-3.8-flash",
         "extra": {},
     },
     # Examples of other kinds/surfaces:
@@ -55,7 +55,7 @@ ARMS = {
     # },
     # "gemini-native": {
     #     "kind": "gemini", "key_env": "GEMINI_API_KEY",
-    #     "model": "gemini-3.7-flash",
+    #     "model": "gemini-3.8-flash",
     #     "extra": {"thinkingConfig": {"thinkingBudget": 0}},  # VERIFY: often ignored (trap 4)
     # },
 }

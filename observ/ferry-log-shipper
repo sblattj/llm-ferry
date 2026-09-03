@@ -134,7 +134,7 @@ REQUESTED_PATTERNS = [
     re.compile(r"model group[:=]?\s*['\"]?(" + _IDCHARS + r")"),
 ]
 # Known ferry backend ids (CONTRACT.md route topology), optionally provider-
-# prefixed: zai/glm-5.3, anthropic/k3, gemini/gemini-3.7-flash,
+# prefixed: zai/glm-5.3, anthropic/k3, gemini/gemini-3.8-flash,
 # fireworks_ai/accounts/fireworks/models/deepseek-v4-pro-0813, gpt-5.6-sol …
 KNOWN_MODEL = re.compile(
     r"(?<![\w.-])((?:[\w-]+/)*"

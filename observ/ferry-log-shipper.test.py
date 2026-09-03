@@ -56,7 +56,7 @@ FALLBACK = ("15:52:01 - LiteLLM Router:INFO: Falling back to model_group=orchest
             "fallback after litellm_model_name=anthropic/k3-256k failed")
 COOLDOWN = "15:52:02 - LiteLLM Router:INFO: Adding deployment to cooldown for 60s"
 RESOURCE_EXHAUSTED = ("15:53:00 - LiteLLM:ERROR: VertexAIException - 429 "
-                      "RESOURCE_EXHAUSTED for model gemini/gemini-3.7-flash")
+                      "RESOURCE_EXHAUSTED for model gemini/gemini-3.8-flash")
 TRACEBACK = "Traceback (most recent call last):"
 EXCEPTION = "Exception occurred during processing of request from ('192.168.0.167', 55264)"
 BANNER = "   " + ESC + "[1;37m#--------------------------------------------#" + ESC + "[0m"
@@ -144,8 +144,8 @@ class TestModelExtraction(unittest.TestCase):
         self.assertEqual(r["requested_model"], "orchestrator-fallback")
 
     def test_known_id_scan_when_no_key_value_pair(self):
-        r = S.parse_line("15:53:00 - LiteLLM:INFO: selected gemini-3.7-flash for this call")
-        self.assertEqual(r["model"], "gemini-3.7-flash")
+        r = S.parse_line("15:53:00 - LiteLLM:INFO: selected gemini-3.8-flash for this call")
+        self.assertEqual(r["model"], "gemini-3.8-flash")
 
     def test_known_id_scan_matches_bare_k3(self):
         # The orch lane moved from `k3-256k` to the 1M-context `k3` (2026-08-26).
@@ -177,13 +177,13 @@ class TestModelExtraction(unittest.TestCase):
             self.assertEqual(r["requested_model"], lane, "lane %r not recognised" % lane)
 
     def test_group_scan_does_not_match_inside_a_backend_id(self):
-        """`flash` must not be clipped out of the middle of `gemini-3.7-flash`.
+        """`flash` must not be clipped out of the middle of `gemini-3.8-flash`.
 
         The backend id is a MODEL, not a group; a bare-substring match there would
         mislabel every Gemini line as a request for the `flash` lane.
         """
-        r = S.parse_line("15:53:00 - LiteLLM:INFO: selected gemini-3.7-flash for this call")
-        self.assertEqual(r["model"], "gemini-3.7-flash")
+        r = S.parse_line("15:53:00 - LiteLLM:INFO: selected gemini-3.8-flash for this call")
+        self.assertEqual(r["model"], "gemini-3.8-flash")
         self.assertEqual(r["requested_model"], "")
 
     def test_model_absent_leaves_empty_strings(self):
@@ -197,7 +197,7 @@ class TestModelExtraction(unittest.TestCase):
 
     def test_resource_exhausted_line_keeps_its_model(self):
         r = S.parse_line(RESOURCE_EXHAUSTED)
-        self.assertEqual(r["model"], "gemini/gemini-3.7-flash")
+        self.assertEqual(r["model"], "gemini/gemini-3.8-flash")
 
 
 class TestAttribution(unittest.TestCase):
@@ -219,7 +219,7 @@ class TestAttribution(unittest.TestCase):
         # The shape observed live on 2026-08-29: a catalogue line whose whole
         # body is a model name. It carried a populated `model` field and
         # described no request at all.
-        self.assertEqual(S.parse_line("    gemini-3.7-flash")["attribution"], "mention")
+        self.assertEqual(S.parse_line("    gemini-3.8-flash")["attribution"], "mention")
 
     def test_fallback_is_a_request(self):
         self.assertEqual(S.parse_line(FALLBACK)["attribution"], "request")

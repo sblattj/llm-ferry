@@ -769,6 +769,12 @@ _ferry_launch_front() {
   [[ -f "$front" ]] || return 1
   py="$(_ferry_front_python)" || return 1
   "$py" -c 'import uvicorn, yaml, litellm' >/dev/null 2>&1 || return 1
+  # FERRY_EVENTS arms the front door's event tap (front/ferry_front.py
+  # tap_enabled()), which is what ferry dash's LIVE TRAFFIC panel reads.
+  # Nothing else in the launch path set it, so the panel could show "tap
+  # armed" with an empty file forever. It is fail-open and the writes ride a
+  # bounded queue off the response path, so on-by-default costs nothing.
+  export FERRY_EVENTS="${FERRY_EVENTS:-1}"
   nohup "$py" "$front" \
     --config "$config" \
     --port "$port" \

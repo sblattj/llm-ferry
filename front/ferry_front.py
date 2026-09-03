@@ -78,7 +78,9 @@ def is_inference_path(path: str) -> bool:
 # against a tap-disabled control, and that test is the rollout gate.
 #
 # `receive` is never wrapped: the lane comes from a RESPONSE header, so no
-# request body is ever read. Off unless FERRY_EVENTS says otherwise.
+# request body is ever read. The one body-derived field is `resp_bytes`, a
+# length counted on the way past (never buffered, never rewritten), attached
+# when the final body chunk forwards. Off unless FERRY_EVENTS says otherwise.
 _TAP = None
 _TAP_PATH = None
 
@@ -202,8 +204,9 @@ class LaneCatalogueFilter:
         # around `send` at all, so a streamed completion is byte-for-byte what
         # litellm produced and the wrapped app receives the caller's own send by
         # identity. With the tap on a wrapper does exist, but it forwards every
-        # message unmodified and only READS the header list on
-        # http.response.start; lib/ferry-front.test.py asserts the two are
+        # message unmodified and only READS on the response path — the header
+        # list on http.response.start, body LENGTHS on http.response.body —
+        # and lib/ferry-front.test.py asserts the two are
         # message-for-message equal.
         if (
             not self.public
@@ -241,27 +244,49 @@ class LaneCatalogueFilter:
         await self.app(scope, receive, capture)
 
     def _tapped(self, scope, send):
-        """Wrap `send` to read attribution headers off http.response.start.
+        """Wrap `send` to read attribution headers off http.response.start and
+        count response body bytes off http.response.body.
 
-        Every message is forwarded unmodified — no body is inspected, no header
-        is rewritten, no ordering is changed, and the only await is the
-        forwarded send. Fail-open in every branch: a broken tap must never fail,
-        delay, or alter a request.
+        Every message is forwarded unmodified — no body is buffered or
+        rewritten, no header is changed, no ordering is altered, and the only
+        await is the forwarded send. The record is written when the FINAL body
+        chunk passes so its `resp_bytes` count is complete; a response that
+        never finishes costs its event record, which is the price of counting
+        without buffering. Fail-open in every branch: a broken tap must never
+        fail, delay, or alter a request.
         """
+        rec = None
+        nbytes = 0
+
         async def tapped(message):
-            if message.get("type") == "http.response.start":
+            nonlocal rec, nbytes
+            mtype = message.get("type")
+            if mtype == "http.response.start":
                 try:
                     tap = _tap()
                     if tap is not None:
                         client = scope.get("client") or ("", 0)
-                        tap.offer(tap.record_from_headers(
+                        rec = tap.record_from_headers(
                             message.get("headers") or [],
                             client[0] if client else "",
                             scope.get("path", ""),
                             message.get("status", 0),
-                        ))
+                        )
                 except Exception:
                     pass
+            elif mtype == "http.response.body":
+                try:
+                    nbytes += len(message.get("body", b""))
+                except Exception:
+                    pass
+                if not message.get("more_body"):
+                    try:
+                        tap = _tap()
+                        if tap is not None and rec is not None:
+                            rec["resp_bytes"] = nbytes
+                            tap.offer(rec)
+                    except Exception:
+                        pass
             return await send(message)
 
         return tapped

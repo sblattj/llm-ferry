@@ -27,8 +27,10 @@ WHAT IT DOES NOT DO
 
 It never reads a request or response body. The caller hands over the header list
 and nothing else, which is what lets the tap sit on the streaming path without
-buffering. Token counts are therefore absent — the headers do not carry them, and
-they stay the metrics pipeline's job.
+buffering. Token counts are therefore absent — the headers do not carry them,
+and they stay the metrics pipeline's job. The one body-derived number,
+`resp_bytes`, is counted by the tap itself — length only, never content — and
+attached to the record before it is written; this module's default for it is 0.
 
 Standard library only: ferry-dash runs under any python3, and everything it
 reaches imports the same way.
@@ -48,7 +50,7 @@ _EMPTY = {
     "t": "", "call_id": "", "lane": "unknown", "deployment": "", "model": "",
     "provider": "", "api_base": "", "status": 0, "fallbacks": 0, "retries": 0,
     "hop_errors": [], "duration_ms": None, "overhead_ms": None, "cost": None,
-    "client_ip": "", "path": "",
+    "resp_bytes": 0, "client_ip": "", "path": "",
 }
 
 # `openai/` and friends are litellm API-DIALECT markers, not providers. Any

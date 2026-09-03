@@ -255,6 +255,45 @@ class TestEventTail(unittest.TestCase):
         self.assertEqual(frame.count(b"\n"), 2)
 
 
+class TestThroughput(unittest.TestCase):
+    """The per-request bytes/s proxy the dash renders.
+
+    This is BYTES over duration, never a tokens/s claim: the tap counts body
+    lengths because the event headers carry no token counts. `bps_of` is the
+    one formula and it lives here, in python, so the browser never re-derives
+    it — `ferry-dash` attaches the result to each SSE frame.
+    """
+
+    def test_bytes_over_duration_is_bytes_per_second(self):
+        self.assertEqual(L.bps_of({"resp_bytes": 3000, "duration_ms": 1500}),
+                         2000.0)
+
+    def test_a_non_positive_duration_cannot_produce_a_rate(self):
+        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "duration_ms": 0}))
+        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "duration_ms": -5}))
+
+    def test_a_missing_or_null_duration_yields_no_rate(self):
+        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "duration_ms": None}))
+        self.assertIsNone(L.bps_of({"resp_bytes": 3000}))
+
+    def test_a_record_without_resp_bytes_yields_no_rate(self):
+        self.assertIsNone(L.bps_of({"duration_ms": 100}))
+        self.assertIsNone(L.bps_of({}))
+
+    def test_zero_bytes_is_no_data_not_zero_speed(self):
+        # 0 is the default the record ships with, so it means "never counted"
+        # (old event file, untapped proxy) exactly as often as it means an
+        # empty body. Rendering it as 0 B/s would dress "cannot know" up as a
+        # relay that moved no bytes.
+        self.assertIsNone(L.bps_of({"resp_bytes": 0, "duration_ms": 100}))
+
+    def test_a_non_numeric_field_is_refused_not_coerced(self):
+        # The record contract types both fields; a string would mean a
+        # different producer, and guessing formats here would paper over it.
+        self.assertIsNone(L.bps_of({"resp_bytes": "100", "duration_ms": 100}))
+        self.assertIsNone(L.bps_of({"resp_bytes": 100, "duration_ms": "100"}))
+
+
 RULES = {
     "version": 1,
     "ttl": {"rate_limited": 60, "unreachable": 120, "unknown": 300},

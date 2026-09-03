@@ -135,7 +135,15 @@ class TestRecord(unittest.TestCase):
         self.assertEqual(set(r), {
             "t", "call_id", "lane", "deployment", "model", "provider",
             "api_base", "status", "fallbacks", "retries", "hop_errors",
-            "duration_ms", "overhead_ms", "cost", "client_ip", "path"})
+            "duration_ms", "overhead_ms", "cost", "resp_bytes",
+            "client_ip", "path"})
+
+    def test_resp_bytes_defaults_to_zero_until_the_tap_counts(self):
+        # record_from_headers never sees a body; the tap attaches the count it
+        # measured. 0 means "not counted", which the dash renders as no data —
+        # never as a request that moved no bytes.
+        r = E.record_from_headers([], "", "/v1/chat/completions", 200)
+        self.assertEqual(r["resp_bytes"], 0)
 
     def test_timestamp_is_rfc3339_utc_with_milliseconds(self):
         r = E.record_from_headers([], "", "/v1/chat/completions", 200)

@@ -581,6 +581,11 @@ class Handler(BaseHTTPRequestHandler):
                     if CFG.get("exhaustion"):
                         CFG["exhaustion"].observe(
                             rec, chain=chains.get(rec.get("lane")))
+                    # The per-request throughput proxy rides the frame, so the
+                    # browser never re-derives it: one formula, one place.
+                    bps = live.bps_of(rec)
+                    if bps is not None:
+                        rec["bps"] = bps
                     self.wfile.write(live.sse_frame(rec))
                 if records:
                     self.wfile.flush()
@@ -763,6 +768,7 @@ PAGE = r"""<!doctype html>
   <section class="card full" id="live">
     <h2>Live traffic <span class="muted" id="livemeta"></span></h2>
     <div id="tapoff" class="event" style="display:none"></div>
+    <div id="tpsnote" class="sub" style="display:none"></div>
     <div id="livelanes" class="muted">loading&hellip;</div>
     <div style="display:flex;align-items:center;margin-top:10px">
       <span class="sub" id="feedmeta"></span>
@@ -1004,16 +1010,33 @@ const LIVE={events:[], flash:{}, es:null, fails:0, showAll:false};
 
 const hhmm=sec=>{const d=new Date((sec||0)*1000);return isNaN(d)?'—':d.toTimeString().slice(0,5);};
 const clock=t=>{const d=new Date(t);return isNaN(d)?'--:--:--':d.toLocaleTimeString();};
+// Everything the dash says about throughput is BYTES per second — a proxy, never
+// a tokens/s claim. Null/negative in, null out: the caller shows nothing rather
+// than a 0 that reads as "no traffic".
+const fmtBps=n=>!isFinite(n)||n<=0?null
+  :n<1024?Math.round(n)+' B/s'
+  :n<1048576?(n/1024).toFixed(1)+' kB/s'
+  :(n/1048576).toFixed(1)+' MB/s';
 
 // Stats come from the feed buffer, so they describe what THIS page has seen
 // since it loaded - never a claim about history the dash does not have.
 function depStats(id){
-  if(!id) return {rpm:0,p50:null};
+  if(!id) return {rpm:0,p50:null,bps:null};
   const now=Date.now(), rows=LIVE.events.filter(e=>e.deployment===id);
   const durs=rows.slice(0,20).map(e=>e.duration_ms)
                  .filter(v=>typeof v==='number').sort((a,b)=>a-b);
+  // bytes/s over the same ~20-event window: total bytes over total time, so
+  // each request is weighted by how long it actually ran. Records without a
+  // usable resp_bytes/duration pair (old files, untapped proxy) drop out, and
+  // a window with none of them yields null — never a 0 B/s that looks idle.
+  let bytes=0, ms=0;
+  rows.slice(0,20).forEach(e=>{
+    if(typeof e.duration_ms==='number'&&e.duration_ms>0&&e.resp_bytes>0){
+      bytes+=e.resp_bytes; ms+=e.duration_ms;
+    }});
   return {rpm:rows.filter(e=>now-e._ms<60000).length,
-          p50:durs.length?durs[Math.floor(durs.length/2)]:null};
+          p50:durs.length?durs[Math.floor(durs.length/2)]:null,
+          bps:ms>0?bytes*1000/ms:null};
 }
 
 // An event names the deployment that SUCCEEDED and, in hop_errors, the ones
@@ -1037,6 +1060,7 @@ function depChip(d,st){
   if(state) bits.push(state.replace(/_/g,' '));
   if(s.rpm) bits.push(s.rpm+'/min');
   if(s.p50!=null) bits.push(Math.round(s.p50)+'ms');
+  const bps=fmtBps(s.bps); if(bps) bits.push(bps);
   if(info && info.code) bits.push(info.code);
   if(info && STICKY.indexOf(state)>=0) bits.push('since '+hhmm(info.since));
   c.textContent=bits.join(' · ');
@@ -1080,6 +1104,15 @@ function renderLive(st){
     off.style.display='';
     off.textContent='tap armed, nothing written yet — '+tap.path;
   }else{ off.style.display='none'; }
+  // Same honest-degrade idea as #tapoff, one rung softer: the stream works but
+  // carries no byte counts (old event file, proxy predating the counter), which
+  // must read as "cannot know", not as a relay moving zero bytes.
+  const tps=$('#tpsnote');
+  if(tap.path && tap.writing && LIVE.fails<=2 && LIVE.events.length
+     && !LIVE.events.some(e=>e.resp_bytes>0)){
+    tps.style.display='';
+    tps.textContent='no throughput data in the event stream — restart ferry so the tap counts bytes/s';
+  }else{ tps.style.display='none'; }
   $('#livemeta').textContent=tap.rules?'':'(no classifier table — every failure reads as "unknown")';
 
   const box=$('#livelanes'); box.innerHTML=''; box.className='';
@@ -1122,6 +1155,7 @@ function renderFeed(){
       +(e.retries?'  ↻'+e.retries:'');
     r.appendChild(w);
     r.appendChild(el('span','t',e.duration_ms!=null?Math.round(e.duration_ms)+'ms':''));
+    r.appendChild(el('span','t',fmtBps(e.bps)||''));
     box.appendChild(r);
   });
   const n=LIVE.events.length;

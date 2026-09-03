@@ -416,6 +416,43 @@ class TestEventTap(unittest.TestCase):
         lines = [l for l in open(self.path) if l.strip()]
         self.assertEqual(len(lines), 1)
 
+    def test_the_event_counts_every_body_byte(self):
+        # b"a" + b"bb" + b"ccc" = 6, counted on the way past. The equivalence
+        # gate above proves the same bytes still reach the client; this proves
+        # the counter read them correctly.
+        self._drive(True)
+        FF.tap_flush()
+        rec = json.loads(open(self.path).readline())
+        self.assertEqual(rec["resp_bytes"], 6)
+
+    def test_an_empty_body_counts_zero_bytes(self):
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+        asyncio.run(drive(LaneCatalogueFilter(RecordingApp(
+            headers=list(self.ATTRIB), payload=b""), LANES),
+            "/v1/chat/completions"))
+        FF.tap_flush()
+        rec = json.loads(open(self.path).readline())
+        self.assertEqual(rec["resp_bytes"], 0)
+
+    def test_a_raising_counter_still_writes_the_record(self):
+        # Counting is best-effort; the record is not. A body whose length
+        # cannot be read must degrade to 0 counted bytes, never lose the
+        # attribution the whole live view runs on.
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+
+        class WeirdBody:
+            def __len__(self):
+                raise RuntimeError("no length")
+
+        app = RecordingApp(headers=list(self.ATTRIB),
+                           chunks=[WeirdBody(), b"ok"])
+        asyncio.run(drive(LaneCatalogueFilter(app, LANES), "/v1/chat/completions"))
+        FF.tap_flush()
+        rec = json.loads(open(self.path).readline())
+        self.assertEqual(rec["resp_bytes"], 2)
+
     def test_disabled_writes_nothing(self):
         self._drive(False)
         self.assertFalse(os.path.exists(self.path))

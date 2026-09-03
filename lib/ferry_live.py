@@ -5,8 +5,9 @@ Two halves, both consumed by `ferry-dash`:
   * `lanes(topology)` turns the parsed config into what the view draws — every
     lane as its primary plus its ordered fallback hops, with a pooled hop
     (several deployments sharing one model_name) marked so it can fan out.
-  * `EventTail` follows the NDJSON the front-door tap writes, and `sse_frame`
-    frames a record for the browser.
+  * `EventTail` follows the NDJSON the front-door tap writes, `sse_frame`
+    frames a record for the browser, and `bps_of` derives the per-request
+    bytes/s throughput proxy from a finished record.
 
 Standard library only: ferry-dash runs under any python3 and everything it
 reaches inherits that.
@@ -103,6 +104,27 @@ def sse_frame(record):
     desynchronise the client for the rest of the stream.
     """
     return b"data: " + json.dumps(record, separators=(",", ":")).encode() + b"\n\n"
+
+
+def bps_of(record):
+    """Bytes per second for one request, or None when it cannot be known.
+
+    resp_bytes over duration_ms — a throughput PROXY expressed in bytes, never
+    a claim about tokens. A missing count, a missing or non-numeric duration,
+    or a non-positive either yields None, and the view treats None as "no
+    data" rather than 0: an old event file or an untapped proxy must not
+    render as a relay that moved no bytes.
+    """
+    try:
+        b = record.get("resp_bytes")
+        ms = record.get("duration_ms")
+        if not isinstance(b, (int, float)) or not isinstance(ms, (int, float)):
+            return None
+        if b <= 0 or ms <= 0:
+            return None
+        return b * 1000.0 / ms
+    except Exception:
+        return None
 
 
 DEFAULT_RULES_PATH = os.path.expanduser("~/.config/ferry/event-rules.json")

@@ -42,6 +42,10 @@
 # re-applies `ferry claude --host/--port`; anything else — "none", or the key
 # absent on a pre-claude profile — means the machine never opted in, and the
 # step is skipped. A reset re-applies scope, it never widens it.
+#
+# The MASTER KEY (v1.22.0) is threaded the same way: read out of client.json
+# and passed to the CLI as --key ONLY when the bootstrap stored one — never
+# printed, and never invented for a profile that has none.
 
 set -eu
 
@@ -82,7 +86,7 @@ echo "================================================================="
 # Injected value wins; otherwise the last bootstrap's profile. We never prompt:
 # a reset is a catch-up on a machine that has already been set up, so if there
 # is no profile the right answer is the bootstrap, not an interactive guess.
-saved_host=""; saved_share=""; saved_port=""; saved_mode=""
+saved_host=""; saved_share=""; saved_port=""; saved_mode=""; saved_key=""
 if [[ -f "$CLIENT_JSON" ]]; then
   saved=$(python3 - "$CLIENT_JSON" <<'PYEOF'
 import json, sys
@@ -90,7 +94,7 @@ try:
     c = json.load(open(sys.argv[1]))
 except Exception:
     c = {}
-print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}")
+print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}\t{c.get('master_key','')}")
 PYEOF
 )
   # Peel the fields off one at a time. A `##*\t` shortcut for the last field
@@ -99,7 +103,8 @@ PYEOF
   saved_share="${rest%%$'\t'*}";  rest="${rest#*$'\t'}"
   saved_port="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
   saved_mode="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
-  saved_claude="${rest%%$'\t'*}"
+  saved_claude="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  saved_key="$rest"
 fi
 
 # The override is per-run; the profile is the default; a profile written before
@@ -147,6 +152,16 @@ case "$CLAUDE_MODE" in
 esac
 [[ -n "$OC_MODE_OVERRIDE" ]] && echo "                (flag override for this run; client.json is not rewritten)"
 echo "================================================================="
+
+# The master key the bootstrap stored, threaded through to `ferry opencode` /
+# `ferry claude` as --key so the re-applied configs carry it. ONLY when it
+# exists: an unkeyed host's profile has no master_key, and then the args array
+# stays empty and no --key is passed at all. The value is never echoed.
+key_args=()
+if [[ -n "$saved_key" ]]; then
+  key_args=(--key "$saved_key")
+  echo "Auth: using the master_key stored in $CLIENT_JSON (value never printed)"
+fi
 
 # --- 1. Re-pull the CLI -----------------------------------------------------
 # Download to a temp file and VALIDATE before overwriting. A share server that
@@ -224,7 +239,7 @@ for oc_target in "${oc_targets[@]}"; do
   # default target, so a shell that exports one would redirect all of these
   # writes onto the same file.
   if ! env -u OPENCODE_CONFIG "$FERRY_BIN" opencode \
-        --host "$HOST_NAME" --port "$HOST_PORT" --config "$oc_path" $oc_flag; then
+        --host "$HOST_NAME" --port "$HOST_PORT" --config "$oc_path" $oc_flag "${key_args[@]}"; then
     RESET_FAILED=1
   fi
 done
@@ -242,7 +257,7 @@ if [[ "$CLAUDE_MODE" != "none" ]]; then
   # CLI that cannot find a client profile decides it is ON the host and wires
   # everything to 127.0.0.1. env -u OPENCODE_CONFIG for the same reason.
   if ! env -u OPENCODE_CONFIG "$FERRY_BIN" claude \
-        --host "$HOST_NAME" --port "$HOST_PORT"; then
+        --host "$HOST_NAME" --port "$HOST_PORT" "${key_args[@]}"; then
     # Warning, not fatal: the re-pull and opencode takeover — a reset's core
     # contract — already succeeded, and a failed claude step must not turn
     # every reset red while the release rolls out to hosts at different speeds.

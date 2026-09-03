@@ -67,7 +67,12 @@ SNAP_RE = re.compile(r"^[^/]+\.\d{8}T\d{6}Z(-\d+)?\.jsonc$")
 
 
 class _ModelsHandler(BaseHTTPRequestHandler):
+    # The Authorization header of the most recent request, for the auth tests.
+    # Reset to None before every observed call so a stale value cannot pass.
+    LAST_AUTH = None
+
     def do_GET(self):
+        type(self).LAST_AUTH = self.headers.get("Authorization")
         if self.path != "/v1/models":
             self.send_error(404)
             return
@@ -102,7 +107,7 @@ class FerryOpencodeCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.cfg = os.path.join(self.dir, "opencode.json")
 
-    def run_ferry(self, *extra, config=None, port=None):
+    def run_ferry(self, *extra, config=None, port=None, home=None):
         cfg = config or self.cfg
         cmd = ["zsh", FERRY, "opencode", "--host", "127.0.0.1",
                "--port", str(port if port is not None else self.port),
@@ -110,6 +115,8 @@ class FerryOpencodeCase(unittest.TestCase):
         # env -u OPENCODE_CONFIG equivalent: the command honours it as the
         # default target, and an inherited one would silently redirect the write.
         env = {k: v for k, v in os.environ.items() if k != "OPENCODE_CONFIG"}
+        if home is not None:
+            env["HOME"] = home
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
                               cwd=REPO, timeout=60)
         self.assertEqual(proc.returncode, 0,
@@ -288,6 +295,75 @@ class TestLaneNamesOnly(FerryOpencodeCase):
         out = self.run_ferry("--model", "no-such-lane")
         self.assertIn("does not serve", out)
         self.assertIn("no-such-lane", out)
+
+
+class TestMasterKeyAuth(FerryOpencodeCase):
+    """v1.22.0 — the front door can sit behind a litellm master_key.
+
+    client.json gains an optional `master_key`; when it is set (or --key is
+    passed) the generated provider carries it as the bearer AND the catalogue
+    check sends it, because an authed door 401s a bare /v1/models and that
+    would read as "host down" and wire the lanes unchecked. When absent, the
+    legacy 'local' token is written and no Authorization header is sent, so a
+    keyless LAN setup is byte-for-byte unchanged.
+    """
+
+    PROFILE_KEY = "sk-test-ferry-master"
+
+    def client_home(self, master_key=None):
+        home = tempfile.mkdtemp(prefix="ferry-oc-home-")
+        self.addCleanup(shutil.rmtree, home, True)
+        fdir = os.path.join(home, ".config", "ferry")
+        os.makedirs(fdir)
+        prof = {"host": "127.0.0.1", "port": str(self.port)}
+        if master_key is not None:
+            prof["master_key"] = master_key
+        with open(os.path.join(fdir, "client.json"), "w") as f:
+            json.dump(prof, f)
+        return home
+
+    def setUp(self):
+        super().setUp()
+        _ModelsHandler.LAST_AUTH = None
+
+    def test_profile_master_key_reaches_the_generated_config(self):
+        home = self.client_home(self.PROFILE_KEY)
+        self.run_ferry(home=home)
+        opts = self.read()["provider"]["ferry"]["options"]
+        self.assertEqual(opts["apiKey"], self.PROFILE_KEY)
+
+    def test_without_a_key_the_legacy_local_token_is_kept(self):
+        home = self.client_home()
+        self.run_ferry(home=home)
+        self.assertEqual(self.read()["provider"]["ferry"]["options"]["apiKey"], "local")
+
+    def test_the_key_flag_overrides_the_profile(self):
+        home = self.client_home(self.PROFILE_KEY)
+        self.run_ferry("--key", "sk-flag-key", home=home)
+        self.assertEqual(self.read()["provider"]["ferry"]["options"]["apiKey"],
+                         "sk-flag-key")
+
+    def test_the_catalogue_check_authenticates_with_the_profile_key(self):
+        home = self.client_home(self.PROFILE_KEY)
+        self.run_ferry(home=home)
+        self.assertEqual(_ModelsHandler.LAST_AUTH, f"Bearer {self.PROFILE_KEY}",
+                         "an authed door 401s a bare catalogue check")
+
+    def test_the_catalogue_check_prefers_the_flag_key(self):
+        home = self.client_home(self.PROFILE_KEY)
+        self.run_ferry("--key", "sk-flag-key", home=home)
+        self.assertEqual(_ModelsHandler.LAST_AUTH, "Bearer sk-flag-key")
+
+    def test_no_key_sends_no_authorization_header(self):
+        home = self.client_home()
+        self.run_ferry(home=home)
+        self.assertIsNone(_ModelsHandler.LAST_AUTH,
+                          "a keyless LAN setup must request the catalogue bare")
+
+    def test_the_key_is_never_printed(self):
+        home = self.client_home(self.PROFILE_KEY)
+        out = self.run_ferry(home=home)
+        self.assertNotIn(self.PROFILE_KEY, out)
 
 
 class TestSuperProfile(FerryOpencodeCase):

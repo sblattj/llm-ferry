@@ -263,6 +263,12 @@ cmd_opencode() {
   # file is left exactly as it was, and the whole original is snapshotted to
   # <name>.<UTC>.jsonc first, so a takeover is always reversible.
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
+  # v1.22.0: the front door can run litellm behind a master_key. The bearer
+  # baked into the generated configs (and sent on the catalogue check) resolves
+  # --key > client.json's master_key (boot-loaded as CLIENT_MASTER_KEY) > unset
+  # (the legacy 'local' token, so keyless LAN setups are unchanged). The key is
+  # only written into files / request headers, never printed.
+  local oc_key=""
   # opencode resolves its config from $OPENCODE_CONFIG when that is set, so
   # honour it here too. Writing the hardcoded default on a machine that sets
   # OPENCODE_CONFIG edits a file opencode never reads: the command reports
@@ -275,6 +281,7 @@ cmd_opencode() {
       --host)         oc_host="$2"; shift 2 ;;
       --port)         oc_port="$2"; shift 2 ;;
       --config)       oc_config="$2"; shift 2 ;;
+      --key)          oc_key="$2"; shift 2 ;;
       --model)        force_model="$2"; shift 2 ;;
       --small-model)  force_small="$2"; shift 2 ;;
       --housekeeper)  force_house="$2"; shift 2 ;;
@@ -314,7 +321,10 @@ cmd_opencode() {
     echo "    own proxy at http://127.0.0.1:$oc_port/v1."
   fi
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" <<'PYEOF'
+  # Flag wins over the boot-loaded profile key; both unset keeps the legacy token.
+  [[ -z "$oc_key" ]] && oc_key="${CLIENT_MASTER_KEY:-}"
+
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" "$oc_key" <<'PYEOF'
 import datetime, json, os, re, sys, shutil, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
@@ -323,6 +333,7 @@ prefer_local = sys.argv[7] == "1"
 force_write  = sys.argv[8] == "1"   # no-op; see the --force note above
 keep_snaps   = int(sys.argv[9])
 force_house  = sys.argv[10]
+oc_key       = sys.argv[11]
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
@@ -368,7 +379,13 @@ house  = force_house or house
 # out of a menu, so they stay out of the config.
 served = []
 try:
-    with urllib.request.urlopen(f"{base}/models", timeout=4) as r:
+    # An authed front door rejects a bare catalogue request, which would read
+    # as "host down" and wire the lane pair unchecked — so carry the same
+    # bearer the generated configs will use. No key => no header (unchanged).
+    req = urllib.request.Request(f"{base}/models")
+    if oc_key:
+        req.add_header("Authorization", "Bearer %s" % oc_key)
+    with urllib.request.urlopen(req, timeout=4) as r:
         served = [m.get("id") for m in json.load(r).get("data", []) if m.get("id")]
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
@@ -484,7 +501,9 @@ prov["ferry"] = {
     # carried over from a previous host would label the picker with a box the
     # baseURL no longer points at.
     "name": f"Ferry ({host})",
-    "options": {"baseURL": base, "apiKey": "local"},
+    # The bearer the front door expects: the master key when one is configured
+    # (client.json / --key), else the legacy 'local' placeholder.
+    "options": {"baseURL": base, "apiKey": oc_key or "local"},
     "models": models,
 }
 

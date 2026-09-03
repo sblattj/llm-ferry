@@ -91,19 +91,23 @@ class ClientHarness(unittest.TestCase):
         os.chmod(stub, 0o755)
 
     # --- helpers ------------------------------------------------------------
-    def env(self):
+    def env(self, master_key=None, port=None):
         e = os.environ.copy()
         e["HOME"] = self.home
         e["PATH"] = self.bin + os.pathsep + e.get("PATH", "")
         e["HOST_NAME"] = "127.0.0.1"
-        e["HOST_PORT"] = str(self.port)
-        e["SHARE_PORT"] = str(self.port)
+        e["HOST_PORT"] = str(port if port is not None else self.port)
+        e["SHARE_PORT"] = str(port if port is not None else self.port)
         # A client is not expected to carry the host's own config pointer.
         e.pop("OPENCODE_CONFIG", None)
+        # ...nor a stray master key from the operator's shell.
+        e.pop("FERRY_MASTER_KEY", None)
+        if master_key is not None:
+            e["FERRY_MASTER_KEY"] = master_key
         return e
 
-    def run_script(self, script, *flags, expect_ok=True):
-        p = subprocess.run(["zsh", script, *flags], env=self.env(),
+    def run_script(self, script, *flags, env=None, expect_ok=True):
+        p = subprocess.run(["zsh", script, *flags], env=env or self.env(),
                            capture_output=True, text=True, timeout=180)
         if expect_ok:
             self.assertEqual(p.returncode, 0,
@@ -317,6 +321,81 @@ class ClientScopeTest(ClientHarness):
         self.assertIn("unrecognised opencode_mode", p.stdout + p.stderr)
 
 
+class KeyedStubHost(StubHost):
+    """A front door running the v1.22.0 master-key auth: /v1/models answers
+    401 without the Bearer key and 200 with it. /ferry stays open — the share
+    server is unauthenticated by design."""
+
+    REQUIRED_KEY = "test-master-key"
+
+    def do_GET(self):
+        if self.path.startswith("/v1/models"):
+            if self.headers.get("Authorization", "") != f"Bearer {self.REQUIRED_KEY}":
+                self.send_response(401)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+        StubHost.do_GET(self)
+
+
+class MasterKeyTest(ClientHarness):
+    """The optional shared key: bootstrap accepts it (env or --key), stores it
+    in client.json, probes with it, hints when it is missing, never prints it."""
+
+    @classmethod
+    def setUpClass(cls):
+        ClientHarness.setUpClass()
+        cls.keyed = ThreadingHTTPServer(("127.0.0.1", 0), KeyedStubHost)
+        cls.keyed_port = cls.keyed.server_address[1]
+        cls.keyed_thread = threading.Thread(target=cls.keyed.serve_forever, daemon=True)
+        cls.keyed_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.keyed.shutdown()
+        cls.keyed.server_close()
+        ClientHarness.tearDownClass()
+
+    def test_the_probe_carries_the_key_and_the_profile_stores_it(self):
+        # The stub host 401s every Bearer-less request, so a SUCCESS here is
+        # only reachable by the probe carrying `Authorization: Bearer <key>`.
+        p = self.run_script(BOOTSTRAP, "--no-opencode",
+                            env=self.env(master_key=KeyedStubHost.REQUIRED_KEY,
+                                         port=self.keyed_port))
+        self.assertIn("SUCCESS: Connected", p.stdout)
+
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["master_key"], KeyedStubHost.REQUIRED_KEY)
+        # The rest of the profile keeps its shape with the key present.
+        self.assertEqual(prof["host"], "127.0.0.1")
+        self.assertEqual(prof["port"], str(self.keyed_port))
+        self.assertEqual(prof["opencode_mode"], "none")
+        # And the key never reaches the transcript.
+        self.assertNotIn(KeyedStubHost.REQUIRED_KEY, p.stdout)
+        self.assertNotIn(KeyedStubHost.REQUIRED_KEY, p.stderr)
+
+    def test_the_key_can_come_as_a_flag_too(self):
+        self.run_script(BOOTSTRAP, "--no-opencode", "--key", KeyedStubHost.REQUIRED_KEY,
+                        env=self.env(port=self.keyed_port))
+        self.assertEqual(self.read_json(".config", "ferry", "client.json")["master_key"],
+                         KeyedStubHost.REQUIRED_KEY)
+
+    def test_without_a_key_the_profile_has_no_master_key_field(self):
+        # The field must be ABSENT, not empty: its absence is how every reader
+        # knows this host takes no key.
+        self.run_script(BOOTSTRAP, "--no-opencode")
+        self.assertNotIn("master_key", self.read_json(".config", "ferry", "client.json"))
+
+    def test_a_keyed_host_hints_at_the_key_when_probed_bare(self):
+        p = self.run_script(BOOTSTRAP, "--no-opencode",
+                            env=self.env(port=self.keyed_port), expect_ok=False)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("requires a key", p.stdout + p.stderr)
+        self.assertIn("FERRY_MASTER_KEY", p.stdout + p.stderr)
+        # Nothing was configured against a host that refuses every request.
+        self.assertFalse(os.path.exists(self.path(".config", "ferry", "client.json")))
+
+
 class ClientCleanupTest(ClientHarness):
     """What client-cleanup.sh takes away — and, more importantly, what it leaves."""
 
@@ -364,6 +443,43 @@ class ClientCleanupTest(ClientHarness):
         self.assertNotIn("ferry", after.get("provider", {}))
         self.assertIn("someprovider", after["provider"])
         self.assertEqual(after["mcp"], {"mine": {"command": ["true"]}})
+
+    def test_it_strips_a_ferry_provider_with_a_real_master_key(self):
+        """v1.22.0: an authed setup writes the front door's master key, not
+        'local', so the apiKey-literal fingerprint would strand it. The
+        fingerprint is the provider OBJECT KEY ('ferry'), which is also what
+        keeps a user's unrelated openai-compatible provider — same npm, its
+        own baseURL, its own key — standing."""
+        self.run_script(BOOTSTRAP)
+        cfg_path = self.path(".config", "opencode", "opencode.json")
+
+        def bake_authed_shape():
+            cfg = self.read_json(".config", "opencode", "opencode.json")
+            cfg["provider"]["ferry"]["options"]["apiKey"] = "sk-ferry-master-key"
+            # The control: an openai-compatible provider that is NOT ferry's.
+            cfg["provider"]["someprovider"] = {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {"baseURL": "http://localhost:9999/v1",
+                            "apiKey": "their-own-key"},
+            }
+            with open(cfg_path, "w") as f:
+                json.dump(cfg, f, indent=2)
+
+        # Dry run detects the authed shape before the real pass removes it.
+        bake_authed_shape()
+        dry = self.run_script(CLEANUP, "--dry-run").stdout
+        self.assertIn("would strip the ferry provider block", dry)
+        self.assertIn("ferry", self.read_json(".config", "opencode",
+                                              "opencode.json")["provider"])
+
+        bake_authed_shape()
+        self.run_script(CLEANUP)
+
+        after = self.read_json(".config", "opencode", "opencode.json")
+        self.assertNotIn("ferry", after.get("provider", {}))
+        self.assertIn("someprovider", after["provider"])
+        self.assertEqual(after["provider"]["someprovider"]["options"]["apiKey"],
+                         "their-own-key")
 
     def test_a_config_with_no_ferry_provider_is_left_alone(self):
         """The --profiles-only case: nothing of ours is in there to remove."""
@@ -463,6 +579,15 @@ class ScriptContractTest(unittest.TestCase):
             text = self.read(path)
             self.assertIn("HOST_MDNS_PLACEHOLDER", text, path)
             self.assertIn("SHARE_PORT_PLACEHOLDER", text, path)
+
+    def test_reset_threads_a_stored_master_key_through_to_the_cli(self):
+        """v1.22.0: a reset re-applies the key the bootstrap stored — as --key,
+        and only when the profile has one."""
+        reset = self.read(RESET)
+        self.assertIn("master_key", reset)
+        self.assertIn('key_args=(--key "$saved_key")', reset)
+        # Both ferry calls ride the array; empty when no key was stored.
+        self.assertEqual(reset.count('"${key_args[@]}"'), 2)
 
 
 if __name__ == "__main__":

@@ -205,6 +205,10 @@ CLIENT_MODE=0
 CLIENT_HOST=""
 CLIENT_PORT="8090"
 CLIENT_SHARE_PORT="8095"
+# v1.22.0: optional litellm master_key (LITELLM_MASTER_KEY) on the front door.
+# Absent => the generators bake the legacy 'local' bearer, so a keyless LAN
+# setup is unchanged. Held in a variable, never echoed.
+CLIENT_MASTER_KEY=""
 
 CLIENT_CONF="$HOME/.config/ferry/client.json"
 if [[ -f "$CLIENT_CONF" ]]; then
@@ -212,6 +216,7 @@ if [[ -f "$CLIENT_CONF" ]]; then
   CLIENT_HOST=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('host', ''))" 2>/dev/null || echo "")
   CLIENT_PORT=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('port', '8090'))" 2>/dev/null || echo "8090")
   CLIENT_SHARE_PORT=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('share_port', '8095'))" 2>/dev/null || echo "8095")
+  CLIENT_MASTER_KEY=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('master_key') or '')" 2>/dev/null || echo "")
 fi
 
 # Logging locations (Host Mode only)

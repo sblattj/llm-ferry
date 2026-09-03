@@ -210,6 +210,10 @@ CLIENT_MODE=0
 CLIENT_HOST=""
 CLIENT_PORT="8090"
 CLIENT_SHARE_PORT="8095"
+# v1.22.0: optional litellm master_key (LITELLM_MASTER_KEY) on the front door.
+# Absent => the generators bake the legacy 'local' bearer, so a keyless LAN
+# setup is unchanged. Held in a variable, never echoed.
+CLIENT_MASTER_KEY=""
 
 CLIENT_CONF="$HOME/.config/ferry/client.json"
 if [[ -f "$CLIENT_CONF" ]]; then
@@ -217,6 +221,7 @@ if [[ -f "$CLIENT_CONF" ]]; then
   CLIENT_HOST=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('host', ''))" 2>/dev/null || echo "")
   CLIENT_PORT=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('port', '8090'))" 2>/dev/null || echo "8090")
   CLIENT_SHARE_PORT=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('share_port', '8095'))" 2>/dev/null || echo "8095")
+  CLIENT_MASTER_KEY=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('master_key') or '')" 2>/dev/null || echo "")
 fi
 
 # Logging locations (Host Mode only)
@@ -1446,6 +1451,7 @@ class DynamicHandler(SimpleHTTPRequestHandler):
                         content = f.read()
                     content = content.replace("HOST_MDNS_PLACEHOLDER", mdns_name)
                     content = content.replace("SHARE_PORT_PLACEHOLDER", str(port))
+                    # v1.22.0: master_key deliberately does NOT ride this channel — the share server is unauthenticated, so injecting the key here would publish it to the whole LAN (clients bring it via FERRY_MASTER_KEY / --key, or it travels in client.json after they supply it).
                     # Also rewrite the script's own your-host.local fallback, so
                     # even the no-injection code path lands on the real host.
                     content = content.replace("your-host.local", mdns_name)
@@ -3294,6 +3300,12 @@ cmd_opencode() {
   # file is left exactly as it was, and the whole original is snapshotted to
   # <name>.<UTC>.jsonc first, so a takeover is always reversible.
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
+  # v1.22.0: the front door can run litellm behind a master_key. The bearer
+  # baked into the generated configs (and sent on the catalogue check) resolves
+  # --key > client.json's master_key (boot-loaded as CLIENT_MASTER_KEY) > unset
+  # (the legacy 'local' token, so keyless LAN setups are unchanged). The key is
+  # only written into files / request headers, never printed.
+  local oc_key=""
   # opencode resolves its config from $OPENCODE_CONFIG when that is set, so
   # honour it here too. Writing the hardcoded default on a machine that sets
   # OPENCODE_CONFIG edits a file opencode never reads: the command reports
@@ -3306,6 +3318,7 @@ cmd_opencode() {
       --host)         oc_host="$2"; shift 2 ;;
       --port)         oc_port="$2"; shift 2 ;;
       --config)       oc_config="$2"; shift 2 ;;
+      --key)          oc_key="$2"; shift 2 ;;
       --model)        force_model="$2"; shift 2 ;;
       --small-model)  force_small="$2"; shift 2 ;;
       --housekeeper)  force_house="$2"; shift 2 ;;
@@ -3345,7 +3358,10 @@ cmd_opencode() {
     echo "    own proxy at http://127.0.0.1:$oc_port/v1."
   fi
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" <<'PYEOF'
+  # Flag wins over the boot-loaded profile key; both unset keeps the legacy token.
+  [[ -z "$oc_key" ]] && oc_key="${CLIENT_MASTER_KEY:-}"
+
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" "$oc_key" <<'PYEOF'
 import datetime, json, os, re, sys, shutil, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
@@ -3354,6 +3370,7 @@ prefer_local = sys.argv[7] == "1"
 force_write  = sys.argv[8] == "1"   # no-op; see the --force note above
 keep_snaps   = int(sys.argv[9])
 force_house  = sys.argv[10]
+oc_key       = sys.argv[11]
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
@@ -3399,7 +3416,13 @@ house  = force_house or house
 # out of a menu, so they stay out of the config.
 served = []
 try:
-    with urllib.request.urlopen(f"{base}/models", timeout=4) as r:
+    # An authed front door rejects a bare catalogue request, which would read
+    # as "host down" and wire the lane pair unchecked — so carry the same
+    # bearer the generated configs will use. No key => no header (unchanged).
+    req = urllib.request.Request(f"{base}/models")
+    if oc_key:
+        req.add_header("Authorization", "Bearer %s" % oc_key)
+    with urllib.request.urlopen(req, timeout=4) as r:
         served = [m.get("id") for m in json.load(r).get("data", []) if m.get("id")]
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
@@ -3515,7 +3538,9 @@ prov["ferry"] = {
     # carried over from a previous host would label the picker with a box the
     # baseURL no longer points at.
     "name": f"Ferry ({host})",
-    "options": {"baseURL": base, "apiKey": "local"},
+    # The bearer the front door expects: the master key when one is configured
+    # (client.json / --key), else the legacy 'local' placeholder.
+    "options": {"baseURL": base, "apiKey": oc_key or "local"},
     "models": models,
 }
 
@@ -3617,7 +3642,10 @@ FERRY_CL_MARK_START="# >>> ferry claude profiles >>>"
 FERRY_CL_MARK_END="# <<< ferry claude profiles <<<"
 
 _ferry_install_claude_wrappers() {
-  local cl_host="$1" cl_port="$2"
+  local cl_host="$1" cl_port="$2" cl_key="${3:-}"
+  # Empty / absent key keeps the legacy 'local' bearer, so a front door without
+  # a litellm master_key is unchanged. Anything else is baked in verbatim.
+  [[ -z "$cl_key" ]] && cl_key="local"
   local rc="$HOME/.zshrc"
   touch "$rc"
 
@@ -3666,15 +3694,17 @@ PYEOF
   fi
 
   # QUOTED heredoc, so the $HOME and $@ inside the functions survive verbatim.
-  # Host/port ride as placeholder tokens and are baked in by the substitution
-  # right after — a quoted heredoc cannot interpolate them itself.
+  # Host/port/key ride as placeholder tokens and are baked in by the
+  # substitution right after — a quoted heredoc cannot interpolate them itself.
   local block
   block=$(cat <<'EOF'
 # >>> ferry claude profiles >>>
 # Installed by `ferry claude` / host-reset.sh. ANTHROPIC_BASE_URL carries NO
 # /v1 suffix: Claude Code appends /v1/messages itself, and LiteLLM already
-# serves that path for every lane. AUTH_TOKEN is an arbitrary string — the
-# proxy does no auth.
+# serves that path for every lane. AUTH_TOKEN is 'local' unless the front door
+# runs litellm with a master_key (LITELLM_MASTER_KEY) — `ferry claude` bakes
+# the real key from ~/.config/ferry/client.json's master_key (or --key) when
+# one is configured, else the 'local' placeholder a keyless LAN setup expects.
 #
 # Host and port are baked in at install time: the wrapper must work with ferry
 # down, so there is no runtime resolution to fail.
@@ -3689,7 +3719,7 @@ unalias claude-ferry claude-ferry-local claude-ferry-super 2>/dev/null
 # haiku-slot background calls.
 claude-ferry() {
   env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
-      ANTHROPIC_AUTH_TOKEN=local \
+      ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
       ANTHROPIC_MODEL=heavy \
       ANTHROPIC_DEFAULT_HAIKU_MODEL=flash \
       CLAUDE_CODE_SUBAGENT_MODEL=flash \
@@ -3705,7 +3735,7 @@ claude-ferry() {
 # reason `ferry opencode` caps local-lane output at 8k.
 claude-ferry-local() {
   env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
-      ANTHROPIC_AUTH_TOKEN=local \
+      ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
       ANTHROPIC_MODEL=local-orch \
       ANTHROPIC_DEFAULT_HAIKU_MODEL=local-sub \
       CLAUDE_CODE_SUBAGENT_MODEL=local-sub \
@@ -3720,7 +3750,7 @@ claude-ferry-local() {
 # subagents. The cheapest cloud profile.
 claude-ferry-super() {
   env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
-      ANTHROPIC_AUTH_TOKEN=local \
+      ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
       ANTHROPIC_MODEL=heavy \
       ANTHROPIC_DEFAULT_HAIKU_MODEL=super-flash \
       CLAUDE_CODE_SUBAGENT_MODEL=super-flash \
@@ -3734,6 +3764,7 @@ EOF
 )
   block="${block//__FERRY_CL_HOST__/$cl_host}"
   block="${block//__FERRY_CL_PORT__/$cl_port}"
+  block="${block//__FERRY_CL_KEY__/$cl_key}"
   print -r -- "$block" >> "$rc"
 
   echo ">>> claude shell wrappers installed in $rc:"
@@ -3749,19 +3780,20 @@ cmd_claude() {
   # plays which role. The JSON is the machine-readable twin of the wrappers —
   # other tooling (host-reset.sh, tests) reads the mapping instead of parsing
   # zshrc — so both are written in one pass and always agree.
-  local cl_host="" cl_port="" _wrappers_only=0
+  local cl_host="" cl_port="" cl_key="" _wrappers_only=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --host)     cl_host="$2"; shift 2 ;;
       --port)     cl_port="$2"; shift 2 ;;
+      --key)      cl_key="$2"; shift 2 ;;
       --wrappers) _wrappers_only=1; shift ;;
       --help|-h)
         cat <<'EOF'
 ferry claude — point Claude Code at the ferry endpoint by lane name.
 
 Usage:
-  ferry claude [--host H] [--port P] [--wrappers]
+  ferry claude [--host H] [--port P] [--key K] [--wrappers]
 
   (no flags)   Install the ~/.zshrc wrappers (claude-ferry / claude-ferry-local)
                and write ~/.config/ferry/claude.json recording the lane map.
@@ -3770,6 +3802,8 @@ Usage:
   --wrappers   Install ONLY the zshrc wrappers (used by host-reset.sh).
   --host H     Endpoint host to bake into the wrappers.
   --port P     Endpoint port (default 8090).
+  --key K      Bearer token baked into the wrappers and sent to the front door.
+               Default: client.json's master_key when set, else 'local'.
 
 Lane map:  cloud  main=heavy   background=flash
            local  main=local-orch  background=local-sub
@@ -3812,19 +3846,34 @@ except Exception:
   fi
   cl_port="${cl_port:-8090}"
 
+  # Key precedence: --key, else the client profile's optional master_key, else
+  # empty (the installer then bakes the legacy 'local' token). Read fresh from
+  # client.json — same reason host/port are — because `ferry claude --wrappers`
+  # runs from host-reset.sh, which may run before/outside a normal CLI boot.
+  # The value only lands in files, never on stdout.
+  if [[ -z "$cl_key" ]]; then
+    cl_key=$(python3 -c "import json, os, sys
+try:
+    print(json.load(open(os.path.expanduser(sys.argv[1]))).get('master_key') or '')
+except Exception:
+    pass" "$HOME/.config/ferry/client.json" 2>/dev/null)
+  fi
+  cl_key="${cl_key:-${CLIENT_MASTER_KEY:-}}"
+
   if (( _wrappers_only )); then
-    _ferry_install_claude_wrappers "$cl_host" "$cl_port"
+    _ferry_install_claude_wrappers "$cl_host" "$cl_port" "$cl_key"
     return $?
   fi
 
-  _ferry_install_claude_wrappers "$cl_host" "$cl_port"
+  _ferry_install_claude_wrappers "$cl_host" "$cl_port" "$cl_key"
 
   # Snapshot any existing claude.json before overwrite, so a lane re-mapping is
   # always reversible (same convention as `ferry opencode`'s config snapshots).
-  python3 - "$cl_host" "$cl_port" "$HOME/.config/ferry/claude.json" <<'PYEOF'
+  python3 - "$cl_host" "$cl_port" "$cl_key" "$HOME/.config/ferry/claude.json" <<'PYEOF'
 import datetime, json, os, shutil, sys
 
-host, port, path = sys.argv[1], sys.argv[2], os.path.expanduser(sys.argv[3])
+host, port, path = sys.argv[1], sys.argv[2], os.path.expanduser(sys.argv[4])
+key = sys.argv[3]
 if os.path.exists(path):
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     snap = f"{path}.{ts}.bak"
@@ -3843,6 +3892,11 @@ cfg = {
         "local": {"main": "local-orch", "background": "local-sub"},
     },
 }
+# Mirrored only when it is a real key: 'local' (or empty) is the keyless LAN
+# default, and recording it would make the mirror claim an auth setup that
+# does not exist.
+if key and key != "local":
+    cfg["master_key"] = key
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)

@@ -1,12 +1,12 @@
 {
-  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP. The host serves FOUR lanes from one endpoint: 'orch' + 'flash' (cloud) and 'local-orch' + 'local-sub' (host GPU). A lane name is the stable contract - the host can swap the model behind it without any client edit. Point the main model at a driving lane ('orch' or 'local-orch') and the worker/subagent model at its cheap partner ('flash' or 'local-sub'). Client bootstrap also installs `opencode-cloud` (the cloud pair) and `opencode-local` (the GPU pair). Easiest of all: just run `ferry opencode` on the client to write the opencode block below automatically (it detects whatever the host is serving).",
+  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP. The host serves FIVE lanes from one endpoint: 'heavy' + 'flash' + 'super-flash' (cloud) and 'local-orch' + 'local-sub' (host GPU). A lane name is the stable contract - the host can swap the model behind it without any client edit. Point the main model at a driving lane ('heavy' or 'local-orch') and the worker/subagent model at its cheap partner ('flash', 'super-flash', or 'local-sub'). Client bootstrap also installs `opencode-cloud`, `opencode-local`, and `opencode-super` profiles. Easiest of all: just run `ferry opencode` on the client to write the opencode block below automatically (it detects whatever the host is serving).",
 
   "opencode": {
     "provider": {
       "ferry": {
         "npm": "@ai-sdk/openai-compatible",
         "name": "Ferry (host)",
-        "options": { "baseURL": "http://your-mac.local:8090/v1", "apiKey": "local" },
+        "options": { "baseURL": "http://your-mac.local:8090/v1", "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>" },
         "models": {
           "orch": {},
           "flash": {},
@@ -34,8 +34,8 @@
         "provider": "openai",
         "model": "orch",
         "apiBase": "http://your-mac.local:8090/v1",
-        "apiKey": "local",
-        "_note": "The host serves four lanes at once: orch + flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
+        "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
+        "_note": "The host serves five lanes at once: heavy + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
       }
     ]
   },
@@ -43,13 +43,13 @@
   "cursor_ide": {
     "section": "Settings -> Models -> OpenAI-Compatible",
     "override_baseURL": "http://your-mac.local:8090/v1",
-    "apiKey": "local",
+    "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
     "model_name_to_add": "orch",
-    "_note": "The host serves four lanes at once: orch + flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
+    "_note": "The host serves five lanes at once: heavy + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
   },
 
   "generic_openai_sdk_python": {
     "code": "from openai import OpenAI\n\nclient = OpenAI(\n    base_url='http://your-mac.local:8090/v1',\n    api_key='local'\n)\n\nresponse = client.chat.completions.create(\n    model='orch',\n    messages=[{'role': 'user', 'content': 'Tell me a joke.'}]\n)\nprint(response.choices[0].message.content)",
-    "_note": "The host serves four lanes at once: orch + flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
+    "_note": "The host serves five lanes at once: heavy + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
   }
 }

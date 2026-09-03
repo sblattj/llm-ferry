@@ -33,7 +33,7 @@ It goes further than serving inference: it can **ferry whole models and files** 
 - 🏠 **You run a home lab.** One box becomes the inference appliance; everything else is a thin client.
 - 👥 **A small team wants to share one set of API keys.** Centralize billing and secrets on a host; clients never see a key.
 - 🤖 **You do agentic coding and want cheap + smart on tap.** Serve a big **orchestrator** model and a pool of cheap **workers** on the same endpoint, and let your agent fan out across both.
-- 🔒 **Mac/Linux host, LAN-only, your hardware.** Client↔host traffic is plain HTTP on your private network; cloud calls go host→provider over HTTPS with the host's keys. This is not a public gateway, an auth layer, or a hosted service — and that's the point.
+- 🔒 **Mac/Linux host, LAN-only, your hardware.** Client↔host traffic is plain HTTP on your private network behind one shared master key (v1.22); cloud calls go host→provider over HTTPS with the host's keys. This is not a public gateway or a hosted service — and that's the point.
 
 ## Why not just…?
 
@@ -56,7 +56,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 ## Features
 
 - 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too, so **Claude Code runs on the ferry backend** (`claude-ferry` wrapper, new in v1.20).
-- 🔑 **Keys stay on the host** — clients authenticate to the LAN, never to your providers. No key ever ships to a client.
+- 🔑 **Keys stay on the host** — your *provider* keys never leave the host; clients hold one shared master key (v1.22) and never see a provider key.
 - ⚡ **Local GPU + cloud, same endpoint** — Apple MLX inference on the Mac, or a cloud proxy, or **both models on one route config**.
 - 🧠 **Orchestrator + strict fallback chain** — a big planning model with an ordered failover chain across **independent** providers (Kimi, Fireworks DeepSeek/GLM, a ChatGPT subscription).
 - 🎛️ **Multi-key worker pool** — several API keys pooled with `usage-based-routing-v2` (proactive least-used spread) and automatic 429 cooldown/failover.
@@ -267,6 +267,7 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 - [Ferrying models & files across the LAN](#ferrying-models--files-across-the-lan)
 - [Route a client's downloads through the host](#route-a-clients-downloads-through-the-host)
 - [Reverse expose: publish a client's port through the host](#reverse-expose-publish-a-clients-port-through-the-host)
+- [Remote access (Tailscale)](#remote-access-tailscale)
 - [Local models](#local-models)
 - [Platform support](#platform-support)
 - [Privacy](#privacy)
@@ -600,6 +601,22 @@ ferry status    # lists every published port, its client, and when it started
 ferry down      # tears down the relay and everything published through it
 ```
 
+## Remote access (Tailscale)
+
+The endpoint is a LAN appliance; ferry publishes nothing to the internet. When you want it from *outside* the LAN, front it with [Tailscale Serve](https://tailscale.com/kb/1242/tailscale-serve) — one command on the host puts a real TLS certificate and your tailnet's identity in front of the same local port, so the master key gets a TLS wire to travel over and only devices on your tailnet (plus anyone you explicitly share the node with) can knock:
+
+```bash
+# host: serve the endpoint over the tailnet
+tailscale serve --bg --https=443 http://127.0.0.1:8090
+
+# client (on the tailnet): point the profile at the ts.net name, then
+# regenerate the configs so the wrappers carry the real key
+#   ~/.config/ferry/client.json  →  "host": "your-mac.<tailnet>.ts.net"
+ferry opencode --key <master-key>     # or: ferry claude --key <master-key>
+```
+
+Clients now talk to `https://your-mac.<tailnet>.ts.net/v1`. **What this does not cover:** the share server (`8095` — bootstrap, `pull`/`get`, `/hq` telemetry), the relay (`8098`), and the download proxies stay LAN-only — a remote client can drive inference but cannot bootstrap, ferry files, or send telemetry. And this is a documented recipe, not an integration: ferry does not install, start, or manage Tailscale for you.
+
 ## Local models
 
 The two GPU lanes and how to swap their models are covered in [The local GPU lanes](#the-local-gpu-lanes). This section is the operational detail.
@@ -634,7 +651,7 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 
 ## Privacy
 
-Everything runs on your own hardware and network. Client↔host traffic stays on your **private LAN as plain HTTP**; cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the keys**. The one transport built for an untrusted channel is `ferry drop` / `ferry pickup`, which encrypts before the data leaves the machine — everything else assumes the LAN. Inbound client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host — outside any checkout, so it survives a repo that moves or a worktree that is removed. The observability stack binds to `127.0.0.1` only. A port published with `ferry relay` binds on the **host** (the LAN by default) and is reachable by anything that can reach the host on that port — the relay authenticates only the client that registers it, so whatever you `ferry expose` must carry its own authentication.
+Everything runs on your own hardware and network. The front door answers only requests carrying the **master key** — one shared secret you set in `LITELLM_MASTER_KEY` and every client holds a copy of (new in v1.22; a keyless request gets a 401). The LAN transport is still **plain HTTP**, so that key travels in a header anyone sharing the wire can read: it is an auth layer, not encryption — enough to keep a neighbor's laptop or a misaddressed `curl` out, not enough for a hostile network. The hostile-network answer is [Tailscale Serve](#remote-access-tailscale), which adds TLS and tailnet identity without ferry integrating a tunnel. The MLX servers bind `127.0.0.1`, so the GPU lanes are reachable only through the front door, never directly. Cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the provider keys** — the master key is the one credential a client holds. The one transport built for an untrusted channel is `ferry drop` / `ferry pickup`, which encrypts before the data leaves the machine — everything else assumes the LAN. Inbound client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host — outside any checkout, so it survives a repo that moves or a worktree that is removed. The observability stack binds to `127.0.0.1` only. A port published with `ferry relay` binds on the **host** (the LAN by default) and is reachable by anything that can reach the host on that port — the relay authenticates only the client that registers it, so whatever you `ferry expose` must carry its own authentication.
 
 ## Command reference
 
@@ -647,7 +664,7 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up. Detects the role from `~/.config/ferry/client.json` and runs that side's reset: a **host** rebuilds the CLI from its own checkout, re-links it, and bounces the proxy; a **client** re-pulls the CLI from its host. `--full` also reloads the GPU lanes (host only) |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |
 | — | — | The dashboard's **Routes** panel edits each lane's failover chain in place: reorder, add or remove hops, preview the exact YAML diff, then apply. A timestamped snapshot is written first, only the `fallbacks:` line is rewritten (every comment in your config is left as-is), and the proxy picks the change up on the next `ferry update` |
-| `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`) |
+| `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`). Clients pass the endpoint key through the one-liner as `FERRY_MASTER_KEY=…` so the new client's profile carries it |
 | `msg <text>` | client | Send a text note to the host's `~/.config/ferry/client_logs.txt` |
 | `log` | client | Pipe stdin straight to the host's `~/.config/ferry/client_logs.txt` |
 | `inbox [-n N] [-f] [--all] [--path]` | host | Read that file back, dated and attributed from the share server's access log where the receipt still exists |
@@ -661,13 +678,14 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `serve-hf [--port P]` | host | Start the experimental HuggingFace pass-through proxy (default `8096`) |
 | `serve-proxy [--port P]` | host | Start the general HTTP(S) download forward proxy (default `8097`) |
 | `env [--host H] [--proxy-port P] [--hf-port P2] [--write]` | client | Emit shell exports so this laptop routes downloads via the host proxy |
-| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, `model`, `small_model`, and all seven built-in agents, pinned to lane names. `--super` pins worker AND housekeeper to `super-flash` (heavy keeps driving). Snapshots the original first |
+| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--key KEY] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, `model`, `small_model`, and all seven built-in agents, pinned to lane names. `--key` writes the master key into the configs (v1.22) — without it they carry the keyless `local` placeholder, which a hardened front door rejects. `--super` pins worker AND housekeeper to `super-flash` (heavy keeps driving). Snapshots the original first |
+| `claude [--host H] [--port P] [--key KEY] [--wrappers]` | dual | Point Claude Code at the ferry endpoint by lane name: installs the `claude-ferry` / `claude-ferry-local` / `claude-ferry-super` wrappers into `~/.zshrc` and writes `~/.config/ferry/claude.json` recording the lane map. `--key` bakes the master key into the wrappers (v1.22); `--wrappers` installs the `~/.zshrc` block only (the host-reset shim) |
 
 Run `ferry --help` for the built-in usage banner.
 
 ## Development
 
-`ferry` is assembled from per-domain modules so the CLI isn't one file to reason about. Source lives in [`lib/`](lib/) as **10 modules**: `ferry-core` (bootstrap, LAN/mDNS discovery, config, secrets), `ferry-usage`, `ferry-install`, `ferry-serve` (up/down/status/catalog), `ferry-share`, `ferry-transfer` (pull/get/send/receive/offer), `ferry-proxy` (serve-hf/serve-proxy), `ferry-integrate` (env/opencode), `ferry-dash`, and `ferry-main` (dispatch). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules and regenerate:
+`ferry` is assembled from per-domain modules so the CLI isn't one file to reason about. Source lives in [`lib/`](lib/) as **15 modules**: `ferry-core` (bootstrap, LAN/mDNS discovery, config, secrets), `ferry-usage`, `ferry-install`, `ferry-serve` (up/down/status/catalog), `ferry-share` (LAN share server + telemetry), `ferry-inbox` (read the telemetry back), `ferry-relay` (reverse expose), `ferry-transfer` (pull/get/send/receive/offer), `ferry-drop` (encrypted off-LAN transfer), `ferry-proxy` (serve-hf/serve-proxy), `ferry-integrate` (env/opencode), `ferry-claude` (Claude Code wiring), `ferry-dash`, `ferry-update`, and `ferry-main` (dispatch). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules and regenerate:
 
 ```bash
 ./build.zsh            # regenerate ./ferry from lib/ferry-*.zsh
@@ -681,14 +699,21 @@ Commit both `lib/` and the regenerated `ferry`; don't hand-edit `ferry` (the syn
 Stdlib `unittest`, no dependencies, each suite runnable on its own:
 
 ```bash
-python3 lib/ferry-serve.test.py       # lane ports, launch flags, KV governor
-python3 lib/ferry-integrate.test.py   # the opencode takeover: scope, lane split, snapshots
-python3 lib/ferry-share.test.py       # share server + client-script placeholder injection
-python3 lib/ferry-hostreset.test.py   # host-reset: route-config validation, endpoint verify
-python3 lib/ferry-front.test.py       # the front door: /v1/models advertises lanes only
+python3 lib/ferry-serve.test.py            # lane ports, launch flags, KV governor
+python3 lib/ferry-front.test.py            # the front door: /v1/models advertises lanes only
+python3 lib/ferry-integrate.test.py        # the opencode takeover: scope, lane split, snapshots
+python3 lib/ferry-claude.test.py           # the Claude Code wiring: wrappers, lane map, snapshot
+python3 lib/ferry-hostwrappers.test.py     # host-side opencode wrappers: marker strip, baked host/port
+python3 lib/ferry-share.test.py            # share server + client-script placeholder injection
+python3 lib/ferry-hostreset.test.py        # host-reset: route-config validation, endpoint verify
 python3 lib/ferry-clientbootstrap.test.py  # client scope: bootstrap / reset / cleanup
-python3 lib/ferry-inbox.test.py       # inbox: the receipt/entry join, host-only guard
-python3 lib/ferry-relay.test.py       # reverse tunnel: byte round-trip, teardown on disconnect, refusals
+python3 lib/ferry-update.test.py           # `ferry update`: role detection, client/host dispatch
+python3 lib/ferry-inbox.test.py            # inbox: the receipt/entry join, host-only guard
+python3 lib/ferry-relay.test.py            # reverse tunnel: byte round-trip, teardown on disconnect, refusals
+python3 lib/ferry-drop.test.py             # drop/pickup: encrypt, authenticate, decrypt, refuse tampering
+python3 lib/ferry-dashroutes.test.py       # the dash route editor: the fallbacks writer + snapshots
+python3 lib/ferry-events.test.py           # ferry_events.py: the per-request event record and writer
+python3 lib/ferry-live.test.py             # the live view: topology parse + the event tail
 ```
 
 The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.

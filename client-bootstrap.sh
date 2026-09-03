@@ -26,6 +26,13 @@
 #
 # The chosen mode is recorded in client.json as "opencode_mode", so a later
 # `client-reset.sh` catches this machine up without silently re-widening it.
+#
+# CLAUDE CODE is a separate integration with its own single switch. By default
+# the claude-ferry / claude-ferry-local wrappers are installed when a `claude`
+# CLI exists on this machine (claude absent: a one-line note, same gate the
+# guardrails apply to `opencode`); --no-claude skips the step entirely. The
+# choice is recorded in client.json as "claude_mode" (full / none), the same
+# way, for client-reset.sh to re-apply.
 
 set -eu
 
@@ -33,14 +40,17 @@ set -eu
 # Piped invocations pass these after `zsh -s --`.
 OC_MODE="full"
 GUARDRAILS=""   # empty = follow the mode; 1/0 = explicit --with/--no-guardrails
+NO_CLAUDE=0
 
 usage() {
-  sed -n '2,28p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+  sed -n '2,35p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
   echo ""
   echo "Flags: --profiles-only | --no-opencode | --full-opencode"
   echo "       --with-guardrails | --no-guardrails   (the /fan-out command and the"
   echo "         spawning-subagents skill, which live in ~/.config/opencode/;"
   echo "         on by default in full mode, off in the other two)"
+  echo "       --no-claude   (skip the Claude Code wrappers; by default they are"
+  echo "         installed when a 'claude' CLI is on PATH)"
   echo "       -h | --help"
 }
 
@@ -51,8 +61,9 @@ for arg in "$@"; do
     --full-opencode)   OC_MODE="full" ;;
     --with-guardrails) GUARDRAILS=1 ;;
     --no-guardrails)   GUARDRAILS=0 ;;
+    --no-claude)       NO_CLAUDE=1 ;;
     -h|--help)         usage; exit 0 ;;
-    *) echo "Unknown flag: $arg"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --with-guardrails, --no-guardrails, --help"; exit 1 ;;
+    *) echo "Unknown flag: $arg"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --with-guardrails, --no-guardrails, --no-claude, --help"; exit 1 ;;
   esac
 done
 
@@ -162,18 +173,33 @@ else
   chmod +x "$HOME/.local/bin/ferry"
 fi
 
+# Claude Code scope is decided before client.json is written so it lands in the
+# profile client-reset.sh reads — same gate as the guardrails below use for
+# `opencode`: the wrappers only make sense when the claude CLI exists to run.
+if [[ $NO_CLAUDE -eq 1 ]]; then
+  CLAUDE_MODE="none"
+elif command -v claude >/dev/null 2>&1; then
+  CLAUDE_MODE="full"
+else
+  CLAUDE_MODE="none"
+fi
+
 # Write local client JSON config profile
 echo ">>> Creating client configuration profile..."
 mkdir -p "$HOME/.config/ferry"
 # opencode_mode is written for client-reset.sh, which re-applies the takeover
 # later and must not re-widen a machine that was deliberately bootstrapped
 # narrow. Absent (a profile from before this key existed) reads as "full".
+# claude_mode is the same idea for the Claude Code wrappers: full when they
+# were installed, none when --no-claude was passed or no `claude` CLI exists.
+# Absent on a pre-claude profile reads as "none" — a reset never widens.
 cat <<EOF > "$HOME/.config/ferry/client.json"
 {
   "host": "$HOST_NAME",
   "port": "$HOST_PORT",
   "share_port": "$SHARE_PORT",
-  "opencode_mode": "$OC_MODE"
+  "opencode_mode": "$OC_MODE",
+  "claude_mode": "$CLAUDE_MODE"
 }
 EOF
 echo "    Successfully saved profile: ~/.config/ferry/client.json"
@@ -520,6 +546,33 @@ SKILLMD
   echo "              ~/.config/opencode/skills/spawning-subagents/SKILL.md"
 fi
 
+# 4. Claude Code integration. Claude Code speaks the Anthropic protocol, not
+# OpenAI's, so the opencode profiles do not serve it: `ferry claude` writes
+# ~/.config/ferry/claude.json and installs the claude-ferry /
+# claude-ferry-local wrapper functions into its own marked block in ~/.zshrc
+# (its installer, its markers — this script adds no bare `claude()` wrapper).
+# Independent of the opencode mode; scope was recorded in client.json above.
+echo ""
+CLAUDE_FAILED=0
+if [[ "$CLAUDE_MODE" == "full" ]]; then
+  echo ">>> Wiring Claude Code to the host..."
+  # env -u OPENCODE_CONFIG: same hygiene as the `ferry opencode` calls above —
+  # the shell's own pointer must not leak into ferry's installer.
+  if ! env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" claude \
+        --host "$HOST_NAME" --port "$HOST_PORT"; then
+    CLAUDE_FAILED=1
+  fi
+elif [[ $NO_CLAUDE -eq 1 ]]; then
+  echo ">>> Skipping Claude Code wiring (--no-claude)."
+else
+  echo ">>> NOTE: no 'claude' CLI on PATH — skipping Claude Code wiring."
+fi
+if [[ $CLAUDE_FAILED -eq 1 ]]; then
+  echo "    WARNING: 'ferry claude' failed. By hand: point Claude Code's"
+  echo "    ANTHROPIC_BASE_URL at http://$HOST_NAME:$HOST_PORT (any bearer token),"
+  echo "    or re-run this script / client-reset.sh."
+fi
+
 # 5. Wrap up
 echo "================================================================="
 echo ">>> SUCCESS! Client setup is complete."
@@ -559,6 +612,28 @@ case "$OC_MODE" in
     echo "      model   a LANE NAME from http://$HOST_NAME:$HOST_PORT/v1/models"
     echo "    Or re-run this script with --profiles-only for ferry-owned opencode"
     echo "    profiles that leave ~/.config/opencode alone."
+    ;;
+esac
+
+case "$CLAUDE_MODE" in
+  full)
+    echo ">>> CLAUDE CODE ON THE FERRY BACKEND:"
+    echo "    claude-ferry / claude-ferry-local installed (Claude Code on the ferry backend)"
+    echo "    claude-ferry       -> cloud lanes: heavy drives, flash fans out"
+    echo "    claude-ferry-local -> GPU lanes:   local-orch drives, local-sub fans out"
+    echo "    bare 'claude' is UNCHANGED. Skip the wrappers with --no-claude."
+    if [[ $CLAUDE_FAILED -eq 1 ]]; then
+      echo "    (WARNING: the wiring step FAILED above — the wrappers may not work yet.)"
+    fi
+    ;;
+  none)
+    if [[ $NO_CLAUDE -eq 1 ]]; then
+      echo ">>> CLAUDE CODE WAS NOT CONFIGURED (--no-claude)."
+    else
+      echo ">>> CLAUDE CODE WAS NOT CONFIGURED (no 'claude' CLI on PATH)."
+    fi
+    echo "    By hand: ANTHROPIC_BASE_URL=http://$HOST_NAME:$HOST_PORT (any bearer"
+    echo "    token), model = a LANE NAME (heavy/flash cloud, local-orch/local-sub GPU)."
     ;;
 esac
 echo ""

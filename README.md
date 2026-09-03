@@ -55,7 +55,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 
 ## Features
 
-- 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too in cloud/route mode via LiteLLM.
+- 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too, so **Claude Code runs on the ferry backend** (`claude-ferry` wrapper, new in v1.20).
 - 🔑 **Keys stay on the host** — clients authenticate to the LAN, never to your providers. No key ever ships to a client.
 - ⚡ **Local GPU + cloud, same endpoint** — Apple MLX inference on the Mac, or a cloud proxy, or **both models on one route config**.
 - 🧠 **Orchestrator + strict fallback chain** — a big planning model with an ordered failover chain across **independent** providers (Kimi, Fireworks DeepSeek/GLM, a ChatGPT subscription).
@@ -108,6 +108,26 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 - bare `opencode` — whichever pair you used **last** (cloud until you first run `opencode-local`; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
 Both need `ferry up` on the host, which serves all five lanes at once.
+
+**Claude Code works too, as of v1.20.** The ferry endpoint speaks the Anthropic
+`/v1/messages` protocol, so Claude Code can run on the ferry backend with no
+changes to `claude` itself. When `claude` is installed, the bootstrap also
+installs two wrappers into `~/.zshrc` (skip with `--no-claude`):
+
+- `claude-ferry` — the **cloud lanes**: `heavy` drives, `flash` covers background
+  tasks and subagents.
+- `claude-ferry-local` — the **GPU lanes**: `local-orch` drives, `local-sub` fans
+  out. Nothing leaves the host.
+
+Both point Claude Code at the host with `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`
+scoped to the child process, with the compatibility flags a non-Anthropic backend
+needs (`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`, and
+`CLAUDE_CODE_DISABLE_THINKING=1` on the local lanes). Bare `claude` is deliberately
+untouched — it's your personal tool. The host gets the same wrappers via
+`ferry install` / `ferry update`, pointed at `127.0.0.1:8090`, and
+`client-reset.sh` re-applies the wiring so `ferry update` delivers it to existing
+clients (re-run the bootstrap one-liner only if the shell block itself needs
+refreshing).
 
 **The host gets these too, as of v1.17.** `ferry opencode` deliberately wires the
 host to its own endpoint, so the host drives the local lanes exactly like a client

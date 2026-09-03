@@ -440,6 +440,11 @@ if ! "$FERRY_BIN" opencode --wrappers; then
   RESET_FAILED=1
 fi
 
+# The claude-ferry profiles' zshrc block gets the same refresh.
+if ! "$FERRY_BIN" claude --wrappers --host 127.0.0.1 --port "$PORT"; then
+  RESET_FAILED=1
+fi
+
 # --- 7. Verify against the running endpoint ---------------------------------
 # Nothing above proves the lanes answer. Ask the endpoint, then check the local
 # backends separately: litellm lists local-orch and local-sub whether or not an

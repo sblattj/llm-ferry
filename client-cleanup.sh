@@ -1,9 +1,9 @@
 #!/bin/zsh
 # client-cleanup.sh — remove every trace of llm-ferry from a CLIENT laptop.
 # The inverse of client-bootstrap.sh: uninstall the ferry CLI, delete the
-# client profile and ferry-written opencode configs, strip the shell wrappers
-# and the host-code alias from ~/.zshrc, and remove the guardrail files
-# bootstrap installed.
+# client profile and ferry-written opencode + claude configs, strip the shell
+# wrappers (opencode and claude) and the host-code alias from ~/.zshrc, and
+# remove the guardrail files bootstrap installed.
 #
 #   curl -fsSL http://<host>:<share-port>/client-cleanup.sh | zsh
 #   curl -fsSL http://<host>:<share-port>/client-cleanup.sh | zsh -s -- --full
@@ -91,8 +91,11 @@ fi
 echo ""
 
 # --- 3. Remove the client profile + ferry-written opencode profiles ---------
+# The whole directory goes, which also takes the claude profile
+# (~/.config/ferry/claude.json) and the client.json "claude_mode" key with it —
+# there is no scenario where client.json survives this script.
 echo ">>> Removing ~/.config/ferry (client profile, opencode lane profiles,"
-echo "    last-lane marker, takeover snapshots)..."
+echo "    claude profile, last-lane marker, takeover snapshots)..."
 if [[ -d "$HOME/.config/ferry" ]]; then
   run rm -rf "$HOME/.config/ferry"
   echo "    Removed ~/.config/ferry"
@@ -165,14 +168,16 @@ fi
 echo ""
 
 # --- 5. Strip the shell wrappers + host-code alias from ~/.zshrc ------------
-# Reuses bootstrap's own markers for the wrapper block, plus the alias and the
-# comment banner it added. Delimited-block removal is line-based and safe; the
-# alias/banner are single lines matched exactly.
+# Reuses bootstrap's own markers for the wrapper block(s) — the opencode one
+# and the claude one `ferry claude` installs — plus the host-code alias, its
+# comment banner, and the legacy `alias opencode*=` / `alias claude-ferry*=`
+# lines from older hand-wired setups. Delimited-block removal is line-based
+# and safe; the alias/banner are single lines matched exactly.
 ZSHRC="$HOME/.zshrc"
 echo ">>> Stripping ferry wrappers from ~/.zshrc..."
 if [[ -f "$ZSHRC" ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
-    hits=$(grep -cE 'ferry opencode profiles|alias host-code=|# LLM-Ferry Shortcut' "$ZSHRC" 2>/dev/null || true)
+    hits=$(grep -cE 'ferry opencode profiles|ferry claude profiles|alias host-code=|# LLM-Ferry Shortcut|alias claude-ferry' "$ZSHRC" 2>/dev/null || true)
     echo "    [dry-run] $hits ferry line(s)/marker(s) found in ~/.zshrc"
   else
     python3 - "$ZSHRC" <<'PYEOF'
@@ -187,6 +192,10 @@ for ln in lines:
         skip = True; removed += 1; continue
     if s == "# <<< ferry opencode profiles <<<":
         skip = False; removed += 1; continue
+    if s == "# >>> ferry claude profiles >>>":
+        skip = True; removed += 1; continue
+    if s == "# <<< ferry claude profiles <<<":
+        skip = False; removed += 1; continue
     if skip:
         continue
     t = s.strip()
@@ -194,7 +203,9 @@ for ln in lines:
         or t == "# LLM-Ferry Shortcut"
         or t.startswith("alias opencode-cloud=")
         or t.startswith("alias opencode-local=")
-        or t.startswith("alias opencode=")):
+        or t.startswith("alias opencode=")
+        or t.startswith("alias claude-ferry=")
+        or t.startswith("alias claude-ferry-local=")):
         removed += 1
         continue
     out.append(ln)

@@ -6,10 +6,19 @@
 #   curl -fsSL http://<host>:<share-port>/client-reset.sh | zsh
 #   curl -fsSL http://<host>:<share-port>/client-reset.sh | zsh -s -- --profiles-only
 #
-# Difference from client-bootstrap.sh: this does not touch ~/.zshrc, does not
-# write client.json, and does not probe/prompt for a host — it reuses the
-# profile a previous bootstrap left behind. Run the bootstrap instead if this
-# machine has never been set up, or if the wrapper functions need refreshing.
+# Difference from client-bootstrap.sh: this does not write client.json and does
+# not probe/prompt for a host — it reuses the profile a previous bootstrap left
+# behind. Run the bootstrap instead if this machine has never been set up, or
+# if the opencode wrapper functions need refreshing.
+#
+# "~/.zshrc" NUANCE, READ TWICE: a reset never touches the OPENCODE wrapper
+# block (those wrappers are bootstrap-only — the header of client-bootstrap.sh
+# explains why). The Claude Code wiring is deliberately different and IS
+# re-applied here: `ferry claude` rewrites its own marker block in ~/.zshrc
+# whenever client.json records "claude_mode" != "none". That is the mechanism
+# by which a plain `ferry update` + reset delivers this release's claude
+# support to an already-bootstrapped machine without a re-bootstrap.
+# client.json is never rewritten, so the recorded scope cannot drift.
 #
 # WHY THE CLI COMES FIRST, ALWAYS: `ferry opencode` is the thing that performs
 # the takeover, so an out-of-date CLI silently does the OLD thing and reports
@@ -28,6 +37,11 @@
 #
 # A flag overrides the saved mode for THIS RUN only — client.json is never
 # rewritten here, so an override cannot silently redefine the machine.
+#
+# Claude Code is read the same way: "claude_mode" out of client.json. "full"
+# re-applies `ferry claude --host/--port`; anything else — "none", or the key
+# absent on a pre-claude profile — means the machine never opted in, and the
+# step is skipped. A reset re-applies scope, it never widens it.
 
 set -eu
 
@@ -39,7 +53,7 @@ for arg in "$@"; do
     --profiles-only) OC_MODE_OVERRIDE="profiles" ;;
     --full-opencode) OC_MODE_OVERRIDE="full" ;;
     -h|--help)
-      sed -n '2,30p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+      sed -n '2,40p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
       echo ""
       echo "Flags: --profiles-only | --no-opencode | --full-opencode | --help"
       exit 0 ;;
@@ -76,7 +90,7 @@ try:
     c = json.load(open(sys.argv[1]))
 except Exception:
     c = {}
-print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}")
+print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}")
 PYEOF
 )
   # Peel the fields off one at a time. A `##*\t` shortcut for the last field
@@ -84,7 +98,8 @@ PYEOF
   saved_host="${saved%%$'\t'*}";  rest="${saved#*$'\t'}"
   saved_share="${rest%%$'\t'*}";  rest="${rest#*$'\t'}"
   saved_port="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
-  saved_mode="${rest%%$'\t'*}"
+  saved_mode="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
+  saved_claude="${rest%%$'\t'*}"
 fi
 
 # The override is per-run; the profile is the default; a profile written before
@@ -96,6 +111,18 @@ case "$OC_MODE" in
      echo "       Expected full, profiles or none. Pass --full-opencode /"
      echo "       --profiles-only / --no-opencode to override for this run."
      exit 1 ;;
+esac
+
+# Claude Code scope: the profile's own decision. The key is absent on a
+# pre-claude profile and that reads as "none" — a reset must not widen a
+# machine any more than it re-widens opencode. An unrecognised value is
+# treated as none with a warning, not an error: unlike the opencode scope
+# there is no flag to override it with, and skipping is the safe direction.
+CLAUDE_MODE="${saved_claude:-none}"
+case "$CLAUDE_MODE" in
+  full|none) ;;
+  *) echo "Warning: unrecognised claude_mode '$CLAUDE_MODE' in $CLIENT_JSON — skipping Claude Code."
+     CLAUDE_MODE="none" ;;
 esac
 
 [[ "$HOST_NAME"  == "HOST_MDNS_PLACEHOLDER"  ]] && HOST_NAME="$saved_host"
@@ -113,6 +140,10 @@ case "$OC_MODE" in
   full)     echo "opencode scope: FULL (opencode's own config + both ferry profiles)" ;;
   profiles) echo "opencode scope: PROFILES ONLY (~/.config/opencode untouched)" ;;
   none)     echo "opencode scope: NONE (CLI re-pull only)" ;;
+esac
+case "$CLAUDE_MODE" in
+  full) echo "claude scope:   FULL (claude-ferry / claude-ferry-local re-applied)" ;;
+  none) echo "claude scope:   NONE (skipped)" ;;
 esac
 [[ -n "$OC_MODE_OVERRIDE" ]] && echo "                (flag override for this run; client.json is not rewritten)"
 echo "================================================================="
@@ -161,6 +192,7 @@ echo "    \033[1;32mCLI updated: $FERRY_BIN\033[0m"
 # before it is written, so this is reversible.
 echo ""
 RESET_FAILED=0
+CLAUDE_APPLIED=0
 if [[ "$OC_MODE" == "none" ]]; then
   echo ">>> opencode scope is 'none' — no config written."
   echo "    The CLI above is up to date, which is the whole reset for this machine."
@@ -196,6 +228,31 @@ for oc_target in "${oc_targets[@]}"; do
   fi
 done
 
+# --- 3. Re-apply the Claude Code wiring --------------------------------------
+# The one deliberate ~/.zshrc exception (see the header): the opencode WRAPPER
+# block is bootstrap-only, but the claude wiring MUST be re-applied here so a
+# plain `ferry update` + reset delivers this release's claude support to an
+# already-bootstrapped machine. `ferry claude` rewrites its own marker block;
+# client.json is never rewritten, so the recorded scope cannot drift.
+if [[ "$CLAUDE_MODE" != "none" ]]; then
+  echo ""
+  echo ">>> Re-applying the Claude Code wiring..."
+  # Same explicit --host/--port as the opencode calls above: without them a
+  # CLI that cannot find a client profile decides it is ON the host and wires
+  # everything to 127.0.0.1. env -u OPENCODE_CONFIG for the same reason.
+  if ! env -u OPENCODE_CONFIG "$FERRY_BIN" claude \
+        --host "$HOST_NAME" --port "$HOST_PORT"; then
+    # Warning, not fatal: the re-pull and opencode takeover — a reset's core
+    # contract — already succeeded, and a failed claude step must not turn
+    # every reset red while the release rolls out to hosts at different speeds.
+    echo "    WARNING: 'ferry claude' failed. The claude-ferry /"
+    echo "    claude-ferry-local wrappers in ~/.zshrc may be missing or stale."
+    echo "    Check the host serves a current CLI, then re-run this script."
+  else
+    CLAUDE_APPLIED=1
+  fi
+fi
+
 echo ""
 echo "================================================================="
 if [[ $RESET_FAILED -eq 1 ]]; then
@@ -213,4 +270,8 @@ if [[ "$OC_MODE" == "profiles" ]]; then
 fi
 echo "Shell wrappers (opencode / opencode-cloud / opencode-local) are NOT touched"
 echo "by a reset — re-run client-bootstrap.sh if those need refreshing."
+if [[ $CLAUDE_APPLIED -eq 1 ]]; then
+  echo "Claude Code wiring re-applied: claude-ferry / claude-ferry-local in ~/.zshrc"
+  echo "(claude_mode scope from client.json; its block is the one ~/.zshrc write a reset makes)."
+fi
 echo "================================================================="

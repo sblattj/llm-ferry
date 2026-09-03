@@ -16,7 +16,7 @@ cd "${0:A:h}"
 # Assembly order matters: the core bootstrap runs at load time (it defines
 # constants and probes the LAN), the command functions follow, and the dispatch
 # parser MUST come last so every cmd_* it calls is already defined.
-MODULES=(core usage install serve share inbox relay transfer drop proxy integrate dash update main)
+MODULES=(core usage install serve share inbox relay transfer drop proxy integrate claude dash update main)
 
 build_to() {
   local out="$1" m

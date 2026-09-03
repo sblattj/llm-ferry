@@ -187,6 +187,15 @@ class TestShippedClientScripts(unittest.TestCase):
         listed = set(re.findall(r'"([^"]+)"', m.group(1)))
         self.assertEqual(listed, set(CLIENT_SCRIPTS))
 
+    def test_the_share_server_never_injects_the_master_key(self):
+        # The share server is unauthenticated, so the v1.22.0 master key must
+        # never ride the served script — that would publish it to the LAN.
+        # Comment lines may DOCUMENT the omission; no code may reference it.
+        code = "\n".join(line for line in read_repo("lib", "ferry-share.zsh").splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertNotIn("master_key", code)
+        self.assertNotIn("MASTER_KEY", code)
+
     def test_reset_validates_the_download_before_overwriting(self):
         # A share server that is down, or a proxy serving an error page, must not
         # be able to replace a working CLI with an HTML 404.

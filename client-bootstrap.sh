@@ -7,6 +7,15 @@
 #   curl -fsSL http://<host>:<share-port>/client-bootstrap.sh | zsh
 #   curl -fsSL http://<host>:<share-port>/client-bootstrap.sh | zsh -s -- --profiles-only
 #   curl -fsSL http://<host>:<share-port>/client-bootstrap.sh | zsh -s -- --no-opencode
+#   FERRY_MASTER_KEY=<key> curl -fsSL http://<host>:<share-port>/client-bootstrap.sh | zsh
+#   curl -fsSL http://<host>:<share-port>/client-bootstrap.sh | zsh -s -- --key <key>
+#
+# THE MASTER KEY (v1.22.0): a host may require a shared key on its inference
+# front door (/v1/models answers 401 without it). The key is OPTIONAL — hosts
+# without auth never see one. When given (env FERRY_MASTER_KEY, or --key which
+# wins), it is stored as "master_key" in ~/.config/ferry/client.json, carried
+# on every connectivity probe, and picked up from the profile by the ferry CLI
+# when it wires the opencode/claude configs. The key is never echoed.
 #
 # HOW MUCH OF OPENCODE THIS TOUCHES is a flag, because the answer is not the same
 # on a laptop that already has an opencode setup of its own. Three modes:
@@ -41,11 +50,16 @@ set -eu
 OC_MODE="full"
 GUARDRAILS=""   # empty = follow the mode; 1/0 = explicit --with/--no-guardrails
 NO_CLAUDE=0
+# The shared master key (v1.22.0): optional. Env first; an explicit --key wins.
+MASTER_KEY="${FERRY_MASTER_KEY:-}"
 
 usage() {
-  sed -n '2,35p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+  sed -n '2,43p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
   echo ""
   echo "Flags: --profiles-only | --no-opencode | --full-opencode"
+  echo "       --key KEY   (master key for a host whose front door requires"
+  echo "         one; FERRY_MASTER_KEY in the environment is the other way in,"
+  echo "         and an explicit --key wins)"
   echo "       --with-guardrails | --no-guardrails   (the /fan-out command and the"
   echo "         spawning-subagents skill, which live in ~/.config/opencode/;"
   echo "         on by default in full mode, off in the other two)"
@@ -54,18 +68,44 @@ usage() {
   echo "       -h | --help"
 }
 
-for arg in "$@"; do
-  case "$arg" in
-    --no-opencode)     OC_MODE="none" ;;
-    --profiles-only)   OC_MODE="profiles" ;;
-    --full-opencode)   OC_MODE="full" ;;
-    --with-guardrails) GUARDRAILS=1 ;;
-    --no-guardrails)   GUARDRAILS=0 ;;
-    --no-claude)       NO_CLAUDE=1 ;;
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-opencode)     OC_MODE="none"; shift ;;
+    --profiles-only)   OC_MODE="profiles"; shift ;;
+    --full-opencode)   OC_MODE="full"; shift ;;
+    --with-guardrails) GUARDRAILS=1; shift ;;
+    --no-guardrails)   GUARDRAILS=0; shift ;;
+    --no-claude)       NO_CLAUDE=1; shift ;;
+    --key)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "Error: --key needs a value"; exit 1
+      fi
+      MASTER_KEY="$2"; shift 2 ;;
+    --key=*)
+      MASTER_KEY="${1#--key=}"; shift ;;
     -h|--help)         usage; exit 0 ;;
-    *) echo "Unknown flag: $arg"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --with-guardrails, --no-guardrails, --no-claude, --help"; exit 1 ;;
+    *) echo "Unknown flag: $1"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --key KEY, --with-guardrails, --no-guardrails, --no-claude, --help"; exit 1 ;;
   esac
 done
+
+# The profile writer below is a heredoc, so a key carrying a quote, a
+# backslash or a control character would corrupt client.json for every reader
+# that parses it as JSON. Refuse rather than write a broken profile.
+if [[ -n "$MASTER_KEY" ]] && printf '%s' "$MASTER_KEY" | grep -q '[[:cntrl:]"\\]'; then
+  echo "Error: the master key contains a quote, backslash or control character"
+  echo "       and cannot be stored safely in client.json. Refusing."
+  exit 1
+fi
+
+# Hand-config hint phrasing. Once a key is in play, the hand-written configs
+# need it as their apiKey / bearer — but the VALUE is never printed.
+if [[ -n "$MASTER_KEY" ]]; then
+  APIKEY_HINT="your ferry master key (stored as master_key in ~/.config/ferry/client.json)"
+  BEARER_HINT="your ferry master key"
+else
+  APIKEY_HINT="'local'"
+  BEARER_HINT="any bearer token"
+fi
 
 # Guardrails default off outside full mode: both files land in ~/.config/opencode,
 # which is exactly what the narrower modes exist to leave alone.
@@ -104,6 +144,31 @@ case "$OC_MODE" in
 esac
 echo "================================================================="
 
+# Probe /v1/models on $1 and print its HTTP status (000 = unreachable). When a
+# key is known it rides the probe — a v1.22.0 host answers 401 without it.
+# The status code (not curl -f) is what the flow branches on, so a 401 can be
+# told apart from "host not there" and hinted at properly.
+probe_host() {
+  local code
+  if [[ -n "$MASTER_KEY" ]]; then
+    code=$(curl -sS -m 3 -o /dev/null -w '%{http_code}' \
+             -H "Authorization: Bearer $MASTER_KEY" \
+             "http://$1:$HOST_PORT/v1/models" 2>/dev/null)
+  else
+    code=$(curl -sS -m 3 -o /dev/null -w '%{http_code}' \
+             "http://$1:$HOST_PORT/v1/models" 2>/dev/null)
+  fi
+  echo "${code:-000}"
+}
+
+# The host answered 401 to a Bearer-less probe: it is UP, it just wants the
+# key. No point prompting for another hostname or configuring against it —
+# say so and stop. (Never prints the key itself.)
+key_required_hint() {
+  echo "    \033[1;31mThis ferry requires a key — re-run with FERRY_MASTER_KEY=... or --key ...\033[0m"
+  exit 1
+}
+
 # 1. Resolve the host. Try, in order, WITHOUT ever prompting first:
 #    (a) the share server's injected mDNS name (normal case — no prompt at all)
 #    (b) the host saved by a previous run in ~/.config/ferry/client.json
@@ -111,9 +176,13 @@ echo "================================================================="
 #        flaky on some corp networks, so accept an IP too).
 # The prompt only appears when every automatic candidate fails.
 echo ">>> Probing host at http://$HOST_NAME:$HOST_PORT..."
-if curl -fsS -m 3 "http://$HOST_NAME:$HOST_PORT/v1/models" >/dev/null 2>&1; then
+probe=$(probe_host "$HOST_NAME")
+if [[ "$probe" == 2* ]]; then
   echo "    \033[1;32mSUCCESS: Connected to host inference server!\033[0m"
 else
+  if [[ "$probe" == "401" && -z "$MASTER_KEY" ]]; then
+    key_required_hint
+  fi
   # (b) last-known host from a previous bootstrap
   SAVED_HOST=""
   if [[ -f "$HOME/.config/ferry/client.json" ]]; then
@@ -122,9 +191,13 @@ else
   if [[ -n "$SAVED_HOST" && "$SAVED_HOST" != "$HOST_NAME" ]]; then
     echo ">>> First probe failed; retrying with last-known host $SAVED_HOST..."
     HOST_NAME="$SAVED_HOST"
-    if curl -fsS -m 3 "http://$HOST_NAME:$HOST_PORT/v1/models" >/dev/null 2>&1; then
+    probe=$(probe_host "$HOST_NAME")
+    if [[ "$probe" == 2* ]]; then
       echo "    \033[1;32mSUCCESS: Connected to host inference server at $HOST_NAME!\033[0m"
     else
+      if [[ "$probe" == "401" && -z "$MASTER_KEY" ]]; then
+        key_required_hint
+      fi
       HOST_NAME=""
     fi
   else
@@ -144,8 +217,11 @@ else
     if [[ -n "${NEW_HOST_NAME:-}" ]]; then
       HOST_NAME="$NEW_HOST_NAME"
       echo ">>> Probing new host at http://$HOST_NAME:$HOST_PORT..."
-      if curl -fsS -m 3 "http://$HOST_NAME:$HOST_PORT/v1/models" >/dev/null 2>&1; then
+      probe=$(probe_host "$HOST_NAME")
+      if [[ "$probe" == 2* ]]; then
         echo "    \033[1;32mSUCCESS: Connected to host inference server at $HOST_NAME!\033[0m"
+      elif [[ "$probe" == "401" && -z "$MASTER_KEY" ]]; then
+        key_required_hint
       else
         echo "    \033[1;33mWARNING: Still could not connect to $HOST_NAME:$HOST_PORT.\033[0m"
         echo "    We will proceed with configuring client shortcuts anyway."
@@ -193,13 +269,20 @@ mkdir -p "$HOME/.config/ferry"
 # claude_mode is the same idea for the Claude Code wrappers: full when they
 # were installed, none when --no-claude was passed or no `claude` CLI exists.
 # Absent on a pre-claude profile reads as "none" — a reset never widens.
+# master_key rides in the profile ONLY when a key was supplied. Its absence is
+# how every reader (client-reset.sh, the ferry CLI) knows this host takes no
+# key — so the JSON shape below is byte-stable when MASTER_KEY is empty.
+MASTER_KEY_JSON=""
+if [[ -n "$MASTER_KEY" ]]; then
+  MASTER_KEY_JSON=$(printf ',\n  "master_key": "%s"' "$MASTER_KEY")
+fi
 cat <<EOF > "$HOME/.config/ferry/client.json"
 {
   "host": "$HOST_NAME",
   "port": "$HOST_PORT",
   "share_port": "$SHARE_PORT",
   "opencode_mode": "$OC_MODE",
-  "claude_mode": "$CLAUDE_MODE"
+  "claude_mode": "$CLAUDE_MODE"${MASTER_KEY_JSON}
 }
 EOF
 echo "    Successfully saved profile: ~/.config/ferry/client.json"
@@ -230,7 +313,7 @@ if [[ "$OC_MODE" == "none" ]]; then
   echo ">>> Skipping opencode configuration (--no-opencode)."
   echo "    Nothing under ~/.config/opencode or ~/.config/ferry/opencode-*.json was"
   echo "    written. To route an OpenAI-compatible client at the host by hand:"
-  echo "      baseURL http://$HOST_NAME:$HOST_PORT/v1, apiKey 'local', and a LANE"
+  echo "      baseURL http://$HOST_NAME:$HOST_PORT/v1, apiKey $APIKEY_HINT, and a LANE"
   echo "      NAME from http://$HOST_NAME:$HOST_PORT/v1/models."
 else
   echo ">>> Auto-configuring 'opencode' to route through the host..."
@@ -266,7 +349,7 @@ fi
 if [[ $OC_FAILED -eq 1 ]]; then
   echo "    WARNING: 'ferry opencode' failed for at least one target. Wire opencode"
   echo "    manually: an openai-compatible provider with baseURL=http://$HOST_NAME:$HOST_PORT/v1,"
-  echo "    apiKey=local, and a LANE NAME from http://$HOST_NAME:$HOST_PORT/v1/models."
+  echo "    apiKey=$APIKEY_HINT, and a LANE NAME from http://$HOST_NAME:$HOST_PORT/v1/models."
 fi
 
 # Setup shell alias in .zshrc. In full mode `host-code` rides on the bare
@@ -592,7 +675,7 @@ else
 fi
 if [[ $CLAUDE_FAILED -eq 1 ]]; then
   echo "    WARNING: 'ferry claude' failed. By hand: point Claude Code's"
-  echo "    ANTHROPIC_BASE_URL at http://$HOST_NAME:$HOST_PORT (any bearer token),"
+  echo "    ANTHROPIC_BASE_URL at http://$HOST_NAME:$HOST_PORT ($BEARER_HINT),"
   echo "    or re-run this script / client-reset.sh."
 fi
 
@@ -635,7 +718,7 @@ case "$OC_MODE" in
   none)
     echo ">>> OPENCODE WAS NOT CONFIGURED (--no-opencode)."
     echo "    Point any OpenAI-compatible client at the host yourself:"
-    echo "      baseURL http://$HOST_NAME:$HOST_PORT/v1   apiKey local"
+    echo "      baseURL http://$HOST_NAME:$HOST_PORT/v1   apiKey $APIKEY_HINT"
     echo "      model   a LANE NAME from http://$HOST_NAME:$HOST_PORT/v1/models"
     echo "    Or re-run this script with --profiles-only for ferry-owned opencode"
     echo "    profiles that leave ~/.config/opencode alone."
@@ -659,8 +742,8 @@ case "$CLAUDE_MODE" in
     else
       echo ">>> CLAUDE CODE WAS NOT CONFIGURED (no 'claude' CLI on PATH)."
     fi
-    echo "    By hand: ANTHROPIC_BASE_URL=http://$HOST_NAME:$HOST_PORT (any bearer"
-    echo "    token), model = a LANE NAME (heavy/flash cloud, local-orch/local-sub GPU)."
+    echo "    By hand: ANTHROPIC_BASE_URL=http://$HOST_NAME:$HOST_PORT ($BEARER_HINT),"
+    echo "    model = a LANE NAME (heavy/flash cloud, local-orch/local-sub GPU)."
     ;;
 esac
 echo ""

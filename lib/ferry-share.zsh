@@ -94,6 +94,7 @@ class DynamicHandler(SimpleHTTPRequestHandler):
                         content = f.read()
                     content = content.replace("HOST_MDNS_PLACEHOLDER", mdns_name)
                     content = content.replace("SHARE_PORT_PLACEHOLDER", str(port))
+                    # v1.22.0: master_key deliberately does NOT ride this channel — the share server is unauthenticated, so injecting the key here would publish it to the whole LAN (clients bring it via FERRY_MASTER_KEY / --key, or it travels in client.json after they supply it).
                     # Also rewrite the script's own your-host.local fallback, so
                     # even the no-injection code path lands on the real host.
                     content = content.replace("your-host.local", mdns_name)

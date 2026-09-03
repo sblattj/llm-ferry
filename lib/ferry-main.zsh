@@ -30,6 +30,7 @@ case "$COMMAND" in
   serve-proxy)   cmd_serve_proxy "$@" ;;
   env)           cmd_env "$@" ;;
   opencode)      cmd_opencode "$@" ;;
+  claude)        cmd_claude "$@" ;;
   update)        cmd_update "$@" ;;
   dash)          cmd_dash "$@" ;;
   --help|-h)     usage ;;

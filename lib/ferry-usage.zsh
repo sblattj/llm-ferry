@@ -36,7 +36,11 @@ Commands:
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
   opencode           [Client] Auto-wire opencode to route through the host (detects served models)
-                       ferry opencode [--host H] [--port P] [--config PATH] [--model M] [--small-model SM] [--no-default]
+                        ferry opencode [--host H] [--port P] [--config PATH] [--model M] [--small-model SM] [--no-default]
+  claude             [Dual] Wire Claude Code to the ferry endpoint: installs the
+                       claude-ferry / claude-ferry-local wrappers (cloud: heavy/flash,
+                       local: local-orch/local-sub) and records the lane map
+                        ferry claude [--host H] [--port P] [--wrappers]
 
 Ferrying models & files across the LAN:
   offer <path>...    [Host] Record files/dirs in ~/.config/ferry/offered.json for clients to fetch

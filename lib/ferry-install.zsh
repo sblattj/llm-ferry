@@ -141,6 +141,13 @@ cmd_install() {
   # and no way to select between them.
   _ferry_install_host_wrappers
 
+  # The claude-ferry / claude-ferry-local shell wrappers, same deal: clients
+  # got them via client-bootstrap.sh, so the host needed its own copy pointed
+  # at the local front door.
+  if (( $+functions[_ferry_install_claude_wrappers] )); then
+    _ferry_install_claude_wrappers 127.0.0.1 "$PORT"
+  fi
+
   # Link globally to ~/.local/bin/ferry (+ the ferry-dash companion)
   echo ">>> Creating global symlinks in ~/.local/bin (ferry, ferry-dash)..."
   mkdir -p "$HOME/.local/bin"

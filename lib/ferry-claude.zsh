@@ -21,9 +21,10 @@ _ferry_install_claude_wrappers() {
   touch "$rc"
 
   # Strip the canonical block, then re-add. Legacy `alias claude-ferry=` /
-  # `alias claude-ferry-local=` lines go too: an alias ABOVE a function of the
-  # same name makes zsh expand the alias inside `name() {`, a parse error on
-  # every subsequent `source ~/.zshrc` (same footgun client-bootstrap.sh strips).
+  # `alias claude-ferry-local=` / `alias claude-ferry-super=` lines go too: an
+  # alias ABOVE a function of the same name makes zsh expand the alias inside
+  # `name() {`, a parse error on every subsequent `source ~/.zshrc` (same
+  # footgun client-bootstrap.sh strips).
   python3 - "$rc" "$FERRY_CL_MARK_START" "$FERRY_CL_MARK_END" <<'PYEOF'
 import sys
 rc, start, end = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -45,7 +46,9 @@ for ln in lines:
 
 def is_legacy_alias(l):
     t = l.lstrip()
-    return t.startswith("alias claude-ferry=") or t.startswith("alias claude-ferry-local=")
+    return (t.startswith("alias claude-ferry=")
+            or t.startswith("alias claude-ferry-local=")
+            or t.startswith("alias claude-ferry-super="))
 
 out = [l for l in out if not is_legacy_alias(l)]
 
@@ -79,7 +82,7 @@ PYEOF
 # tool, and wrapping it would hijack sessions they never asked to route
 # anywhere. Env is scoped with `env`, so it reaches the claude child process
 # only and never leaks into the interactive shell.
-unalias claude-ferry claude-ferry-local 2>/dev/null
+unalias claude-ferry claude-ferry-local claude-ferry-super 2>/dev/null
 
 # claude-ferry: the CLOUD pair — heavy drives, flash runs subagents and the
 # haiku-slot background calls.
@@ -111,6 +114,20 @@ claude-ferry-local() {
       CLAUDE_CODE_DISABLE_THINKING=1 \
       command claude "$@"
 }
+
+# claude-ferry-super: heavy drives; super-flash covers background tasks AND
+# subagents. The cheapest cloud profile.
+claude-ferry-super() {
+  env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
+      ANTHROPIC_AUTH_TOKEN=local \
+      ANTHROPIC_MODEL=heavy \
+      ANTHROPIC_DEFAULT_HAIKU_MODEL=super-flash \
+      CLAUDE_CODE_SUBAGENT_MODEL=super-flash \
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000 \
+      CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1 \
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+      command claude "$@"
+}
 # <<< ferry claude profiles <<<
 EOF
 )
@@ -119,8 +136,9 @@ EOF
   print -r -- "$block" >> "$rc"
 
   echo ">>> claude shell wrappers installed in $rc:"
-  echo "    claude-ferry       -> cloud pair: heavy drives, flash fans out"
-  echo "    claude-ferry-local -> GPU pair:   local-orch drives, local-sub fans out"
+  echo "    claude-ferry        -> cloud pair: heavy drives, flash fans out"
+  echo "    claude-ferry-local  -> GPU pair:   local-orch drives, local-sub fans out"
+  echo "    claude-ferry-super  -> super pair: heavy drives, super-flash covers the rest"
   echo "    (bare 'claude' is untouched — run: source $rc)"
 }
 

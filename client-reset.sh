@@ -186,8 +186,8 @@ chmod +x "$FERRY_BIN"
 echo "    \033[1;32mCLI updated: $FERRY_BIN\033[0m"
 
 # --- 2. Re-apply the opencode takeover --------------------------------------
-# Same three targets the bootstrap writes: opencode's own default config (for a
-# bare `command opencode` or a non-zsh shell) plus the two ferry profiles the
+# Same targets the bootstrap writes: opencode's own default config (for a bare
+# `command opencode` or a non-zsh shell) plus the three ferry profiles the
 # wrapper functions select between. Each is snapshotted to <name>.<UTC>.jsonc
 # before it is written, so this is reversible.
 echo ""
@@ -203,6 +203,7 @@ else
   oc_targets=(
     "$HOME/.config/ferry/opencode-cloud.json|"
     "$HOME/.config/ferry/opencode-local.json|--local"
+    "$HOME/.config/ferry/opencode-super.json|--super"
   )
   # opencode's OWN config joins the list only in full scope — see the header.
   if [[ "$OC_MODE" == "full" ]]; then
@@ -220,8 +221,8 @@ for oc_target in "${oc_targets[@]}"; do
   # by running this script against a scratch HOME, where exactly that happened.
   #
   # env -u OPENCODE_CONFIG: `ferry opencode` honours that variable as its
-  # default target, so a shell that exports one would redirect all three writes
-  # onto the same file.
+  # default target, so a shell that exports one would redirect all of these
+  # writes onto the same file.
   if ! env -u OPENCODE_CONFIG "$FERRY_BIN" opencode \
         --host "$HOST_NAME" --port "$HOST_PORT" --config "$oc_path" $oc_flag; then
     RESET_FAILED=1

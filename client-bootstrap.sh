@@ -207,9 +207,9 @@ echo "    Successfully saved profile: ~/.config/ferry/client.json"
 # 3. Automatic opencode configuration (the one supported integration; everything
 # else can point an OpenAI-compatible client at http://HOST:8090/v1 by hand).
 # No lane question: the host predetermines the models behind each lane, the
-# `opencode-cloud` / `opencode-local` wrappers pick a pair per invocation, and
-# bare `opencode` follows whichever wrapper ran last (cloud until then). So the
-# persistent default written here is always the cloud pair.
+# `opencode-cloud` / `opencode-local` / `opencode-super` wrappers pick a pair
+# per invocation, and bare `opencode` follows whichever wrapper ran last (cloud
+# until then). So the persistent default written here is always the cloud pair.
 #
 # MECHANISM NOTE: opencode takes config via OPENCODE_CONFIG (a FILE PATH), not
 # an env var holding JSON — an invented OPENCODE_CONFIG_CONTENT is silently
@@ -235,13 +235,14 @@ if [[ "$OC_MODE" == "none" ]]; then
 else
   echo ">>> Auto-configuring 'opencode' to route through the host..."
   mkdir -p "$HOME/.config/ferry"
-  # target|extra-flags. The two ferry profiles the wrappers select between are
-  # always written — they are ferry's own files. opencode's OWN default config
-  # is in the list only in full mode: --profiles-only exists precisely so that
-  # a laptop with its own opencode setup keeps it.
+  # target|extra-flags. The three ferry profiles the wrappers select between
+  # are always written — they are ferry's own files. opencode's OWN default
+  # config is in the list only in full mode: --profiles-only exists precisely
+  # so that a laptop with its own opencode setup keeps it.
   oc_targets=(
     "$HOME/.config/ferry/opencode-cloud.json|"
     "$HOME/.config/ferry/opencode-local.json|--local"
+    "$HOME/.config/ferry/opencode-super.json|--super"
   )
   if [[ "$OC_MODE" == "full" ]]; then
     oc_targets=("$HOME/.config/opencode/opencode.json|" "${oc_targets[@]}")
@@ -320,7 +321,8 @@ else
   echo "$PATH_LINE" > "$ZSHRC"
 fi
 
-# Ensure opencode profile functions (opencode-cloud, opencode-local) are in ~/.zshrc.
+# Ensure opencode profile functions (opencode-cloud, opencode-local,
+# opencode-super) are in ~/.zshrc.
 # --no-opencode installs none of them and, deliberately, does not remove a block
 # an earlier run left behind either: silently deleting shell functions the user
 # may still be using is its own surprise. It says so instead.
@@ -362,7 +364,8 @@ for ln in lines:
 # is written, so a user's own `alias opencode=...` is theirs to keep.
 def is_legacy_alias(l):
     t = l.lstrip()
-    if t.startswith("alias opencode-cloud=") or t.startswith("alias opencode-local="):
+    if (t.startswith("alias opencode-cloud=") or t.startswith("alias opencode-local=")
+            or t.startswith("alias opencode-super=")):
         return True
     return mode == "full" and t.startswith("alias opencode=")
 out = [l for l in out if not is_legacy_alias(l)]
@@ -374,7 +377,7 @@ with open(rc, "w") as f:
         f.write("\n")
 PYEOF
 
-# The two profile FILES the wrappers below select between were already written
+# The three profile FILES the wrappers below select between were already written
 # by `ferry opencode` in step 3 — this block only installs the wrappers.
 #
 # QUOTED heredoc: the body is written VERBATIM (no $, backtick, or quote
@@ -382,10 +385,11 @@ PYEOF
 if [[ "$OC_MODE" == "profiles" ]]; then
 cat <<'EOF' >> "$ZSHRC"
 # >>> ferry opencode profiles >>>
-# --profiles-only: the two NAMED wrappers and nothing else. There is deliberately
-# no bare `opencode` function here, so plain `opencode` keeps using whatever
-# config this machine already had — ferry is opt-in, per invocation.
-unalias opencode-cloud opencode-local 2>/dev/null
+# --profiles-only: the three NAMED wrappers and nothing else. There is
+# deliberately no bare `opencode` function here, so plain `opencode` keeps
+# using whatever config this machine already had — ferry is opt-in, per
+# invocation.
+unalias opencode-cloud opencode-local opencode-super 2>/dev/null
 
 # opencode-cloud: the CLOUD pair — orch drives (build/plan), flash runs the
 # fan-out and the housekeeping models. Nothing touches the host GPU.
@@ -399,9 +403,15 @@ opencode-local() {
   OPENCODE_CONFIG="$HOME/.config/ferry/opencode-local.json" command opencode "$@"
 }
 
+# opencode-super: heavy drives; super-flash runs the fan-out AND the
+# housekeeping (title/summary/compaction). The cheapest cloud profile.
+opencode-super() {
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-super.json" command opencode "$@"
+}
+
 # <<< ferry opencode profiles <<<
 EOF
-echo "    Added opencode-cloud / opencode-local to ~/.zshrc."
+echo "    Added opencode-cloud / opencode-local / opencode-super to ~/.zshrc."
 echo "    Bare 'opencode' was NOT wrapped (--profiles-only)."
 else
 cat <<'EOF' >> "$ZSHRC"
@@ -409,18 +419,23 @@ cat <<'EOF' >> "$ZSHRC"
 # Defensive: an alias with a function's name anywhere earlier in the file (or in
 # the live shell) breaks the definitions below with "defining function based on
 # alias". Kill them first.
-unalias opencode opencode-cloud opencode-local 2>/dev/null
+unalias opencode opencode-cloud opencode-local opencode-super 2>/dev/null
 
 # Bare `opencode` routes through whichever lane you used LAST (cloud until you
-# first run opencode-local). An explicit OPENCODE_CONFIG always wins, so other
-# tools/wrappers passing their own config are unaffected.
+# first run opencode-local or opencode-super). An explicit OPENCODE_CONFIG
+# always wins, so other tools/wrappers passing their own config are unaffected.
 opencode() {
   if [[ -n "${OPENCODE_CONFIG:-}" ]]; then
     command opencode "$@"
     return
   fi
+  local lane="$(cat "$HOME/.config/ferry/last-lane" 2>/dev/null)"
   local cfg="$HOME/.config/ferry/opencode-cloud.json"
-  [[ "$(cat "$HOME/.config/ferry/last-lane" 2>/dev/null)" == "local" ]] && cfg="$HOME/.config/ferry/opencode-local.json"
+  if [[ "$lane" == "super" ]]; then
+    cfg="$HOME/.config/ferry/opencode-super.json"
+  elif [[ "$lane" == "local" ]]; then
+    cfg="$HOME/.config/ferry/opencode-local.json"
+  fi
   OPENCODE_CONFIG="$cfg" command opencode "$@"
 }
 
@@ -438,6 +453,14 @@ opencode-cloud() {
 opencode-local() {
   mkdir -p "$HOME/.config/ferry" && printf 'local\n' > "$HOME/.config/ferry/last-lane"
   OPENCODE_CONFIG="$HOME/.config/ferry/opencode-local.json" command opencode "$@"
+}
+
+# opencode-super: heavy drives; super-flash runs the fan-out AND the
+# housekeeping (title/summary/compaction). The cheapest cloud profile. Sets the
+# bare-`opencode` default.
+opencode-super() {
+  mkdir -p "$HOME/.config/ferry" && printf 'super\n' > "$HOME/.config/ferry/last-lane"
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-super.json" command opencode "$@"
 }
 
 # <<< ferry opencode profiles <<<
@@ -591,15 +614,19 @@ case "$OC_MODE" in
     echo ">>> OPENCODE CLI INSTANT ACCESS:"
     echo "    You can now call the host model using standard commands:"
     echo "    \033[1;32mhost-code run \"Build a snake game in Python\"\033[0m"
-    echo "    opencode-cloud   -> cloud pair: orch drives, flash fans out"
-    echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
+    echo "    opencode-cloud   -> cloud pair:  orch drives, flash fans out"
+    echo "    opencode-local   -> GPU pair:    local-orch drives, local-sub fans out"
+    echo "    opencode-super   -> super pair:  heavy drives, super-flash fans out"
+    echo "                     AND keeps house (title/summary/compaction)"
     echo "    bare 'opencode'  -> whichever pair you used LAST (cloud until you first"
-    echo "                       run opencode-local)"
+    echo "                       run opencode-local or opencode-super)"
     ;;
   profiles)
     echo ">>> OPENCODE, OPT-IN PER INVOCATION:"
-    echo "    opencode-cloud   -> cloud pair: orch drives, flash fans out"
-    echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
+    echo "    opencode-cloud   -> cloud pair:  orch drives, flash fans out"
+    echo "    opencode-local   -> GPU pair:    local-orch drives, local-sub fans out"
+    echo "    opencode-super   -> super pair:  heavy drives, super-flash fans out"
+    echo "                     AND keeps house (title/summary/compaction)"
     echo "    bare 'opencode'  -> UNCHANGED. Your own config, exactly as it was."
     echo "    Without the wrappers, the same thing by hand:"
     echo "      OPENCODE_CONFIG=~/.config/ferry/opencode-cloud.json opencode ..."

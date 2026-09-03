@@ -34,6 +34,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -101,10 +102,11 @@ class FerryOpencodeCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.cfg = os.path.join(self.dir, "opencode.json")
 
-    def run_ferry(self, *extra, config=None):
+    def run_ferry(self, *extra, config=None, port=None):
         cfg = config or self.cfg
         cmd = ["zsh", FERRY, "opencode", "--host", "127.0.0.1",
-               "--port", str(self.port), "--config", cfg, *extra]
+               "--port", str(port if port is not None else self.port),
+               "--config", cfg, *extra]
         # env -u OPENCODE_CONFIG equivalent: the command honours it as the
         # default target, and an inherited one would silently redirect the write.
         env = {k: v for k, v in os.environ.items() if k != "OPENCODE_CONFIG"}
@@ -286,6 +288,61 @@ class TestLaneNamesOnly(FerryOpencodeCase):
         out = self.run_ferry("--model", "no-such-lane")
         self.assertIn("does not serve", out)
         self.assertIn("no-such-lane", out)
+
+
+class TestSuperProfile(FerryOpencodeCase):
+    """`--super` — the cheap cloud profile: heavy drives, super-flash everywhere.
+
+    The worker AND housekeeper roles collapse onto super-flash (general/explore/
+    title/summary/compaction and small_model), while build/plan and the model
+    stay on heavy. A later explicit flag must still win over the profile, and
+    the hidden-lane catalogue exemption must extend to super-flash in its new
+    worker role.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # A bound-then-closed port: connection refused, deterministically, which
+        # is the "wires unchecked" path — the config must land anyway.
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        cls.dead_port = s.getsockname()[1]
+        s.close()
+
+    def test_super_wires_the_full_pin_set_with_the_host_unreachable(self):
+        out = self.run_ferry("--super", port=self.dead_port)
+        self.assertIn("Could not query", out,
+                      "the host was supposed to be unreachable")
+        cfg = self.read()
+        self.assertEqual(cfg["model"], "ferry/heavy")
+        self.assertEqual(cfg["small_model"], "ferry/super-flash")
+        agent = cfg["agent"]
+        for a in DRIVER_AGENTS:
+            self.assertEqual(agent[a]["model"], "ferry/heavy")
+        for a in WORKER_AGENTS + HOUSE_AGENTS:
+            self.assertEqual(agent[a]["model"], "ferry/super-flash")
+
+    def test_a_later_explicit_small_model_flag_wins_over_super(self):
+        self.run_ferry("--super", "--small-model", "flash")
+        agent = self.read()["agent"]
+        for a in WORKER_AGENTS:
+            self.assertEqual(agent[a]["model"], "ferry/flash")
+        for a in HOUSE_AGENTS:
+            self.assertEqual(agent[a]["model"], "ferry/super-flash")
+        cfg = self.read()
+        self.assertEqual(cfg["model"], "ferry/heavy")
+        # small_model follows the housekeeper, which --super pinned and the
+        # later flag did not touch.
+        self.assertEqual(cfg["small_model"], "ferry/super-flash")
+
+    def test_super_gets_the_same_hidden_housekeeper_exemption(self):
+        # The stub CATALOGUE omits super-flash exactly as the live host does
+        # (see the CATALOGUE note). Under --super it is the WORKER lane too, so
+        # the check must exempt it there as well or every correct --super setup
+        # warns.
+        out = self.run_ferry("--super")
+        self.assertNotIn("does not serve", out)
 
 
 class TestGoalPlugin(FerryOpencodeCase):

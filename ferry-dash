@@ -365,6 +365,92 @@ def apply_chains(path, chains):
     return snap, d
 
 
+# ── unified order: [primary, ...fallbacks] as one editable list ────────────
+# The Routes editor used to expose only the fallbacks tail, with the primary
+# fixed. The unified model lets a client send the whole lane as one ordered
+# list, position 0 first. Position 0 is VALIDATED, never written: in this
+# config a lane's primary is its own model_name group in model_list, and
+# "promoting" a fallback would mean renaming model_name values — swapping
+# identities between multi-line, comment-dense deployment blocks. That is
+# outside the one-anchored-line doctrine three ways: the comment above a block
+# describes the deployment it names (a rename leaves it on the wrong side of
+# the swap), `public: true` and model_info.id follow the block into a name the
+# catalogue may not want to advertise, and this config carries a SECOND chain
+# map (context_window_fallbacks) this parser does not own, whose hops a rename
+# would silently re-point. So reordering positions 1..n is free; position 0
+# must be the lane's current primary, and anything else is refused with the
+# stable "primary changes not yet supported" prefix the UI can match on.
+ORDER_PRIMARY_ERR = (
+    "primary changes not yet supported: %r would become the primary of lane "
+    "%r, but a lane's primary is its own model_name (the deployment litellm "
+    "tries first); reorder positions 1..n only")
+
+
+def order_to_chains(order):
+    """{lane: [primary, ...fallbacks]} -> the fallbacks-map shape.
+
+    The only transform the unified model needs: drop position 0 and the tail
+    IS a chain for splice_fallbacks."""
+    return {lane: list(seq[1:]) for lane, seq in order.items()}
+
+
+def validate_order(topo, order):
+    """Every reason to refuse a unified-order rewire, as readable strings.
+
+    Adds the order-shape rules on top of validate_chains, which still owns the
+    tail (positions 1..n) so the two validators can never disagree about what
+    litellm fails on silently: list-ness, non-emptiness, position 0 == the
+    lane's own primary, and no duplicate anywhere in the list (the tail's
+    duplicates are validate_chains')."""
+    errs = []
+    tails = {}
+    for lane, seq in order.items():
+        if not isinstance(seq, list):
+            errs.append("lane %r: order must be a list — position 0 the "
+                        "primary, positions 1..n the fallbacks" % lane)
+            continue
+        if not seq:
+            errs.append("lane %r: order may not be empty — position 0 is the "
+                        "primary (the lane itself); an order of just the lane "
+                        "means hard-fail, no fallbacks" % lane)
+            continue
+        if seq[0] != lane:
+            errs.append(ORDER_PRIMARY_ERR % (seq[0], lane))
+        if seq[0] in seq[1:]:
+            errs.append("hop %r appears twice in %s (as primary and as a "
+                        "fallback)" % (lane, lane))
+        tails[lane] = seq[1:]
+    return errs + validate_chains(topo, tails)
+
+
+def diff_order(path, order):
+    """(unified diff, errors) for a proposed rewire in the unified shape.
+
+    Delegates to diff_chains once the order validates, so the preview the UI
+    shows is produced by the same splice the apply will run."""
+    with open(path, errors="replace") as f:
+        old = f.read()
+    errs = validate_order(parse_topology_text(old), order)
+    if errs:
+        return "", errs
+    return diff_chains(path, order_to_chains(order))
+
+
+def apply_order(path, order):
+    """Validate the unified shape, then write through apply_chains.
+
+    Snapshot-before-write, the atomic tmp+rename, and the topology-cache
+    invalidation are apply_chains' — inherited here rather than reimplemented.
+    apply_chains re-reads and re-validates the tail on its own fresh view, so
+    a config that changed between the two reads is still guarded."""
+    with open(path, errors="replace") as f:
+        old = f.read()
+    errs = validate_order(parse_topology_text(old), order)
+    if errs:
+        raise SpliceError("; ".join(errs))
+    return apply_chains(path, order_to_chains(order))
+
+
 # ── proxy-log activity tail ────────────────────────────────────────────────
 class Activity:
     # uvicorn access line: `INFO: 1.2.3.4:5678 - "POST /v1/chat/completions HTTP/1.1" 200 OK`
@@ -605,14 +691,20 @@ class Handler(BaseHTTPRequestHandler):
     # endpoint is not exposed to the LAN the way the ferry proxy itself is.
     def do_POST(self):
         route = self.path.split("?")[0]
-        if route not in ("/api/routes/preview", "/api/routes/apply"):
+        # Legacy shape: {chains: {lane: [fallback, ...]}} (fallbacks only).
+        # Unified shape: {order: {lane: [primary, ...fallbacks]}} — position 0
+        # is the lane's current primary and must be sent back unchanged; only
+        # positions 1..n may be reordered (see ORDER_PRIMARY_ERR).
+        unified = route in ("/api/routes/order/preview", "/api/routes/order/apply")
+        if not (unified or route in ("/api/routes/preview", "/api/routes/apply")):
             self._send(404, "not found", "text/plain")
             return
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            chains = json.loads(self.rfile.read(n) or b"{}").get("chains") or {}
-            if not isinstance(chains, dict):
-                raise ValueError("chains must be an object")
+            key = "order" if unified else "chains"
+            req = json.loads(self.rfile.read(n) or b"{}").get(key) or {}
+            if not isinstance(req, dict):
+                raise ValueError("%s must be an object" % key)
         except Exception as e:
             self._send(400, json.dumps({"errors": ["bad request: %s" % e]}),
                        "application/json")
@@ -621,11 +713,11 @@ class Handler(BaseHTTPRequestHandler):
         path = CFG["config_path"]
         try:
             if route.endswith("/preview"):
-                diff, errs = diff_chains(path, chains)
+                diff, errs = (diff_order if unified else diff_chains)(path, req)
                 self._send(200, json.dumps({"diff": diff, "errors": errs}),
                            "application/json")
             else:
-                snap, diff = apply_chains(path, chains)
+                snap, diff = (apply_order if unified else apply_chains)(path, req)
                 self._send(200, json.dumps({
                     "ok": True, "snapshot": snap, "diff": diff,
                     # litellm has no reload endpoint for a file-backed config

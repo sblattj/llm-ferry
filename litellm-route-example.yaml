@@ -269,6 +269,12 @@ model_list:
       public: true        # advertised in /v1/models
       id: local-sub-mlx
 
+general_settings:
+  # Shared static key every client must present (Authorization: Bearer ...).
+  # Lives in ~/.config/ferry/secrets.env as: export LITELLM_MASTER_KEY=sk-...
+  # host-reset.sh's os.environ validator fails closed if it is unset.
+  master_key: os.environ/LITELLM_MASTER_KEY
+
 litellm_settings:
   # Exposes litellm-native /metrics on :8090 (per-model usage, per-deployment
   # success/failure, fallback events) for the Grafana stack. Requires the

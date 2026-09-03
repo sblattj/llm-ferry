@@ -253,6 +253,7 @@ _ferry_launch_front() {
   # armed" with an empty file forever. It is fail-open and the writes ride a
   # bounded queue off the response path, so on-by-default costs nothing.
   export FERRY_EVENTS="${FERRY_EVENTS:-1}"
+  # Exposure control is the master key, not the bind; Tailscale serve fronts this port.
   nohup "$py" "$front" \
     --config "$config" \
     --port "$port" \
@@ -297,9 +298,12 @@ _ferry_launch_mlx() {
   export APC_ENABLED=1
   [[ -n "$apc_blocks" ]] && export APC_NUM_BLOCKS="$apc_blocks"
 
+  # Internal backends behind the litellm front door: the front door reaches
+  # them on loopback (api_base: http://127.0.0.1:...), so loopback bind is all
+  # they need. Binding 0.0.0.0 exposed unauthenticated inference to the LAN.
   local mlargs=(
     --model "$model"
-    --host 0.0.0.0
+    --host 127.0.0.1
     --port "$port"
   )
   [[ -n "$draft" ]]    && mlargs+=(--draft-model "$draft")

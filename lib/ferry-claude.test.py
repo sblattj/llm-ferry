@@ -246,6 +246,95 @@ class WrapperInstallTest(ClaudeHarness):
                          "ANTHROPIC_BASE_URL leaked into an unsourced shell")
 
 
+class MasterKeyTest(ClaudeHarness):
+    """v1.22.0 — the front door can sit behind a litellm master_key.
+
+    client.json gains an optional `master_key` (or --key passes one); the
+    wrappers then bake it as ANTHROPIC_AUTH_TOKEN instead of the legacy
+    'local', and the claude.json mirror records it — but ONLY when it is a
+    real key: a keyless setup must keep 'local' in the wrappers and no
+    master_key field in the json, exactly as before.
+    """
+
+    PROFILE_KEY = "sk-test-claude-master"
+
+    def write_client_profile(self, master_key=None):
+        fdir = os.path.join(self.home, ".config", "ferry")
+        os.makedirs(fdir, exist_ok=True)
+        prof = {"host": INSTALL_HOST, "port": INSTALL_PORT}
+        if master_key is not None:
+            prof["master_key"] = master_key
+        with open(os.path.join(fdir, "client.json"), "w") as f:
+            json.dump(prof, f)
+
+    def claude_json(self):
+        with open(os.path.join(self.home, ".config", "ferry", "claude.json")) as f:
+            return json.load(f)
+
+    def test_profile_master_key_is_baked_into_all_three_wrappers(self):
+        self.write_client_profile(self.PROFILE_KEY)
+        self.assertEqual(self.run_install().returncode, 0)
+        text = self.rc_text()
+        self.assertEqual(text.count(f"ANTHROPIC_AUTH_TOKEN={self.PROFILE_KEY}"), 3)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN=local", text)
+
+    def test_no_key_keeps_local_and_leaves_no_master_key_in_the_mirror(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.count("ANTHROPIC_AUTH_TOKEN=local"), 3)
+        self.assertNotIn("master_key", self.claude_json())
+
+    def test_profile_key_is_mirrored_into_claude_json(self):
+        self.write_client_profile(self.PROFILE_KEY)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.claude_json()["master_key"], self.PROFILE_KEY)
+
+    def test_the_key_flag_overrides_the_profile(self):
+        self.write_client_profile(self.PROFILE_KEY)
+        self.assertEqual(self.run_install("--key", "sk-flag-key").returncode, 0)
+        text = self.rc_text()
+        self.assertEqual(text.count("ANTHROPIC_AUTH_TOKEN=sk-flag-key"), 3)
+        self.assertNotIn(self.PROFILE_KEY, text)
+        self.assertEqual(self.claude_json()["master_key"], "sk-flag-key")
+
+    def test_a_literal_local_flag_counts_as_keyless(self):
+        # --key local is the keyless default spelled out; the mirror must not
+        # record it as if it were a real credential.
+        self.assertEqual(self.run_install("--key", "local").returncode, 0)
+        self.assertEqual(self.count("ANTHROPIC_AUTH_TOKEN=local"), 3)
+        self.assertNotIn("master_key", self.claude_json())
+
+    def test_re_running_without_a_key_clears_a_stale_baked_key(self):
+        # The block is marker-stripped and rewritten wholesale, so a key
+        # removed from client.json disappears from the wrappers on the next
+        # install instead of surviving as a stale credential.
+        self.write_client_profile(self.PROFILE_KEY)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.write_client_profile()
+        self.assertEqual(self.run_install().returncode, 0)
+        text = self.rc_text()
+        self.assertNotIn(self.PROFILE_KEY, text)
+        self.assertEqual(self.count("ANTHROPIC_AUTH_TOKEN=local"), 3)
+
+    def test_the_wrapper_actually_exports_the_baked_key(self):
+        """Behavioral: source the block and run a stub claude that echoes the
+        token it received, so the assertion observes the wrapper's real
+        effect rather than re-reading the text we just wrote."""
+        self.write_client_profile(self.PROFILE_KEY)
+        self.assertEqual(self.run_install().returncode, 0)
+        bindir = os.path.join(self.home, "bin")
+        os.makedirs(bindir)
+        stub = os.path.join(bindir, "claude")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\necho "TOKEN=$ANTHROPIC_AUTH_TOKEN"\n')
+        os.chmod(stub, 0o755)
+        r = subprocess.run(
+            ["zsh", "-c", "source %s; claude-ferry-super" % self.rc],
+            capture_output=True, text=True, env=self.env(path_prefix=bindir),
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"TOKEN={self.PROFILE_KEY}", r.stdout)
+
+
 class ClaudeJsonTest(ClaudeHarness):
     """The default action records the endpoint; --wrappers must not touch it."""
 

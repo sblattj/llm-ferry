@@ -108,14 +108,16 @@ echo ""
 # Bootstrap ran `ferry opencode` against this file, which replaced the
 # provider block with a baseURL pointing at the host. Removing the whole file
 # would eat any non-ferry keys the user added since, so we strip only the
-# ferry-injected provider: identifiable because ferry writes apiKey "local"
-# and a baseURL that is NOT api.openai.com. If nothing ferry-shaped is found,
-# the file is left exactly as-is.
+# ferry-injected provider: identifiable by its OBJECT KEY — `ferry opencode`
+# always writes provider.ferry — and not by its apiKey, which is 'local' on a
+# keyless LAN setup but the front door's real master key (v1.22.0) on an
+# authed one. If nothing ferry-shaped is found, the file is left exactly
+# as-is.
 OC_CFG="$HOME/.config/opencode/opencode.json"
 echo ">>> Unwiring $OC_CFG ..."
 if [[ -f "$OC_CFG" ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
-    if grep -q '"apiKey": "local"' "$OC_CFG" 2>/dev/null; then
+    if grep -q '"ferry": {' "$OC_CFG" 2>/dev/null; then
       echo "    [dry-run] would strip the ferry provider block from $OC_CFG"
     else
       echo "    No ferry provider block found — file would be left alone."
@@ -134,11 +136,15 @@ providers = cfg.get("provider")
 if not isinstance(providers, dict):
     print("    No provider block — leaving it untouched.")
     sys.exit(0)
+# Match the provider OBJECT KEY, never the apiKey: the key is the stable
+# fingerprint ('ferry opencode' writes provider.ferry and only provider.ferry),
+# while the apiKey now varies between 'local' and a real master key. Matching
+# apiKey=='local' (the old fingerprint) missed every authed setup — and would
+# have eaten a user's own unrelated provider that happens to use a 'local'
+# token.
 ferry_keys = [
     name for name, p in providers.items()
-    if isinstance(p, dict)
-    and isinstance(p.get("options"), dict)
-    and p["options"].get("apiKey") == "local"
+    if isinstance(p, dict) and name == "ferry"
 ]
 if not ferry_keys:
     print("    No ferry provider block found — file left unchanged.")

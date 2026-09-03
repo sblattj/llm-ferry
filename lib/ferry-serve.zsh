@@ -489,7 +489,7 @@ cmd_up() {
   if [[ "$LAUNCH_MODE" == "stack" ]]; then
     # ── THE STACK: one door, four lanes ────────────────────────────────────
     #   litellm on $target_port  ->  orch        (cloud: GLM 5.3 + fallback chain)
-    #                            ->  flash       (cloud: Gemini 3.7 Flash key pool)
+    #                            ->  flash       (cloud: Gemini 3.8 Flash key pool)
     #                            ->  local-orch  (MLX on :$LOCAL_ORCH_PORT)
     #                            ->  local-sub   (MLX on :$LOCAL_SUB_PORT)
     # The two MLX ports are INTERNAL plumbing — clients only ever talk to
@@ -505,7 +505,7 @@ cmd_up() {
     echo "   FERRY STACK — four lanes, one endpoint"
     echo "================================================================="
     echo "   orch         cloud   GLM 5.3 + strict fallback chain"
-    echo "   flash        cloud   Gemini 3.7 Flash key pool"
+    echo "   flash        cloud   Gemini 3.8 Flash key pool"
     echo "   local-orch   GPU     $LOCAL_MODEL_ORCH"
     echo "   local-sub    GPU     $LOCAL_MODEL_SUB"
     echo "================================================================="

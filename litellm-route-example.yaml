@@ -13,7 +13,7 @@
 #   heavy-fallback -> an INDEPENDENT model litellm reroutes to when `heavy` fails;
 #                     chain several for depth (example: Fireworks DeepSeek V4 Pro
 #                     first, GLM 5.2 last)
-#   flash          -> WORKER: cheap high-volume fan-out lane (example: Gemini 3.7
+#   flash          -> WORKER: cheap high-volume fan-out lane (example: Gemini 3.8
 #                     Flash); widen it with MORE MODEL IDS on the SAME key, never
 #                     with more keys (see the quota note below)
 #   super-flash    -> HOUSEKEEPER: title / summary / compaction only
@@ -56,9 +56,12 @@
 #          gemini-3.1-flash-lite   10K RPM / 10M TPM / 350K RPD
 #
 #      Each id is its own bucket, one key, one project. Add a model id and you add
-#      a bucket; add a key and you add nothing. The template ships only the first
-#      id: the two older ones were dropped 2026-09-02 after a 3-round bench put
-#      3.5 Flash at 37 visible tok/s behind ~1000 reasoning tokens per reply.
+#      a bucket; add a key and you add nothing. The template ships only
+#      gemini-3.8-flash (swapped in for 3.7 on 2026-09-02): the two older ids
+#      were dropped the same day after a 3-round bench put 3.5 Flash at 37
+#      visible tok/s behind ~1000 reasoning tokens per reply. 3.8 Flash is not in
+#      the table above because the rate-limit page lists only models with usage;
+#      its bucket is ASSUMED to match its 3.7 sibling until it shows a row.
 #
 # The other sanctioned lever is RAISING THE PAID TIER on that one project, which
 # lifts every bucket at once (Tier 3 = 20M TPM for Gemini 3.7 Flash). Beyond that,
@@ -173,11 +176,11 @@ model_list:
   # never add another project's key.
   - model_name: flash
     litellm_params:
-      model: gemini/gemini-3.7-flash
+      model: gemini/gemini-3.8-flash
       api_key: os.environ/GEMINI_API_KEY      # ONE key, one project
     model_info:
       public: true        # advertised in /v1/models
-      id: gemini-flash-37
+      id: gemini-flash-38
 
   # -- super-flash: the HOUSEKEEPER lane --------------------------------------
   # title / summary / compaction only. It gets its own lane rather than sharing
@@ -217,7 +220,7 @@ model_list:
   # via OpenRouter) it is inert either way.
   - model_name: super-flash
     litellm_params:
-      model: openrouter/google/gemini-3.7-flash
+      model: openrouter/google/gemini-3.8-flash
       api_key: os.environ/OPENROUTER_API_KEY
       timeout: 600
       extra_body:

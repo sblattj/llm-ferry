@@ -787,24 +787,47 @@ PAGE = r"""<!doctype html>
   button{font:inherit;cursor:pointer;background:var(--accent);color:#fff;border:0;
          border-radius:8px;padding:7px 14px;font-weight:700}
   button:disabled{opacity:.55;cursor:progress}
-  /* route editor */
+  /* route editor — one draggable list per lane */
   .lane{border-top:1px solid var(--line);padding:10px 0}
   .lane:first-of-type{border-top:0}
   .lane h3{margin:0 0 6px;font-size:13px;font-weight:700}
   .lane h3 .kind{font-weight:400;color:var(--dim);font-size:11px;margin-left:8px}
-  .hop{display:flex;align-items:center;gap:8px;padding:3px 0}
+  .hops{border-radius:8px}
+  /* while dragging, ONLY the dragged hop's own lane lights up as a drop zone */
+  .lane.dropping .hops{outline:1px dashed color-mix(in srgb,var(--blue) 55%,transparent);
+                       outline-offset:3px}
+  .hop{display:flex;align-items:center;gap:8px;padding:4px 6px;margin:2px 0;border-radius:8px;
+       transition:box-shadow .12s ease,background .12s ease,opacity .12s ease}
   .hop .idx{color:var(--dim);width:18px;text-align:right;flex:none}
   .hop .who{flex:1;min-width:0}
   .hop .who b{font-weight:600}
   .hop .who span{color:var(--dim);font-size:12px;margin-left:8px}
+  .hop[draggable="true"]{cursor:grab}
+  .hop[draggable="true"]:active{cursor:grabbing}
+  .hop.dragging{position:relative;z-index:3;opacity:.92;background:var(--panel);
+                box-shadow:0 8px 22px rgba(0,0,0,.45);cursor:grabbing}
+  /* the blue line shows where the drop will land; inset so nothing reflows */
+  .hop.drop-before{box-shadow:inset 0 2px 0 var(--blue)}
+  .hop.drop-after{box-shadow:inset 0 -2px 0 var(--blue)}
+  .hop.primary{background:color-mix(in srgb,var(--blue) 9%,transparent)}
   .hop.primary .who b{color:var(--blue)}
+  .star{color:var(--blue);width:14px;text-align:center;flex:none;font-size:12px}
+  .grip{color:var(--dim);width:14px;text-align:center;flex:none;font-size:13px;user-select:none}
+  .ptag{font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--blue);flex:none;
+        border:1px solid color-mix(in srgb,var(--blue) 45%,transparent);
+        border-radius:5px;padding:0 5px}
+  .pinhint{max-height:0;opacity:0;overflow:hidden;color:var(--amber);font-size:11px;
+           transition:max-height .25s ease,opacity .25s ease}
+  .pinhint.show{max-height:3em;opacity:1}
+  .addhop{display:flex;flex-direction:column;align-items:flex-start;gap:4px;margin:4px 0 0 26px}
+  .picker{display:flex;flex-direction:column;gap:3px;padding:6px;border:1px solid var(--line);
+          border-radius:8px;max-height:180px;overflow:auto}
+  .picker .mini{text-align:left}
   .mini{font:inherit;font-size:11px;font-weight:700;padding:2px 7px;border-radius:6px;
         background:transparent;color:var(--dim);border:1px solid var(--line)}
   .mini:hover:not(:disabled){color:var(--fg);border-color:var(--dim)}
   .mini:disabled{opacity:.3;cursor:default}
   .mini.rm:hover{color:var(--red);border-color:var(--red)}
-  select{font:inherit;font-size:12px;background:var(--bg);color:var(--fg);
-         border:1px solid var(--line);border-radius:6px;padding:3px 6px}
   .diff{background:var(--bg);border:1px solid var(--line);border-radius:8px;
         padding:10px 12px;overflow-x:auto;font-size:12px;max-height:340px}
   .diff .add{color:var(--green)} .diff .del{color:var(--red)} .diff .hunk{color:var(--dim)}
@@ -980,11 +1003,57 @@ function renderAct(st){
     eb.appendChild(el('div','event','⚠ '+a.last_event.text+'  ·  '+secs+'s ago')); }
 }
 // ── route editor ───────────────────────────────────────────────────────────
-// EDIT holds the user's in-progress chains. It is seeded from the server once
-// and then LEFT ALONE: tick() runs every 5s, and reseeding on each poll would
-// silently discard an edit mid-drag. SERVER keeps the last server truth so
-// "dirty" is a real comparison rather than a flag we hope stays in sync.
+// The UNIFIED-ORDER model: EDIT holds each lane as one ordered list,
+// [primary, ...fallbacks]. Position 0 is the lane itself and is PINNED — the
+// backend validates it as unchanged ("primary changes not yet supported:" on
+// anything else) and rewrites only the tail, so the UI never offers a
+// position-0 move at all: the primary row is not draggable and not a drop
+// target, and every drop slot clamps into 1..n.
+//
+// EDIT is seeded from the server once and then LEFT ALONE: tick() runs every
+// 5s, and reseeding on each poll would silently discard an edit mid-drag.
+// SERVER keeps the last server truth so "dirty" is a real comparison rather
+// than a flag we hope stays in sync.
 let EDIT=null, SERVER=null, GROUPS={};
+
+// While a hop is in flight: {lane, from}. A 5s tick that rebuilt the DOM
+// under a live drag would kill the drag, so renderRoutes skips while this is
+// set and the dragend/drop handlers clear it. PICKER_OPEN does the same for
+// the "+ add hop" picker, which is mid-interaction even though EDIT is clean.
+let DRAG=null;
+let PICKER_OPEN=false;
+
+// ── pure order helpers — also exercised by lib/ferry-dashui.test.mjs ──────
+// moveHop: insert the hop at `from` (>= 1; position 0 is pinned) before the
+// index `dropBefore`, clamped into [1..n]. Dropping onto itself or directly
+// below itself is a no-op — which is exactly what the drop geometry computes
+// for those two pointer positions, so a sloppy drop can't jitter the list.
+function moveHop(order,from,dropBefore){
+  const n=order.length;
+  from=Math.round(from); let to=Math.round(dropBefore);
+  if(!(from>=1)||from>=n) return order.slice();
+  if(!(to>=1)) to=1; else if(to>n) to=n;
+  if(to===from||to===from+1) return order.slice();
+  const next=order.slice();
+  const [x]=next.splice(from,1);
+  next.splice(to>from?to-1:to,0,x);
+  return next;
+}
+// dropIndexFromY: which insert-before slot does a pointer at y land in, given
+// the vertical midpoints of the fallback rows? Slot i+1 sits above row i,
+// slot len+1 below the last row. There is deliberately no slot 0 — the
+// primary row is never a drop target.
+function dropIndexFromY(centers,y){
+  for(let i=0;i<centers.length;i++) if(y<centers[i]) return i+1;
+  return centers.length+1;
+}
+// Candidates for "+ add hop": anything the catalogue serves that this lane
+// neither is nor already falls back through.
+function availHops(groups,lane,order){
+  return Object.keys(groups).filter(g=>g!==lane&&!order.includes(g)).sort();
+}
+function sameJSON(a,b){return JSON.stringify(a)===JSON.stringify(b);}
+// ── end pure order helpers ─────────────────────────────────────────────────
 
 const laneKind=g=>(GROUPS[g]&&GROUPS[g].count>1)
   ? 'pool · '+GROUPS[g].count+' deployments share this name'
@@ -993,10 +1062,11 @@ const modelOf=g=>shortModel(((GROUPS[g]||{}).models||[])[0]||'');
 
 function routesDirty(){
   if(!EDIT||!SERVER) return false;
-  return JSON.stringify(EDIT)!==JSON.stringify(SERVER);
+  return !sameJSON(EDIT,SERVER);
 }
 
 function renderRoutes(st){
+  if(DRAG||PICKER_OPEN) return;   // never rebuild the DOM under a live gesture
   const t=st.topology||{}; GROUPS=t.groups||{};
   const fb=t.fallbacks||{};
   // Editable lanes: anything with a chain, plus anything the catalogue serves.
@@ -1005,57 +1075,129 @@ function renderRoutes(st){
   const lanes=[...new Set([...Object.keys(fb),...(st.models||[])])]
     .filter(l=>GROUPS[l]).sort();
   // SERVER must carry the SAME key set as EDIT or the dirty comparison is
-  // unequal from the first render: a lane with no fallbacks entry is [] here,
-  // not missing. Getting this wrong made the editor claim unsaved edits on
-  // load, which also froze the poll (tick skips reseeding while dirty).
-  SERVER={}; lanes.forEach(l=>SERVER[l]=(fb[l]||[]).slice());
-  if(EDIT===null){ EDIT={}; lanes.forEach(l=>EDIT[l]=(fb[l]||[]).slice()); }
+  // unequal from the first render: a lane with no fallbacks entry is just the
+  // lane itself ([lane]) here, not missing. Getting this wrong made the
+  // editor claim unsaved edits on load, which also froze the poll (tick skips
+  // reseeding while dirty).
+  SERVER={}; lanes.forEach(l=>SERVER[l]=[l,...(fb[l]||[])]);
+  if(EDIT===null){ EDIT={}; lanes.forEach(l=>EDIT[l]=[l,...(fb[l]||[])]); }
 
   $('#routespath').textContent=st.config_path||'';
   const box=$('#routesbody'); box.innerHTML=''; box.className='';
   if(!lanes.length){ box.className='muted'; box.textContent=t.error||'no lanes found'; return; }
 
   lanes.forEach(lane=>{
-    const chain=EDIT[lane]||(EDIT[lane]=[]);
+    const order=EDIT[lane]||(EDIT[lane]=[lane]);
     const sec=el('div','lane');
     const h=el('h3',null,lane);
     h.appendChild(el('span','kind',laneKind(lane)));
-    if(JSON.stringify(chain)!==JSON.stringify(SERVER[lane]||[]))
-      h.appendChild(el('span','dirty',' · modified'));
+    if(!sameJSON(order,SERVER[lane])) h.appendChild(el('span','dirty',' · modified'));
     sec.appendChild(h);
 
-    const p=el('div','hop primary');
-    p.appendChild(el('span','idx','→'));
+    const list=el('div','hops'); list.setAttribute('role','list');
+    // Position 0 — the primary. Pinned: not draggable, never a drop target,
+    // so the pinned posture the backend enforces is impossible to violate
+    // rather than merely error-prone.
+    const p=el('div','hop hoprow primary'); p.setAttribute('role','listitem');
+    p.appendChild(el('span','idx','0'));
+    const star=el('span','star','★'); star.title='primary — pinned'; p.appendChild(star);
     const pw=el('div','who'); pw.appendChild(el('b',null,modelOf(lane)||lane));
-    pw.appendChild(el('span',null,lane+' · primary'));
-    p.appendChild(pw); sec.appendChild(p);
+    pw.appendChild(el('span',null,lane));
+    p.appendChild(pw);
+    p.appendChild(el('span','ptag','PRIMARY'));
+    // draggable=false means no dragstart ever fires, so the hint rides a
+    // mousedown + pull instead: the moment the user hauls on the row, say why
+    // nothing happens.
+    p.addEventListener('mousedown',e=>{
+      const sx=e.clientX, sy=e.clientY;
+      const mv=ev=>{ if(Math.abs(ev.clientX-sx)+Math.abs(ev.clientY-sy)>6){pinHint(sec);cleanup();} };
+      const cleanup=()=>{document.removeEventListener('mousemove',mv);
+                         document.removeEventListener('mouseup',up);};
+      const up=()=>cleanup();
+      document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up);
+    });
+    list.appendChild(p);
 
-    chain.forEach((hop,i)=>{
-      const r=el('div','hop');
-      r.appendChild(el('span','idx',String(i+1)));
+    // Positions 1..n — the fallback hops, one draggable row each. ↑/↓ stay as
+    // the keyboard-accessible path; drag is the primary gesture.
+    const fbrows=[];
+    const centers=()=>fbrows.map(r=>{const b=r.getBoundingClientRect();
+                                     return b.top+b.height/2;});
+    for(let i=1;i<order.length;i++){
+      const hop=order[i];
+      const r=el('div','hop hoprow'); r.setAttribute('role','listitem');
+      r.draggable=true;
+      r.appendChild(el('span','idx',String(i)));
+      const grip=el('span','grip','⠿'); grip.title='drag to reorder'; r.appendChild(grip);
       const w=el('div','who'); w.appendChild(el('b',null,modelOf(hop)||hop));
       w.appendChild(el('span',null,hop+(GROUPS[hop]&&GROUPS[hop].count>1?' · pool':'')));
       r.appendChild(w);
-      const up=el('button','mini','↑'); up.disabled=(i===0);
-      up.onclick=()=>{chain.splice(i-1,0,chain.splice(i,1)[0]);redraw();};
-      const dn=el('button','mini','↓'); dn.disabled=(i===chain.length-1);
-      dn.onclick=()=>{chain.splice(i+1,0,chain.splice(i,1)[0]);redraw();};
-      const rm=el('button','mini rm','remove');
-      rm.onclick=()=>{chain.splice(i,1);redraw();};
+      const up=el('button','mini','↑'); up.title='move up';
+      up.setAttribute('aria-label','move '+hop+' up'); up.disabled=(i===1);
+      up.onclick=()=>{EDIT[lane]=moveHop(order,i,i-1);redraw();};
+      const dn=el('button','mini','↓'); dn.title='move down';
+      dn.setAttribute('aria-label','move '+hop+' down'); dn.disabled=(i===order.length-1);
+      dn.onclick=()=>{EDIT[lane]=moveHop(order,i,i+2);redraw();};
+      const rm=el('button','mini rm','×'); rm.title='remove hop';
+      rm.setAttribute('aria-label','remove '+hop);
+      rm.onclick=()=>{order.splice(i,1);redraw();};
       r.appendChild(up); r.appendChild(dn); r.appendChild(rm);
-      sec.appendChild(r);
-    });
+      r.addEventListener('dragstart',e=>{
+        DRAG={lane:lane,from:i};
+        try{e.dataTransfer.setData('text/plain',hop);}catch(err){}
+        e.dataTransfer.effectAllowed='move';
+        r.classList.add('dragging'); sec.classList.add('dropping');
+      });
+      r.addEventListener('dragend',()=>endDrag(sec));
+      list.appendChild(r); fbrows.push(r);
+    }
 
-    const avail=Object.keys(GROUPS).filter(g=>g!==lane&&!chain.includes(g)).sort();
+    // The drop zone is THIS lane's list and nothing else: a hop from another
+    // lane never preventDefaults here, so the browser refuses the drop and a
+    // chain cannot leak across lanes.
+    list.addEventListener('dragover',e=>{
+      if(!DRAG||DRAG.lane!==lane) return;
+      e.preventDefault(); e.dataTransfer.dropEffect='move';
+      const idx=dropIndexFromY(centers(),e.clientY);
+      fbrows.forEach((row,k)=>{
+        const on=row!==fbrows[DRAG.from-1];
+        row.classList.toggle('drop-before',on&&idx===k+1);
+        row.classList.toggle('drop-after',on&&idx===fbrows.length+1&&k===fbrows.length-1);
+      });
+    });
+    list.addEventListener('dragleave',e=>{
+      if(e.relatedTarget&&list.contains(e.relatedTarget)) return;
+      fbrows.forEach(row=>row.classList.remove('drop-before','drop-after'));
+    });
+    list.addEventListener('drop',e=>{
+      if(!DRAG||DRAG.lane!==lane) return;
+      e.preventDefault();
+      const idx=dropIndexFromY(centers(),e.clientY);
+      EDIT[lane]=moveHop(order,DRAG.from,idx);
+      endDrag(sec); redraw();
+    });
+    sec.appendChild(list);
+    sec.appendChild(el('div','pinhint',
+      'the primary (position 0) is pinned — drag the fallback hops below it to reorder'));
+
+    const avail=availHops(GROUPS,lane,order);
     if(avail.length){
-      const add=el('div','hop');
-      add.appendChild(el('span','idx','+'));
-      const sel=document.createElement('select');
-      sel.appendChild(el('option',null,'add a fallback hop…'));
-      avail.forEach(g=>{const o=el('option',null,g+'  ('+(modelOf(g)||'?')+')');o.value=g;sel.appendChild(o);});
-      sel.onchange=()=>{ if(sel.value){chain.push(sel.value);redraw();} };
-      const wrap=el('div','who'); wrap.appendChild(sel);
-      add.appendChild(wrap); sec.appendChild(add);
+      const add=el('div','addhop');
+      const btn=el('button','mini add','+ add hop');
+      btn.setAttribute('aria-expanded','false');
+      const pick=el('div','picker'); pick.style.display='none';
+      btn.onclick=()=>{
+        PICKER_OPEN=pick.style.display==='none';
+        pick.style.display=PICKER_OPEN?'':'none';
+        btn.setAttribute('aria-expanded',String(PICKER_OPEN));
+      };
+      avail.forEach(g=>{
+        const b=el('button','mini pick',g+'  ·  '+(modelOf(g)||'?'));
+        b.onclick=()=>{PICKER_OPEN=false;order.push(g);redraw();};
+        pick.appendChild(b);
+      });
+      add.appendChild(btn); add.appendChild(pick);
+      sec.appendChild(add);
     }
     box.appendChild(sec);
   });
@@ -1064,11 +1206,22 @@ function renderRoutes(st){
   $('#applybtn').disabled=true;          // Apply unlocks only after a preview
   $('#previewbtn').disabled=!routesDirty();
 }
+function endDrag(sec){
+  if(sec){ sec.classList.remove('dropping');
+    sec.querySelectorAll('.hop').forEach(r=>r.classList.remove('drop-before','drop-after')); }
+  const d=document.querySelector('.dragging'); if(d) d.classList.remove('dragging');
+  DRAG=null;
+}
+function pinHint(sec){
+  const h=sec&&sec.querySelector('.pinhint'); if(!h) return;
+  h.classList.add('show'); clearTimeout(h._t);
+  h._t=setTimeout(()=>h.classList.remove('show'),2400);
+}
 function redraw(){ renderRoutes(LAST||{}); }
 
 async function postRoutes(url){
   const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
-                           body:JSON.stringify({chains:EDIT})});
+                           body:JSON.stringify({order:EDIT})});
   return {code:r.status, body:await r.json()};
 }
 function showDiff(d){
@@ -1287,7 +1440,7 @@ $('#testbtn').onclick=async()=>{
 $('#previewbtn').onclick=async()=>{
   msg('preview…'); showDiff('');
   try{
-    const {body}=await postRoutes('/api/routes/preview');
+    const {body}=await postRoutes('/api/routes/order/preview');
     if(body.errors&&body.errors.length){ showDiff(''); msg(body.errors.join('  ·  '),'err');
                                          $('#applybtn').disabled=true; return; }
     showDiff(body.diff||'(no change)');
@@ -1300,13 +1453,18 @@ $('#previewbtn').onclick=async()=>{
 $('#applybtn').onclick=async()=>{
   const b=$('#applybtn'); b.disabled=true; msg('writing…');
   try{
-    const {code,body}=await postRoutes('/api/routes/apply');
+    const {code,body}=await postRoutes('/api/routes/order/apply');
     if(code!==200){ msg((body.errors||['failed']).join('  ·  '),'err'); return; }
     msg('Written. Snapshot: '+body.snapshot+'  ·  '+body.note,'ok');
-    EDIT=null; showDiff(''); tick();
+    PICKER_OPEN=false; EDIT=null; showDiff(''); tick();
   }catch(e){ msg('apply failed: '+e,'err'); b.disabled=false; }
 };
-$('#resetbtn').onclick=()=>{ EDIT=null; showDiff(''); msg(''); tick(); };
+$('#resetbtn').onclick=()=>{ PICKER_OPEN=false; EDIT=null; showDiff(''); msg(''); tick(); };
+// Escape is a way out of an open picker that does not touch the mouse.
+document.addEventListener('keydown',e=>{
+  if(e.key!=='Escape'||!PICKER_OPEN) return;
+  PICKER_OPEN=false; redraw();
+});
 renderFeed(); tick(); setInterval(tick, 5000);
 </script>
 </body></html>

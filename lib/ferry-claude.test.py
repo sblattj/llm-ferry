@@ -5,8 +5,10 @@ Run:  python3 lib/ferry-claude.test.py
 
 `ferry claude` is the Claude Code twin of `ferry opencode --wrappers`: it writes
 one marker-delimited block into ~/.zshrc defining `claude-ferry()` (the cloud
-lanes) and `claude-ferry-local()` (the GPU lanes), so a shell picks a lane by
-invoking the right function instead of exporting ANTHROPIC_* itself. The
+pair), `claude-ferry-local()` (the GPU pair) and `claude-ferry-super()` (the
+cheap cloud profile: heavy drives, super-flash on background AND subagents), so
+a shell picks a lane by invoking the right function instead of exporting
+ANTHROPIC_* itself. The
 default action additionally records the host's endpoint in
 ~/.config/ferry/claude.json (host/port/lanes), snapshotting an existing one to
 a .bak first; `--wrappers` installs the zshrc block and NOTHING else, because
@@ -131,7 +133,7 @@ class ClaudeHarness(unittest.TestCase):
 class WrapperInstallTest(ClaudeHarness):
     """What `ferry claude` writes into ~/.zshrc."""
 
-    def test_fresh_install_writes_one_block_with_both_functions(self):
+    def test_fresh_install_writes_one_block_with_all_three_functions(self):
         r = self.run_install()
         self.assertEqual(r.returncode, 0, r.stderr)
         text = self.rc_text()
@@ -139,12 +141,14 @@ class WrapperInstallTest(ClaudeHarness):
         self.assertEqual(text.count(CANON_END), 1)
         self.assertIn("claude-ferry() {", text)
         self.assertIn("claude-ferry-local() {", text)
+        self.assertIn("claude-ferry-super() {", text)
         self.assertEqual(text.count("claude-ferry() {"), 1)
         self.assertEqual(text.count("claude-ferry-local() {"), 1)
-        # The endpoint is baked into BOTH wrappers, and both authenticate as
+        self.assertEqual(text.count("claude-ferry-super() {"), 1)
+        # The endpoint is baked into ALL THREE wrappers, and all authenticate as
         # the local ferry proxy rather than a real Anthropic account.
-        self.assertGreaterEqual(text.count(f"http://{INSTALL_HOST}:{INSTALL_PORT}"), 2)
-        self.assertEqual(text.count("ANTHROPIC_AUTH_TOKEN=local"), 2)
+        self.assertEqual(text.count(f"http://{INSTALL_HOST}:{INSTALL_PORT}"), 3)
+        self.assertEqual(text.count("ANTHROPIC_AUTH_TOKEN=local"), 3)
 
     def test_is_idempotent_and_result_parses(self):
         for _ in range(3):
@@ -152,6 +156,7 @@ class WrapperInstallTest(ClaudeHarness):
         self.assertEqual(self.count(CANON_START), 1)
         self.assertEqual(self.count(CANON_END), 1)
         self.assertEqual(self.count("claude-ferry-local() {"), 1)
+        self.assertEqual(self.count("claude-ferry-super() {"), 1)
         r = subprocess.run(["zsh", "-n", self.rc], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, f"generated ~/.zshrc does not parse: {r.stderr}")
 
@@ -159,9 +164,14 @@ class WrapperInstallTest(ClaudeHarness):
         # An alias above a function of the same name makes zsh expand it inside
         # `name() {`, which is a parse error on every later `source ~/.zshrc`.
         with open(self.rc, "w") as f:
-            f.write("alias claude-ferry='echo old'\n")
+            f.write("alias claude-ferry='echo old'\n"
+                    "alias claude-ferry-local='echo old'\n"
+                    "alias claude-ferry-super='echo old'\n")
         self.assertEqual(self.run_install().returncode, 0)
-        self.assertNotIn("alias claude-ferry=", self.rc_text())
+        text = self.rc_text()
+        self.assertNotIn("alias claude-ferry=", text)
+        self.assertNotIn("alias claude-ferry-local=", text)
+        self.assertNotIn("alias claude-ferry-super=", text)
         self.assertEqual(self.count(CANON_START), 1)
 
     def test_writes_no_bare_claude_function(self):
@@ -186,6 +196,9 @@ class WrapperInstallTest(ClaudeHarness):
         local_idx = block.index("claude-ferry-local() {")
         cloud_body = block[:local_idx]
         self.assertNotIn("CLAUDE_CODE_DISABLE_THINKING", cloud_body)
+        super_idx = block.index("claude-ferry-super() {")
+        self.assertNotIn("CLAUDE_CODE_DISABLE_THINKING", block[super_idx:],
+                         "the super profile is cloud lanes; they need thinking")
 
     def test_the_functions_actually_select_the_right_lanes(self):
         """Source the result and prove each wrapper exports the lane it names.
@@ -201,13 +214,17 @@ class WrapperInstallTest(ClaudeHarness):
         with open(stub, "w") as f:
             f.write('#!/bin/sh\necho "BASE=$ANTHROPIC_BASE_URL MODEL=$ANTHROPIC_MODEL '
                     'BG=$ANTHROPIC_DEFAULT_HAIKU_MODEL '
+                    'SUB=$CLAUDE_CODE_SUBAGENT_MODEL '
                     'THINK=${CLAUDE_CODE_DISABLE_THINKING:-unset}"\n')
         os.chmod(stub, 0o755)
 
         expectations = {
-            "claude-ferry": ("http://testhost:8090", "MODEL=heavy", "BG=flash", "THINK=unset"),
+            "claude-ferry": ("http://testhost:8090", "MODEL=heavy", "BG=flash",
+                             "SUB=flash", "THINK=unset"),
             "claude-ferry-local": ("http://testhost:8090", "MODEL=local-orch",
-                                   "BG=local-sub", "THINK=1"),
+                                   "BG=local-sub", "SUB=local-sub", "THINK=1"),
+            "claude-ferry-super": ("http://testhost:8090", "MODEL=heavy",
+                                   "BG=super-flash", "SUB=super-flash", "THINK=unset"),
         }
         for fn, needles in expectations.items():
             r = subprocess.run(
@@ -305,6 +322,21 @@ class ScriptContractTest(unittest.TestCase):
 
     def test_host_reset_refreshes_the_claude_wrappers(self):
         self.assertIn("claude --wrappers", self.read("host-reset.sh"))
+
+    # --- the super-lane wiring contract (sibling seats) ----------------------
+    # These pin work that lands in OTHER files: client-bootstrap.sh and
+    # client-reset.sh route an opencode-super profile, and host-reset.sh writes
+    # the host's opencode-super.json. A failure here before the sibling seats
+    # land is the contract being enforced loudly, not a bug in this module.
+
+    def test_client_bootstrap_wires_the_super_profile(self):
+        self.assertIn("opencode-super", self.read("client-bootstrap.sh"))
+
+    def test_client_reset_reapplies_the_super_profile(self):
+        self.assertIn("opencode-super", self.read("client-reset.sh"))
+
+    def test_host_reset_writes_the_super_profile(self):
+        self.assertIn("opencode-super", self.read("host-reset.sh"))
 
     def test_build_orders_claude_before_main(self):
         text = self.read("build.zsh")

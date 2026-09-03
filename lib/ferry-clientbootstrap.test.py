@@ -230,8 +230,37 @@ class ClientScopeTest(ClientHarness):
             self.read_json(".config", "ferry", "client.json")["opencode_mode"], "full")
         rc = self.zshrc()
         self.assertIn("\nopencode() {", rc)
+        self.assertIn("opencode-super()", rc)
+        # The bare wrapper routes on the LAST lane used, and `super` is one of
+        # the lanes it must know about.
+        self.assertIn('"$lane" == "super"', rc)
         self.assertIn("alias host-code='opencode'", rc)
         self.assertTrue(os.path.exists(self.path(".config", "opencode", "command", "fan-out.md")))
+
+    def test_full_scope_bare_opencode_follows_the_super_last_lane(self):
+        """Behavioral last-lane routing: `super` written to last-lane, bare
+        `opencode` run, the super profile is the one it picks.
+
+        The stub `opencode` echoes $OPENCODE_CONFIG, so the routing decision is
+        observed, not re-read from the text the bootstrap just wrote."""
+        self.run_script(BOOTSTRAP)
+        stub = os.path.join(self.bin, "opencode")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\necho "CONFIG=$OPENCODE_CONFIG"\n')
+        os.chmod(stub, 0o755)
+
+        # Control first: with no last-lane file the default is the cloud pair.
+        r = subprocess.run(["zsh", "-c", f"source {self.path('.zshrc')}; opencode"],
+                           env=self.env(), capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("opencode-cloud.json", r.stdout)
+
+        with open(self.path(".config", "ferry", "last-lane"), "w") as f:
+            f.write("super\n")
+        r = subprocess.run(["zsh", "-c", f"source {self.path('.zshrc')}; opencode"],
+                           env=self.env(), capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("opencode-super.json", r.stdout)
 
     def test_an_unknown_flag_stops_before_touching_anything(self):
         p = self.run_script(BOOTSTRAP, "--wat", expect_ok=False)

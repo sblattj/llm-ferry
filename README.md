@@ -101,23 +101,26 @@ Run the command `ferry share` prints — it embeds your host's live mDNS name an
 curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 ```
 
-`ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint (cloud pair as the persistent default), and adds a `host-code` shell shortcut. It also installs two opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
+`ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint (cloud pair as the persistent default), and adds a `host-code` shell shortcut. It also installs three opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
 
 - `opencode-cloud` — the **cloud pair**: `heavy` drives (build/plan), `flash` runs the fan-out (general/explore), `super-flash` handles the background models (title/summary/compaction).
 - `opencode-local` — the **GPU pair**: `local-orch` drives, `local-sub` runs the fan-out. Nothing leaves the host.
-- bare `opencode` — whichever pair you used **last** (cloud until you first run `opencode-local`; the last-used lane is remembered in `~/.config/ferry/last-lane`).
+- `opencode-super` — the **cheapest cloud profile**, new in v1.21: `heavy` still drives, but `super-flash` runs **both** the fan-out and the background models.
+- bare `opencode` — whichever profile you used **last** (cloud until you pick another; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
 Both need `ferry up` on the host, which serves all five lanes at once.
 
 **Claude Code works too, as of v1.20.** The ferry endpoint speaks the Anthropic
 `/v1/messages` protocol, so Claude Code can run on the ferry backend with no
 changes to `claude` itself. When `claude` is installed, the bootstrap also
-installs two wrappers into `~/.zshrc` (skip with `--no-claude`):
+installs three wrappers into `~/.zshrc` (skip with `--no-claude`):
 
 - `claude-ferry` — the **cloud lanes**: `heavy` drives, `flash` covers background
   tasks and subagents.
 - `claude-ferry-local` — the **GPU lanes**: `local-orch` drives, `local-sub` fans
   out. Nothing leaves the host.
+- `claude-ferry-super` — the **cheapest cloud profile**, new in v1.21: `heavy`
+  drives, `super-flash` covers background tasks and subagents.
 
 Both point Claude Code at the host with `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`
 scoped to the child process, with the compatibility flags a non-Anthropic backend
@@ -658,7 +661,7 @@ Everything runs on your own hardware and network. Client↔host traffic stays on
 | `serve-hf [--port P]` | host | Start the experimental HuggingFace pass-through proxy (default `8096`) |
 | `serve-proxy [--port P]` | host | Start the general HTTP(S) download forward proxy (default `8097`) |
 | `env [--host H] [--proxy-port P] [--hf-port P2] [--write]` | client | Emit shell exports so this laptop routes downloads via the host proxy |
-| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--model M] [--small-model SM] [--housekeeper HK] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, `model`, `small_model`, and all seven built-in agents, pinned to lane names. Snapshots the original first |
+| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, `model`, `small_model`, and all seven built-in agents, pinned to lane names. `--super` pins worker AND housekeeper to `super-flash` (heavy keeps driving). Snapshots the original first |
 
 Run `ferry --help` for the built-in usage banner.
 

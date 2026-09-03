@@ -70,7 +70,7 @@ class HostWrapperTest(unittest.TestCase):
     def count(self, needle):
         return self.rc_text().count(needle)
 
-    def test_fresh_zshrc_gets_one_block_with_both_functions(self):
+    def test_fresh_zshrc_gets_one_block_with_all_three_functions(self):
         r = self.run_install()
         self.assertEqual(r.returncode, 0, r.stderr)
         text = self.rc_text()
@@ -78,12 +78,15 @@ class HostWrapperTest(unittest.TestCase):
         self.assertEqual(text.count(CANON_END), 1)
         self.assertIn("opencode-cloud() {", text)
         self.assertIn("opencode-local() {", text)
+        self.assertIn("opencode-super() {", text)
+        self.assertEqual(text.count("opencode-super() {"), 1)
 
     def test_is_idempotent(self):
         for _ in range(3):
             self.assertEqual(self.run_install().returncode, 0)
         self.assertEqual(self.count(CANON_START), 1)
         self.assertEqual(self.count("opencode-local() {"), 1)
+        self.assertEqual(self.count("opencode-super() {"), 1)
 
     def test_absorbs_the_legacy_host_marker(self):
         """The hand-wired '(host)' block must be replaced, not joined."""
@@ -162,7 +165,8 @@ class HostWrapperTest(unittest.TestCase):
         os.chmod(stub, 0o755)
 
         for fn, expected in (("opencode-cloud", "opencode-cloud.json"),
-                             ("opencode-local", "opencode-local.json")):
+                             ("opencode-local", "opencode-local.json"),
+                             ("opencode-super", "opencode-super.json")):
             r = subprocess.run(
                 ["zsh", "-c", f"source {self.rc}; {fn}"],
                 capture_output=True, text=True,

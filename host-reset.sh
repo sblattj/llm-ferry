@@ -421,7 +421,8 @@ echo "    -> $oc_default"
 
 for oc_target in \
   "$HOME/.config/ferry/opencode-cloud.json|" \
-  "$HOME/.config/ferry/opencode-local.json|--local"
+  "$HOME/.config/ferry/opencode-local.json|--local" \
+  "$HOME/.config/ferry/opencode-super.json|--super"
 do
   oc_path="${oc_target%%|*}"
   oc_flag="${oc_target#*|}"

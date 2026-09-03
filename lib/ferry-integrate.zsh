@@ -34,13 +34,13 @@ _ferry_install_opencode_guardrails() {
   echo "     putting it in system instructions measured WORSE.)"
 }
 
-# _ferry_install_host_wrappers — put the `opencode-cloud` / `opencode-local`
-# shell functions in the HOST's ~/.zshrc.
+# _ferry_install_host_wrappers — put the `opencode-cloud` / `opencode-local` /
+# `opencode-super` shell functions in the HOST's ~/.zshrc.
 #
 # The same gap as the guardrails above, one layer out: the wrappers were written
 # ONLY by client-bootstrap.sh, so every client got them and the host never did.
 # Confirmed by absence rather than assumed — host-bootstrap.sh contains no
-# occurrence of "opencode" at all, and host-reset.sh writes the two profile JSONs
+# occurrence of "opencode" at all, and host-reset.sh writes the profile JSONs
 # but never touches ~/.zshrc. So the host ended up with the FILES the wrappers
 # select between and no way to select between them.
 #
@@ -48,7 +48,7 @@ _ferry_install_opencode_guardrails() {
 # block by EXACT string compare on "# >>> ferry opencode profiles >>>", and
 # client-cleanup.sh compares the same way. Writing a host block under any other
 # marker means neither tool can see it, and the next client bootstrap appends a
-# SECOND block defining the same two functions (the later definition wins, so the
+# SECOND block defining the same functions (the later definition wins, so the
 # duplicate is invisible until the two disagree). This writes the canonical
 # marker for exactly that reason, and additionally absorbs the "(host)" variant
 # that hand-wiring produced before this function existed.
@@ -90,13 +90,15 @@ for ln in lines:
     if not skip:
         out.append(ln)
 
-# A stray `alias opencode-cloud=` / `alias opencode-local=` ABOVE a function of
-# the same name makes zsh expand the alias inside `name() {`, which is a parse
-# error on every subsequent `source ~/.zshrc`. client-bootstrap.sh strips these
-# for the same reason.
+# A stray `alias opencode-cloud=` / `alias opencode-local=` / `alias
+# opencode-super=` ABOVE a function of the same name makes zsh expand the alias
+# inside `name() {`, which is a parse error on every subsequent
+# `source ~/.zshrc`. client-bootstrap.sh strips these for the same reason.
 def is_legacy_alias(l):
     t = l.lstrip()
-    return t.startswith("alias opencode-cloud=") or t.startswith("alias opencode-local=")
+    return (t.startswith("alias opencode-cloud=")
+            or t.startswith("alias opencode-local=")
+            or t.startswith("alias opencode-super="))
 
 out = [l for l in out if not is_legacy_alias(l)]
 
@@ -116,12 +118,12 @@ PYEOF
   # survive into the file instead of being expanded now.
   cat <<'EOF' >> "$rc"
 # >>> ferry opencode profiles >>>
-# Installed by `ferry update` / host-reset.sh on the HOST. The two profile FILES
+# Installed by `ferry update` / host-reset.sh on the HOST. The profile FILES
 # these select between are written by `ferry opencode` in the same pass.
 #
 # There is deliberately no bare `opencode` function: an explicit OPENCODE_CONFIG
 # is the host's own choice and ferry does not override it.
-unalias opencode-cloud opencode-local 2>/dev/null
+unalias opencode-cloud opencode-local opencode-super 2>/dev/null
 
 # opencode-cloud: the CLOUD pair — heavy drives (build/plan), flash runs the
 # fan-out, super-flash handles title/summary/compaction.
@@ -134,11 +136,18 @@ opencode-cloud() {
 opencode-local() {
   OPENCODE_CONFIG="$HOME/.config/ferry/opencode-local.json" command opencode "$@"
 }
+
+# opencode-super: heavy drives; super-flash runs the fan-out AND the
+# housekeeping. The cheapest cloud profile.
+opencode-super() {
+  OPENCODE_CONFIG="$HOME/.config/ferry/opencode-super.json" command opencode "$@"
+}
 # <<< ferry opencode profiles <<<
 EOF
 
   echo ">>> opencode shell wrappers installed in $rc:"
   echo "    opencode-cloud   -> cloud pair: heavy drives, flash fans out"
+  echo "    opencode-super   -> cloud pair: heavy drives, super-flash fans out"
   echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
   echo "    (bare 'opencode' is untouched — run: source $rc)"
 }
@@ -269,6 +278,10 @@ cmd_opencode() {
       --model)        force_model="$2"; shift 2 ;;
       --small-model)  force_small="$2"; shift 2 ;;
       --housekeeper)  force_house="$2"; shift 2 ;;
+      # --super: the cheapest cloud profile — heavy still drives, super-flash
+      # takes BOTH the worker and housekeeper lanes. Set here at parse time so a
+      # later --small-model / --housekeeper overrides exactly one half.
+      --super)        force_small="super-flash"; force_house="super-flash"; shift ;;
       --keep)         keep_snaps="$2"; shift 2 ;;
       --no-default)   set_default=0; shift ;;
       --local)        prefer_local=1; shift ;;
@@ -360,17 +373,22 @@ try:
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
 if served:
-    # Only the driver and worker are checked. The housekeeper is deliberately
-    # absent from /v1/models, so testing it against the catalogue would warn on a
-    # correct setup every single time.
+    # Only the driver and worker are checked, and any lane equal to the
+    # housekeeper value is exempt. A lane hidden from /v1/models cannot be
+    # catalogue-checked: the housekeeper is absent from the catalogue by design,
+    # and under --super the worker IS the housekeeper lane, so the old check
+    # warned on every correct --super setup. (On the GPU pair the housekeeper
+    # shares the worker, so local-sub goes unchecked here too — there is no way
+    # to be precise about hidden-ness from the client without a public-lane
+    # registry, which ferry deliberately does not have.)
     #
-    # It used to be absent because it was a `model_group_alias` marked
+    # The housekeeper used to be hidden because it was a `model_group_alias` marked
     # `hidden: true`. It is a real `model_name` as of 2026-08-29 — an alias
     # silently loses its whole fallback chain (litellm looks fallbacks up by the
     # raw client string before resolving aliases, router.py:6411), and a failed
     # compaction drops the entire transcript. It stays out of the catalogue by
     # omitting `model_info: {public: true}`, which ferry_front.py filters on.
-    missing = [l for l in (driver, worker) if l not in served]
+    missing = [l for l in (driver, worker) if l not in served and l != house]
     if missing:
         print(f"    WARNING: host does not serve {', '.join(missing)}.")
         print(f"    Catalogue: {', '.join(served)}")

@@ -4247,7 +4247,8 @@ def _keys_column(fleets):
         with open(route_config) as f:
             text = f.read()
     except OSError:
-        return {fname: "ok" for fname in fleets}
+        # Unreadable route config: nothing was checked, so say unknown, not ok.
+        return {fname: "?" for fname in fleets}
     out = {}
     for fname in fleets:
         pat = re.compile(

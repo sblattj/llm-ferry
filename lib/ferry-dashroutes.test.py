@@ -1071,5 +1071,70 @@ class FleetTopologyTest(unittest.TestCase):
         self.assertFalse(any("not in fleet" in e for e in errs))
 
 
+class FleetForwardTest(unittest.TestCase):
+    """forward_fleet: POST /api/fleet is a pass-through to the front door.
+
+    The front door reads {"fleet": null} as "clear my selection", so the
+    forwarder must send exactly the keys it was given: a body without a
+    fleet key earns the front door's 400, never a clear. http_json is
+    stubbed; no proxy is touched."""
+
+    def _capture(self, status=200, doc=None):
+        seen = {}
+
+        def cap(url, key, method, body, timeout=None, headers=None):
+            seen.update(url=url, key=key, method=method, body=body,
+                        headers=headers)
+            return {"ok": status == 200, "status": status,
+                    "json": doc if doc is not None else {"ok": True}}
+        prev = D.http_json
+        D.http_json = cap
+        self.addCleanup(setattr, D, "http_json", prev)
+        return seen
+
+    def test_a_client_row_posts_the_fleet_as_that_identity(self):
+        seen = self._capture()
+        status, out = D.forward_fleet(
+            "http://x", "k", {"fleet": "domestic", "identity": "laptop"})
+        self.assertEqual(status, 200)
+        self.assertEqual(out, {"ok": True})
+        self.assertTrue(seen["url"].endswith("/v1/ferry/fleet"))
+        self.assertEqual(seen["method"], "POST")
+        self.assertEqual(seen["body"], {"fleet": "domestic"})
+        self.assertEqual(seen["headers"], {"X-Ferry-Client": "laptop"})
+
+    def test_the_default_row_travels_without_an_identity(self):
+        seen = self._capture()
+        D.forward_fleet("http://x", "k",
+                        {"fleet": "international", "default": True})
+        self.assertEqual(seen["body"],
+                         {"fleet": "international", "default": True})
+        self.assertIsNone(seen["headers"])
+
+    def test_an_explicit_null_is_still_a_clear(self):
+        seen = self._capture()
+        D.forward_fleet("http://x", "k", {"fleet": None, "identity": "laptop"})
+        self.assertEqual(seen["body"], {"fleet": None})
+
+    def test_a_body_without_a_fleet_key_is_not_rewritten_into_a_clear(self):
+        refused = {"error": {"message": 'body needs a "fleet" key',
+                             "type": "ferry_fleet"}}
+        seen = self._capture(status=400, doc=refused)
+        status, out = D.forward_fleet("http://x", "k", {"identity": "laptop"})
+        self.assertNotIn("fleet", seen["body"])
+        self.assertEqual(status, 400)
+        self.assertEqual(out, refused)
+
+    def test_a_transport_failure_is_a_502_with_the_reason(self):
+        def boom(*a, **k):
+            return {"ok": False, "status": None, "error": "refused"}
+        prev = D.http_json
+        D.http_json = boom
+        self.addCleanup(setattr, D, "http_json", prev)
+        status, out = D.forward_fleet("http://x", "k", {"fleet": "domestic"})
+        self.assertEqual(status, 502)
+        self.assertIn("error", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

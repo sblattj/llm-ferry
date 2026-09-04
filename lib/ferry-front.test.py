@@ -26,6 +26,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "front"))
@@ -1130,6 +1131,119 @@ class MainWorkersTest(unittest.TestCase):
                 self.assertEqual(os.listdir(preset), [])
             finally:
                 os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+
+
+class TestFleetDiscovery(unittest.TestCase):
+    """A fleet is DISCOVERED from model_name prefixes, never declared."""
+
+    def _write(self, text):
+        fd, path = tempfile.mkstemp(suffix=".yaml")
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_splits_at_the_first_dot_only(self):
+        # A provider string with its own dots must not become a fleet: the
+        # split is on the LANE name, and only its first dot.
+        path = self._write("""
+model_list:
+  - model_name: domestic.heavy
+    litellm_params: {model: chatgpt/responses/gpt-5.6-sol}
+  - model_name: domestic.super-flash
+    litellm_params: {model: openrouter/~google/gemini-flash-latest}
+  - model_name: international.flash-or
+    litellm_params: {model: openrouter/~z-ai/glm-flash-latest}
+""")
+        self.assertEqual(FF.discover_fleets(path), {
+            "domestic": {"heavy": "chatgpt/responses/gpt-5.6-sol",
+                         "super-flash": "openrouter/~google/gemini-flash-latest"},
+            "international": {"flash-or": "openrouter/~z-ai/glm-flash-latest"},
+        })
+
+    def test_a_lane_name_with_two_dots_keeps_the_tail(self):
+        path = self._write(
+            "model_list:\n"
+            "  - {model_name: domestic.gpt-3.5, litellm_params: {model: openai/gpt-3.5-turbo}}\n")
+        self.assertEqual(FF.discover_fleets(path),
+                         {"domestic": {"gpt-3.5": "openai/gpt-3.5-turbo"}})
+
+    def test_undotted_names_are_ignored(self):
+        # local-orch / local-sub are shared and unprefixed: they are not a
+        # fleet and must never create one.
+        path = self._write("""
+model_list:
+  - {model_name: local-orch, litellm_params: {model: hosted_vllm/qwen}}
+  - {model_name: local-sub, litellm_params: {model: hosted_vllm/qwen-sub}}
+""")
+        self.assertEqual(FF.discover_fleets(path), {})
+
+    def test_the_first_deployment_wins(self):
+        path = self._write("""
+model_list:
+  - {model_name: domestic.flash, litellm_params: {model: first/one}}
+  - {model_name: domestic.flash, litellm_params: {model: second/one}}
+""")
+        self.assertEqual(FF.discover_fleets(path), {"domestic": {"flash": "first/one"}})
+
+    def test_a_missing_model_string_is_an_empty_value_not_a_crash(self):
+        path = self._write("model_list:\n  - {model_name: domestic.flash}\n")
+        self.assertEqual(FF.discover_fleets(path), {"domestic": {"flash": ""}})
+
+    def test_missing_file_is_empty_not_an_error(self):
+        # Fail-open: no fleets => the resolver is a no-op and every name
+        # passes through, exactly as before this feature existed.
+        self.assertEqual(FF.discover_fleets("/nonexistent/ferry.yaml"), {})
+        self.assertEqual(FF.discover_fleets(""), {})
+
+    def test_unparsable_file_is_empty_not_an_error(self):
+        path = self._write("model_list: [oops\n  broken: :\n")
+        self.assertEqual(FF.discover_fleets(path), {})
+
+    def test_junk_entries_are_skipped_not_fatal(self):
+        path = self._write("""
+model_list:
+  - "just a string"
+  - {model_name: domestic.heavy, litellm_params: {model: chatgpt/x}}
+""")
+        self.assertEqual(FF.discover_fleets(path), {"domestic": {"heavy": "chatgpt/x"}})
+
+
+class TestFleetGaps(unittest.TestCase):
+    """A fleet missing a cloud lane degrades that lane, not the front door."""
+
+    def test_names_each_missing_cloud_lane(self):
+        gaps = FF.fleet_gaps({"domestic": {"heavy": "a", "flash": "b", "super-flash": "c"},
+                              "international": {"heavy": "d"}})
+        self.assertEqual(gaps, ["fleet 'international' has no lane 'flash'",
+                                "fleet 'international' has no lane 'super-flash'"])
+
+    def test_a_complete_fleet_reports_nothing(self):
+        self.assertEqual(FF.fleet_gaps(
+            {"domestic": {"heavy": "a", "flash": "b", "super-flash": "c", "flash-luna": "d"}}), [])
+
+    def test_no_fleets_reports_nothing(self):
+        self.assertEqual(FF.fleet_gaps({}), [])
+
+
+class TestFleetStatePath(unittest.TestCase):
+    def test_defaults_beside_the_config(self):
+        self.assertEqual(FF.fleet_state_path("/home/x/.config/ferry/litellm.yaml"),
+                         "/home/x/.config/ferry/fleets.json")
+
+    def test_the_env_override_wins(self):
+        with unittest.mock.patch.dict(
+                os.environ, {FF.FLEET_STATE_ENV: "/tmp/other/fleets.json"}):
+            self.assertEqual(FF.fleet_state_path("/home/x/.config/ferry/litellm.yaml"),
+                             "/tmp/other/fleets.json")
+
+    def test_an_empty_env_value_is_not_an_override(self):
+        with unittest.mock.patch.dict(os.environ, {FF.FLEET_STATE_ENV: ""}):
+            self.assertEqual(FF.fleet_state_path("/home/x/.config/ferry/litellm.yaml"),
+                             "/home/x/.config/ferry/fleets.json")
+
+    def test_an_empty_config_path_puts_the_state_in_the_cwd(self):
+        self.assertEqual(FF.fleet_state_path(""), "fleets.json")
 
 
 if __name__ == "__main__":

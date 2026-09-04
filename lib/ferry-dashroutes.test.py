@@ -147,6 +147,39 @@ class SpliceTest(unittest.TestCase):
         with self.assertRaises(D.SpliceError):
             D.splice_fallbacks(doubled, {"heavy": ["heavy-glm"]})
 
+    # ── the second chain map: context_window_fallbacks ────────────────────
+    CW_CONFIG = CONFIG.replace(
+        "  fallbacks:",
+        '  context_window_fallbacks: [{"heavy": ["heavy-glm"]}]\n'
+        '  fallbacks:', 1)
+
+    def test_a_reorder_syncs_the_context_window_map(self):
+        """The cw map carries the overflow chain; leaving it on the old order
+        while fallbacks moves would send a context overflow to the hop the
+        reorder just demoted. Same one-line splice, same merge rule."""
+        new = D.splice_fallbacks(self.CW_CONFIG, {"heavy": ["flash"]})
+        cw = [l for l in new.splitlines()
+              if l.lstrip().startswith("context_window_fallbacks:")][0]
+        merged = {}
+        for e in json.loads(cw.split("context_window_fallbacks:", 1)[1].strip()):
+            merged.update(e)
+        self.assertEqual(merged["heavy"], ["flash"])
+
+    def test_the_cw_map_gains_no_entry_for_a_lane_it_never_had(self):
+        new = D.splice_fallbacks(self.CW_CONFIG, {"flash": ["heavy"]})
+        cw = [l for l in new.splitlines()
+              if l.lstrip().startswith("context_window_fallbacks:")][0]
+        merged = {}
+        for e in json.loads(cw.split("context_window_fallbacks:", 1)[1].strip()):
+            merged.update(e)
+        self.assertNotIn("flash", merged)
+
+    def test_the_fallbacks_anchor_does_not_match_the_cw_line(self):
+        new = D.splice_fallbacks(self.CW_CONFIG, {"heavy": ["flash"]})
+        lines = [l for l in new.splitlines()
+                 if l.lstrip().startswith("context_window_fallbacks:")]
+        self.assertEqual(len(lines), 1, "the cw line must survive as-is")
+
 
 class ValidateTest(unittest.TestCase):
     def setUp(self):
@@ -363,6 +396,356 @@ class OrderTest(unittest.TestCase):
         for e in json.loads(line.split("fallbacks:", 1)[1].strip()):
             merged.update(e)
         self.assertEqual(merged, {"heavy": ["flash-or"], "flash": ["heavy"]})
+
+
+class HotswapNoteTest(unittest.TestCase):
+    """hotswap_reorder: the live half of an apply never fails the file half.
+
+    The file write already succeeded when this runs, so every outcome is a
+    NOTE, never an exception: success, unreachable proxy, a proxy predating
+    the endpoint, and a live router refusing what the file accepted (the one
+    that must read as a warning, not a success — the next restart would serve
+    the refused order). http_json is stubbed; no proxy is touched."""
+
+    def _with(self, stub):
+        prev = D.http_json
+        D.http_json = stub
+        self.addCleanup(setattr, D, "http_json", prev)
+
+    def test_success_reports_no_restart_needed(self):
+        self._with(lambda *a, **k: {"ok": True, "status": 200,
+                                    "json": {"ok": True}})
+        note = D.hotswap_reorder("http://x", "k",
+                                 {"heavy": ["heavy", "flash-or"]})
+        self.assertIn("no restart needed", note)
+
+    def test_an_unreachable_proxy_names_the_restart_fallback(self):
+        def boom(*a, **k):
+            raise ConnectionError("refused")
+        self._with(boom)
+        note = D.hotswap_reorder("http://x", "k",
+                                 {"heavy": ["heavy", "flash-or"]})
+        self.assertIn("restart it", note)
+
+    def test_a_proxy_predating_the_endpoint_names_the_restart_fallback(self):
+        self._with(lambda *a, **k: {"ok": False, "status": 404,
+                                    "json": {"errors": ["not found"]}})
+        note = D.hotswap_reorder("http://x", "k",
+                                 {"heavy": ["heavy", "flash-or"]})
+        self.assertIn("restart the proxy", note)
+
+    def test_a_live_refusal_reads_as_a_warning_not_a_success(self):
+        self._with(lambda *a, **k: {"ok": False, "status": 409,
+                                    "json": {"errors": ["hop 'ghost' "
+                                                        "not served"]}})
+        note = D.hotswap_reorder("http://x", "k",
+                                 {"heavy": ["heavy", "ghost"]})
+        self.assertIn("REFUSED", note)
+        self.assertIn("ghost", note)
+
+    def test_the_legacy_shape_sends_chains_not_order(self):
+        seen = {}
+
+        def cap(url, key, method, body, timeout=None):
+            seen.update(body)
+            return {"ok": True, "status": 200, "json": {"ok": True}}
+        self._with(cap)
+        D.hotswap_reorder("http://x", "k",
+                          {"__chains__": {"heavy": ["flash-or"]}})
+        # A bare chains map has no position 0: sending it as `order` would
+        # eat its first hop as a primary. It must go out as `chains`.
+        self.assertEqual(seen, {"chains": {"heavy": ["flash-or"]}})
+
+    def test_the_unified_shape_sends_order_verbatim(self):
+        seen = {}
+
+        def cap(url, key, method, body, timeout=None):
+            seen.update(body)
+            return {"ok": True, "status": 200, "json": {"ok": True}}
+        self._with(cap)
+        D.hotswap_reorder("http://x", "k",
+                          {"heavy": ["heavy", "flash-or"]})
+        self.assertEqual(seen, {"order": {"heavy": ["heavy", "flash-or"]}})
+
+
+SWAP_CONFIG = """\
+# A comment that must not move.
+model_list:
+  - model_name: lane-a
+    litellm_params:
+      model: provider-a/model-a
+      api_key: os.environ/KEY_A
+    model_info:
+      public: true
+      id: id-a
+
+  # A comment owned by lane-b.
+  - model_name: lane-b
+    litellm_params:
+      model: provider-b/model-b
+      api_key: os.environ/KEY_B
+      api_base: https://b.example/v1
+    model_info:
+      id: id-b
+
+router_settings:
+  fallbacks: [{"lane-a": ["lane-b"]}]
+"""
+
+
+# The 2026-09-04 outage shape: the HOP's block sits ABOVE the lane's and its
+# litellm_params body is one line longer (api_base). A third block follows the
+# lane so an off-by-one splice has a neighbour to damage.
+SWAP_CONFIG_HOP_FIRST = """\
+model_list:
+  # A comment owned by lane-b.
+  - model_name: lane-b
+    litellm_params:
+      model: provider-b/model-b
+      api_key: os.environ/KEY_B
+      api_base: https://b.example/v1
+    model_info:
+      id: id-b
+
+  # A comment owned by lane-a.
+  - model_name: lane-a
+    litellm_params:
+      model: provider-a/model-a
+      api_key: os.environ/KEY_A
+    model_info:
+      public: true
+      id: id-a
+
+  # A comment owned by lane-c.
+  - model_name: lane-c
+    litellm_params:
+      model: provider-c/model-c
+    model_info:
+      id: id-c
+
+router_settings:
+  fallbacks: [{"lane-a": ["lane-b"]}]
+"""
+
+
+class SwapPrimariesTest(unittest.TestCase):
+    """swap_primaries: the file half of a promote.
+
+    Byte discipline is the property: only the litellm_params bodies trade
+    places (exact bytes) and the two id: values change. Comments, key order,
+    and every other byte stay put — the diff must show the moved lines as
+    moved, never a rewrite."""
+
+    def test_backends_trade_places_ids_take_the_supplied_fresh_pair(self):
+        new = D.swap_primaries(SWAP_CONFIG, "lane-a", "lane-b",
+                               "lane-a-promoted-T", "lane-b-promoted-T")
+        _, blocks = D._deploy_blocks(new.splitlines())
+        for name, want_model, want_id in (
+                ("lane-a", "provider-b/model-b", "lane-a-promoted-T"),
+                ("lane-b", "provider-a/model-a", "lane-b-promoted-T")):
+            s, e = blocks[name]
+            blk = "\n".join(new.splitlines()[s:e])
+            self.assertIn("model: " + want_model, blk)
+            self.assertIn("id: " + want_id, blk)
+
+    def test_names_public_and_chains_are_untouched(self):
+        new = D.swap_primaries(SWAP_CONFIG, "lane-a", "lane-b", "x", "y")
+        self.assertIn("- model_name: lane-a", new)
+        self.assertIn("- model_name: lane-b", new)
+        self.assertIn("public: true", new)
+        self.assertIn('fallbacks: [{"lane-a": ["lane-b"]}]', new)
+
+    def test_comments_survive_byte_identical(self):
+        def comments(t):
+            return [l for l in t.splitlines() if l.lstrip().startswith("#")]
+        new = D.swap_primaries(SWAP_CONFIG, "lane-a", "lane-b", "x", "y")
+        self.assertEqual(comments(SWAP_CONFIG), comments(new))
+
+    def test_only_backend_lines_and_ids_change(self):
+        new = D.swap_primaries(SWAP_CONFIG, "lane-a", "lane-b", "x", "y")
+        a, b = SWAP_CONFIG.splitlines(), new.splitlines()
+        # The bodies differ in length by one (api_base), so the file grows by
+        # one line: every UNCHANGED line keeps its bytes, and every line the
+        # diff touches is a moved backend line, an id, or a block-boundary
+        # line whose address shifted by the length delta.
+        import difflib
+        ops = [op for op in difflib.SequenceMatcher(None, a, b).get_opcodes()
+               if op[0] != "equal"]
+        touched = set()
+        for tag, i1, i2, j1, j2 in ops:
+            touched.update(a[i1:i2])
+            touched.update(b[j1:j2])
+        for l in touched:
+            s = l.strip()
+            self.assertTrue(
+                not s or s.startswith("#") or s.startswith("- model_name:")
+                or s.split(":")[0] in (
+                    "model", "api_key", "api_base", "timeout",
+                    "reasoning_effort", "extra_body", "provider", "sort",
+                    "litellm_params",
+                    "model_info", "public", "id", "max_input_tokens")
+                or s.startswith(("model:", "api_key:", "api_base:", "id:")),
+                l)
+
+    def test_hop_block_above_lane_block_with_unequal_bodies(self):
+        """Regression for the 2026-09-04 front-door outage. Both spans were
+        computed on the original text, then spliced into ONE list in dict
+        order (hop first). The hop's body was a line shorter after the swap,
+        so every later line shifted up by one and the lane's splice landed
+        one line off: it ate the blank line above the lane's anchor and left
+        the lane's last comment duplicated. The swap BACK then doubled the
+        lane's anchor and overwrote the NEXT block's, litellm raised
+        KeyError('litellm_params') on startup, and the proxy stayed down."""
+        new = D.swap_primaries(SWAP_CONFIG_HOP_FIRST, "lane-a", "lane-b",
+                               "lane-a-promoted-T", "lane-b-promoted-T")
+        lines = new.splitlines()
+        _, blocks = D._deploy_blocks(lines)          # duplicate anchors raise
+        self.assertEqual(sorted(blocks), ["lane-a", "lane-b", "lane-c"])
+        for name in ("lane-a", "lane-b", "lane-c"):
+            self.assertEqual(new.count("- model_name: %s" % name), 1, name)
+        for name, want_model, want_id in (
+                ("lane-a", "provider-b/model-b", "lane-a-promoted-T"),
+                ("lane-b", "provider-a/model-a", "lane-b-promoted-T"),
+                ("lane-c", "provider-c/model-c", "id-c")):
+            s, e = blocks[name]
+            blk = "\n".join(lines[s:e])
+            self.assertIn("model: " + want_model, blk)
+            self.assertIn("id: " + want_id, blk)
+        self.assertIn("api_base: https://b.example/v1",
+                      "\n".join(lines[slice(*blocks["lane-a"])]))
+        self.assertNotIn("api_base",
+                         "\n".join(lines[slice(*blocks["lane-b"])]))
+
+    def test_comments_survive_when_the_hop_block_is_above(self):
+        def comments(t):
+            return [l for l in t.splitlines() if l.lstrip().startswith("#")]
+        new = D.swap_primaries(SWAP_CONFIG_HOP_FIRST, "lane-a", "lane-b",
+                               "x", "y")
+        self.assertEqual(comments(SWAP_CONFIG_HOP_FIRST), comments(new))
+
+    def test_swapping_back_restores_the_original_bytes(self):
+        """The outage's exact sequence: promote, then promote back with the
+        original ids. The file must come back byte-identical."""
+        once = D.swap_primaries(SWAP_CONFIG_HOP_FIRST, "lane-a", "lane-b",
+                                "lane-a-promoted-T", "lane-b-promoted-T")
+        back = D.swap_primaries(once, "lane-a", "lane-b", "id-a", "id-b")
+        self.assertEqual(back, SWAP_CONFIG_HOP_FIRST)
+
+    def test_missing_block_raises_and_writes_nothing(self):
+        with self.assertRaises(D.SpliceError):
+            D.swap_primaries(SWAP_CONFIG, "lane-a", "ghost", "x", "y")
+
+    def test_duplicate_anchors_raise(self):
+        doubled = SWAP_CONFIG.replace("- model_name: lane-b",
+                                      "- model_name: lane-a", 1)
+        with self.assertRaises(D.SpliceError):
+            D.swap_primaries(doubled, "lane-a", "lane-b", "x", "y")
+
+    def test_a_block_without_params_raises(self):
+        stripped = SWAP_CONFIG.replace("    litellm_params:\n", "", 1)
+        with self.assertRaises(D.SpliceError):
+            D.swap_primaries(stripped, "lane-a", "lane-b", "x", "y")
+
+
+class PromoteFileTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "litellm.yaml")
+        with open(self.path, "w") as f:
+            f.write(SWAP_CONFIG)
+        self.topo = D.parse_topology_text(SWAP_CONFIG)
+
+    def test_validate_accepts_a_chain_hop(self):
+        self.assertEqual(D.validate_promote_file(
+            self.topo, "lane-a", "lane-b"), [])
+
+    def test_validate_refuses_a_hop_outside_the_chain(self):
+        errs = D.validate_promote_file(self.topo, "lane-b", "lane-a")
+        self.assertTrue(any("not in" in e for e in errs), errs)
+
+    def test_validate_refuses_unknown_names(self):
+        self.assertTrue(D.validate_promote_file(self.topo, "ghost", "lane-b"))
+        self.assertTrue(D.validate_promote_file(self.topo, "lane-a", "ghost"))
+
+    def test_apply_swaps_and_snapshots(self):
+        snap, diff = D.apply_promote(self.path, "lane-a", "lane-b",
+                                     "lane-a-promoted-T", "lane-b-promoted-T")
+        with open(snap) as f:
+            self.assertEqual(f.read(), SWAP_CONFIG)
+        with open(self.path) as f:
+            written = f.read()
+        self.assertIn("id: lane-a-promoted-T", written)
+        self.assertIn("id: lane-b-promoted-T", written)
+        self.assertTrue(diff)
+
+    def test_apply_refuses_and_writes_nothing(self):
+        with self.assertRaises(D.SpliceError):
+            D.apply_promote(self.path, "lane-b", "lane-a", "x", "y")
+        with open(self.path) as f:
+            self.assertEqual(f.read(), SWAP_CONFIG)
+
+    def test_minted_ids_are_distinct_and_prefixed(self):
+        a, b = D._mint_file_ids("lane-a", "lane-b")
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.startswith("lane-a-promoted-"))
+        self.assertTrue(b.startswith("lane-b-promoted-"))
+
+
+class PromoteHotswapTest(unittest.TestCase):
+    """hotswap_promote: the live half of a promote apply.
+
+    Preview posts read-only and returns the verdict dict; apply posts the
+    file-first ids so file and router agree; every transport failure is a
+    note, never an exception."""
+
+    def _with(self, stub):
+        prev = D.http_json
+        D.http_json = stub
+        self.addCleanup(setattr, D, "http_json", prev)
+
+    def test_preview_returns_the_verdict_dict(self):
+        verdict = {"ok": True, "lane": "heavy", "hop": "x"}
+        seen = {}
+
+        def cap(url, key, method, body, timeout=None):
+            seen["url"] = url
+            seen["body"] = body
+            return {"ok": True, "status": 200, "json": verdict}
+        self._with(cap)
+        out = D.hotswap_promote("http://x", "k", "heavy", "x", preview_only=True)
+        self.assertEqual(out, verdict)
+        self.assertTrue(seen["url"].endswith("/v1/ferry/promote/preview"))
+        # Preview sends no ids — there is nothing to echo yet.
+        self.assertEqual(seen["body"], {"lane": "heavy", "hop": "x"})
+
+    def test_apply_sends_the_file_first_ids(self):
+        seen = {}
+
+        def cap(url, key, method, body, timeout=None):
+            seen["body"] = body
+            return {"ok": True, "status": 200, "json": {"ok": True}}
+        self._with(cap)
+        note = D.hotswap_promote("http://x", "k", "heavy", "x",
+                                 lane_id="L", hop_id="H")
+        self.assertIn("no restart needed", note)
+        self.assertEqual(seen["body"],
+                         {"lane": "heavy", "hop": "x",
+                          "lane_id": "L", "hop_id": "H"})
+
+    def test_a_live_refusal_reads_as_a_warning(self):
+        self._with(lambda *a, **k: {"ok": False, "status": 409,
+                                    "json": {"errors": ["not in chain"]}})
+        note = D.hotswap_promote("http://x", "k", "heavy", "x",
+                                 lane_id="L", hop_id="H")
+        self.assertIn("REFUSED", note)
+
+    def test_an_unreachable_proxy_names_the_restart_fallback(self):
+        def boom(*a, **k):
+            raise ConnectionError("refused")
+        self._with(boom)
+        note = D.hotswap_promote("http://x", "k", "heavy", "x",
+                                 lane_id="L", hop_id="H")
+        self.assertIn("restart it", note)
 
 
 if __name__ == "__main__":

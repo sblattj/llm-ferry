@@ -141,6 +141,359 @@ def strip_headers_enabled() -> bool:
     return (os.environ.get("FERRY_STRIP_HEADERS") or "1").strip().lower() not in (
         "0", "off", "false", "no")
 
+# ── fallback-chain hot-swap ────────────────────────────────────────────────
+# Reordering a lane's fallbacks must not need `ferry reload`: restarting the
+# front door drops every in-flight request, while a reorder is one list
+# assignment on litellm's Router. litellm reads router.fallbacks per REQUEST
+# (router.py: `kwargs.get("fallbacks", self.fallbacks)` inside the call path),
+# so swapping the attribute is live for the very next request — no restart, no
+# dropped connections, in-flight requests keep the old chain to completion.
+#
+# The write half is atomic: every lane in the request is validated against the
+# CURRENT router state first, and only when all lanes pass does any assignment
+# happen — a rejected reorder changes nothing. Validation is the same three
+# rules litellm itself enforces at Router boot plus the ferry lane rule:
+# every hop must be a model_name the router serves, no hop twice, a lane never
+# its own fallback. Unknown hops are REFUSED, never skipped: litellm's boot
+# validator raises on a bad chain, so silently accepting one here would drift
+# the live state away from anything the config could produce.
+#
+# Control surface: GET /v1/ferry/chains reads the live chains, POST
+# /v1/ferry/reorder writes them. Loopback-only (same rule as the dash's header
+# exemption): these mutate routing, so the LAN never reaches them. litellm's
+# own auth still applies first — litellm resolves auth before this middleware
+# ever runs, so without the bearer the request is a 401 from litellm itself.
+# Paths are /v1/ferry/* on purpose: is_inference_path has no /v1/ferry prefix,
+# so the event tap never records a reorder as a served request.
+REORDER_CHAINS_PATH = "/v1/ferry/chains"
+REORDER_PATH = "/v1/ferry/reorder"
+
+
+def _live_router():
+    """The running proxy's Router, or None (tests, import without boot).
+
+    Imported lazily: this module loads without litellm installed (the unit
+    tests import it offline), and at import time the proxy has not built its
+    router yet anyway. The global lives on litellm.proxy.proxy_server, which
+    is where cmd_reload's process already keeps it."""
+    try:
+        from litellm.proxy import proxy_server
+        return proxy_server.llm_router
+    except Exception:
+        return None
+
+
+def parse_reorder_body(raw: bytes):
+    """(chains, error) from a POST /v1/ferry/reorder body.
+
+    Accepts the dash's unified order shape ({order: {lane: [primary, ...]}})
+    and the bare chains shape ({chains: {lane: [...]}}). Anything else is a
+    400 with the reason, never a guess: an order whose position 0 is not the
+    lane itself would silently re-point the primary if coerced."""
+    try:
+        doc = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    except Exception:
+        return None, "body is not JSON"
+    if not isinstance(doc, dict):
+        return None, "body must be a JSON object"
+    if isinstance(doc.get("order"), dict):
+        chains = {}
+        for lane, seq in doc["order"].items():
+            if not isinstance(seq, list):
+                return None, "order[%r] must be a list" % (lane,)
+            if not seq:
+                return None, "order[%r] may not be empty" % (lane,)
+            if seq[0] != lane:
+                return None, (
+                    "primary changes not yet supported: %r would become the "
+                    "primary of lane %r" % (seq[0], lane))
+            chains[lane] = list(seq[1:])
+        return chains, None
+    if isinstance(doc.get("chains"), dict):
+        chains = doc["chains"]
+        for lane, seq in chains.items():
+            if not isinstance(seq, list):
+                return None, "chains[%r] must be a list of model names" % (lane,)
+            if any(not isinstance(h, str) for h in seq):
+                return None, "chains[%r] must be a list of model names" % (lane,)
+        return {lane: list(seq) for lane, seq in chains.items()}, None
+    return None, "body needs an 'order' or 'chains' object"
+
+
+def validate_reorder(chains, router_names) -> list:
+    """Every reason to refuse a hot-swap, as human-readable strings.
+
+    router_names is the set of model_names the live proxy serves — NOT the
+    file's groups: the router is the thing that will execute the chain, so a
+    hop it does not know would be skipped silently at 2am, exactly the failure
+    validate_chains guards against for the file path."""
+    errs = []
+    for lane, seq in chains.items():
+        if lane not in router_names:
+            errs.append("lane %r is not served by the running proxy" % (lane,))
+            continue
+        if lane in seq:
+            errs.append("lane %r lists itself as its own fallback" % (lane,))
+        seen = set()
+        for hop in seq:
+            if hop not in router_names:
+                errs.append("hop %r (in %s) is not served by the running proxy"
+                            % (hop, lane))
+            if hop in seen:
+                errs.append("hop %r appears twice in %s" % (hop, lane))
+            seen.add(hop)
+    return errs
+
+
+def chain_signature(router) -> list:
+    """The router's live fallbacks as a sorted [[lane, hops]] list.
+
+    Sorted so two workers serving the same chains produce the same body, and a
+    list (not a dict) so the GET response has a stable key order to eyeball."""
+    out = []
+    for entry in getattr(router, "fallbacks", None) or []:
+        if isinstance(entry, dict):
+            for lane, hops in entry.items():
+                out.append([lane, list(hops)])
+    out.sort()
+    return out
+
+
+def service_reorder(router, chains):
+    """Validate-then-assign on the live router. Returns (ok, errors).
+
+    The all-or-nothing half: validation runs over EVERY lane before the first
+    assignment, so a three-lane reorder with one bad hop leaves all three
+    chains exactly as they were. Assignment keeps litellm's own shape —
+    [{lane: hops}] — so anything downstream reading router.fallbacks sees what
+    a boot from the same config would have built."""
+    names = set(getattr(router, "model_group_alias", None) or {})
+    try:
+        groups = router.get_model_groups() if hasattr(router, "get_model_groups") else []
+        names.update(g if isinstance(g, str) else g.get("model_name", "") for g in groups or [])
+    except Exception:
+        pass
+    if not names:
+        try:
+            names.update(d.get("model_name", "") for d in
+                         (getattr(router, "model_list", None) or [])
+                         if isinstance(d, dict))
+        except Exception:
+            pass
+    names.discard("")
+    errs = validate_reorder(chains, names)
+    if errs:
+        return False, errs
+    live = {lane: list(hops) for entry in (router.fallbacks or [])
+            if isinstance(entry, dict) for lane, hops in entry.items()}
+    live.update(chains)
+    router.fallbacks = [{lane: hops} for lane, hops in live.items()]
+    return True, []
+
+
+# ── primary hot-swap ───────────────────────────────────────────────────────
+# A reorder only moves the TAIL (positions 1..n); the primary (position 0) is
+# a deployment's own model_name, and "promoting" a fallback used to mean
+# ferry reload. It no longer does, and the operation is NOT a params-reseat
+# but a BACKEND SWAP between the two names: the lane's deployment and the
+# hop's deployment trade litellm_params (each under a FRESH id), names and
+# chains untouched.
+#
+# The swap shape is what makes it safe. A reseat (hop params under the lane
+# name, old primary deleted) would orphan the demoted backend: re-adding it
+# under the lane's own name is a self-fallback, and inventing a new name for
+# it breaks every chain referencing the old ones. A swap loses nothing: after
+# promoting muse to heavy, heavy's chain [orch-muse-spark, ...] still works —
+# that hop now serves the demoted K3 backend, so the effective order is
+# muse -> K3 -> GLM -> ... with zero chain edits. Cross-lane side effect is
+# symmetric and honest: every other chain naming the hop gets the demoted
+# backend in that slot too (e.g. orch's first hop becomes K3, same as orch's
+# own primary — a harmless redundant hop), and the dash shows model strings
+# from the file, so after the file echo the new mapping is VISIBLE.
+#
+# litellm resolves the primary per REQUEST (_get_all_deployments reads
+# model_name_to_deployment_indices -> model_list[idx] fresh on every call),
+# and upsert/delete_deployment maintain every index they touch, so the swap
+# is live for the very next request — in-flight requests finish on the old
+# backend; only the already-picked attempt keeps it.
+#
+# THE ONE RULE, from the per-worker-state audit: every id-keyed cache
+# (cooldowns, allowed-fails, usage counters, provider SDK clients) is keyed
+# by model_info.id. BOTH backends move, so BOTH arrive under fresh ids —
+# service_promote mints (or freshness-checks) two ids, one per name.
+#
+# Same shape as service_reorder: (ok, errors, ids), validate-everything-
+# first, and the file writer MUST echo the swap into litellm.yaml's
+# model_list — litellm re-reads the config on reconcile and would evict a
+# memory-only swap, and the dash parses the file. The dash applies
+# file-first-then-live with the SAME ids, so any failure converges via
+# restart instead of diverging.
+PROMOTE_CHAINS_PATH = "/v1/ferry/promote/preview"
+PROMOTE_PATH = "/v1/ferry/promote"
+
+
+def _deployment_dict(router, model_name):
+    """The live deployment dict backing a lane, or None.
+
+    get_deployment_by_model_group_name returns the FIRST deployment for the
+    group — which is the primary by construction (one deployment per lane in
+    this config; a pooled lane promotes its first member, same as serving)."""
+    try:
+        dep = router.get_deployment_by_model_group_name(model_name)
+    except Exception:
+        return None
+    if dep is None:
+        return None
+    try:
+        return dep.to_json(exclude_none=True) if hasattr(dep, "to_json") else dict(dep)
+    except Exception:
+        return None
+
+
+def _mint_promote_id(name):
+    import datetime
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return "%s-promoted-%s" % (name, ts)
+
+
+def _fresh_promote_id(candidate, taken):
+    """Whether a caller-supplied promote id is safe to use.
+
+    Fresh means: a non-empty string that is not any deployment id the live
+    router currently serves. Anything else inherits id-keyed state (cooldowns,
+    usage, provider clients) and is refused."""
+    return (isinstance(candidate, str) and bool(candidate)
+            and candidate not in taken)
+
+
+def parse_promote_body(raw: bytes):
+    """(lane, hop, ids, error) from a POST /v1/ferry/promote body.
+
+    {lane, hop}: swap the backends behind the two names. The hop must already
+    be in the lane's live CHAIN — promotion never invents a backend, it only
+    re-seats one the chain already trusts. Optional {lane_id, hop_id}: the ids
+    the swapped deployments will serve under — used ONLY by the dash's
+    file-first apply, which mints them, writes them into litellm.yaml, then
+    sends the same ones so file and router agree. A caller-supplied id that
+    is already live is refused (it would inherit that deployment's cooldowns,
+    usage, and provider client); omitted ids are minted server-side.
+    Anything else is a 400/409, never a guess about which provider string
+    the caller meant."""
+    try:
+        doc = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+    except Exception:
+        return None, None, None, "body is not JSON"
+    if not isinstance(doc, dict):
+        return None, None, None, "body must be a JSON object"
+    lane, hop = doc.get("lane"), doc.get("hop")
+    if not isinstance(lane, str) or not lane:
+        return None, None, None, "body needs a 'lane' string"
+    if not isinstance(hop, str) or not hop:
+        return None, None, None, "body needs a 'hop' string"
+    if lane == hop:
+        return None, None, None, "lane %r is already its own primary" % (lane,)
+    ids = {k: doc.get(k) for k in ("lane_id", "hop_id")
+           if isinstance(doc.get(k), str) and doc.get(k)}
+    return lane, hop, ids, None
+
+
+def _live_ids(router) -> set:
+    """Every model_info.id the live router currently serves."""
+    out = set()
+    try:
+        for d in getattr(router, "model_list", None) or []:
+            info = (d.get("model_info") if isinstance(d, dict)
+                    else getattr(d, "model_info", None)) or {}
+            ident = info.get("id") if isinstance(info, dict) else getattr(info, "id", None)
+            if ident:
+                out.add(ident)
+    except Exception:
+        pass
+    return out
+
+
+def validate_promote(router, lane, hop, ids=None) -> list:
+    """Every reason to refuse a primary swap, as human-readable strings."""
+    errs = []
+    lane_dep = _deployment_dict(router, lane)
+    if lane_dep is None:
+        errs.append("lane %r is not served by the running proxy" % (lane,))
+        return errs
+    hop_dep = _deployment_dict(router, hop)
+    if hop_dep is None:
+        errs.append("hop %r is not served by the running proxy — promotion "
+                    "only re-seats a backend the proxy already runs" % (hop,))
+        return errs
+    if ((lane_dep.get("model_info") or {}).get("id") ==
+            (hop_dep.get("model_info") or {}).get("id")):
+        errs.append("lane %r and hop %r share one deployment — nothing to swap"
+                    % (lane, hop))
+    chain = [h for entry in (getattr(router, "fallbacks", None) or [])
+             if isinstance(entry, dict) for l, hs in entry.items()
+             if l == lane for h in hs]
+    if hop not in chain:
+        errs.append("hop %r is not in %s's fallback chain — promote only "
+                    "moves a trusted hop, never an unlisted backend" % (hop, lane))
+    taken = _live_ids(router)
+    for key in ("lane_id", "hop_id"):
+        cand = (ids or {}).get(key)
+        if cand is not None and not _fresh_promote_id(cand, taken):
+            errs.append("%r %r is already served — a reused id inherits that "
+                        "deployment's cooldowns, usage, and provider client"
+                        % (key, cand))
+    return errs
+
+
+def service_promote(router, lane, hop, ids=None):
+    """Swap the backends behind lane and hop. Returns (ok, errors, id_map).
+
+    Upsert BOTH swapped deployments under fresh ids, THEN evict both old ids:
+    neither lane is ever without a backend if an add throws. Chains are
+    untouched — the demoted backend keeps serving under the HOP's name, so
+    the lane's existing chain order stays meaningful with zero edits.
+    id_map {lane: fresh_lane_id, hop: fresh_hop_id} is returned so the file
+    writer echoes the SAME ids — the live router and the file must agree, or
+    the dash misattributes hops and the next reconcile evicts the swap."""
+    errs = validate_promote(router, lane, hop, ids)
+    if errs:
+        return False, errs, None
+    lane_dep = _deployment_dict(router, lane)
+    hop_dep = _deployment_dict(router, hop)
+    old_lane_id = (lane_dep.get("model_info") or {}).get("id")
+    old_hop_id = (hop_dep.get("model_info") or {}).get("id")
+    if not old_lane_id or not old_hop_id:
+        return False, ["both deployments need a model_info.id to evict"], None
+    ids = ids or {}
+    fresh_lane = ids.get("lane_id") or _mint_promote_id(lane)
+    fresh_hop = ids.get("hop_id") or _mint_promote_id(hop)
+    if fresh_lane == fresh_hop:
+        return False, ["lane_id and hop_id must differ"], None
+    lane_params = dict(hop_dep.get("litellm_params") or {})
+    hop_params = dict(lane_dep.get("litellm_params") or {})
+    lane_info = dict(lane_dep.get("model_info") or {})
+    hop_info = dict(hop_dep.get("model_info") or {})
+    lane_info["id"] = fresh_lane
+    hop_info["id"] = fresh_hop
+    try:
+        # The Deployment import is local so this module still imports without
+        # litellm installed (the offline unit tests).
+        try:
+            from litellm.types.router import Deployment
+            mk = lambda name, params, info: Deployment(
+                model_name=name, litellm_params=params, model_info=info)
+        except Exception:
+            mk = lambda name, params, info: type("NewDeployment", (), {
+                "model_name": name, "litellm_params": params,
+                "model_info": info})()
+        router.upsert_deployment(deployment=mk(lane, lane_params, lane_info))
+        router.upsert_deployment(deployment=mk(hop, hop_params, hop_info))
+        router.delete_deployment(id=old_lane_id)
+        router.delete_deployment(id=old_hop_id)
+    except Exception as e:
+        return False, ["primary swap failed: %s: %s" % (type(e).__name__, e)], None
+    return True, [], {"lane": fresh_lane, "hop": fresh_hop}
+
+
 # ── the event tap ──────────────────────────────────────────────────────────
 # litellm returns the whole per-request attribution record in its RESPONSE
 # HEADERS, and nothing in ferry reads it. The proxy log cannot substitute:
@@ -274,6 +627,99 @@ class LaneCatalogueFilter:
         self.public = public
 
     async def __call__(self, scope, receive, send):
+        # The control plane first: GET /v1/ferry/chains, POST /v1/ferry/reorder,
+        # and POST /v1/ferry/promote are answered HERE, before litellm ever sees
+        # the request — litellm has no such routes and would 404 them, and more
+        # importantly its auth layer would bill them as unknown model calls.
+        # Loopback-only: mutating routing from the LAN is a non-starter.
+        path = scope.get("path", "") if scope.get("type") == "http" else ""
+        if path in (REORDER_CHAINS_PATH, REORDER_PATH,
+                    PROMOTE_CHAINS_PATH, PROMOTE_PATH):
+            if not _is_loopback_client(scope):
+                return await self._reply(
+                    send, 403, {"errors": ["ferry control plane is loopback-only"]})
+            if path == REORDER_CHAINS_PATH:
+                if scope.get("method", "GET").upper() != "GET":
+                    return await self._reply(
+                        send, 405, {"errors": ["use GET for chains"]})
+                return await self._reply(
+                    send, 200, {"chains": chain_signature(_live_router())})
+            if path == PROMOTE_CHAINS_PATH:
+                # Preview: what a promote WOULD do, without touching anything.
+                # The dash shows this before the user confirms.
+                if scope.get("method", "GET").upper() != "POST":
+                    return await self._reply(
+                        send, 405, {"errors": ["use POST for promote preview"]})
+                body = await self._read_body(receive, send)
+                if body is None:
+                    return
+                lane, hop, ids, err = parse_promote_body(body)
+                if err is not None:
+                    return await self._reply(send, 400, {"errors": [err]})
+                router = _live_router()
+                if router is None:
+                    return await self._reply(
+                        send, 503, {"errors": ["proxy router not ready"]})
+                errs = validate_promote(router, lane, hop, ids)
+                if errs:
+                    return await self._reply(send, 409, {"errors": errs})
+                lane_dep = _deployment_dict(router, lane)
+                hop_dep = _deployment_dict(router, hop)
+                return await self._reply(send, 200, {
+                    "ok": True,
+                    "lane": lane, "hop": hop,
+                    "old_lane_model": (lane_dep.get("litellm_params") or {}).get("model"),
+                    "old_hop_model": (hop_dep.get("litellm_params") or {}).get("model"),
+                    "note": "Confirm to swap: the two backends trade names "
+                            "under fresh ids; chains are untouched.",
+                })
+            if path in (REORDER_PATH, PROMOTE_PATH) and \
+                    scope.get("method", "GET").upper() != "POST":
+                return await self._reply(
+                    send, 405, {"errors": ["use POST here"]})
+            if path == PROMOTE_PATH:
+                body = await self._read_body(receive, send)
+                if body is None:
+                    return
+                lane, hop, ids, err = parse_promote_body(body)
+                if err is not None:
+                    return await self._reply(send, 400, {"errors": [err]})
+                router = _live_router()
+                if router is None:
+                    return await self._reply(
+                        send, 503, {"errors": ["proxy router not ready"]})
+                ok, errs, id_map = service_promote(router, lane, hop, ids)
+                if not ok:
+                    return await self._reply(send, 409, {"errors": errs})
+                return await self._reply(send, 200, {
+                    "ok": True, "lane": lane, "hop": hop,
+                    "ids": id_map,
+                    "chains": chain_signature(router),
+                    "note": "Live backends swapped (chains untouched); the "
+                            "config file is unchanged — Apply in ferry-dash "
+                            "writes the same swap (same ids %s) into "
+                            "litellm.yaml so a restart keeps it." % (id_map,),
+                })
+            # REORDER_PATH from here on.
+            body = await self._read_body(receive, send)
+            if body is None:
+                return
+            chains, err = parse_reorder_body(body)
+            if err is not None:
+                return await self._reply(send, 400, {"errors": [err]})
+            router = _live_router()
+            if router is None:
+                return await self._reply(
+                    send, 503, {"errors": ["proxy router not ready"]})
+            ok, errs = service_reorder(router, chains)
+            if not ok:
+                return await self._reply(send, 409, {"errors": errs})
+            return await self._reply(send, 200, {
+                "ok": True, "chains": chain_signature(router),
+                "note": "Live chains updated; the config file is unchanged — "
+                        "Apply in ferry-dash also writes litellm.yaml so a "
+                        "restart keeps this order.",
+            })
         # The hot path: anything that is not the model listing is handed over
         # untouched. With FERRY_EVENTS off — the default — there is no wrapper
         # around `send` at all, so a streamed completion is byte-for-byte what
@@ -324,6 +770,31 @@ class LaneCatalogueFilter:
             await send(message)
 
         await self.app(scope, receive, capture)
+
+    async def _read_body(self, receive, send):
+        """Read a full request body, or reply 400 and return None."""
+        body = b""
+        try:
+            while True:
+                msg = await receive()
+                body += msg.get("body", b"")
+                if not msg.get("more_body"):
+                    return body
+        except Exception:
+            await self._reply(
+                send, 400, {"errors": ["could not read request body"]})
+            return None
+
+    async def _reply(self, send, status, doc):
+        body = json.dumps(doc).encode()
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [(b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode())],
+        })
+        await send({"type": "http.response.body", "body": body,
+                    "more_body": False})
 
     def _stripping(self, send):
         """Wrap `send` to drop the identity headers on http.response.start.
@@ -421,7 +892,11 @@ def should_wrap(public) -> bool:
 
     A non-empty public set means catalogue filtering. An enabled tap means
     events. Header stripping (on by default) means lane-name confidentiality.
-    With none of the three, plain litellm is handed back untouched.
+    The reorder hot-swap always needs the middleware: POST /v1/ferry/reorder
+    and GET /v1/ferry/chains are answered in LaneCatalogueFilter.__call__,
+    before the request ever reaches litellm — so a config that needs none of
+    the other three still wraps, or the dash loses its one no-restart write
+    path. With none of the four, plain litellm is handed back untouched.
 
     This exists as its own predicate because `build_app` used to return the raw
     app whenever no lane was marked public — which silently disabled the event
@@ -430,7 +905,7 @@ def should_wrap(public) -> bool:
     never call build_app, so the object worked while the app never installed it.
     Caught by a live run under the real loader, 2026-08-30.
     """
-    return bool(public) or tap_enabled() or strip_headers_enabled()
+    return bool(public) or tap_enabled() or strip_headers_enabled() or True
 
 
 def build_app():

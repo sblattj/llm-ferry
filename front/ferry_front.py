@@ -621,6 +621,89 @@ def filter_catalogue(payload: bytes, public: frozenset[str]) -> bytes | None:
     return json.dumps(doc).encode()
 
 
+# ── fleets ────────────────────────────────────────────────────────────────
+# A fleet is a complete routing set — one deployment (plus its hops) per cloud
+# lane — living in the SAME litellm.yaml as every other fleet, distinguished by
+# a prefix on the model_name: `domestic.heavy`, `international.flash-or`. The
+# set of fleets is DISCOVERED from those prefixes; there is no registry and no
+# second file to drift. A client keeps sending the bare lane name and the
+# resolver below rewrites it, so switching fleets needs no reload and no client
+# restart.
+#
+# FAIL-OPEN, same doctrine as the catalogue filter: a config with no dotted
+# names discovers no fleets, and with no fleets the resolver is a no-op that
+# passes every model name through untouched.
+CLOUD_LANES = ("heavy", "flash", "super-flash")
+LOCAL_LANES = frozenset({"local-orch", "local-sub"})
+LEGACY_HEAVY = frozenset({"orch", "orchestrator"})
+FLEET_HEADER = b"x-ferry-fleet"
+CLIENT_HEADER = b"x-ferry-client"
+FLEET_PATH = "/v1/ferry/fleet"
+FLEET_STATE_ENV = "FERRY_FLEETS"
+HOST_IDENTITY = "host"
+
+
+def fleet_state_path(config_path: str) -> str:
+    """Where the per-client selections live: beside litellm.yaml by default.
+
+    FERRY_FLEETS overrides it, which is how the unit tests and a second host
+    instance keep their state out of the real ~/.config/ferry."""
+    override = (os.environ.get(FLEET_STATE_ENV) or "").strip()
+    if override:
+        return override
+    return os.path.join(os.path.dirname(config_path or ""), "fleets.json")
+
+
+def discover_fleets(config_path: str) -> dict:
+    """{fleet: {lane: primary model string}} read out of the routing file.
+
+    Every `model_name` containing a "." is split at the FIRST "." into
+    (fleet, lane); the value is `litellm_params.model` of the FIRST deployment
+    carrying that name, which is the primary by construction (the same rule
+    _deployment_dict relies on). Names without a "." — the shared local GPU
+    lanes — are ignored. Any read or parse problem returns {}: no fleets means
+    the resolver is a no-op, which is the pre-fleets behaviour."""
+    if not config_path or not os.path.exists(config_path):
+        return {}
+    try:
+        import yaml
+
+        with open(config_path) as handle:
+            cfg = yaml.safe_load(handle) or {}
+        out: dict = {}
+        for entry in cfg.get("model_list") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("model_name")
+            if not isinstance(name, str) or "." not in name:
+                continue
+            fleet, lane = name.split(".", 1)
+            if not fleet or not lane:
+                continue
+            params = entry.get("litellm_params") or {}
+            model = params.get("model") if isinstance(params, dict) else ""
+            lanes = out.setdefault(fleet, {})
+            if lane not in lanes:
+                lanes[lane] = model if isinstance(model, str) else ""
+        return out
+    except Exception:
+        return {}
+
+
+def fleet_gaps(fleets: dict) -> list:
+    """Human-readable complaints about fleets missing a cloud lane.
+
+    Logged to stderr at startup rather than raised: a typo in one lane of one
+    fleet degrades that lane (its requests 400 with the same message) instead
+    of taking the whole front door down."""
+    out = []
+    for fleet, lanes in (fleets or {}).items():
+        for lane in CLOUD_LANES:
+            if lane not in (lanes or {}):
+                out.append("fleet %r has no lane %r" % (fleet, lane))
+    return out
+
+
 class LaneCatalogueFilter:
     """ASGI middleware that filters the model listing and nothing else."""
 

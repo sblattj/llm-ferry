@@ -8,18 +8,18 @@
         "name": "Ferry (host)",
         "options": { "baseURL": "http://your-mac.local:8090/v1", "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>", "headers": {"X-Ferry-Client": "your-laptop", "X-Ferry-Fleet": "{env:FERRY_FLEET}"} },
         "models": {
-          "orch": {},
+          "heavy": {},
           "flash": {},
           "local-orch": {},
           "local-sub": {}
         }
       }
     },
-    "model": "ferry/orch",
+    "model": "ferry/heavy",
     "small_model": "ferry/flash",
     "agent": {
-      "build":   { "model": "ferry/orch" },
-      "plan":    { "model": "ferry/orch" },
+      "build":   { "model": "ferry/heavy" },
+      "plan":    { "model": "ferry/heavy" },
       "general": { "model": "ferry/flash" },
       "explore": { "model": "ferry/flash" },
       "scout":   { "model": "ferry/flash" }
@@ -30,9 +30,9 @@
   "continue_dev_vscode_or_jetbrains": {
     "models": [
       {
-        "title": "Ferry (orch)",
+        "title": "Ferry (heavy)",
         "provider": "openai",
-        "model": "orch",
+        "model": "heavy",
         "apiBase": "http://your-mac.local:8090/v1",
         "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
         "_note": "The host serves five lanes at once: heavy + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
@@ -44,7 +44,7 @@
     "section": "Settings -> Models -> OpenAI-Compatible",
     "override_baseURL": "http://your-mac.local:8090/v1",
     "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
-    "model_name_to_add": "orch",
+    "model_name_to_add": "heavy",
     "_note": "The host serves five lanes at once: heavy + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
   },
 

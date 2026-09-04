@@ -49,7 +49,7 @@
   },
 
   "generic_openai_sdk_python": {
-    "code": "from openai import OpenAI\n\nclient = OpenAI(\n    base_url='http://your-mac.local:8090/v1',\n    api_key='local'\n)\n\nresponse = client.chat.completions.create(\n    model='orch',\n    messages=[{'role': 'user', 'content': 'Tell me a joke.'}]\n)\nprint(response.choices[0].message.content)",
+    "code": "from openai import OpenAI\n\nclient = OpenAI(\n    base_url='http://your-mac.local:8090/v1',\n    api_key='local'\n)\n\nresponse = client.chat.completions.create(\n    model='heavy',\n    messages=[{'role': 'user', 'content': 'Tell me a joke.'}]\n)\nprint(response.choices[0].message.content)",
     "_note": "The host serves five lanes at once: heavy + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Name any of them as the model."
   }
 }

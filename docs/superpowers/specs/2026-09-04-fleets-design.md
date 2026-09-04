@@ -13,8 +13,8 @@ The ask: several complete routing setups, each covering the same lane roles with
 ## 2. Vocabulary
 
 - **Lane** — a role name a client sends as `model`: `heavy`, `flash`, `super-flash` (cloud) and `local-orch`, `local-sub` (host GPU). Unchanged.
-- **Fleet** — a named routing set that defines a deployment (and its fallback hops) for each cloud lane. Initial fleets: `domestic` (the current lineup) and `international` (Kimi K3 driver, GLM hops).
-- **Fleet lane** — a real litellm `model_name` of the form `<fleet>.<lane>`, e.g. `domestic.heavy`, `international.flash-glm`.
+- **Fleet** — a named routing set that defines a deployment (and its fallback hops) for each cloud lane. Initial fleets: `domestic` (US-only models: Codex subscription, Gemini and GPT on OpenRouter) and `international` (cheapest across every model: Kimi and Z.ai coding plans first, OpenRouter last).
+- **Fleet lane** — a real litellm `model_name` of the form `<fleet>.<lane>`, e.g. `domestic.heavy`, `international.flash-gemini`.
 - **Selection** — which fleet a bare lane name resolves to for a given caller.
 
 The word *profile* keeps its existing client-side meaning (the `opencode-cloud` / `opencode-super` / `opencode-local` lane pairs). A fleet is orthogonal to a profile: any profile can run on any fleet.
@@ -23,38 +23,48 @@ The word *profile* keeps its existing client-side meaning (the `opencode-cloud` 
 
 The routing file stays one hand-commented `~/.config/ferry/litellm.yaml`. A fleet is a prefix on the cloud lane names.
 
+Two fleets. **domestic** is US-only models: the Codex subscription and OpenRouter's Google and OpenAI entries. **international** is the cheapest route across every model: the flat-rate Kimi and Z.ai coding plans first, per-token OpenRouter last, and never the Codex subscription, so its shared usage limit stays reserved for domestic. Every chain except `domestic.heavy` ends on OpenRouter's `~openai/gpt-latest` as the universal paid backstop. OpenRouter models are addressed by OpenRouter's `~vendor/model-latest` alias wherever one exists.
+
 ```yaml
 model_list:
   # ── domestic ──────────────────────────────────────────────
-  - model_name: domestic.heavy          # was: heavy
-  - model_name: domestic.flash          # was: flash
-  - model_name: domestic.super-flash    # was: super-flash
-  - model_name: domestic.flash-terra    # was: flash-terra (hop, gpt-5.6-terra)
-  - model_name: domestic.super-flash-luna  # was: super-flash-luna (hop)
+  - model_name: domestic.heavy              # chatgpt/responses/gpt-5.6-sol, xhigh; no hop by design
+  - model_name: domestic.flash              # openrouter/~google/gemini-flash-latest, xhigh
+  - model_name: domestic.flash-terra        # chatgpt/responses/gpt-5.6-terra, xhigh (hop)
+  - model_name: domestic.flash-gpt          # openrouter/~openai/gpt-latest, xhigh (hop)
+  - model_name: domestic.super-flash        # openrouter/~google/gemini-flash-latest, minimal (Gemini's floor)
+  - model_name: domestic.super-flash-luna   # chatgpt/responses/gpt-5.6-luna, none (hop)
+  - model_name: domestic.super-flash-gpt    # openrouter/~openai/gpt-latest, none (hop)
   # ── international ─────────────────────────────────────────
-  - model_name: international.heavy         # anthropic/k3 (Kimi K3)
-  - model_name: international.heavy-glm     # zai/glm-5.3 (hop)
-  - model_name: international.flash         # zai/glm-5.3-flash coding plan
-  - model_name: international.flash-or      # openrouter/~z-ai/glm-flash-latest (hop)
-  - model_name: international.super-flash   # zai/glm-5.3-flash, reasoning floor
-  - model_name: international.super-flash-or  # openrouter/~z-ai/glm-flash-latest (hop)
+  - model_name: international.heavy               # anthropic/k3 on the Kimi coding plan, xhigh
+  - model_name: international.heavy-glm           # zai/glm-5.3 coding plan, thinking on (hop)
+  - model_name: international.heavy-gpt           # openrouter/~openai/gpt-latest, xhigh (hop)
+  - model_name: international.flash               # zai/glm-5.3-flash coding plan, thinking on
+  - model_name: international.flash-gemini        # openrouter/~google/gemini-flash-latest, xhigh (hop)
+  - model_name: international.flash-gpt           # openrouter/~openai/gpt-latest, xhigh (hop)
+  - model_name: international.super-flash         # zai/glm-5.3-flash coding plan, thinking off
+  - model_name: international.super-flash-gemini  # openrouter/~google/gemini-flash-latest, minimal (hop)
+  - model_name: international.super-flash-gpt     # openrouter/~openai/gpt-latest, none (hop)
   # ── shared GPU lanes, no prefix ───────────────────────────
   - model_name: local-orch
   - model_name: local-sub
 
 router_settings:
   fallbacks:
-    - {"domestic.flash": ["domestic.flash-terra"]}
-    - {"domestic.super-flash": ["domestic.super-flash-luna"]}
-    - {"international.heavy": ["international.heavy-glm"]}
-    - {"international.flash": ["international.flash-or"]}
-    - {"international.super-flash": ["international.super-flash-or"]}
+    - {"domestic.flash": ["domestic.flash-terra", "domestic.flash-gpt"]}
+    - {"domestic.super-flash": ["domestic.super-flash-luna", "domestic.super-flash-gpt"]}
+    - {"international.heavy": ["international.heavy-glm", "international.heavy-gpt"]}
+    - {"international.flash": ["international.flash-gemini", "international.flash-gpt"]}
+    - {"international.super-flash": ["international.super-flash-gemini", "international.super-flash-gpt"]}
 ```
+
+Effort per backend, as the installed litellm 1.99.0 actually forwards it: the ChatGPT bridge forwards `none` through `xhigh` and drops only `max`; OpenRouter takes `reasoning.effort` in `extra_body`, and Gemini there refuses anything below `minimal`; the Z.ai adapter forwards only `thinking: {type: enabled|disabled}` and drops `reasoning_effort`, so GLM lanes are thinking on or off with no levels; the Anthropic-format Kimi endpoint maps `xhigh` to a thinking budget.
 
 Rules:
 
 - **A fleet name is discovered, not declared.** The set of fleets is the set of distinct prefixes before the first `.` across `model_list` names that contain a `.`. No registry, no extra file to keep in sync. A fleet should define every cloud lane (`heavy`, `flash`, `super-flash`); the front door logs the gap at startup and answers 400 for that lane in that fleet, so a typo degrades one lane rather than taking the front door down.
-- **The primary for a lane is `<fleet>.<lane>`; hops are `<fleet>.<lane>-<tag>`.** Chains never cross a fleet, and `ferry-dash`'s chain validator enforces that (a hop from another fleet is rejected with a readable reason).
+- **The primary for a lane is `<fleet>.<lane>`; hops are `<fleet>.<lane>-<tag>`.** Chains never cross a fleet, and `ferry-dash`'s chain validator enforces that (a hop from another fleet is rejected with a readable reason). A model may serve in both fleets, but each fleet carries its own deployment of it (Gemini Flash is `domestic.flash` and also `international.flash-gemini`).
+- **A chain is an ordered list, tried left to right.** litellm tries every entry in a lane's fallback list in order and never follows a hop's own list, so the whole chain is written on the primary.
 - **Local lanes are unprefixed and shared.** They have no fleet variant and no fallback, exactly as today.
 - **The legacy `orch` and `orchestrator` deployments are deleted.** The resolver maps both names to the fleet's `heavy`, so a session pinned to either keeps working with one fewer copy of the driver block.
 - **`model_info.public: true`** keeps its meaning per fleet lane. The catalogue synthesizes bare names from it (section 4).
@@ -155,7 +165,7 @@ Verified 2026-09-04 against the installed opencode 1.18.x binary: the provider f
 
 ## 8. Migration on this host
 
-1. Snapshot `litellm.yaml` (the dash's `snapshot_config` shape), then rewrite: rename the five cloud deployments (`flash` and `super-flash` on `openrouter/~google/gemini-flash-latest`, the `flash-terra` and `super-flash-luna` hops, and `heavy`) to `domestic.*` (re-read the live file first: another session was editing it on 2026-09-04), delete `orch` and `orchestrator`, prefix the two fallback entries, and add the `international.*` deployments seeded from `litellm.yaml.20260904T152100Z.bak` (Kimi K3 as `anthropic/k3` for `heavy`, `zai/glm-5.3` as its hop; the Z.ai coding-plan `zai/glm-5.3-flash` for `flash` and `super-flash` with `openrouter/~z-ai/glm-flash-latest` hops). OpenRouter models are addressed by OpenRouter's `~vendor/model-latest` alias wherever one exists, so a vendor's next flash release lands without a config edit. Reasoning settings per lane follow the recorded findings: the zai adapter drops `reasoning_effort: none`, so `super-flash` uses the lowest value the adapter honours.
+1. Snapshot `litellm.yaml` (the dash's `snapshot_config` shape), then rewrite it to the section 3 lineup (re-read the live file first: another session was editing it on 2026-09-04): carry `heavy`, `flash` and `super-flash` verbatim under `domestic.*`, move the Terra and Luna hops from OpenRouter to the Codex bridge (`chatgpt/responses/gpt-5.6-terra` at xhigh, `chatgpt/responses/gpt-5.6-luna` at none), add the `~openai/gpt-latest` backstop hops, delete `orch` and `orchestrator`, and add the `international.*` deployments seeded from `litellm.yaml.20260904T152100Z.bak` (Kimi K3 as `anthropic/k3` on the Kimi coding endpoint, `zai/glm-5.3` and `zai/glm-5.3-flash` on the Z.ai coding endpoint with `thinking.type` on, and off for `international.super-flash`). Eighteen deployments in all. Before going live, measure `international.super-flash` reasoning tokens with `stream_options.include_usage`: expected 0, against `international.super-flash-gemini` as the control (Gemini's minimal floor is above 0). If GLM still reasons with thinking disabled, reorder that chain Gemini-first.
 2. Write `fleets.json` as `{"default": "domestic", "clients": {"host": "international"}}`: clients run domestic unless they choose otherwise, and the host's own sessions run international. Because `host` is the loopback identity, this holds for every session on the host machine, including ones started before the configs were regenerated.
 3. `ferry reload`. The GPU lanes stay warm.
 4. `host-reset.sh` regenerates the host's opencode profiles and claude wrappers with the headers.

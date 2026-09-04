@@ -30,8 +30,7 @@ model_list:
   - model_name: domestic.flash          # was: flash
   - model_name: domestic.super-flash    # was: super-flash
   - model_name: domestic.flash-terra    # was: flash-terra (hop, gpt-5.6-terra)
-  - model_name: domestic.flash-luna     # was: flash-luna (currently unchained)
-  - model_name: domestic.super-flash-luna
+  - model_name: domestic.super-flash-luna  # was: super-flash-luna (hop)
   # ── international ─────────────────────────────────────────
   - model_name: international.heavy         # anthropic/k3 (Kimi K3)
   - model_name: international.heavy-glm     # zai/glm-5.3 (hop)
@@ -111,7 +110,7 @@ Two new routes answered by the middleware before litellm sees them, alongside th
  "clients": {"host": "international", "stephens-laptop": "domestic"}}
 ```
 
-The per-lane value is the primary's `litellm_params.model`. Off-host callers get the same body: a client choosing a fleet needs to know what it is choosing, and the existing header-stripping confidentiality rule covers response headers, not this deliberate listing. (If that is ever unwanted, `FERRY_FLEET_LISTING=lanes` reduces the values to lane names only. Default is full.)
+The per-lane value is the primary's `litellm_params.model`. Off-host callers get the same body: a client choosing a fleet needs to know what it is choosing, and the existing header-stripping confidentiality rule covers response headers, not this deliberate listing.
 
 **`POST /v1/ferry/fleet`** with `{"fleet": "international"}` — sets the caller's own sticky selection, identity resolved exactly as in section 4. Bearer required when a master key is configured; this is the first LAN-reachable mutation, and it can only ever change the caller's own entry. With `{"fleet": "international", "default": true}` it sets the host-wide default and is loopback-only, like every other mutation today. `{"fleet": null}` clears the caller's entry so they follow the default again. The response is the same document as GET, after the write. The write is atomic (temp file + rename) so a worker never reads a half-written file.
 
@@ -156,7 +155,7 @@ Verified 2026-09-04 against the installed opencode 1.18.x binary: the provider f
 
 ## 8. Migration on this host
 
-1. Snapshot `litellm.yaml` (the dash's `snapshot_config` shape), then rewrite: rename the six cloud deployments (`flash` and `super-flash` on `openrouter/~google/gemini-flash-latest`, the `flash-terra`, `flash-luna` and `super-flash-luna` hops, and `heavy`) to `domestic.*`, delete `orch` and `orchestrator`, prefix the two fallback entries, and add the `international.*` deployments seeded from `litellm.yaml.20260904T152100Z.bak` (Kimi K3 as `anthropic/k3` for `heavy`, `zai/glm-5.3` as its hop; the Z.ai coding-plan `zai/glm-5.3-flash` for `flash` and `super-flash` with `openrouter/~z-ai/glm-flash-latest` hops). OpenRouter models are addressed by OpenRouter's `~vendor/model-latest` alias wherever one exists, so a vendor's next flash release lands without a config edit. Reasoning settings per lane follow the recorded findings: the zai adapter drops `reasoning_effort: none`, so `super-flash` uses the lowest value the adapter honours.
+1. Snapshot `litellm.yaml` (the dash's `snapshot_config` shape), then rewrite: rename the five cloud deployments (`flash` and `super-flash` on `openrouter/~google/gemini-flash-latest`, the `flash-terra` and `super-flash-luna` hops, and `heavy`) to `domestic.*` (re-read the live file first: another session was editing it on 2026-09-04), delete `orch` and `orchestrator`, prefix the two fallback entries, and add the `international.*` deployments seeded from `litellm.yaml.20260904T152100Z.bak` (Kimi K3 as `anthropic/k3` for `heavy`, `zai/glm-5.3` as its hop; the Z.ai coding-plan `zai/glm-5.3-flash` for `flash` and `super-flash` with `openrouter/~z-ai/glm-flash-latest` hops). OpenRouter models are addressed by OpenRouter's `~vendor/model-latest` alias wherever one exists, so a vendor's next flash release lands without a config edit. Reasoning settings per lane follow the recorded findings: the zai adapter drops `reasoning_effort: none`, so `super-flash` uses the lowest value the adapter honours.
 2. Write `fleets.json` as `{"default": "domestic", "clients": {"host": "international"}}`: clients run domestic unless they choose otherwise, and the host's own sessions run international. Because `host` is the loopback identity, this holds for every session on the host machine, including ones started before the configs were regenerated.
 3. `ferry reload`. The GPU lanes stay warm.
 4. `host-reset.sh` regenerates the host's opencode profiles and claude wrappers with the headers.

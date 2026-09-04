@@ -28,6 +28,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from unittest import mock  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "front"))
@@ -2112,6 +2113,136 @@ class TestFleetCatalogue(FleetHarness):
         start, payload = self._list()
         length = dict((k.lower(), v) for k, v in start["headers"])[b"content-length"]
         self.assertEqual(int(length), len(payload))
+
+
+class TestFleetControlPlane(FleetHarness):
+    def call(self, method, doc=None, headers=None,
+             client=("192.168.1.50", 5000), state="use"):
+        raw = b"" if doc is None else json.dumps(doc).encode()
+        app = RecordingApp(b"{}")
+        mw = self.mw(app, state=state)
+        scope = {"type": "http", "path": FF.FLEET_PATH, "method": method,
+                 "client": client, "headers": list(headers or [])}
+        msgs = [{"type": "http.request", "body": raw, "more_body": False}]
+        sent = []
+
+        async def receive():
+            return msgs.pop(0) if msgs else {
+                "type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+
+        asyncio.run(mw(scope, receive, send))
+        self.assertEqual(app.calls, 0, "litellm must never see the fleet route")
+        start, payload = collect(sent)
+        return start["status"], json.loads(payload)
+
+    def test_get_returns_the_document(self):
+        self.write_state({"default": "domestic", "clients": {"laptop": "international"}})
+        status, doc = self.call("GET", headers=[(b"x-ferry-client", b"laptop")])
+        self.assertEqual(status, 200)
+        self.assertEqual(doc["you"], "laptop")
+        self.assertEqual(doc["fleet"], "international")
+        self.assertEqual(doc["default"], "domestic")
+        self.assertEqual(sorted(doc["fleets"]), ["domestic", "international"])
+        self.assertEqual(doc["clients"], {"laptop": "international"})
+
+    def test_get_without_a_bearer_is_401_when_a_key_is_configured(self):
+        with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": "sk-ferry"}):
+            status, _ = self.call("GET")
+        self.assertEqual(status, 401)
+
+    def test_get_with_the_right_bearer_is_200(self):
+        with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": "sk-ferry"}):
+            status, _ = self.call("GET", headers=[
+                (b"authorization", b"Bearer sk-ferry")])
+        self.assertEqual(status, 200)
+
+    def test_get_needs_no_bearer_when_no_key_is_configured(self):
+        env = dict(os.environ)
+        env.pop("LITELLM_MASTER_KEY", None)
+        with mock.patch.dict(os.environ, env, clear=True):
+            status, _ = self.call("GET")
+        self.assertEqual(status, 200)
+
+    def test_post_sets_only_the_callers_own_selection(self):
+        status, doc = self.call("POST", {"fleet": "international"},
+                                headers=[(b"x-ferry-client", b"laptop")])
+        self.assertEqual(status, 200)
+        self.assertEqual(doc["fleet"], "international")
+        self.assertEqual(doc["default"], "domestic")
+        with open(self.state_path) as handle:
+            self.assertEqual(json.load(handle),
+                             {"default": "domestic",
+                              "clients": {"laptop": "international"}})
+
+    def test_post_null_clears_the_selection(self):
+        self.write_state({"default": "domestic", "clients": {"laptop": "international"}})
+        status, doc = self.call("POST", {"fleet": None},
+                                headers=[(b"x-ferry-client", b"laptop")])
+        self.assertEqual(status, 200)
+        self.assertEqual(doc["fleet"], "domestic")
+        with open(self.state_path) as handle:
+            self.assertEqual(json.load(handle)["clients"], {})
+
+    def test_default_true_from_loopback_sets_the_host_default(self):
+        status, doc = self.call("POST", {"fleet": "international", "default": True},
+                                client=("127.0.0.1", 5000))
+        self.assertEqual(status, 200)
+        self.assertEqual(doc["default"], "international")
+
+    def test_default_true_from_the_lan_is_403(self):
+        status, doc = self.call("POST", {"fleet": "international", "default": True},
+                                client=("192.168.1.50", 5000))
+        self.assertEqual(status, 403)
+        self.assertEqual(doc["error"]["type"], "ferry_fleet")
+        self.assertIn("host's to set", doc["error"]["message"])
+        with open(self.state_path) as handle:
+            self.assertEqual(json.load(handle)["default"], "domestic")
+
+    def test_post_an_unknown_fleet_is_400_naming_the_fleets(self):
+        status, doc = self.call("POST", {"fleet": "nope"})
+        self.assertEqual(status, 400)
+        self.assertEqual(doc["error"]["type"], "ferry_fleet")
+        self.assertIn("unknown fleet 'nope'", doc["error"]["message"])
+        self.assertIn("international", doc["error"]["message"])
+
+    def test_post_a_body_without_a_fleet_key_is_400(self):
+        status, doc = self.call("POST", {"default": True},
+                                client=("127.0.0.1", 5000))
+        self.assertEqual(status, 400)
+        self.assertEqual(doc["error"]["type"], "ferry_fleet")
+
+    def test_post_a_non_json_body_is_400(self):
+        app = RecordingApp(b"{}")
+        mw = self.mw(app)
+        scope = {"type": "http", "path": FF.FLEET_PATH, "method": "POST",
+                 "client": ("127.0.0.1", 5000), "headers": []}
+        msgs = [{"type": "http.request", "body": b"nope", "more_body": False}]
+        sent = []
+
+        async def receive():
+            return msgs.pop(0) if msgs else {
+                "type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+
+        asyncio.run(mw(scope, receive, send))
+        self.assertEqual(collect(sent)[0]["status"], 400)
+
+    def test_put_is_405(self):
+        status, _ = self.call("PUT", {"fleet": "domestic"})
+        self.assertEqual(status, 405)
+
+    def test_no_fleets_in_the_config_is_503(self):
+        status, doc = self.call("GET", state=None)
+        self.assertEqual(status, 503)
+        self.assertEqual(doc, {"errors": ["no fleets in this config"]})
+
+    def test_the_fleet_route_is_never_tapped_as_inference(self):
+        self.assertFalse(FF.is_inference_path(FF.FLEET_PATH))
 
 
 if __name__ == "__main__":

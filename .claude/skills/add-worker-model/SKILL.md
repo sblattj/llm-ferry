@@ -11,6 +11,8 @@ routed to whichever upstream provider is fastest right now, each carrying one Lu
 hop. They live in a **load-balanced pool** in `~/.config/ferry/litellm.yaml` and are served
 by `ferry up` (or `ferry up --route` for the cloud lanes alone).
 
+Since fleets (2026-09-04) lane names are `<fleet>.<lane>`; chains never cross a fleet.
+
 **Lane names are the contract.** Clients bind to a name (`heavy`, `flash`, `super-flash`,
 `local-orch`, `local-sub`), not to a model id — so prefer re-pointing an existing lane over
 minting a new name whenever the ROLE is unchanged. The current config has NO

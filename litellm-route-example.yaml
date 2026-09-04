@@ -17,19 +17,16 @@
 #                        id so metrics never conflate the two, kept resolving
 #                        so a session pinned to the old name mid-run does not
 #                        404 after a rename.
-#   flash              -> WORKER: cheap high-volume fan-out lane (example:
-#                        Gemini 3.8 Flash via OpenRouter). Falls back to
-#                        `flash-luna` ONLY when it errors.
+#   flash              -> WORKER: cheap high-volume fan-out lane:
+#                        `~google/gemini-flash-latest` via OpenRouter (currently
+#                        resolves to Gemini 3.8 Flash). Falls back to `flash-terra`.
 #   super-flash        -> HOUSEKEEPER: title / summary / compaction only. Same
 #                        model as `flash`, its own deployment so compaction
 #                        never queues behind a fan-out — at the LOWEST
 #                        reasoning effort the model will accept. Falls back to
 #                        `super-flash-luna` ONLY when it errors.
-#   flash-luna         -> `flash`'s fallback hop: an upstream-independent model
-#                        via OpenRouter (example: GPT-5.6 Luna), reached only
-#                        on error, at the worker's own reasoning depth.
-#   super-flash-luna   -> `super-flash`'s fallback hop, same model as
-#                        `flash-luna`, with reasoning turned OFF.
+#   super-flash-luna   -> `super-flash`'s fallback hop: GPT-5.6 Luna via
+#                        OpenRouter, with reasoning turned OFF.
 #   local-orch         -> the host GPU's "smart" model, via mlx_vlm.server on :8092
 #   local-sub          -> the host GPU's cheap fan-out model, via mlx_vlm.server on :8093
 #
@@ -145,12 +142,14 @@ model_list:
   # No `api_base`: litellm's `openrouter/` provider already knows the endpoint.
   - model_name: flash
     litellm_params:
-      model: openrouter/google/gemini-3.8-flash
+      model: openrouter/~google/gemini-flash-latest
       api_key: os.environ/OPENROUTER_API_KEY
       timeout: 600
       extra_body:
         provider:
           sort: throughput    # fastest provider this minute, ranked by OpenRouter
+        reasoning:
+          effort: xhigh
     model_info:
       public: true        # advertised in /v1/models
       # ONE `model_info:` key per deployment. YAML silently keeps the LAST
@@ -180,10 +179,10 @@ model_list:
   # reconciles for you. That happened on this host on 2026-08-30: host-reset
   # .sh's verifier failed with "super-flash NOT served" for a lane that
   # answered a probe correctly on the next line. Mark every LANE; never mark a
-  # fallback hop (see `flash-luna` / `super-flash-luna` below).
+  # fallback hop (see `flash-terra` / `super-flash-luna` below).
   #
   # REASONING FLOOR (verified 2026-09-04): compaction wants NO thinking, but
-  # Gemini 3.8 Flash refuses to switch it off — through OpenRouter, effort
+  # Gemini Flash refuses to switch it off — through OpenRouter, effort
   # `none`, `max_tokens: 0`, and `enabled: false` all 400 with "Reasoning is
   # mandatory for this endpoint and cannot be disabled". `minimal` is the
   # LOWEST value it accepts. Sent as OpenRouter's own native `reasoning`
@@ -191,19 +190,19 @@ model_list:
   # between.
   - model_name: super-flash
     litellm_params:
-      model: openrouter/google/gemini-3.8-flash
+      model: openrouter/~google/gemini-flash-latest
       api_key: os.environ/OPENROUTER_API_KEY
       timeout: 600
       extra_body:
         provider:
           sort: throughput    # fastest provider this minute, ranked by OpenRouter
         reasoning:
-          effort: minimal     # the floor Gemini 3.8 Flash accepts; see note above
+          effort: minimal     # the floor Gemini Flash accepts; see note above
     model_info:
       public: true        # advertised in /v1/models
       id: or-gemini-sf
 
-  # -- Luna hops: the fallback for each Gemini worker, ONLY on error --------
+  # -- Fallback hops: Terra for flash, Luna for super-flash, ONLY on error ---
   # One hop per Gemini lane, each its own model_name wired into
   # router_settings.fallbacks below (litellm fallbacks are non-transitive and
   # keyed by the RAW client-supplied model string, not by any alias — see the
@@ -216,22 +215,6 @@ model_list:
   # (pay-per-token, no idle cost). Not `public`: a hop routes by name but must
   # never be advertised — a client that selects a hop directly gets no
   # failover behind IT.
-  - model_name: flash-luna
-    litellm_params:
-      model: openrouter/openai/gpt-5.6-luna
-      api_key: os.environ/OPENROUTER_API_KEY
-      timeout: 600
-      extra_body:
-        provider:
-          sort: throughput    # fastest provider this minute, ranked by OpenRouter
-        reasoning:
-          effort: high        # the worker's own depth: real fan-out work lands here
-    model_info:
-      # No `public: true` — see the note above this block. Still wants an id:
-      # without one litellm labels its metrics with a hash that changes every
-      # time this file is edited, so a Grafana panel loses the series.
-      id: or-luna-flash-fb
-
   - model_name: super-flash-luna
     litellm_params:
       model: openrouter/openai/gpt-5.6-luna
@@ -244,6 +227,19 @@ model_list:
           effort: none        # the housekeeper's own depth: reasoning OFF
     model_info:
       id: or-luna-sf-fb
+
+  - model_name: flash-terra
+    litellm_params:
+      model: openrouter/openai/gpt-5.6-terra
+      api_key: os.environ/OPENROUTER_API_KEY
+      timeout: 600
+      extra_body:
+        provider:
+          sort: throughput
+        reasoning:
+          effort: xhigh
+    model_info:
+      id: or-terra-flash-fb
 
   # -- LOCAL GPU lanes: the host's own MLX models, addressable by name ---------
   # `ferry up` launches one mlx_vlm.server per lane on an internal loopback port
@@ -399,4 +395,4 @@ router_settings:
   # so a fan-out or a compaction call survives a Gemini outage. litellm
   # fallbacks are single-hop (not transitive): the fallback target's own
   # fallback list is never chained in, and neither Luna hop has one of its own.
-  fallbacks: [{"flash": ["flash-luna"]}, {"super-flash": ["super-flash-luna"]}]
+  fallbacks: [{"flash": ["flash-terra"]}, {"super-flash": ["super-flash-luna"]}]

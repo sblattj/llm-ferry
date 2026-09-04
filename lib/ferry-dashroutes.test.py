@@ -1016,6 +1016,20 @@ class FleetTopologyTest(unittest.TestCase):
         self.assertEqual(
             errs, ["hop 'international.flash-or' is not in fleet 'domestic'"])
 
+    def test_a_fleet_lane_cannot_fall_back_to_a_bare_lane(self):
+        # The untested half of the rule: an UNPREFIXED hop. A fleet lane
+        # falling back to a legacy bare lane is still leaving its fleet.
+        # `local-orch` is a real model_name in this config, so the fleet rule
+        # is the ONLY thing that can reject it — which is the point.
+        self.assertEqual(
+            D.validate_chains(self.topo, {"domestic.flash": ["local-orch"]}),
+            ["hop 'local-orch' is not in fleet 'domestic'"])
+        # A bare lane that is not in the config at all trips both rules.
+        self.assertEqual(
+            D.validate_chains(self.topo, {"domestic.flash": ["flash"]}),
+            ["hop 'flash' (in domestic.flash) is not a model_name in this config",
+             "hop 'flash' is not in fleet 'domestic'"])
+
     def test_same_fleet_hop_allowed(self):
         self.assertEqual(
             D.validate_chains(

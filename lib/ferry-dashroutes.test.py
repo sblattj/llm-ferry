@@ -942,5 +942,120 @@ class TapClassifierTest(unittest.TestCase):
         self.assertEqual(a.last_event["kind"], "quota_exhausted")
 
 
+FLEET_CONFIG = """\
+# ---------------------------------------------------------------------------
+# THE FERRY STACK — fleets fixture. This block must survive every write.
+# ---------------------------------------------------------------------------
+
+model_list:
+  # domestic fleet
+  - model_name: domestic.flash
+    litellm_params:
+      model: openrouter/~google/gemini-flash-latest
+    model_info:
+      public: true
+      id: d-flash-1
+
+  - model_name: domestic.flash-luna
+    litellm_params:
+      model: openrouter/openai/gpt-5.6-luna
+    model_info:
+      id: d-flash-luna-1
+
+  # international fleet
+  - model_name: international.flash
+    litellm_params:
+      model: zai/glm-5.3-flash
+    model_info:
+      public: true
+      id: i-flash-1
+
+  - model_name: international.flash-or
+    litellm_params:
+      model: openrouter/~z-ai/glm-flash-latest
+    model_info:
+      id: i-flash-or-1
+
+  # shared GPU lane, no fleet prefix
+  - model_name: local-orch
+    litellm_params:
+      model: openai/local-orch
+    model_info:
+      public: true
+      id: local-orch-1
+
+router_settings:
+  # A comment directly above the anchor line, which must not move.
+  fallbacks: [{"domestic.flash": ["domestic.flash-luna"]}, {"international.flash": ["international.flash-or"]}]
+  # And one directly below it.
+  cooldown_time: 5
+"""
+
+
+class FleetTopologyTest(unittest.TestCase):
+    """Grouping lane names by fleet prefix, and the cross-fleet hop refusal.
+
+    FLEET_CONFIG mirrors the layout in the fleets design spec section 3: two
+    prefixed fleets (domestic, international) plus one unprefixed shared GPU
+    lane. validate_order is exercised too, but only to confirm it inherits the
+    rule through validate_chains rather than needing a second copy of it."""
+
+    def setUp(self):
+        self.topo = D.parse_topology_text(FLEET_CONFIG)
+
+    def test_fleets_and_shared_grouping(self):
+        self.assertEqual(self.topo["fleets"], {
+            "domestic": ["domestic.flash", "domestic.flash-luna"],
+            "international": ["international.flash", "international.flash-or"],
+        })
+        self.assertEqual(self.topo["shared"], ["local-orch"])
+
+    def test_cross_fleet_hop_rejected(self):
+        errs = D.validate_chains(
+            self.topo, {"domestic.flash": ["international.flash-or"]})
+        self.assertEqual(
+            errs, ["hop 'international.flash-or' is not in fleet 'domestic'"])
+
+    def test_same_fleet_hop_allowed(self):
+        self.assertEqual(
+            D.validate_chains(
+                self.topo, {"domestic.flash": ["domestic.flash-luna"]}),
+            [])
+
+    def test_validate_order_inherits_the_cross_fleet_rule(self):
+        errs = D.validate_order(self.topo, {
+            "domestic.flash": ["domestic.flash", "international.flash-or"],
+        })
+        self.assertIn(
+            "hop 'international.flash-or' is not in fleet 'domestic'", errs)
+
+    def test_same_fleet_reorder_preserves_comments(self):
+        """Control: proves the byte-preserving splice still holds for dotted
+        fleet lane names, same style as SpliceTest.test_comments_survive."""
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "litellm.yaml")
+        with open(path, "w") as f:
+            f.write(FLEET_CONFIG)
+        D.apply_chains(path, {
+            "domestic.flash": ["domestic.flash-luna"],
+            "international.flash": ["international.flash-or"],
+        })
+        with open(path) as f:
+            new = f.read()
+        self.assertEqual(comments(FLEET_CONFIG), comments(new))
+
+    def test_a_dotted_non_fleet_lane_is_not_a_fleet(self):
+        # gpt-3.5-turbo has a dot and is not one of this topology's declared
+        # fleets (domestic, international); it must not be treated as a fleet
+        # of its own, mirroring the guard resolve_model applies
+        # (front/ferry_front.py: "." in model and model.split(".", 1)[0] in
+        # fleets). The lane is not itself declared here, so `validate_chains`
+        # may still complain it is not a model_name — only the "not in fleet"
+        # message is what must never appear.
+        errs = D.validate_chains(
+            self.topo, {"gpt-3.5-turbo": ["domestic.flash-luna"]})
+        self.assertFalse(any("not in fleet" in e for e in errs))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

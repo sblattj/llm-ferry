@@ -974,12 +974,46 @@ def _bearer_ok(headers: dict) -> bool:
     return len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == key
 
 
+def _header_map(scope) -> dict:
+    """ASGI request headers as {lowercased name: value}, last value wins."""
+    out = {}
+    try:
+        for key, value in scope.get("headers") or []:
+            out[bytes(key).lower()] = bytes(value)
+    except Exception:
+        return {}
+    return out
+
+
+def _set_content_length(scope, length: int) -> None:
+    """Replace content-length in a live ASGI scope after a body rewrite.
+
+    litellm's stack reads the length from the scope, not from our replayed
+    receive, so a rewrite that grows the body by the fleet prefix would be
+    truncated to the original length without this.
+    """
+    try:
+        headers = [(k, v) for k, v in (scope.get("headers") or [])
+                   if bytes(k).lower() != b"content-length"]
+        headers.append((b"content-length", str(length).encode()))
+        scope["headers"] = headers
+    except Exception:
+        pass
+
+
 class LaneCatalogueFilter:
     """ASGI middleware that filters the model listing and nothing else."""
 
-    def __init__(self, app, public: frozenset[str]) -> None:
+    def __init__(self, app, public: frozenset[str], fleets=None, state=None) -> None:
         self.app = app
         self.public = public
+        # `fleets` is the discovery map {fleet: {lane: provider model}}; `state`
+        # is the FleetState over fleets.json. BOTH default to the pre-fleets
+        # behaviour: with `state is None` not one byte of a request is read or
+        # rewritten, which is what keeps every test written before this feature
+        # passing unchanged.
+        self.fleets = fleets or {}
+        self.state = state
 
     async def __call__(self, scope, receive, send):
         # The control plane first: GET /v1/ferry/chains, POST /v1/ferry/reorder,
@@ -1075,6 +1109,16 @@ class LaneCatalogueFilter:
                         "Apply in ferry-dash also writes litellm.yaml so a "
                         "restart keeps this order.",
             })
+        # Fleet resolution. This runs BEFORE the hot-path handover so the tap
+        # and the header strip below still see — and record — the REWRITTEN
+        # request: metrics must group by `international.heavy`, not by `heavy`.
+        # Only `receive` is replaced; `send` is untouched, so the streamed
+        # response path gains no Python.
+        if (self.state is not None and scope.get("type") == "http"
+                and is_inference_path(path)):
+            receive = await self._fleet_rewrite(scope, receive, send)
+            if receive is None:
+                return
         # The hot path: anything that is not the model listing is handed over
         # untouched. With FERRY_EVENTS off — the default — there is no wrapper
         # around `send` at all, so a streamed completion is byte-for-byte what
@@ -1139,6 +1183,58 @@ class LaneCatalogueFilter:
             await self._reply(
                 send, 400, {"errors": ["could not read request body"]})
             return None
+
+    async def _fleet_rewrite(self, scope, receive, send):
+        """Resolve this request's fleet and return a one-shot replay `receive`.
+
+        Returns None when a reply has already been sent (a 400 for an unknown
+        fleet), in which case the caller must return immediately. The body is
+        fully buffered here — chat bodies are not streamed uploads — and every
+        failure mode short of an unreadable socket replays the ORIGINAL bytes.
+        """
+        body = await self._read_body(receive, send)
+        if body is None:
+            return None
+        out = body
+        try:
+            doc = json.loads(body)
+        except Exception:
+            doc = None
+        if isinstance(doc, dict) and isinstance(doc.get("model"), str):
+            headers = _header_map(scope)
+            header_fleet = headers.get(FLEET_HEADER, b"").decode(
+                "utf-8", "replace").strip()
+            try:
+                resolved = resolve_model(
+                    doc["model"], header_fleet,
+                    caller_identity(scope, headers), self.state)
+            except ResolveError as err:
+                await self._reply(send, 400, {"error": {
+                    "message": str(err.args[0]), "type": "ferry_fleet"}})
+                return None
+            except Exception:
+                # FleetStateError or anything else: fail open, exactly as an
+                # unreadable litellm.yaml does for the catalogue.
+                resolved = None
+            if resolved and resolved != doc["model"]:
+                try:
+                    out = rewrite_body_model(body, resolved)
+                except Exception:
+                    out = body
+        if out != body:
+            _set_content_length(scope, len(out))
+
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": out,
+                        "more_body": False}
+            return await receive()
+
+        return replay
 
     async def _reply(self, send, status, doc):
         body = json.dumps(doc).encode()

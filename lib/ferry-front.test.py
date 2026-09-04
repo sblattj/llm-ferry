@@ -1623,5 +1623,294 @@ class TestBearerOk(unittest.TestCase):
             self.assertTrue(FF._bearer_ok({b"authorization": b"bearer sk-ferry"}))
 
 
+# ── fleets ───────────────────────────────────────────────────────────────────
+# The middleware gains one job on the hot path: rewrite the request body's
+# `model` from a bare lane name to `<fleet>.<lane>`. The property that must
+# survive is the one at the top of this file — the wrapped app still receives
+# the caller's ORIGINAL `send` by identity. Only `receive` is ever wrapped, and
+# only after the body has already been fully buffered, so nothing on the
+# RESPONSE path (a streamed token) passes through new Python.
+#
+# This task reuses the module-level `FLEETS` constant Task 2 already added to
+# this test file; it is not redefined here.
+
+
+class BodyApp:
+    """An ASGI app that drains `receive` and records the exact bytes it saw."""
+
+    def __init__(self):
+        self.body = None
+        self.more = []
+        self.scope = None
+        self.seen_send = None
+        self.seen_receive = None
+        self.calls = 0
+
+    async def __call__(self, scope, receive, send):
+        self.calls += 1
+        self.scope = scope
+        self.seen_send = send
+        self.seen_receive = receive
+        buf = b""
+        while True:
+            msg = await receive()
+            buf += msg.get("body", b"")
+            self.more.append(bool(msg.get("more_body")))
+            if not msg.get("more_body"):
+                break
+        self.body = buf
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": b"{}",
+                    "more_body": False})
+
+
+class FleetHarness(unittest.TestCase):
+    """Base: a real FleetState over a real temp fleets.json."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ferry-fleets-")
+        self.state_path = os.path.join(self.dir, "fleets.json")
+        with open(self.state_path, "w") as handle:
+            json.dump({"default": "domestic", "clients": {}}, handle)
+        self.state = FF.FleetState(self.state_path, FLEETS)
+        # No strip wrapper: these tests are about `receive`, and the strip
+        # wraps `send`, which would mask the identity assertion.
+        os.environ["FERRY_STRIP_HEADERS"] = "0"
+
+    def tearDown(self):
+        os.environ.pop("FERRY_STRIP_HEADERS", None)
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write_state(self, doc):
+        with open(self.state_path, "w") as handle:
+            json.dump(doc, handle)
+        # Guarantee a distinct mtime_ns even on a coarse clock.
+        st = os.stat(self.state_path)
+        os.utime(self.state_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+    def mw(self, app, state="use", public=frozenset()):
+        return LaneCatalogueFilter(
+            app, public, fleets=FLEETS,
+            state=self.state if state == "use" else state)
+
+    def drive_body(self, mw, path, raw, headers=None, client=("192.168.1.50", 5000)):
+        """Send one request with `raw` as the body. Returns the sent messages."""
+        scope = {"type": "http", "path": path, "method": "POST",
+                 "client": client,
+                 "headers": list(headers or [])}
+        msgs = [{"type": "http.request", "body": raw, "more_body": False}]
+        sent = []
+
+        async def receive():
+            return msgs.pop(0) if msgs else {
+                "type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+
+        asyncio.run(mw(scope, receive, send))
+        return scope, sent
+
+
+class TestFleetMiddleware(FleetHarness):
+    def test_state_none_is_byte_identical_passthrough(self):
+        # THE compatibility guarantee: with no fleets in the config the
+        # middleware behaves exactly as it did before this feature.
+        raw = json.dumps({"model": "heavy", "messages": []}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app, state=None), "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)
+
+    def test_control_state_set_rewrites_the_same_request(self):
+        # The control for the test above: identical input, state set, body moves.
+        raw = json.dumps({"model": "heavy", "messages": []}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(json.loads(app.body)["model"], "domestic.heavy")
+
+    def test_the_wrapped_app_still_gets_the_original_send(self):
+        # The file's headline property, re-asserted WITH state set: we wrap
+        # `receive`, never `send`.
+        raw = json.dumps({"model": "heavy"}).encode()
+        app = BodyApp()
+        scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST",
+                 "client": ("192.168.1.50", 5000), "headers": []}
+        msgs = [{"type": "http.request", "body": raw, "more_body": False}]
+        sent = []
+
+        async def receive():
+            return msgs.pop(0) if msgs else {
+                "type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+
+        asyncio.run(self.mw(app)(scope, receive, send))
+        self.assertIs(app.seen_send, send)
+        self.assertIsNot(app.seen_receive, receive)
+
+    def test_header_beats_sticky_and_default(self):
+        self.write_state({"default": "domestic", "clients": {"laptop": "domestic"}})
+        raw = json.dumps({"model": "flash"}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[
+            (b"x-ferry-fleet", b"international"),
+            (b"x-ferry-client", b"laptop")])
+        self.assertEqual(json.loads(app.body)["model"], "international.flash")
+
+    def test_control_no_header_falls_to_sticky(self):
+        self.write_state({"default": "domestic", "clients": {"laptop": "international"}})
+        raw = json.dumps({"model": "flash"}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[
+            (b"x-ferry-client", b"laptop")])
+        self.assertEqual(json.loads(app.body)["model"], "international.flash")
+
+    def test_control_no_sticky_falls_to_default(self):
+        self.write_state({"default": "international", "clients": {}})
+        raw = json.dumps({"model": "flash"}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[
+            (b"x-ferry-client", b"laptop")])
+        self.assertEqual(json.loads(app.body)["model"], "international.flash")
+
+    def test_an_empty_fleet_header_is_absent_not_an_error(self):
+        raw = json.dumps({"model": "flash"}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[
+            (b"x-ferry-fleet", b"")])
+        self.assertEqual(json.loads(app.body)["model"], "domestic.flash")
+
+    def test_a_loopback_peer_is_the_host_identity(self):
+        self.write_state({"default": "domestic", "clients": {"host": "international"}})
+        raw = json.dumps({"model": "heavy"}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw,
+                        client=("127.0.0.1", 5000))
+        self.assertEqual(json.loads(app.body)["model"], "international.heavy")
+
+    def test_unknown_fleet_is_a_400_that_names_the_fleets(self):
+        raw = json.dumps({"model": "heavy"}).encode()
+        app = BodyApp()
+        _, sent = self.drive_body(self.mw(app), "/v1/chat/completions", raw,
+                                  headers=[(b"x-ferry-fleet", b"nope")])
+        start, payload = collect(sent)
+        self.assertEqual(start["status"], 400)
+        doc = json.loads(payload)
+        self.assertEqual(doc["error"]["type"], "ferry_fleet")
+        self.assertIn("unknown fleet 'nope'", doc["error"]["message"])
+        self.assertIn("domestic", doc["error"]["message"])
+        self.assertIn("international", doc["error"]["message"])
+        self.assertEqual(app.calls, 0)   # litellm never saw it
+
+    def test_content_length_is_replaced_to_match_the_new_body(self):
+        raw = json.dumps({"model": "heavy", "messages": []}).encode()
+        app = BodyApp()
+        scope, _ = self.drive_body(
+            self.mw(app), "/v1/chat/completions", raw,
+            headers=[(b"content-type", b"application/json"),
+                     (b"content-length", str(len(raw)).encode())])
+        lengths = [v for k, v in scope["headers"] if k.lower() == b"content-length"]
+        self.assertEqual(lengths, [str(len(app.body)).encode()])
+        self.assertNotEqual(len(app.body), len(raw))
+        self.assertIn((b"content-type", b"application/json"), scope["headers"])
+
+    def test_a_non_json_body_is_replayed_byte_identical(self):
+        raw = b"<html>not json at all</html>"
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)
+
+    def test_a_model_less_json_body_is_replayed_byte_identical(self):
+        raw = b'{"messages": [], "stream":   true}'
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)          # whitespace and all
+
+    def test_a_non_string_model_is_replayed_byte_identical(self):
+        raw = b'{"model": 7}'
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)
+
+    def test_a_local_lane_passes_through_untouched(self):
+        raw = json.dumps({"model": "local-orch"}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)
+
+    def test_an_already_prefixed_model_passes_through_untouched(self):
+        raw = json.dumps({"model": "international.flash-or"}).encode()
+        app = BodyApp()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)
+
+    def test_legacy_orchestrator_resolves_to_heavy(self):
+        for name in ("orch", "orchestrator"):
+            app = BodyApp()
+            self.drive_body(self.mw(app), "/v1/chat/completions",
+                            json.dumps({"model": name}).encode())
+            self.assertEqual(json.loads(app.body)["model"], "domestic.heavy", name)
+
+    def test_messages_and_responses_paths_are_rewritten_too(self):
+        for path in ("/v1/messages", "/v1/responses", "/chat/completions"):
+            app = BodyApp()
+            self.drive_body(self.mw(app), path,
+                            json.dumps({"model": "flash"}).encode())
+            self.assertEqual(json.loads(app.body)["model"], "domestic.flash", path)
+
+    def test_a_chunked_request_body_is_reassembled_and_replayed_once(self):
+        raw = json.dumps({"model": "heavy"}).encode()
+        half = len(raw) // 2
+        msgs = [{"type": "http.request", "body": raw[:half], "more_body": True},
+                {"type": "http.request", "body": raw[half:], "more_body": False}]
+        app = BodyApp()
+        sent = []
+
+        async def receive():
+            return msgs.pop(0) if msgs else {
+                "type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+
+        asyncio.run(self.mw(app)({
+            "type": "http", "path": "/v1/chat/completions", "method": "POST",
+            "client": ("192.168.1.50", 5000), "headers": []}, receive, send))
+        self.assertEqual(json.loads(app.body)["model"], "domestic.heavy")
+        self.assertEqual(app.more, [False])      # one chunk, not two
+
+    def test_a_non_inference_path_is_not_body_read(self):
+        # /health must never be buffered: it is polled every few seconds.
+        app = BodyApp()
+        scope = {"type": "http", "path": "/health/liveliness", "method": "GET",
+                 "client": ("127.0.0.1", 5000), "headers": []}
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+
+        asyncio.run(self.mw(app)(scope, receive, send))
+        self.assertIs(app.seen_receive, receive)
+
+    def test_an_unreadable_state_file_fails_open(self):
+        # Doctrine from the module docstring: a broken state file degrades to
+        # today's behaviour, it never turns the front door into a 500.
+        with open(self.state_path, "w") as handle:
+            handle.write("{ not json")
+        st = os.stat(self.state_path)
+        os.utime(self.state_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        raw = json.dumps({"model": "heavy"}).encode()
+        app = BodyApp()
+        _, sent = self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)
+        self.assertEqual(collect(sent)[0]["status"], 200)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

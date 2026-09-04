@@ -45,7 +45,7 @@ EOF
           shift
         fi
       fi
-      if [[ "$flag" != "clear" && -z "$fleet" ]]; then
+      if [[ "$flag" != "clear" && ( -z "$fleet" || "$fleet" == --* ) ]]; then
         echo "Usage: ferry fleet use <fleet> [--default] | ferry fleet use --clear" >&2
         exit 1
       fi
@@ -130,6 +130,8 @@ def _request(method, payload=None):
         except Exception:
             msg = body
         _fail(msg)
+    except urllib.error.URLError as e:
+        _fail("cannot reach the front door at " + base + ": " + str(e.reason))
 
 
 def _get():

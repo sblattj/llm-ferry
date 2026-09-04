@@ -116,9 +116,9 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 #
 #   heavy        -> GPT-5.6 Sol via the ChatGPT subscription, no fallback chain
 #                   (legacy names `orch`/`orchestrator` still resolve to it)
-#   flash        -> Gemini 3.8 Flash via OpenRouter, 1 fallback hop to GPT-5.6 Luna
-#   super-flash  -> same Gemini 3.8 Flash shape, minimal reasoning (housekeeping),
-#                   1 fallback hop to GPT-5.6 Luna with reasoning off
+#   flash        -> ~google/gemini-flash-latest via OpenRouter (currently
+#                   Gemini 3.8 Flash), xhigh reasoning, Terra fallback
+#   super-flash  -> same alias, minimal reasoning (housekeeping), Luna fallback
 #   local-orch   -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
 #   local-sub    -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
 #

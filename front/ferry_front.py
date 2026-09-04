@@ -33,7 +33,10 @@ buffers and is a known way to break SSE.
 FAIL-OPEN, ALWAYS. A hop visible in the catalogue is a routing wart. A front
 door that refuses to answer is an outage. Every failure mode here — an
 unreadable config, no lane marked public, a body that is not the JSON we expect
-— returns the upstream response untouched.
+— returns the upstream response untouched. The one deliberate exception is
+startup with fleets configured: a corrupt fleets.json stops build_app with the
+path in the message (spec §4), because a front door that silently serves the
+wrong fleet is worse than one that refuses to start.
 """
 from __future__ import annotations
 
@@ -907,7 +910,7 @@ def resolve_model(model: str, header_fleet: str, identity: str,
             # is exactly what a MISSING file means, so serving it is
             # deterministic rather than a silent bare-lane passthrough into a
             # litellm model-not-found; the rate-limited warn keeps it loud.
-            _fleet_warn(err)
+            _fleet_warn(err, action="fell back to the first fleet")
             fleet = state._first_fleet()
     if fleet not in fleets:
         raise ResolveError("unknown fleet %r; fleets: %s"
@@ -992,12 +995,15 @@ _FLEET_WARNED: dict = {}
 FLEET_WARN_INTERVAL = 60.0
 
 
-def _fleet_warn(err, stream=None, clock=None) -> bool:
+def _fleet_warn(err, stream=None, clock=None, action="failed open") -> bool:
     """One stderr line per distinct error per FLEET_WARN_INTERVAL seconds.
 
-    The resolver fails OPEN on a broken fleets.json, so without this the
-    degradation is invisible; with a per-request line it would be a flood on
-    the hot path. Returns True when a line was written. Never raises."""
+    A broken fleets.json degrades the resolver (a corrupt file falls back to
+    the first discovered fleet; anything else fails open), so without this
+    the degradation is invisible; with a per-request line it would be a flood
+    on the hot path. `action` names what the caller did about it, so the
+    operator reading stderr sees the real outcome. Returns True when a line
+    was written. Never raises."""
     try:
         key = (type(err).__name__, str(err))
         now = (clock or time.monotonic)()
@@ -1005,7 +1011,7 @@ def _fleet_warn(err, stream=None, clock=None) -> bool:
         if last is not None and now - last < FLEET_WARN_INTERVAL:
             return False
         _FLEET_WARNED[key] = now
-        print("ferry-front: fleet resolution failed open: %s: %s" % key,
+        print("ferry-front: fleet resolution %s: %s: %s" % ((action,) + key),
               file=stream or sys.stderr)
         return True
     except Exception:
@@ -1376,7 +1382,7 @@ class LaneCatalogueFilter:
             # in /v1/models instead of making them vanish in lockstep with the
             # inference path. _fleet_warn rate-limits to one line per distinct
             # error per interval, so the polled catalogue cannot flood.
-            _fleet_warn(err)
+            _fleet_warn(err, action="fell back to the first fleet")
             return self.state._first_fleet() or None
         except Exception as err:
             # Anything unexpected still fails open to plain filtering — but not

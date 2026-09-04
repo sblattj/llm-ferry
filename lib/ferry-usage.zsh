@@ -11,6 +11,9 @@ Commands:
   install            Install uv, litellm, and link globally (+ mlx-vlm & models on macOS)
   up                 [Host] Start local GPU server or cloud API proxy (boots Catalog by default)
   down               [Host] Stop all running servers (local, cloud, sharing)
+  reload             [Host] Restart ONLY the litellm front door (re-reads the
+                       route config); the GPU lanes stay warm. The fast path for
+                       editing ~/.config/ferry/litellm.yaml.
   status             [Dual] Show server listeners, active models, and client test commands
   update             [Dual] Catch this machine up. Detects host vs client from
                        ~/.config/ferry/client.json and runs that role's reset:

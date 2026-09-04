@@ -732,6 +732,54 @@ cmd_down() {
   echo ">>> Success: All servers stopped."
 }
 
+# cmd_reload — restart ONLY the litellm front door, leaving the GPU lanes
+# (mlx_vlm.server on :$LOCAL_ORCH_PORT/: $LOCAL_SUB_PORT) warm. Route-config edits
+# (a new fallback hop, a retuned chain, a new key) only need the proxy to re-read
+# ~/.config/ferry/litellm.yaml; a full `ferry down && ferry up` would also reload
+# ~33GB of MLX weights for no reason. This is the fast path for config changes.
+cmd_reload() {
+  if (( CLIENT_MODE )); then
+    echo "Error: Command 'ferry reload' is only available on the LLM-Ferry Host Mac."
+    exit 1
+  fi
+  if ! command -v litellm >/dev/null 2>&1; then
+    echo "Error: 'litellm' is missing. Run: ferry install"
+    exit 1
+  fi
+  _ferry_require_route_config
+  _ferry_warn_missing_keys
+
+  local target_port="$PORT" cloud_log="$CLOUD_LOG"
+  echo ">>> Reloading the front door (config re-read; GPU lanes stay warm)..."
+  _ferry_stop_litellm "$target_port"
+  _ferry_free_port "$target_port"
+
+  echo ">>> [front] litellm --config $FERRY_ROUTE_CONFIG"
+  echo "        port   :$target_port"
+  echo "        workers:$FERRY_FRONT_WORKERS"
+  echo "        log    $cloud_log"
+  if ! _ferry_launch_front "$FERRY_ROUTE_CONFIG" "$target_port" "$cloud_log"; then
+    echo "        note: catalogue filter unavailable — serving litellm directly"
+    nohup litellm \
+      --config "$FERRY_ROUTE_CONFIG" \
+      --port "$target_port" \
+      --num_workers "$FERRY_FRONT_WORKERS" \
+      --host 0.0.0.0 >> "$cloud_log" 2>&1 & disown
+  fi
+
+  _ferry_wait_http "http://127.0.0.1:$target_port/health/liveliness" "front" 120 readiness || true
+
+  local -a banner_auth=()
+  [[ -n "${LITELLM_MASTER_KEY:-}" ]] && banner_auth=(-H "Authorization: Bearer $LITELLM_MASTER_KEY")
+  echo "================================================================="
+  echo ">>> Front door reloaded on http://$MDNS_NAME:$target_port/v1 :"
+  curl -fsS -m 5 "${banner_auth[@]}" "http://127.0.0.1:$target_port/v1/models" 2>/dev/null \
+    | python3 -c "import json,sys; [print('       ' + m['id']) for m in json.load(sys.stdin).get('data', [])]" 2>/dev/null \
+    || echo "       (not answering yet — check $cloud_log)"
+  echo "    GPU lanes untouched. Full stack restart: ferry down && ferry up"
+  echo "================================================================="
+}
+
 cmd_status() {
   if (( CLIENT_MODE )); then
     echo "================================================================="

@@ -117,9 +117,13 @@ class TestShippedLaunchLines(unittest.TestCase):
         self.assertEqual(self.src.count('host 0.0.0.0 > "$cloud_log"'), 0)
 
     def test_every_litellm_launch_appends(self):
-        self.assertEqual(self.src.count('host 0.0.0.0 >> "$cloud_log"'), 3)
+        # stack + route + cloud + the cmd_reload fallback launch.
+        self.assertEqual(self.src.count('host 0.0.0.0 >> "$cloud_log"'), 4)
 
     def test_every_litellm_launch_resets_its_log_first(self):
+        # Only the cold-start modes reset the log; cmd_reload deliberately
+        # appends so a config-change reload does not wipe the log that records
+        # what the previous config was doing.
         self.assertEqual(self.src.count('_ferry_reset_log "$cloud_log"'), 3)
 
     def test_the_mlx_launch_resets_and_appends(self):
@@ -184,7 +188,8 @@ class TestShippedLaunchLines(unittest.TestCase):
         # If the catalogue front is unavailable and ferry falls back to the raw
         # `litellm` CLI, it must launch the SAME worker count, not silently
         # drop to one process (the CLI flag is --num_workers, not --workers).
-        self.assertEqual(self.src.count('--num_workers "$FERRY_FRONT_WORKERS"'), 2)
+        # stack + route + cmd_reload's fallback all keep worker parity.
+        self.assertEqual(self.src.count('--num_workers "$FERRY_FRONT_WORKERS"'), 3)
 
 
 class TestStatusTestCommand(unittest.TestCase):

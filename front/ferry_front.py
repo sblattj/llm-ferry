@@ -1052,6 +1052,68 @@ class LaneCatalogueFilter:
         # importantly its auth layer would bill them as unknown model calls.
         # Loopback-only: mutating routing from the LAN is a non-starter.
         path = scope.get("path", "") if scope.get("type") == "http" else ""
+        if path == FLEET_PATH:
+            # Unlike the reorder/promote routes this one is deliberately
+            # LAN-reachable: a client has to be able to move ITSELF. The
+            # blast radius is bounded by identity — a POST can only ever
+            # write the caller's own entry — and `default: true`, the one
+            # host-wide write, is still loopback-only.
+            headers = _header_map(scope)
+            if not _bearer_ok(headers):
+                return await self._reply(
+                    send, 401, {"errors": ["bearer required"]})
+            if self.state is None:
+                return await self._reply(
+                    send, 503, {"errors": ["no fleets in this config"]})
+            method = scope.get("method", "GET").upper()
+            identity = caller_identity(scope, headers)
+            if method == "GET":
+                try:
+                    return await self._reply(
+                        send, 200, self.state.document(identity))
+                except Exception as err:
+                    return await self._reply(send, 503, {"errors": [str(err)]})
+            if method != "POST":
+                return await self._reply(
+                    send, 405, {"errors": ["use GET or POST on %s" % FLEET_PATH]})
+            raw = await self._read_body(receive, send)
+            if raw is None:
+                return
+            try:
+                doc = json.loads(raw)
+            except Exception:
+                doc = None
+            bad = {"error": {"message": 'body needs a "fleet" key whose value '
+                                        'is a fleet name or null',
+                             "type": "ferry_fleet"}}
+            if not isinstance(doc, dict) or "fleet" not in doc:
+                return await self._reply(send, 400, bad)
+            fleet = doc.get("fleet")
+            if fleet is not None and not isinstance(fleet, str):
+                return await self._reply(send, 400, bad)
+            as_default = doc.get("default") is True
+            if as_default and not _is_loopback_client(scope):
+                return await self._reply(send, 403, {"error": {
+                    "message": "the default is the host's to set",
+                    "type": "ferry_fleet"}})
+            if fleet is not None and fleet not in self.fleets:
+                return await self._reply(send, 400, {"error": {
+                    "message": "unknown fleet %r; fleets: %s" % (
+                        fleet, ", ".join(self.fleets)),
+                    "type": "ferry_fleet"}})
+            if as_default and fleet is None:
+                return await self._reply(send, 400, {"error": {
+                    "message": "the default needs a fleet name, not null",
+                    "type": "ferry_fleet"}})
+            try:
+                if as_default:
+                    self.state.set_default(fleet)
+                else:
+                    self.state.set_selection(identity, fleet)
+                return await self._reply(
+                    send, 200, self.state.document(identity))
+            except Exception as err:
+                return await self._reply(send, 503, {"errors": [str(err)]})
         if path in (REORDER_CHAINS_PATH, REORDER_PATH,
                     PROMOTE_CHAINS_PATH, PROMOTE_PATH):
             if not _is_loopback_client(scope):

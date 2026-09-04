@@ -177,11 +177,75 @@ def collect(sent):
 class TestMiddleware(unittest.TestCase):
     def test_the_inference_path_is_handed_the_original_send(self):
         # THE test. If this ever fails, every streamed token is being funnelled
-        # through this module's Python instead of going straight out.
+        # through this module's Python instead of going straight out. The header
+        # stripper wraps `send` by default, so this identity holds only with the
+        # strip off — which is what proves the strip is the ONLY new wrapper.
         app = RecordingApp(b"whatever")
         mw = LaneCatalogueFilter(app, LANES)
-        _, send = asyncio.run(drive(mw, "/v1/chat/completions"))
+        os.environ["FERRY_STRIP_HEADERS"] = "0"
+        try:
+            _, send = asyncio.run(drive(mw, "/v1/chat/completions"))
+        finally:
+            os.environ.pop("FERRY_STRIP_HEADERS", None)
         self.assertIs(app.seen_send, send)
+
+    def test_the_inference_path_strips_identity_headers_by_default(self):
+        # The strip wraps `send` and drops the identity headers — the lane
+        # abstraction extends to the header surface. Bodies stay untouched.
+        app = RecordingApp(b"whatever", headers=[
+            (b"content-type", b"text/event-stream"),
+            (b"x-litellm-model-name", b"anthropic/k3"),
+            (b"x-litellm-model-id", b"kimi-k3-heavy"),
+            (b"x-litellm-model-api-base", b"https://api.kimi.com/coding"),
+            (b"x-litellm-model-group", b"heavy"),
+            (b"x-litellm-response-cost", b"0.0"),
+        ])
+        mw = LaneCatalogueFilter(app, LANES)
+        sent, _ = asyncio.run(drive(mw, "/v1/chat/completions"))
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        keys = [k for k, _ in start["headers"]]
+        for gone in (b"x-litellm-model-name", b"x-litellm-model-id",
+                     b"x-litellm-model-api-base", b"x-litellm-model-group"):
+            self.assertNotIn(gone, keys)
+        # cost/timing and content-type survive — they leak nothing.
+        self.assertIn(b"x-litellm-response-cost", keys)
+        self.assertIn(b"content-type", keys)
+
+    def test_the_strip_keeps_headers_for_a_loopback_client(self):
+        # ferry-dash's probe reads x-litellm-model-name over 127.0.0.1 — the
+        # control plane keeps full headers.
+        app = RecordingApp(b"whatever", headers=[
+            (b"x-litellm-model-name", b"anthropic/k3"),
+        ])
+        mw = LaneCatalogueFilter(app, LANES)
+        sent = []
+
+        async def send(m):
+            sent.append(m)
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        scope = {"type": "http", "path": "/v1/chat/completions",
+                 "client": ("127.0.0.1", 5000)}
+        asyncio.run(mw(scope, receive, send))
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        self.assertIn((b"x-litellm-model-name", b"anthropic/k3"),
+                      start["headers"])
+
+    def test_the_strip_can_be_disabled(self):
+        app = RecordingApp(b"whatever", headers=[
+            (b"x-litellm-model-name", b"anthropic/k3"),
+        ])
+        mw = LaneCatalogueFilter(app, LANES)
+        os.environ["FERRY_STRIP_HEADERS"] = "0"
+        try:
+            sent, _ = asyncio.run(drive(mw, "/v1/chat/completions"))
+        finally:
+            os.environ.pop("FERRY_STRIP_HEADERS", None)
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        self.assertIn((b"x-litellm-model-name", b"anthropic/k3"),
+                      start["headers"])
 
     def test_the_model_listing_is_not_handed_the_original_send(self):
         # The converse, so the test above cannot pass by the middleware being
@@ -349,6 +413,7 @@ class TestEventTap(unittest.TestCase):
 
     def setUp(self):
         self._prev = os.environ.get("FERRY_EVENTS")
+        self._prev_strip = os.environ.get("FERRY_STRIP_HEADERS")
         self._dir = tempfile.mkdtemp()
         self.path = os.path.join(self._dir, "ferry-events.ndjson")
 
@@ -358,6 +423,10 @@ class TestEventTap(unittest.TestCase):
             os.environ.pop("FERRY_EVENTS", None)
         else:
             os.environ["FERRY_EVENTS"] = self._prev
+        if self._prev_strip is None:
+            os.environ.pop("FERRY_STRIP_HEADERS", None)
+        else:
+            os.environ["FERRY_STRIP_HEADERS"] = self._prev_strip
 
     def _app(self):
         return RecordingApp(headers=list(self.ATTRIB),
@@ -372,6 +441,9 @@ class TestEventTap(unittest.TestCase):
 
     # ── the gate ───────────────────────────────────────────────────────────
     def test_the_byte_stream_is_identical_with_and_without_the_tap(self):
+        # Byte identity is the tap's invariant, so the strip (a separate,
+        # header-only concern) is held off here to isolate it.
+        os.environ["FERRY_STRIP_HEADERS"] = "0"
         _, with_tap, _ = self._drive(True)
         _, without, _ = self._drive(False)
         self.assertEqual(with_tap, without)
@@ -383,12 +455,30 @@ class TestEventTap(unittest.TestCase):
         self.assertEqual(bodies, [(b"a", True), (b"bb", True), (b"ccc", False)])
 
     def test_headers_are_not_rewritten_on_the_hot_path(self):
+        os.environ["FERRY_STRIP_HEADERS"] = "0"
         _, sent, _ = self._drive(True)
         start = next(m for m in sent if m["type"] == "http.response.start")
         self.assertEqual(start["headers"], list(self.ATTRIB))
         self.assertNotIn(b"content-length", dict(start["headers"]))
 
+    def test_the_tap_still_records_full_attribution_when_headers_are_stripped(self):
+        # The strip runs AFTER the tap reads the headers, so the event keeps the
+        # real lane/deployment even though the client never sees them.
+        os.environ["FERRY_STRIP_HEADERS"] = "1"
+        _, sent, _ = self._drive(True)
+        FF.tap_flush()
+        rec = json.loads(open(self.path).readline())
+        self.assertEqual(rec["lane"], "flash")
+        self.assertEqual(rec["deployment"], "flash-alt-1")
+        self.assertEqual(rec["model"], "someprovider/some-model")
+        # ... while the client-facing start line had them stripped.
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        keys = [k for k, _ in start["headers"]]
+        self.assertNotIn(b"x-litellm-model-name", keys)
+        self.assertNotIn(b"x-litellm-model-group", keys)
+
     def test_tap_off_still_hands_over_the_original_send(self):
+        os.environ["FERRY_STRIP_HEADERS"] = "0"
         app, _, send = self._drive(False)
         self.assertIs(app.seen_send, send)
 
@@ -496,10 +586,18 @@ class TestEventTap(unittest.TestCase):
         self.assertTrue(FF.should_wrap(frozenset()))
 
     def test_the_app_is_not_wrapped_when_there_is_nothing_to_do(self):
-        # The control: with no public lanes AND no tap, plain litellm is handed
-        # back untouched, which is the behaviour that predates this change.
+        # The control: with no public lanes AND no tap AND no strip, plain
+        # litellm is handed back untouched — the behaviour that predates this
+        # change. The strip is on by default, so it must be held off here.
         os.environ["FERRY_EVENTS"] = "off"
+        os.environ["FERRY_STRIP_HEADERS"] = "0"
         self.assertFalse(FF.should_wrap(frozenset()))
+
+    def test_the_app_is_wrapped_for_stripping_with_no_lanes_and_no_tap(self):
+        # Header stripping (on by default) is itself a reason to wrap.
+        os.environ["FERRY_EVENTS"] = "off"
+        os.environ["FERRY_STRIP_HEADERS"] = "1"
+        self.assertTrue(FF.should_wrap(frozenset()))
 
     def test_the_app_is_wrapped_for_filtering_even_with_the_tap_off(self):
         os.environ["FERRY_EVENTS"] = "off"

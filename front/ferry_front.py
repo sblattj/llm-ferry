@@ -66,6 +66,53 @@ def is_inference_path(path: str) -> bool:
         return False
     return any(path.startswith(p) for p in INFERENCE_PATH_PREFIXES)
 
+
+# ── lane-name confidentiality ────────────────────────────────────────────────
+# litellm restamps the response body's `"model"` to the client-requested lane
+# name (1.99.0: `_override_openai_response_model` / `_restamp_streaming_chunk_model`),
+# so the body already honours the lane abstraction. The HEADERS do not: every
+# response carries x-litellm-model-name (the real provider model, e.g.
+# "anthropic/k3"), -model-api-base (the provider URL), -model-id, and
+# -model-group. litellm emits them unconditionally in get_custom_headers with no
+# config toggle, so hiding them is a wrapper job.
+#
+# We strip only the four IDENTITY headers, on inference paths only, and only for
+# clients that are not on this host. Cost/timing headers (x-litellm-response-cost,
+# -duration-ms, …) stay — they leak nothing about the backend and clients may
+# want them. The event tap reads the SAME headers off http.response.start before
+# the strip, so ferry's observability (lib/ferry_events.py) keeps full
+# attribution. The loopback exemption is for ferry-dash's probe_backends, which
+# reads x-litellm-model-name over 127.0.0.1 to show which deployment answered.
+STRIP_RESPONSE_HEADERS = frozenset({
+    b"x-litellm-model-name",
+    b"x-litellm-model-id",
+    b"x-litellm-model-api-base",
+    b"x-litellm-model-group",
+})
+
+_LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
+
+
+def _is_loopback_client(scope) -> bool:
+    client = scope.get("client")
+    return bool(client) and client[0] in _LOOPBACK_CLIENTS
+
+
+def _strip_headers(message):
+    """Return the http.response.start message minus the identity headers."""
+    headers = [(k, v) for k, v in message.get("headers", [])
+               if k.lower() not in STRIP_RESPONSE_HEADERS]
+    out = dict(message)
+    out["headers"] = headers
+    return out
+
+
+def strip_headers_enabled() -> bool:
+    """On by default; FERRY_STRIP_HEADERS=0/off disables (a client that greps
+    the headers for debugging can opt back in)."""
+    return (os.environ.get("FERRY_STRIP_HEADERS") or "1").strip().lower() not in (
+        "0", "off", "false", "no")
+
 # ── the event tap ──────────────────────────────────────────────────────────
 # litellm returns the whole per-request attribution record in its RESPONSE
 # HEADERS, and nothing in ferry reads it. The proxy log cannot substitute:
@@ -213,16 +260,23 @@ class LaneCatalogueFilter:
             or scope.get("type") != "http"
             or scope.get("path") not in MODEL_LIST_PATHS
         ):
-            # Only inference paths are tapped. The catalogue is excluded
-            # explicitly because when NO lane is marked public this branch also
-            # handles /v1/models; health and metrics are excluded because they
-            # are polled every few seconds and are not served model calls.
-            if (
-                scope.get("type") == "http"
-                and is_inference_path(scope.get("path", ""))
-                and tap_enabled()
-            ):
-                return await self.app(scope, receive, self._tapped(scope, send))
+            # Only inference paths are tapped and header-stripped. The catalogue
+            # is excluded explicitly because when NO lane is marked public this
+            # branch also handles /v1/models; health and metrics are excluded
+            # because they are polled every few seconds and are not served model
+            # calls. The strip is for lane-name confidentiality; it is skipped
+            # for loopback clients (ferry-dash's control plane reads the headers).
+            http = scope.get("type") == "http"
+            infer = http and is_inference_path(scope.get("path", ""))
+            strip = (
+                infer
+                and strip_headers_enabled()
+                and not _is_loopback_client(scope)
+            )
+            if infer and tap_enabled():
+                return await self.app(scope, receive, self._tapped(scope, send, strip))
+            if strip:
+                return await self.app(scope, receive, self._stripping(send))
             return await self.app(scope, receive, send)
 
         chunks: list[bytes] = []
@@ -243,17 +297,36 @@ class LaneCatalogueFilter:
 
         await self.app(scope, receive, capture)
 
-    def _tapped(self, scope, send):
+    def _stripping(self, send):
+        """Wrap `send` to drop the identity headers on http.response.start.
+
+        Only the start message is touched, and only its header list — bodies
+        forward by identity, so a streamed token is never funnelled through a
+        rewrite. Fail-open: any error forwards the original message.
+        """
+
+        async def stripping(message):
+            if message.get("type") == "http.response.start":
+                try:
+                    message = _strip_headers(message)
+                except Exception:
+                    pass
+            return await send(message)
+
+        return stripping
+
+    def _tapped(self, scope, send, strip=False):
         """Wrap `send` to read attribution headers off http.response.start and
         count response body bytes off http.response.body.
 
-        Every message is forwarded unmodified — no body is buffered or
-        rewritten, no header is changed, no ordering is altered, and the only
-        await is the forwarded send. The record is written when the FINAL body
-        chunk passes so its `resp_bytes` count is complete; a response that
-        never finishes costs its event record, which is the price of counting
-        without buffering. Fail-open in every branch: a broken tap must never
-        fail, delay, or alter a request.
+        The record is built from the headers BEFORE the optional strip, so
+        observability keeps full attribution even when the client sees fewer
+        headers. Bodies are never buffered or rewritten and no ordering is
+        altered; the only awaits are the forwarded sends. The record is written
+        when the FINAL body chunk passes so its `resp_bytes` count is complete;
+        a response that never finishes costs its event record, which is the
+        price of counting without buffering. Fail-open in every branch: a
+        broken tap must never fail, delay, or alter a request.
         """
         rec = None
         nbytes = 0
@@ -274,6 +347,11 @@ class LaneCatalogueFilter:
                         )
                 except Exception:
                     pass
+                if strip:
+                    try:
+                        message = _strip_headers(message)
+                    except Exception:
+                        pass
             elif mtype == "http.response.body":
                 try:
                     nbytes += len(message.get("body", b""))
@@ -314,7 +392,8 @@ def should_wrap(public) -> bool:
     """Whether the middleware has any job at all.
 
     A non-empty public set means catalogue filtering. An enabled tap means
-    events. With neither, plain litellm is handed back untouched.
+    events. Header stripping (on by default) means lane-name confidentiality.
+    With none of the three, plain litellm is handed back untouched.
 
     This exists as its own predicate because `build_app` used to return the raw
     app whenever no lane was marked public — which silently disabled the event
@@ -323,7 +402,7 @@ def should_wrap(public) -> bool:
     never call build_app, so the object worked while the app never installed it.
     Caught by a live run under the real loader, 2026-08-30.
     """
-    return bool(public) or tap_enabled()
+    return bool(public) or tap_enabled() or strip_headers_enabled()
 
 
 def build_app():

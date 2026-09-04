@@ -55,7 +55,7 @@ e.g. `tailscale serve --bg --https=3443 http://127.0.0.1:3001`, or launch Grafan
 | Dashboard | What it shows |
 |---|---|
 | **ferry-overview** | Up/serving status, models served, health-check latency, request rate, error rate — the at-a-glance page. |
-| **ferry-traffic** | Per-client-IP × HTTP-status request volume, RPS, error rate, backend events (kimi_quota / rate_limit). |
+| **ferry-traffic** | Per-client-IP × HTTP-status request volume, RPS, error rate, backend events (quota_exhausted / rate_limited). |
 | **ferry-backends** | Topology (worker-pool size, deployments, fallback-chain length, config mtime) + an "LLM internals" row fed by litellm-native metrics + a **"Failures & Fallbacks"** row (failures by model/reason, cooldowns, fallbacks fired). |
 | **ferry-models** | Per-model request rate, tokens, spend, latency, success/failure — from litellm-native metrics. |
 | **ferry-logs** | Searchable per-model proxy logs from VictoriaLogs; errors & fallbacks view. |

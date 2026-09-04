@@ -394,7 +394,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Backend events",
-      "description": "ferry_backend_events_total by {{kind}} — spikes when a key cools (kimi_quota) or a backend 429s (rate_limit).",
+      "description": "ferry_backend_events_total by {{kind}} — spikes when a key runs dry (quota_exhausted) or a backend 429s (rate_limited).",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "targets": [
@@ -432,11 +432,11 @@
         },
         "overrides": [
           {
-            "matcher": { "id": "byRegexp", "options": ".*kimi_quota.*" },
+            "matcher": { "id": "byRegexp", "options": ".*quota_exhausted.*" },
             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#eb6834" } }]
           },
           {
-            "matcher": { "id": "byRegexp", "options": ".*rate_limit.*" },
+            "matcher": { "id": "byRegexp", "options": ".*rate_limited.*" },
             "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "#d03b3b" } }]
           }
         ]

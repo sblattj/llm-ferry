@@ -748,5 +748,199 @@ class PromoteHotswapTest(unittest.TestCase):
         self.assertIn("restart it", note)
 
 
+class ProbeBackendsTest(unittest.TestCase):
+    """probe_backends: drives the "Test backends" button. Rewritten
+    2026-09-04 to derive the probe list from the config topology (every lane
+    AND every hop — a hop the operator never sees fail until it fires) rather
+    than a hardcoded 4-tuple, and to stream every call, since the ChatGPT-
+    subscription driver 500s on a non-streamed request even while healthy.
+    http_stream/http_json are stubbed; no proxy is touched."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "litellm.yaml")
+        with open(self.path, "w") as f:
+            f.write(CONFIG)
+        prev_cfg = dict(D.CFG)
+
+        def restore():
+            D.CFG.clear()
+            D.CFG.update(prev_cfg)
+        self.addCleanup(restore)
+        D.CFG.update(ferry="http://x", key="k", config_path=self.path)
+
+    def _with_stream(self, stub):
+        prev = D.http_stream
+        D.http_stream = stub
+        self.addCleanup(setattr, D, "http_stream", prev)
+
+    def _with_json(self, stub):
+        prev = D.http_json
+        D.http_json = stub
+        self.addCleanup(setattr, D, "http_json", prev)
+
+    def test_probes_every_name_in_topology_order_lanes_and_hops(self):
+        seen = []
+
+        def stub(url, key, method, body, timeout=None):
+            seen.append(body["model"])
+            return {"ok": True, "status": 200, "ms": 12, "headers": {}}
+        self._with_stream(stub)
+        D.probe_backends()
+        order = D.parse_topology_text(CONFIG)["order"]
+        self.assertEqual(seen, order)
+        self.assertIn("heavy-glm", seen, "a fallback hop must be probed too")
+        self.assertIn("flash-or", seen, "a fallback hop must be probed too")
+
+    def test_every_probe_body_streams_with_a_bigger_budget(self):
+        bodies = []
+
+        def stub(url, key, method, body, timeout=None):
+            bodies.append(body)
+            return {"ok": True, "status": 200, "ms": 5, "headers": {}}
+        self._with_stream(stub)
+        D.probe_backends()
+        self.assertTrue(bodies, "no requests were captured")
+        for b in bodies:
+            self.assertIs(b.get("stream"), True)
+            self.assertEqual(b.get("max_tokens"), 16)
+
+    def test_results_are_keyed_by_lane_name(self):
+        self._with_stream(lambda url, key, method, body, timeout=None:
+                          {"ok": True, "status": 200, "ms": 7, "headers": {}})
+        out = D.probe_backends()
+        self.assertEqual(set(out.keys()),
+                         set(D.parse_topology_text(CONFIG)["order"]))
+
+    def test_served_by_model_id_and_fallbacks_come_from_headers(self):
+        def stub(url, key, method, body, timeout=None):
+            return {"ok": True, "status": 200, "ms": 9,
+                   "headers": {"x-litellm-model-name": "openrouter/openai/gpt-5.6-luna",
+                               "x-litellm-model-id": "or-luna-flash-fb",
+                               "x-litellm-attempted-fallbacks": "1"}}
+        self._with_stream(stub)
+        out = D.probe_backends()
+        row = out["flash"]
+        self.assertEqual(row["served_by"], "openrouter/openai/gpt-5.6-luna")
+        self.assertEqual(row["model_id"], "or-luna-flash-fb")
+        self.assertEqual(row["fallbacks"], "1")
+
+    def test_requests_hit_the_chat_completions_endpoint(self):
+        urls = []
+
+        def stub(url, key, method, body, timeout=None):
+            urls.append(url)
+            return {"ok": True, "status": 200, "ms": 1, "headers": {}}
+        self._with_stream(stub)
+        D.probe_backends()
+        for u in urls:
+            self.assertTrue(u.endswith("/v1/chat/completions"), u)
+
+    def test_a_non_2xx_keeps_the_response_body_as_the_error(self):
+        def stub(url, key, method, body, timeout=None):
+            return {"ok": False, "status": 500, "ms": 3, "headers": {},
+                   "error": "Unknown items in responses API response: []"}
+        self._with_stream(stub)
+        out = D.probe_backends()
+        self.assertFalse(out["heavy"]["ok"])
+        self.assertIn("Unknown items", out["heavy"]["error"])
+
+    def test_an_unreadable_config_falls_back_to_v1_models(self):
+        D.CFG["config_path"] = os.path.join(self.tmp, "does-not-exist.yaml")
+
+        def json_stub(url, key, method="GET", body=None, timeout=None):
+            self.assertTrue(url.endswith("/v1/models"))
+            return {"ok": True, "status": 200,
+                   "json": {"data": [{"id": "heavy"}, {"id": "flash"}]}}
+        self._with_json(json_stub)
+        seen = []
+
+        def stream_stub(url, key, method, body, timeout=None):
+            seen.append(body["model"])
+            return {"ok": True, "status": 200, "ms": 1, "headers": {}}
+        self._with_stream(stream_stub)
+        out = D.probe_backends()
+        self.assertEqual(set(out.keys()), {"heavy", "flash"})
+        self.assertEqual(sorted(seen), ["flash", "heavy"])
+
+
+class TapClassifierTest(unittest.TestCase):
+    """Activity.poll(): the tap's last_event, now sourced from the shared
+    classifier in lib/ferry_live.py (classify_log_line) instead of the old
+    Kimi-specific "permission_error" + "usage limit" string match."""
+
+    RULES = {"rules": [
+        {"state": "quota_exhausted", "status": [403],
+         "message_contains": ["usage limit"]},
+    ], "ttl": {}}
+
+    # litellm's real cooldown line shape (mirrors
+    # lib/ferry-live.test.py's LogLineTapTests.COOLDOWN) — the status sits
+    # in a python-repr dict, not a bare HTTP status line.
+    COOLDOWN = ("Cooldown Deployments=[('dep-1', {'exception_received': "
+               "'litellm.PermissionDeniedError: usage limit reached', "
+               "'status_code': '403', 'cooldown_time': 5})]")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.path = os.path.join(self.tmp, "access.log")
+        with open(self.path, "w"):
+            pass   # start empty; Activity begins reading at EOF
+
+    def _tail(self, rules):
+        return D.Activity(self.path, rules)
+
+    def _append(self, line):
+        with open(self.path, "a") as f:
+            f.write(line + "\n")
+
+    def test_a_line_that_classifies_quota_exhausted_sets_the_event(self):
+        a = self._tail(self.RULES)
+        self._append(self.COOLDOWN)
+        a.poll()
+        self.assertIsNotNone(a.last_event)
+        self.assertEqual(a.last_event["kind"], "quota_exhausted")
+
+    def test_a_ratelimiterror_line_with_no_rules_sets_rate_limited(self):
+        a = self._tail({"rules": [], "ttl": {}})
+        self._append("litellm.RateLimitError: rate limited, try again")
+        a.poll()
+        self.assertIsNotNone(a.last_event)
+        self.assertEqual(a.last_event["kind"], "rate_limited")
+
+    def test_a_plain_200_access_line_sets_no_event(self):
+        a = self._tail({"rules": [], "ttl": {}})
+        self._append('10.0.0.2:5555 - "POST /v1/chat/completions HTTP/1.1" 200 OK')
+        a.poll()
+        self.assertIsNone(a.last_event)
+        self.assertEqual(a.total, 1, "the request is still counted")
+
+    def test_default_rules_is_the_empty_table_not_a_crash(self):
+        a = D.Activity(self.path)
+        self.assertEqual(a.rules, {"rules": [], "ttl": {}})
+
+    def test_event_text_has_no_vendor_name_or_stale_403_suffix(self):
+        a = self._tail(self.RULES)
+        self._append(self.COOLDOWN)
+        a.poll()
+        self.assertNotIn("Kimi", a.last_event["text"])
+        self.assertNotIn("(403)", a.last_event["text"])
+
+    def test_the_inline_floor_still_classifies_when_ferry_live_is_unavailable(self):
+        """_live() unavailable (the sibling module missing/broken): the tap
+        must still classify through its own vendor-neutral floor rather than
+        going dark, same as ferry_live.classify_log_line's own floor."""
+        prev_live = D._live
+        D._live = lambda: None
+        self.addCleanup(setattr, D, "_live", prev_live)
+        a = self._tail({"rules": [], "ttl": {}})
+        self._append("litellm.RateLimitError: x")
+        a.poll()
+        self.assertEqual(a.last_event["kind"], "rate_limited")
+        self._append("{'error': {'code': 'insufficient_quota'}}")
+        a.poll()
+        self.assertEqual(a.last_event["kind"], "quota_exhausted")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

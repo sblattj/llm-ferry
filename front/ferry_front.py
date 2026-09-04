@@ -3,12 +3,12 @@
 WHY THIS EXISTS
 
 `/v1/models` advertises every real `model_name` in the config, which on the
-ferry stack means the fallback deployments as well as the four lanes. That is
-not cosmetic. `router_settings.fallbacks` is keyed by model group: `orch` has an
-entry, `orch-deepseek` does not. A client that picks a fallback hop out of a
+ferry stack means the fallback deployments as well as the named lanes. That is
+not cosmetic. `router_settings.fallbacks` is keyed by model group: `flash` has
+an entry, `flash-luna` does not. A client that picks a fallback hop out of a
 model list gets a single provider with nothing behind it — the exact opposite of
-what the `orch` lane exists to provide, and it fails only when that hop is down,
-which is the case the chain was built for.
+what the `flash` lane exists to provide, and it fails only when that hop is
+down, which is the case the chain was built for.
 
 litellm has no config-only fix. `hidden` is honoured for `model_group_alias`
 entries ONLY (litellm/router.py, both the model-group-info and model-list
@@ -72,7 +72,7 @@ def is_inference_path(path: str) -> bool:
 # name (1.99.0: `_override_openai_response_model` / `_restamp_streaming_chunk_model`),
 # so the body already honours the lane abstraction. The HEADERS do not: every
 # response carries x-litellm-model-name (the real provider model, e.g.
-# "anthropic/k3"), -model-api-base (the provider URL), -model-id, and
+# "chatgpt/responses/gpt-5.6-sol"), -model-api-base (the provider URL), -model-id, and
 # -model-group. litellm emits them unconditionally in get_custom_headers with no
 # config toggle, so hiding them is a wrapper job.
 #
@@ -80,7 +80,7 @@ def is_inference_path(path: str) -> bool:
 # inference paths only, and only for clients that are not on this host. The
 # llm_provider-* headers are the upstream provider's own response headers
 # forwarded with a prefix (litellm get_custom_headers): `llm_provider-server:
-# cloudflare`, a set-cookie whose Domain names the vendor (`kimi.com`), the
+# cloudflare`, a set-cookie whose Domain names the vendor (`<vendor>.com`), the
 # Cloudflare ray id + PoP — the same identity leak one layer down.
 #
 # What we deliberately KEEP, because consumers use it for optimization:
@@ -303,13 +303,15 @@ def service_reorder(router, chains):
 # name, old primary deleted) would orphan the demoted backend: re-adding it
 # under the lane's own name is a self-fallback, and inventing a new name for
 # it breaks every chain referencing the old ones. A swap loses nothing: after
-# promoting muse to heavy, heavy's chain [orch-muse-spark, ...] still works —
-# that hop now serves the demoted K3 backend, so the effective order is
-# muse -> K3 -> GLM -> ... with zero chain edits. Cross-lane side effect is
-# symmetric and honest: every other chain naming the hop gets the demoted
-# backend in that slot too (e.g. orch's first hop becomes K3, same as orch's
-# own primary — a harmless redundant hop), and the dash shows model strings
-# from the file, so after the file echo the new mapping is VISIBLE.
+# promoting flash-luna to flash, flash's chain [flash-luna] still resolves —
+# that hop now serves the demoted Gemini backend, so the effective order is
+# Luna -> Gemini with zero chain edits. Cross-lane side effect is symmetric
+# and honest: every OTHER chain naming the hop would get the demoted backend
+# in that slot too — under the 2026-09-04 config no lane shares a hop (flash's
+# is flash-luna, super-flash's is super-flash-luna, one apiece), so there is
+# nothing for the effect to touch today, but the mechanism still applies the
+# moment two chains name the same hop — and the dash shows model strings from
+# the file, so after the file echo the new mapping is VISIBLE.
 #
 # litellm resolves the primary per REQUEST (_get_all_deployments reads
 # model_name_to_deployment_indices -> model_list[idx] fresh on every call),

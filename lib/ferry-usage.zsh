@@ -68,11 +68,12 @@ Encrypted transfer over an UNTRUSTED channel (no LAN required):
                        ferry pickup <blob> [--to PATH] [--pass-file FILE]
 
 Options for 'up':
-  (no flags)         THE STACK — all four lanes on one endpoint (:$PORT):
-                       orch        cloud  GLM 5.3 + strict fallback chain
-                       flash       cloud  Gemini 3.8 Flash key pool
-                       local-orch  GPU    $LOCAL_MODEL_ORCH
-                       local-sub   GPU    $LOCAL_MODEL_SUB
+  (no flags)         THE STACK — all five lanes on one endpoint (:$PORT):
+                       heavy        cloud  GPT-5.6 Sol (ChatGPT subscription), no fallback chain
+                       flash        cloud  Gemini 3.8 Flash (OpenRouter), 1 Luna hop
+                       super-flash  cloud  Gemini 3.8 Flash (OpenRouter), 1 Luna hop
+                       local-orch   GPU    $LOCAL_MODEL_ORCH
+                       local-sub    GPU    $LOCAL_MODEL_SUB
                      The GPU lanes run on internal ports $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT;
                      clients only ever address :$PORT and pick a lane by name.
   -a, --all, --stack Same as no flags (explicit form)

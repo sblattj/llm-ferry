@@ -366,5 +366,117 @@ class TestMasterKeyProbes(unittest.TestCase):
                              "a printed command embeds a literal key value")
 
 
+class TestWarnMissingKeys(unittest.TestCase):
+    """2026-09-04: _ferry_warn_missing_keys is DERIVED from the route config in
+    use ($FERRY_ROUTE_CONFIG), not hardcoded to GLM_API_KEY/GEMINI_API_KEY (both
+    retired lanes). It must warn only about vars the config actually references
+    via `api_key: os.environ/VAR`, naming the model_names that reference each.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FERRY) as f:
+            cls.src = f.read()
+
+    def warn_missing_keys_body(self):
+        m = re.search(r"_ferry_warn_missing_keys\(\) \{.*?\n\}", self.src, re.S)
+        self.assertIsNotNone(m, "_ferry_warn_missing_keys is missing from ferry")
+        return m.group(0)
+
+    def run_warn_missing_keys(self, cfg_path, env_overrides):
+        """Execute the REAL extracted function against a throwaway route config."""
+        with tempfile.NamedTemporaryFile("w", suffix=".zsh", delete=False) as f:
+            f.write("set -u\n" + self.warn_missing_keys_body() + "\n"
+                    f"FERRY_ROUTE_CONFIG={cfg_path!r}\n"
+                    "_ferry_warn_missing_keys\n")
+            path = f.name
+        env = dict(os.environ)
+        for k in ("OPENROUTER_API_KEY", "OTHER_KEY", "LIVE_KEY", "DEAD_KEY"):
+            env.pop(k, None)   # hermetic: author shells may export any of these
+        env.update(env_overrides)
+        try:
+            r = subprocess.run(["zsh", path], capture_output=True, text=True,
+                               env=env, timeout=30)
+        finally:
+            os.unlink(path)
+        return r.stdout
+
+    def test_warns_about_the_unset_var_and_its_lanes_only(self):
+        # OPENROUTER_API_KEY is set (referenced by `flash`); OTHER_KEY is not
+        # (referenced by `other-lane`). Only OTHER_KEY, with its own lane name,
+        # should show up — never OPENROUTER_API_KEY or a stale hardcoded name.
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(
+                "model_list:\n"
+                "  - model_name: flash\n"
+                "    litellm_params:\n"
+                "      model: openrouter/google/gemini-3.8-flash\n"
+                "      api_key: os.environ/OPENROUTER_API_KEY\n"
+                "  - model_name: other-lane\n"
+                "    litellm_params:\n"
+                "      model: someprovider/some-model\n"
+                "      api_key: os.environ/OTHER_KEY\n")
+            cfg_path = f.name
+        try:
+            out = self.run_warn_missing_keys(cfg_path, {"OPENROUTER_API_KEY": "sk-set"})
+        finally:
+            os.unlink(cfg_path)
+        self.assertIn("OTHER_KEY", out)
+        self.assertIn("other-lane", out)
+        self.assertNotIn("OPENROUTER_API_KEY", out)
+        self.assertNotIn("GLM_API_KEY", out)
+        self.assertNotIn("GEMINI_API_KEY", out)
+
+    def test_two_lanes_sharing_one_var_are_both_named(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(
+                "model_list:\n"
+                "  - model_name: flash\n"
+                "    litellm_params:\n"
+                "      api_key: os.environ/OTHER_KEY\n"
+                "  - model_name: super-flash\n"
+                "    litellm_params:\n"
+                "      api_key: os.environ/OTHER_KEY\n")
+            cfg_path = f.name
+        try:
+            out = self.run_warn_missing_keys(cfg_path, {})
+        finally:
+            os.unlink(cfg_path)
+        self.assertIn("OTHER_KEY", out)
+        self.assertIn("flash", out)
+        self.assertIn("super-flash", out)
+
+    def test_prints_nothing_when_the_config_cannot_be_read(self):
+        out = self.run_warn_missing_keys("/tmp/ferry-test-no-such-config.yaml", {})
+        self.assertEqual(out, "")
+
+    def test_a_commented_out_example_block_is_ignored(self):
+        # Operators keep template leftovers around, e.g. a commented
+        # `# - model_name: heavy-fallback` block referencing a var no live lane
+        # needs. The grep pass must not pick up commented `model_name:`/
+        # `api_key:` lines — that would both warn about a dead var and (worse)
+        # mislabel the next REAL var's lanes with the commented lane's name.
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(
+                "model_list:\n"
+                "  - model_name: flash\n"
+                "    litellm_params:\n"
+                "      model: openrouter/google/gemini-3.8-flash\n"
+                "      api_key: os.environ/LIVE_KEY\n"
+                "  # - model_name: heavy-fallback\n"
+                "  #   litellm_params:\n"
+                "  #     model: fireworks_ai/whatever\n"
+                "  #     api_key: os.environ/DEAD_KEY\n")
+            cfg_path = f.name
+        try:
+            out = self.run_warn_missing_keys(cfg_path, {})   # both unset
+        finally:
+            os.unlink(cfg_path)
+        self.assertIn("LIVE_KEY", out)
+        self.assertIn("flash", out)
+        self.assertNotIn("DEAD_KEY", out)
+        self.assertNotIn("heavy-fallback", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -278,7 +278,7 @@ groups:
             model:
               refId: A
               editorMode: code
-              expr: increase(ferry_backend_events_total{kind="rate_limit"}[10m])
+              expr: increase(ferry_backend_events_total{kind="rate_limited"}[10m])
               instant: true
               range: false
               intervalMs: 1000
@@ -337,13 +337,15 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "increase(ferry_backend_events_total{kind=\"rate_limit\"}[10m]) > 5 — {{ $values.B.Value }} rate-limit event(s) from the backend in the last 10m."
+          summary: "increase(ferry_backend_events_total{kind=\"rate_limited\"}[10m]) > 5 — {{ $values.B.Value }} rate-limit event(s) from the backend in the last 10m."
 
-      # 5. Kimi quota exhausted — warning. Any occurrence in the trailing 15m is the signal;
-      # fires immediately, same rationale as rule 4 (a discrete backend event, not a noisy
-      # continuous metric that needs debouncing).
-      - uid: ferry-kimi-quota-exhausted
-        title: "Kimi quota exhausted"
+      # 5. Backend quota exhausted — warning. Any occurrence in the trailing 15m is the
+      # signal; fires immediately, same rationale as rule 4 (a discrete backend event, not
+      # a noisy continuous metric that needs debouncing). Vendor-neutral since 2026-09-04
+      # (was "Kimi quota exhausted" / kind="kimi_quota" — Kimi is retired and the kind is
+      # now lib/ferry_live.classify_log_line's quota_exhausted, whichever vendor triggers it).
+      - uid: ferry-quota-exhausted
+        title: "Backend quota exhausted"
         condition: C
         data:
           - refId: A
@@ -355,7 +357,7 @@ groups:
             model:
               refId: A
               editorMode: code
-              expr: increase(ferry_backend_events_total{kind="kimi_quota"}[15m])
+              expr: increase(ferry_backend_events_total{kind="quota_exhausted"}[15m])
               instant: true
               range: false
               intervalMs: 1000
@@ -414,7 +416,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "increase(ferry_backend_events_total{kind=\"kimi_quota\"}[15m]) > 0 — a kimi_quota backend event fired in the last 15m. Current: {{ $values.B.Value }}."
+          summary: "increase(ferry_backend_events_total{kind=\"quota_exhausted\"}[15m]) > 0 — a quota_exhausted backend event fired in the last 15m. Current: {{ $values.B.Value }}."
 
       # 6. Key pool shrank — warning. A pool that HAD several deployments and now has
       # fewer than 2 has lost its headroom for a rotation/outage.

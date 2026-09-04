@@ -902,7 +902,7 @@
       "id": 18,
       "type": "table",
       "title": "Worker lane — failures by deployment (selected range)",
-      "description": "sum by (model_id, exception_status)(increase(litellm_proxy_failed_requests_metric_total{requested_model=\"flash\"}[$__range])) — WHICH deployment in the worker chain failed, and why (429 = quota/rate, 403 = auth or credits exhausted). The Key column is the deployment's model_info.id — coding-glm-flash-1 (Z.ai coding plan, the primary), or-glm-flash-1 (GLM via OpenRouter), gemini-key-1 (Google direct), openrouter-gemini-1. Give every deployment a DISTINCT id in litellm.yaml or this panel lies: a duplicate `model_info:` key once made the primary and its paid fallback report the same id, conflating free coding-plan traffic with paid overflow. Failures concentrated on coding-glm-flash-1 mean the plan credits are dry and the chain is spilling to paid hops.",
+      "description": "sum by (model_id, exception_status)(increase(litellm_proxy_failed_requests_metric_total{requested_model=\"flash\"}[$__range])) — WHICH deployment in the worker chain failed, and why (429 = quota/rate, 403 = auth or credits exhausted). The Key column is the deployment's model_info.id — or-gemini-flash (Gemini 3.8 Flash via OpenRouter, the primary), or-luna-flash-fb (GPT-5.6 Luna via OpenRouter, the one fallback hop). `super-flash` is the same shape under its own ids (or-gemini-sf, or-luna-sf-fb) — swap requested_model to see it. The `heavy` driver (chatgpt/responses/gpt-5.6-sol) has no fallback chain at all, so it never has hop rows here; only flash and super-flash do. Give every deployment a DISTINCT id in litellm.yaml or this panel lies: a duplicate `model_info:` key once made the primary and its fallback report the same id, conflating primary traffic with fallback overflow. Failures concentrated on or-gemini-flash mean the primary is out (quota or rate limit) and the chain is spilling to the Luna fallback.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 0, "y": 57, "w": 14, "h": 9 },
       "fieldConfig": {
@@ -984,7 +984,7 @@
       "id": 19,
       "type": "timeseries",
       "title": "Worker lane 429s by deployment",
-      "description": "sum by (model_id)(rate(litellm_proxy_failed_requests_metric_total{requested_model=\"flash\", exception_status=\"429\"}[$__rate_interval])) — per-deployment 429 rate over time for the worker lane. A single rising line is one provider rate-limiting or running out of credits; many lines rising together means the whole fallback chain is saturated and `flash` is about to spill to `orch`.",
+      "description": "sum by (model_id)(rate(litellm_proxy_failed_requests_metric_total{requested_model=\"flash\", exception_status=\"429\"}[$__rate_interval])) — per-deployment 429 rate over time for the worker lane. A single rising line is one provider rate-limiting or running out of credits; a rising line on the primary (`or-gemini-flash`) means `flash` is about to spill to its one fallback hop, `flash-luna` (or-luna-flash-fb) — there is no further hop beyond that.",
       "datasource": { "type": "prometheus", "uid": "ferry-vm" },
       "gridPos": { "x": 14, "y": 57, "w": 10, "h": 9 },
       "fieldConfig": {

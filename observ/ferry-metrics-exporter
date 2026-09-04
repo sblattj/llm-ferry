@@ -87,21 +87,53 @@ live_mod = _FD._live()
 
 
 # ── traffic: extend the dashboard's tailer with the joint + event counters ──
+def classify_backend_event(rules, line):
+    """Classify one proxy-log line as "quota_exhausted", "rate_limited", or None.
+
+    Canonical logic is lib/ferry_live.classify_log_line — it applies the
+    operator's ~/.config/ferry/event-rules.json rules plus a vendor-neutral
+    floor, so this delegates to it whenever the module loaded. When it did
+    not (lib/ferry_live.py missing), this inlines the SAME vendor-neutral
+    floor so the two kinds are still detected with zero config: litellm's
+    RateLimitError / a bare "rate_limit" mention -> rate_limited, and
+    "insufficient_quota" / "insufficient credits" -> quota_exhausted.
+    """
+    if live_mod:
+        return live_mod.classify_log_line(rules, line)
+    low = line.lower()
+    if "ratelimiterror" in low or "rate_limit" in low:
+        return "rate_limited"
+    if "insufficient_quota" in low or "insufficient credits" in low:
+        return "quota_exhausted"
+    return None
+
+
 class JointActivity(Activity):
     """Activity + the (client, status) joint counters and cumulative backend
-    events Prometheus needs. Reuses the base regex (ACCESS), the incremental
-    offset/truncation tail, and the base event-detection substrings verbatim;
-    it only adds dimensions the dashboard's marginals cannot reconstruct.
+    events Prometheus needs. Reuses the base regex (ACCESS) and the
+    incremental offset/truncation tail verbatim; it only adds dimensions the
+    dashboard's marginals cannot reconstruct. Backend-event detection is
+    classify_backend_event() (above), not a copy of the base class's
+    substrings, so the two kinds — quota_exhausted, rate_limited — are
+    single-sourced with lib/ferry_live.classify_log_line and with the
+    per-deployment ExhaustionState in Collector below.
 
     All counters are in-memory and CUMULATIVE since exporter start (poll only
     ever adds), so `ferry_requests_total` never decreases between scrapes.
     """
 
-    def __init__(self, logpath):
+    def __init__(self, logpath, rules=None):
         super().__init__(logpath)
         self.by_client_status = {}                          # (ip, status) -> count
-        self.backend_events = {"kimi_quota": 0, "rate_limit": 0}
+        kinds = live_mod.TAP_KINDS if live_mod else ("quota_exhausted", "rate_limited")
+        self.backend_events = {k: 0 for k in kinds}
         self.backend_event_ts = {}                          # kind -> epoch of last occurrence
+        # The classifier table, loaded ONCE in build_collector() and shared
+        # with Collector's ExhaustionState below, so a proxy-log line and an
+        # NDJSON tap event are judged by the exact same rules. None (a caller
+        # that constructs this directly, e.g. tests, without a rules file) is
+        # fine — classify_backend_event() then falls straight to the floor.
+        self.rules = rules
 
     def poll(self):
         if not self.logpath or not os.path.exists(self.logpath):
@@ -130,17 +162,12 @@ class JointActivity(Activity):
                         self.by_client[ip] = self.by_client.get(ip, 0) + 1
                         key = (ip, status)
                         self.by_client_status[key] = self.by_client_status.get(key, 0) + 1
-                low = line.lower()
-                if "permission_error" in low and "usage limit" in low:
+                kind = classify_backend_event(self.rules, line)
+                if kind:
                     now = time.time()
-                    self.backend_events["kimi_quota"] += 1
-                    self.backend_event_ts["kimi_quota"] = now
-                    self.last_event = {"kind": "kimi_quota", "t": now}
-                elif "rate_limit" in low or "ratelimiterror" in low:
-                    now = time.time()
-                    self.backend_events["rate_limit"] += 1
-                    self.backend_event_ts["rate_limit"] = now
-                    self.last_event = {"kind": "rate_limit", "t": now}
+                    self.backend_events[kind] = self.backend_events.get(kind, 0) + 1
+                    self.backend_event_ts[kind] = now
+                    self.last_event = {"kind": kind, "t": now}
             self.buckets.append(new)
             self.buckets = self.buckets[-40:]
 
@@ -213,7 +240,7 @@ class Family:
 # ── collector ───────────────────────────────────────────────────────────────
 class Collector:
     def __init__(self, ferry, key, config_path, activity, started=None,
-                 events_path=None, rules_path=None):
+                 events_path=None, rules_path=None, rules=None):
         self.ferry = ferry.rstrip("/")
         self.key = key
         self.config_path = config_path
@@ -235,8 +262,14 @@ class Collector:
                 # These counters mean "since exporter start", exactly like
                 # ferry_requests_total.
                 self._tail = self._live.EventTail(events_path)
-                self._exhaustion = self._live.ExhaustionState(
-                    self._live.load_rules(rules_path))
+                # `rules`, when given, is the classifier table build_collector()
+                # already loaded ONCE and shares with JointActivity's backend-
+                # event counters, so a proxy-log line and an NDJSON tap event
+                # are judged by the exact same rules object. A direct caller
+                # (e.g. tests) that has no pre-loaded rules can still pass a
+                # path via rules_path and this loads it itself.
+                loaded_rules = rules if rules is not None else self._live.load_rules(rules_path)
+                self._exhaustion = self._live.ExhaustionState(loaded_rules)
             except Exception:
                 self._tail = None
                 self._exhaustion = None
@@ -607,10 +640,16 @@ def make_handler(collector):
 def build_collector(args, started=None):
     ferry_port = args.ferry.rsplit(":", 1)[-1].split("/")[0]
     logpath = args.log or find_log(ferry_port)
-    activity = JointActivity(logpath)
+    rules_path = getattr(args, "rules", None)
+    # Load the classifier table ONCE, here — before the tailer (JointActivity)
+    # is constructed — so the proxy-log backend-event counters and the
+    # per-deployment ExhaustionState below both classify against the exact
+    # same rules object instead of each re-parsing event-rules.json.
+    rules = live_mod.load_rules(rules_path) if live_mod else None
+    activity = JointActivity(logpath, rules=rules)
     collector = Collector(args.ferry, args.key, args.config, activity, started=started,
                           events_path=getattr(args, "events", None),
-                          rules_path=getattr(args, "rules", None))
+                          rules=rules)
     return collector, logpath
 
 

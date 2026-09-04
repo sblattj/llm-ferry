@@ -110,14 +110,17 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # NOTE: 8091 is deliberately skipped — `ferry dash` binds it. The stack and the
 # dashboard are meant to run together, so the lanes start above it.
 
-# ---- The four served lanes ----
+# ---- The five served lanes ----
 # Lane names are the STABLE contract clients bind to; the model behind a lane is
 # swappable without touching a single client config.
 #
-#   orch        -> GLM 5.3 (Z.ai Coding Plan) + a 4-hop cloud fallback chain
-#   flash       -> Gemini 3.8 Flash across 10 per-project keys (load-balanced pool)
-#   local-orch  -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
-#   local-sub   -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
+#   heavy        -> GPT-5.6 Sol via the ChatGPT subscription, no fallback chain
+#                   (legacy names `orch`/`orchestrator` still resolve to it)
+#   flash        -> Gemini 3.8 Flash via OpenRouter, 1 fallback hop to GPT-5.6 Luna
+#   super-flash  -> same Gemini 3.8 Flash shape, minimal reasoning (housekeeping),
+#                   1 fallback hop to GPT-5.6 Luna with reasoning off
+#   local-orch   -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
+#   local-sub    -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
 #
 # The cloud lanes live in the litellm route config; the two local lanes are the
 # MLX servers this script launches, wired into that same config as
@@ -184,14 +187,16 @@ MDNS_NAME="$(detect_mdns_name)"
 # This one HAS to be a real provider/model id, not a lane name: --cloud runs a
 # bare `litellm --model "$DEFAULT_CLOUD_MODEL"` with no route config at all, so
 # there is no lane table to resolve against. It rides OpenRouter deliberately —
-# one env var (OPENROUTER_API_KEY) and the stock api_base, whereas the Z.ai
-# coding endpoint that backs the `flash` lane needs a custom api_base the bare
-# `litellm --model` form has nowhere to put.
+# one env var (OPENROUTER_API_KEY) and the stock api_base.
 #
 # Was `gemini/gemini-3.7-flash` (as DEFAULT_GEMINI) until v1.8.4. v1.8.0 retired
 # the multi-project Gemini key pool, so `--cloud` had been defaulting to a key
 # the host no longer holds and failing its own preflight check.
-DEFAULT_CLOUD_MODEL="openrouter/z-ai/glm-5.3-flash"
+#
+# Was `openrouter/z-ai/glm-5.3-flash` from v1.8.4 until 2026-09-04, when the
+# route config was simplified and the `flash` lane it mirrors moved to
+# OpenRouter Gemini 3.8 Flash.
+DEFAULT_CLOUD_MODEL="openrouter/google/gemini-3.8-flash"
 
 # Route mode: serve multiple models (orchestrator + failover workers) from a litellm config
 DEFAULT_ROUTE_CONFIG="$HOME/.config/ferry/litellm.yaml"
@@ -325,11 +330,12 @@ Encrypted transfer over an UNTRUSTED channel (no LAN required):
                        ferry pickup <blob> [--to PATH] [--pass-file FILE]
 
 Options for 'up':
-  (no flags)         THE STACK — all four lanes on one endpoint (:$PORT):
-                       orch        cloud  GLM 5.3 + strict fallback chain
-                       flash       cloud  Gemini 3.8 Flash key pool
-                       local-orch  GPU    $LOCAL_MODEL_ORCH
-                       local-sub   GPU    $LOCAL_MODEL_SUB
+  (no flags)         THE STACK — all five lanes on one endpoint (:$PORT):
+                       heavy        cloud  GPT-5.6 Sol (ChatGPT subscription), no fallback chain
+                       flash        cloud  Gemini 3.8 Flash (OpenRouter), 1 Luna hop
+                       super-flash  cloud  Gemini 3.8 Flash (OpenRouter), 1 Luna hop
+                       local-orch   GPU    $LOCAL_MODEL_ORCH
+                       local-sub    GPU    $LOCAL_MODEL_SUB
                      The GPU lanes run on internal ports $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT;
                      clients only ever address :$PORT and pick a lane by name.
   -a, --all, --stack Same as no flags (explicit form)
@@ -909,7 +915,7 @@ _ferry_require_route_config() {
       echo ">>> Seeded route config from template:"
       echo "    $FERRY_ROUTE_CONFIG"
       echo "    Edit it (set your model ids), export the keys it references"
-      echo "    (e.g. GLM_API_KEY, GEMINI_API_KEY), then re-run."
+      echo "    (e.g. OPENROUTER_API_KEY), then re-run."
       exit 0
     fi
     echo "Error: No route config at $FERRY_ROUTE_CONFIG and no template at $ROUTE_TEMPLATE."
@@ -917,12 +923,42 @@ _ferry_require_route_config() {
   fi
 }
 
-# _ferry_warn_missing_keys — warn (never hard-fail) about unset keys the shipped
-# route template references. A lane whose key is missing 401s; the others are fine.
+# _ferry_warn_missing_keys — warn (never hard-fail) about unset keys the route
+# config IN USE ($FERRY_ROUTE_CONFIG) actually references. A lane whose key is
+# missing 401s; the others are fine. DERIVED from the config, not hardcoded:
+# every LIVE `api_key: os.environ/VAR` line is collected via one grep pass,
+# paired with the `model_name:` of the deployment block it falls under, so a
+# lane rename or a new/retired lane never leaves this warning naming a stale
+# var. Comment lines are stripped FIRST (`^\s*#`): operators keep commented-out
+# example blocks (e.g. a `# - model_name: heavy-fallback` template leftover)
+# around, and those reference vars no live lane needs and would mislabel the
+# next real lane if left in the grep. If the config can't be read, print
+# nothing (there's nothing to derive from).
 _ferry_warn_missing_keys() {
-  local missing=()
-  [[ -z "${GLM_API_KEY:-}" ]]      && missing+=("GLM_API_KEY (orch primary)")
-  [[ -z "${GEMINI_API_KEY:-}" ]]   && missing+=("GEMINI_API_KEY (flash)")
+  [[ -n "${FERRY_ROUTE_CONFIG:-}" && -f "$FERRY_ROUTE_CONFIG" ]] || return 0
+
+  local -A lanes_for_var
+  local lane="" line var
+  while IFS= read -r line; do
+    if [[ "$line" == *model_name:* ]]; then
+      lane="${line#*model_name: }"
+      lane="${lane%%[[:space:]]*}"
+    elif [[ "$line" == *api_key:*os.environ/* ]]; then
+      var="${line#*os.environ/}"
+      var="${var%%[[:space:]]*}"
+      if [[ -n "$lane" ]]; then
+        lanes_for_var[$var]="${lanes_for_var[$var]:+${lanes_for_var[$var]}, }$lane"
+      fi
+    fi
+  done < <(grep -vE '^[[:space:]]*#' "$FERRY_ROUTE_CONFIG" \
+           | grep -E 'model_name:|api_key:.*os\.environ/')
+
+  local missing=() var2
+  for var2 in "${(ok)lanes_for_var[@]}"; do
+    if [[ -z "${(P)var2:-}" ]]; then
+      missing+=("$var2 (lanes: ${lanes_for_var[$var2]})")
+    fi
+  done
   if (( ${#missing[@]} > 0 )); then
     echo ">>> WARNING: these env vars are unset; lanes that need them will 401:"
     for m in "${missing[@]}"; do echo "      - $m"; done
@@ -1052,11 +1088,12 @@ cmd_up() {
   fi
 
   if [[ "$LAUNCH_MODE" == "stack" ]]; then
-    # ── THE STACK: one door, four lanes ────────────────────────────────────
-    #   litellm on $target_port  ->  orch        (cloud: GLM 5.3 + fallback chain)
-    #                            ->  flash       (cloud: Gemini 3.8 Flash key pool)
-    #                            ->  local-orch  (MLX on :$LOCAL_ORCH_PORT)
-    #                            ->  local-sub   (MLX on :$LOCAL_SUB_PORT)
+    # ── THE STACK: one door, five lanes ─────────────────────────────────────
+    #   litellm on $target_port  ->  heavy        (cloud: GPT-5.6 Sol, ChatGPT subscription, no fallback chain)
+    #                            ->  flash        (cloud: Gemini 3.8 Flash via OpenRouter, 1 Luna hop)
+    #                            ->  super-flash  (cloud: Gemini 3.8 Flash via OpenRouter, 1 Luna hop)
+    #                            ->  local-orch   (MLX on :$LOCAL_ORCH_PORT)
+    #                            ->  local-sub    (MLX on :$LOCAL_SUB_PORT)
     # The two MLX ports are INTERNAL plumbing — clients only ever talk to
     # $target_port, and the lane names there are the contract they bind to.
     if ! command -v litellm >/dev/null 2>&1; then
@@ -1067,10 +1104,11 @@ cmd_up() {
     _ferry_warn_missing_keys
 
     echo "================================================================="
-    echo "   FERRY STACK — four lanes, one endpoint"
+    echo "   FERRY STACK — five lanes, one endpoint"
     echo "================================================================="
-    echo "   orch         cloud   GLM 5.3 + strict fallback chain"
-    echo "   flash        cloud   Gemini 3.8 Flash key pool"
+    echo "   heavy        cloud   GPT-5.6 Sol (ChatGPT subscription), no fallback chain"
+    echo "   flash        cloud   Gemini 3.8 Flash (OpenRouter), 1 Luna hop"
+    echo "   super-flash  cloud   Gemini 3.8 Flash (OpenRouter), 1 Luna hop"
     echo "   local-orch   GPU     $LOCAL_MODEL_ORCH"
     echo "   local-sub    GPU     $LOCAL_MODEL_SUB"
     echo "================================================================="
@@ -3520,9 +3558,10 @@ worker = force_small or worker
 house  = force_house or house
 
 # --- Validate the pair against the host catalogue; never populate FROM it. ---
-# The catalogue also advertises the fallback deployments (flash-gem, orch-deepseek,
-# ...). Those are reached by the ROUTER on overflow, not by a client picking one
-# out of a menu, so they stay out of the config.
+# The catalogue does NOT advertise the fallback deployments (flash-luna,
+# super-flash-luna, ...): they route by name but are not `public`, so they never
+# appear in /v1/models. Those are reached by the ROUTER on overflow, not by a
+# client picking one out of a menu, so they stay out of the config.
 served = []
 try:
     # An authed front door rejects a bare catalogue request, which would read

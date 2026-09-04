@@ -375,7 +375,7 @@ _ferry_require_route_config() {
       echo ">>> Seeded route config from template:"
       echo "    $FERRY_ROUTE_CONFIG"
       echo "    Edit it (set your model ids), export the keys it references"
-      echo "    (e.g. GLM_API_KEY, GEMINI_API_KEY), then re-run."
+      echo "    (e.g. OPENROUTER_API_KEY), then re-run."
       exit 0
     fi
     echo "Error: No route config at $FERRY_ROUTE_CONFIG and no template at $ROUTE_TEMPLATE."
@@ -383,12 +383,42 @@ _ferry_require_route_config() {
   fi
 }
 
-# _ferry_warn_missing_keys — warn (never hard-fail) about unset keys the shipped
-# route template references. A lane whose key is missing 401s; the others are fine.
+# _ferry_warn_missing_keys — warn (never hard-fail) about unset keys the route
+# config IN USE ($FERRY_ROUTE_CONFIG) actually references. A lane whose key is
+# missing 401s; the others are fine. DERIVED from the config, not hardcoded:
+# every LIVE `api_key: os.environ/VAR` line is collected via one grep pass,
+# paired with the `model_name:` of the deployment block it falls under, so a
+# lane rename or a new/retired lane never leaves this warning naming a stale
+# var. Comment lines are stripped FIRST (`^\s*#`): operators keep commented-out
+# example blocks (e.g. a `# - model_name: heavy-fallback` template leftover)
+# around, and those reference vars no live lane needs and would mislabel the
+# next real lane if left in the grep. If the config can't be read, print
+# nothing (there's nothing to derive from).
 _ferry_warn_missing_keys() {
-  local missing=()
-  [[ -z "${GLM_API_KEY:-}" ]]      && missing+=("GLM_API_KEY (orch primary)")
-  [[ -z "${GEMINI_API_KEY:-}" ]]   && missing+=("GEMINI_API_KEY (flash)")
+  [[ -n "${FERRY_ROUTE_CONFIG:-}" && -f "$FERRY_ROUTE_CONFIG" ]] || return 0
+
+  local -A lanes_for_var
+  local lane="" line var
+  while IFS= read -r line; do
+    if [[ "$line" == *model_name:* ]]; then
+      lane="${line#*model_name: }"
+      lane="${lane%%[[:space:]]*}"
+    elif [[ "$line" == *api_key:*os.environ/* ]]; then
+      var="${line#*os.environ/}"
+      var="${var%%[[:space:]]*}"
+      if [[ -n "$lane" ]]; then
+        lanes_for_var[$var]="${lanes_for_var[$var]:+${lanes_for_var[$var]}, }$lane"
+      fi
+    fi
+  done < <(grep -vE '^[[:space:]]*#' "$FERRY_ROUTE_CONFIG" \
+           | grep -E 'model_name:|api_key:.*os\.environ/')
+
+  local missing=() var2
+  for var2 in "${(ok)lanes_for_var[@]}"; do
+    if [[ -z "${(P)var2:-}" ]]; then
+      missing+=("$var2 (lanes: ${lanes_for_var[$var2]})")
+    fi
+  done
   if (( ${#missing[@]} > 0 )); then
     echo ">>> WARNING: these env vars are unset; lanes that need them will 401:"
     for m in "${missing[@]}"; do echo "      - $m"; done
@@ -518,11 +548,12 @@ cmd_up() {
   fi
 
   if [[ "$LAUNCH_MODE" == "stack" ]]; then
-    # ── THE STACK: one door, four lanes ────────────────────────────────────
-    #   litellm on $target_port  ->  orch        (cloud: GLM 5.3 + fallback chain)
-    #                            ->  flash       (cloud: Gemini 3.8 Flash key pool)
-    #                            ->  local-orch  (MLX on :$LOCAL_ORCH_PORT)
-    #                            ->  local-sub   (MLX on :$LOCAL_SUB_PORT)
+    # ── THE STACK: one door, five lanes ─────────────────────────────────────
+    #   litellm on $target_port  ->  heavy        (cloud: GPT-5.6 Sol, ChatGPT subscription, no fallback chain)
+    #                            ->  flash        (cloud: Gemini 3.8 Flash via OpenRouter, 1 Luna hop)
+    #                            ->  super-flash  (cloud: Gemini 3.8 Flash via OpenRouter, 1 Luna hop)
+    #                            ->  local-orch   (MLX on :$LOCAL_ORCH_PORT)
+    #                            ->  local-sub    (MLX on :$LOCAL_SUB_PORT)
     # The two MLX ports are INTERNAL plumbing — clients only ever talk to
     # $target_port, and the lane names there are the contract they bind to.
     if ! command -v litellm >/dev/null 2>&1; then
@@ -533,10 +564,11 @@ cmd_up() {
     _ferry_warn_missing_keys
 
     echo "================================================================="
-    echo "   FERRY STACK — four lanes, one endpoint"
+    echo "   FERRY STACK — five lanes, one endpoint"
     echo "================================================================="
-    echo "   orch         cloud   GLM 5.3 + strict fallback chain"
-    echo "   flash        cloud   Gemini 3.8 Flash key pool"
+    echo "   heavy        cloud   GPT-5.6 Sol (ChatGPT subscription), no fallback chain"
+    echo "   flash        cloud   Gemini 3.8 Flash (OpenRouter), 1 Luna hop"
+    echo "   super-flash  cloud   Gemini 3.8 Flash (OpenRouter), 1 Luna hop"
     echo "   local-orch   GPU     $LOCAL_MODEL_ORCH"
     echo "   local-sub    GPU     $LOCAL_MODEL_SUB"
     echo "================================================================="

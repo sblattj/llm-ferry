@@ -158,6 +158,26 @@ class TestModelExtraction(unittest.TestCase):
         r = S.parse_line("15:53:00 - LiteLLM:INFO: selected anthropic/k3-256k for this call")
         self.assertEqual(r["model"], "anthropic/k3-256k")
 
+    def test_known_id_scan_matches_current_backend_ids(self):
+        """The 2026-09-04 route simplification's real deployments, prose-scanned
+        the same way test_known_id_scan_matches_bare_k3 checks the retired one."""
+        cases = [
+            ("15:53:00 - LiteLLM:INFO: selected chatgpt/responses/gpt-5.6-sol for this call",
+             "chatgpt/responses/gpt-5.6-sol"),
+            ("15:53:00 - LiteLLM:INFO: selected openrouter/google/gemini-3.8-flash for this call",
+             "openrouter/google/gemini-3.8-flash"),
+            ("15:53:00 - LiteLLM:INFO: selected openrouter/openai/gpt-5.6-luna for this call",
+             "openrouter/openai/gpt-5.6-luna"),
+            ("15:53:00 - LiteLLM:INFO: selected openai/mlx-community/Qwen3.8-27B-nvfp4 for this call",
+             "openai/mlx-community/Qwen3.8-27B-nvfp4"),
+            ("15:53:00 - LiteLLM:INFO: selected "
+             "openai/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 for this call",
+             "openai/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"),
+        ]
+        for line, expected in cases:
+            r = S.parse_line(line)
+            self.assertEqual(r["model"], expected, "line %r" % line)
+
     def test_known_group_scan_fills_requested_model(self):
         r = S.parse_line("LiteLLM: Proxy initialized with Config, Set models: orchestrator-kimi")
         self.assertEqual(r["requested_model"], "orchestrator-kimi")
@@ -165,12 +185,16 @@ class TestModelExtraction(unittest.TestCase):
     def test_current_lane_names_are_recognised_as_groups(self):
         """Every lane name the stack serves must scan as a model GROUP.
 
-        The names were shortened (orchestrator->orch, gemini-3.7-flash->flash) and
-        two GPU lanes were added; if the group regex misses one, its log lines lose
-        their requested_model label and drop out of the Grafana per-lane views.
+        The route config was simplified again 2026-09-04: the driver is now
+        `heavy` (orch/orchestrator kept resolving as pre-rename names), and
+        the two Gemini worker lanes are `flash` / `super-flash`, each with its
+        own `-luna` fallback hop. If the group regex misses one, its log lines
+        lose their requested_model label and drop out of the Grafana per-lane
+        views.
         """
-        for lane in ("orch", "orch-kimi", "orch-deepseek", "orch-gpt56-sol",
-                     "flash", "local-orch", "local-sub",
+        for lane in ("heavy", "orch", "orch-kimi", "orch-deepseek", "orch-gpt56-sol",
+                     "flash", "flash-luna", "super-flash", "super-flash-luna",
+                     "local-orch", "local-sub",
                      "orchestrator", "orchestrator-fallback"):
             r = S.parse_line(
                 "LiteLLM: Proxy initialized with Config, Set models: %s" % lane)

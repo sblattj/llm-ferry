@@ -1931,29 +1931,43 @@ class TestFleetMiddleware(FleetHarness):
         asyncio.run(self.mw(app)(scope, receive, send))
         self.assertIs(app.seen_receive, receive)
 
-    def test_an_unreadable_state_file_fails_open(self):
-        # Doctrine from the module docstring: a broken state file degrades to
-        # today's behaviour, it never turns the front door into a 500.
+    def _corrupt_state(self):
         with open(self.state_path, "w") as handle:
-            handle.write("{ not json")
+            handle.write("{ this is not json")
         st = os.stat(self.state_path)
         os.utime(self.state_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+
+    def test_a_corrupt_state_file_serves_the_first_fleet(self):
+        # Spec §4 rules out the silent fall-through: after the §8 migration
+        # there is no bare `heavy` deployment, so passing `heavy` through would
+        # 400 every cloud request on every worker. The first discovered fleet
+        # is exactly what a MISSING file means, so serving it is deterministic.
+        self._corrupt_state()
         raw = json.dumps({"model": "heavy"}).encode()
         app = BodyApp()
         # The warner is patched out only to keep the suite's output clean; that
         # it FIRES on this path is asserted by test_the_fail_open_path_warns.
         with unittest.mock.patch.object(FF, "_fleet_warn"):
             _, sent = self.drive_body(self.mw(app), "/v1/chat/completions", raw)
-        self.assertEqual(app.body, raw)
+        self.assertEqual(app.body, b'{"model":"domestic.heavy"}')
         self.assertEqual(collect(sent)[0]["status"], 200)
 
+    def test_a_valid_state_file_serves_the_sticky_fleet_not_the_first(self):
+        # Control for the corrupt case above: with a READABLE file the sticky
+        # selection wins, and it is deliberately NOT the first fleet, so the
+        # two outcomes cannot be confused.
+        self.write_state({"default": "international", "clients": {}})
+        raw = json.dumps({"model": "heavy"}).encode()
+        app = BodyApp()
+        with unittest.mock.patch.object(FF, "_fleet_warn") as warn:
+            self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        warn.assert_not_called()
+        self.assertEqual(app.body, b'{"model":"international.heavy"}')
+
     def test_the_fail_open_path_warns(self):
-        # Failing open must not be SILENT: a permanently broken fleets.json
-        # would otherwise degrade every client with no signal at all.
-        with open(self.state_path, "w") as handle:
-            handle.write("{ not json")
-        st = os.stat(self.state_path)
-        os.utime(self.state_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        # Degrading must not be SILENT: a permanently broken fleets.json
+        # would otherwise reroute every client with no signal at all.
+        self._corrupt_state()
         raw = json.dumps({"model": "heavy"}).encode()
         app = BodyApp()
         with unittest.mock.patch.object(FF, "_fleet_warn") as warn:
@@ -2091,23 +2105,28 @@ class TestFleetCatalogue(FleetHarness):
         self.assertNotIn("heavy", listed)
         self.assertIn("domestic.heavy", listed)
 
-    def test_an_unreadable_state_file_warns_once_and_still_filters(self):
+    def test_a_corrupt_state_file_warns_once_and_still_lists_bare_lanes(self):
         # The catalogue path must be symmetric with the inference path: a
-        # broken fleets.json degrades to plain filtering AND says so once,
-        # rather than degrading every listing with no signal at all.
+        # corrupt fleets.json degrades to the FIRST fleet and says so once. If
+        # it fell back to plain filtering instead, the bare names that `ferry
+        # opencode`, `ferry status` and host-reset all match would vanish at
+        # exactly the moment inference kept serving them.
         with open(self.state_path, "w") as handle:
-            handle.write("{ not json")
+            handle.write("{ this is not json")
         st = os.stat(self.state_path)
         os.utime(self.state_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
         with unittest.mock.patch.object(FF, "_fleet_warn") as warn:
             _, payload = self._list()
         self.assertEqual(warn.call_count, 1)
         self.assertIsInstance(warn.call_args[0][0], FF.FleetStateError)
-        # The body is the plain-filtered catalogue: same ids as the state=None
-        # control, which is what "fails open" has to MEAN here.
+        listed = ids(payload)
+        self.assertIn("heavy", listed)
+        self.assertIn("flash", listed)
+        self.assertIn("super-flash", listed)
+        # Control: plain filtering (state=None) is what this used to do, and
+        # it is a DIFFERENT body — otherwise the assertion above proves nothing.
         _, control = self._list(state=None)
-        self.assertEqual(ids(payload), ids(control))
-        self.assertNotIn("heavy", ids(payload))
+        self.assertNotIn("heavy", ids(control))
 
     def test_content_length_matches_the_synthesized_body(self):
         start, payload = self._list()
@@ -2320,6 +2339,111 @@ class TestFleetGapLog(unittest.TestCase):
                                  fleets=fleets, state=state)
         self.assertIsNone(mw.state)
         self.assertEqual(mw.fleets, {})
+
+
+class TestFleetPublicGapLog(unittest.TestCase):
+    """Fleets with no public lane is a legitimate config that silently empties
+    /v1/models of every bare name. One startup line is the only signal."""
+
+    FLEETS = {"domestic": {"heavy": "a"}, "international": {"heavy": "b"}}
+
+    def test_fleets_with_no_public_lane_write_one_line(self):
+        import io
+        buf = io.StringIO()
+        self.assertTrue(FF.log_fleet_public_gap(self.FLEETS, frozenset(),
+                                                stream=buf))
+        lines = buf.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("domestic", lines[0])
+        self.assertIn("international", lines[0])
+        self.assertIn("model_info.public: true", lines[0])
+
+    def test_fleets_with_a_public_lane_write_nothing(self):
+        import io
+        buf = io.StringIO()
+        self.assertFalse(FF.log_fleet_public_gap(
+            self.FLEETS, frozenset({"domestic.heavy"}), stream=buf))
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_no_fleets_writes_nothing(self):
+        # Fail-open control: a pre-fleets config is not missing anything.
+        import io
+        buf = io.StringIO()
+        self.assertFalse(FF.log_fleet_public_gap({}, frozenset(), stream=buf))
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_a_broken_stream_never_raises(self):
+        class Boom:
+            def write(self, _):
+                raise IOError("no stderr")
+
+        self.assertTrue(FF.log_fleet_public_gap(self.FLEETS, frozenset(),
+                                                stream=Boom()))
+
+
+class TestFleetStartupLoad(unittest.TestCase):
+    """Spec §4: an unparsable fleets.json is a STARTUP error with the path in
+    the message. build_app imports litellm and cannot run here, so the suite
+    drives `_load_state_or_die`, the helper build_app calls."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ferry-fleets-boot-")
+        self.path = os.path.join(self.dir, "fleets.json")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_corrupt_file_raises_with_the_path_in_the_message(self):
+        with open(self.path, "w") as handle:
+            handle.write("{ this is not json")
+        state = FF.FleetState(self.path, FLEETS)
+        with self.assertRaises(FF.FleetStateError) as caught:
+            FF._load_state_or_die(state)
+        self.assertIn(self.path, str(caught.exception.args[0]))
+
+    def test_a_valid_file_does_not_raise(self):
+        with open(self.path, "w") as handle:
+            json.dump({"default": "international", "clients": {}}, handle)
+        state = FF.FleetState(self.path, FLEETS)
+        self.assertIs(FF._load_state_or_die(state), state)
+        self.assertEqual(state.default(), "international")
+
+    def test_a_missing_file_does_not_raise(self):
+        # A MISSING file means "nobody has chosen yet", not corruption.
+        state = FF.FleetState(self.path, FLEETS)
+        FF._load_state_or_die(state)
+        self.assertEqual(state.default(), "domestic")
+
+    def test_no_fleets_means_no_state_and_nothing_to_load(self):
+        self.assertIsNone(FF._load_state_or_die(None))
+
+
+class TestFleetStateWriteCache(unittest.TestCase):
+    """White-box: _write must NOT cache its document under a mtime it stat'd
+    after its own os.replace — another worker's replace can land in between."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ferry-fleets-cache-")
+        self.path = os.path.join(self.dir, "fleets.json")
+        with open(self.path, "w") as handle:
+            json.dump({"default": "domestic", "clients": {}}, handle)
+        self.state = FF.FleetState(self.path, FLEETS)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_write_drops_the_cache_and_the_next_read_reloads(self):
+        self.state.set_selection("laptop", "international")
+        self.assertIsNone(self.state._doc)
+        self.assertIsNone(self.state._mtime)
+        self.assertEqual(self.state.selection_for("laptop"), "international")
+
+    def test_two_reads_with_no_write_keep_the_cache(self):
+        # Control: dropping the cache on WRITE must not have disabled caching.
+        first = self.state.load()
+        self.assertIs(self.state.load(), first)
 
 
 if __name__ == "__main__":

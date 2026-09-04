@@ -803,11 +803,13 @@ class FleetState:
             except OSError:
                 pass
             raise
-        self._doc = doc
-        try:
-            self._mtime = os.stat(self.path).st_mtime_ns
-        except OSError:
-            self._mtime = None
+        # Between os.replace and a stat, ANOTHER worker's os.replace can land.
+        # Caching our own doc under that writer's mtime would make load() see
+        # an unchanged mtime and serve the wrong selection until the next
+        # write. So never trust the mtime observed after our own write: drop
+        # the cache and let the next load() re-read.
+        self._doc = None
+        self._mtime = None
         return doc
 
     def set_selection(self, identity: str, fleet) -> dict:
@@ -895,7 +897,18 @@ def resolve_model(model: str, header_fleet: str, identity: str,
     lane = "heavy" if model in LEGACY_HEAVY else model
     if lane not in CLOUD_LANES:
         return model
-    fleet = (header_fleet or "").strip() or state.selection_for(identity) or state.default()
+    fleet = (header_fleet or "").strip()
+    if not fleet:
+        try:
+            fleet = state.selection_for(identity) or state.default()
+        except FleetStateError as err:
+            # The file was readable at startup (build_app checked), so a
+            # failure HERE is a mid-run corruption. The first discovered fleet
+            # is exactly what a MISSING file means, so serving it is
+            # deterministic rather than a silent bare-lane passthrough into a
+            # litellm model-not-found; the rate-limited warn keeps it loud.
+            _fleet_warn(err)
+            fleet = state._first_fleet()
     if fleet not in fleets:
         raise ResolveError("unknown fleet %r; fleets: %s"
                            % (fleet, ", ".join(fleets)))
@@ -1306,9 +1319,13 @@ class LaneCatalogueFilter:
                     "message": str(err.args[0]), "type": "ferry_fleet"}})
                 return None
             except Exception as err:
-                # FleetStateError or anything else: fail open, exactly as an
-                # unreadable litellm.yaml does for the catalogue — but say so
-                # once per interval, or the degradation is invisible.
+                # Last-resort net for the UNEXPECTED. A FleetStateError no
+                # longer arrives here: resolve_model now absorbs it and serves
+                # the first discovered fleet, because after the §8 migration
+                # there is no bare `heavy` deployment left and a bare-lane
+                # passthrough would be a total cloud-lane outage. Anything
+                # else still fails open — but says so once per interval, or
+                # the degradation is invisible.
                 _fleet_warn(err)
                 resolved = None
             if resolved and resolved != doc["model"]:
@@ -1336,8 +1353,11 @@ class LaneCatalogueFilter:
 
         Same precedence as the inference path, minus the model-shaped rules:
         header > sticky > default. Returns None — meaning "just filter, as
-        before" — for any unknown name or unreadable state, because a catalogue
-        read must never be the thing that takes the front door down.
+        before" — for any unknown fleet NAME, and for any unexpected failure,
+        because a catalogue read must never be the thing that takes the front
+        door down. A mid-run corrupt fleets.json is NOT in that bucket: it
+        degrades to the first discovered fleet, symmetric with resolve_model,
+        so the bare lanes stay listed.
         """
         if self.state is None or not self.fleets:
             return None
@@ -1349,13 +1369,19 @@ class LaneCatalogueFilter:
                 fleet = self.state.selection_for(
                     caller_identity(scope, headers)) or self.state.default()
             return fleet if fleet in self.fleets else None
+        except FleetStateError as err:
+            # Symmetric with resolve_model: the file was readable at startup,
+            # so this is a mid-run corruption, and degrading to the first
+            # discovered fleet keeps the bare heavy/flash/super-flash entries
+            # in /v1/models instead of making them vanish in lockstep with the
+            # inference path. _fleet_warn rate-limits to one line per distinct
+            # error per interval, so the polled catalogue cannot flood.
+            _fleet_warn(err)
+            return self.state._first_fleet() or None
         except Exception as err:
-            # Symmetric with _fleet_rewrite: failing open is fine, failing open
-            # SILENTLY is not — a permanently broken fleets.json would degrade
-            # every listing with no signal. _fleet_warn rate-limits to one line
-            # per distinct error per interval, so the polled catalogue path
-            # cannot turn this into a flood. An unknown fleet NAME does not come
-            # through here: that is an expected fallback, not a degradation.
+            # Anything unexpected still fails open to plain filtering — but not
+            # SILENTLY. An unknown fleet NAME does not come through here: that
+            # is an expected fallback, not a degradation.
             _fleet_warn(err)
             return None
 
@@ -1506,6 +1532,49 @@ def log_fleet_gaps(fleets, stream=None) -> list:
     return gaps
 
 
+def log_fleet_public_gap(fleets, public, stream=None) -> bool:
+    """Say so at startup when fleets exist but no lane is marked public.
+
+    The bare heavy/flash/super-flash entries in /v1/models are SYNTHESISED
+    from `model_info: {public: true}`. Without that flag the catalogue lists
+    only dotted fleet lanes, and `ferry opencode`'s catalogue check, `ferry
+    status` and host-reset's verifier — all of which match bare names — report
+    the lanes missing, with no error anywhere, because "no public lanes" is
+    itself a legitimate config. One startup line is the only available signal.
+
+    Never raises, same as log_fleet_gaps: a startup log is not worth an outage.
+    """
+    if not fleets or public:
+        return False
+    try:
+        out = stream if stream is not None else sys.stderr
+        out.write("ferry_front: fleets %s discovered but no lane carries "
+                  "model_info.public: true; /v1/models will list no bare "
+                  "heavy/flash/super-flash\n" % (", ".join(fleets),))
+        flush = getattr(out, "flush", None)
+        if flush is not None:
+            flush()
+    except Exception:
+        pass
+    return True
+
+
+def _load_state_or_die(state):
+    """Spec §4: an unparsable fleets.json is a STARTUP error, never a silent
+    fall-through. Read it once here so the FleetStateError (whose message
+    already carries the path) propagates out of build_app and the worker
+    refuses to come up, instead of every request discovering the corruption
+    one warn-line at a time. A MISSING file is not an error — load() returns
+    the empty document for it.
+
+    Factored out of build_app only because build_app imports litellm and so
+    cannot be exercised by the unit suite.
+    """
+    if state is not None:
+        state.load()
+    return state
+
+
 def build_app():
     """Import litellm's proxy app and wrap it. Used as the uvicorn app factory.
 
@@ -1519,9 +1588,11 @@ def build_app():
     public = _public_lane_names(config_path)
     fleets = discover_fleets(config_path)
     log_fleet_gaps(fleets)
+    log_fleet_public_gap(fleets, public)
     # No fleets discovered => state is None => the middleware never reads a
     # request body and behaves exactly as it did before fleets existed.
     state = FleetState(fleet_state_path(config_path), fleets) if fleets else None
+    _load_state_or_die(state)
     if not should_wrap(public):
         # Nothing to do — behave exactly like plain litellm.
         return litellm_app

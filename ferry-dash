@@ -857,6 +857,27 @@ def _classify_tap_line(rules, line, live):
     return None
 
 
+def forward_fleet(ferry_base, key, doc):
+    """POST /api/fleet -> the front door's own /v1/ferry/fleet (v1.26.0).
+
+    The dash never decides fleet membership or selection; it carries its own
+    master key (the browser never sees it) and, for a client row, the
+    identity header the front door resolves selections by. Only the keys the
+    caller SENT travel: the front door treats {"fleet": null} as an explicit
+    "clear my selection", so a body with no fleet key must reach it as-is and
+    earn its 400, not be rewritten into a clear on the way through. Returns
+    (status, json-able body); a transport failure is a 502 with the reason."""
+    body = {k: doc[k] for k in ("fleet", "default") if k in doc}
+    identity = doc.get("identity")
+    headers = {"X-Ferry-Client": identity} if identity else None
+    r = http_json(ferry_base + "/v1/ferry/fleet", key, "POST", body,
+                  headers=headers)
+    out = r.get("json")
+    if out is None:
+        out = {"error": _short_err(r) or "no response body"}
+    return r.get("status") or 502, out
+
+
 class Activity:
     # uvicorn access line: `INFO: 1.2.3.4:5678 - "POST /v1/chat/completions HTTP/1.1" 200 OK`
     ACCESS = re.compile(r'(\d+\.\d+\.\d+\.\d+):\d+ - "(\w+) (\S+) [^"]*" (\d+)')
@@ -1145,17 +1166,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, json.dumps({"errors": ["bad request: %s" % e]}),
                            "application/json")
                 return
-            body = {"fleet": doc.get("fleet")}
-            if "default" in doc:
-                body["default"] = doc.get("default")
-            identity = doc.get("identity")
-            headers = {"X-Ferry-Client": identity} if identity else None
-            r = http_json(CFG["ferry"] + "/v1/ferry/fleet", CFG["key"], "POST",
-                         body, headers=headers)
-            out = r.get("json")
-            if out is None:
-                out = {"error": _short_err(r) or "no response body"}
-            self._send(r.get("status") or 502, json.dumps(out), "application/json")
+            if not isinstance(doc, dict):
+                doc = {}
+            status, out = forward_fleet(CFG["ferry"], CFG["key"], doc)
+            self._send(status, json.dumps(out), "application/json")
             return
         # Legacy shape: {chains: {lane: [fallback, ...]}} (fallbacks only).
         # Unified shape: {order: {lane: [primary, ...fallbacks]}} — position 0

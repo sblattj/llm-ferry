@@ -1287,7 +1287,14 @@ class LaneCatalogueFilter:
                 fleet = self.state.selection_for(
                     caller_identity(scope, headers)) or self.state.default()
             return fleet if fleet in self.fleets else None
-        except Exception:
+        except Exception as err:
+            # Symmetric with _fleet_rewrite: failing open is fine, failing open
+            # SILENTLY is not — a permanently broken fleets.json would degrade
+            # every listing with no signal. _fleet_warn rate-limits to one line
+            # per distinct error per interval, so the polled catalogue path
+            # cannot turn this into a flood. An unknown fleet NAME does not come
+            # through here: that is an expected fallback, not a degradation.
+            _fleet_warn(err)
             return None
 
     async def _reply(self, send, status, doc):

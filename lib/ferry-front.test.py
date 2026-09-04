@@ -2081,10 +2081,32 @@ class TestFleetCatalogue(FleetHarness):
     def test_an_unknown_header_fleet_falls_back_to_plain_filtering(self):
         # Fail-open: the catalogue is a read, not a routing decision. A bad
         # header gets its 400 on the next inference call, where it matters.
-        _, payload = self._list(headers=[(b"x-ferry-fleet", b"nope")])
+        # And it is SILENT: an unknown name is an expected fallback, not a
+        # degradation, so it must not spend the warner's rate-limit budget.
+        with unittest.mock.patch.object(FF, "_fleet_warn") as warn:
+            _, payload = self._list(headers=[(b"x-ferry-fleet", b"nope")])
+        warn.assert_not_called()
         listed = ids(payload)
         self.assertNotIn("heavy", listed)
         self.assertIn("domestic.heavy", listed)
+
+    def test_an_unreadable_state_file_warns_once_and_still_filters(self):
+        # The catalogue path must be symmetric with the inference path: a
+        # broken fleets.json degrades to plain filtering AND says so once,
+        # rather than degrading every listing with no signal at all.
+        with open(self.state_path, "w") as handle:
+            handle.write("{ not json")
+        st = os.stat(self.state_path)
+        os.utime(self.state_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        with unittest.mock.patch.object(FF, "_fleet_warn") as warn:
+            _, payload = self._list()
+        self.assertEqual(warn.call_count, 1)
+        self.assertIsInstance(warn.call_args[0][0], FF.FleetStateError)
+        # The body is the plain-filtered catalogue: same ids as the state=None
+        # control, which is what "fails open" has to MEAN here.
+        _, control = self._list(state=None)
+        self.assertEqual(ids(payload), ids(control))
+        self.assertNotIn("heavy", ids(payload))
 
     def test_content_length_matches_the_synthesized_body(self):
         start, payload = self._list()

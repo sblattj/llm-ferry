@@ -1993,6 +1993,20 @@ class TestFleetWarn(unittest.TestCase):
         self.assertIn("boom", out.getvalue())
         self.assertIn("ValueError", out.getvalue())
 
+    def test_the_line_names_what_the_caller_did(self):
+        # A corrupt fleets.json reroutes to the first fleet; anything else
+        # fails open. The operator reading stderr must see which one happened.
+        out = io.StringIO()
+        FF._fleet_warn(ValueError("boom"), stream=out, clock=lambda: 100.0)
+        self.assertIn("fleet resolution failed open:", out.getvalue())
+        out = io.StringIO()
+        FF._fleet_warn(FF.FleetStateError("bad"), stream=out,
+                       clock=lambda: 100.0,
+                       action="fell back to the first fleet")
+        self.assertIn("fleet resolution fell back to the first fleet:",
+                      out.getvalue())
+        self.assertNotIn("failed open", out.getvalue())
+
     def test_the_same_failure_inside_the_interval_is_silent(self):
         out = io.StringIO()
         FF._fleet_warn(ValueError("boom"), stream=out, clock=lambda: 100.0)

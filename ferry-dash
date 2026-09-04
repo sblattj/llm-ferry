@@ -267,6 +267,19 @@ def parse_topology_text(text):
             provider_for(model, bases[i] if i < len(bases) else "")
             for i, model in enumerate(g.get("models") or [])
         ]
+
+    # Fleets: a name containing "." belongs to the fleet named by its prefix
+    # (in file order); everything else is a shared, unprefixed lane. This is
+    # the SAME partition the front door's discover_fleets() computes from the
+    # yaml directly — two derivations of one fact would drift, so the dash
+    # reads it here from the parse it already trusts.
+    topo["fleets"] = {}
+    topo["shared"] = []
+    for name in topo["order"]:
+        if "." in name:
+            topo["fleets"].setdefault(name.split(".", 1)[0], []).append(name)
+        else:
+            topo["shared"].append(name)
     return topo
 
 
@@ -599,6 +612,13 @@ def validate_chains(topo, chains):
                 errs.append("hop %r (in %s) is not a model_name in this config" % (hop, lane))
             if hop in seen:
                 errs.append("hop %r appears twice in %s" % (hop, lane))
+            # Same guard resolve_model applies (front/ferry_front.py: "." in model and
+            # model.split(".", 1)[0] in fleets) — a dot counts as a fleet prefix only
+            # when that prefix is an actual fleet in this topology, not for any dotted
+            # lane name (e.g. a literal `gpt-3.5-turbo`).
+            if ("." in lane and lane.split(".", 1)[0] in topo["fleets"]
+                    and ("." not in hop or hop.split(".", 1)[0] != lane.split(".", 1)[0])):
+                errs.append("hop %r is not in fleet %r" % (hop, lane.split(".", 1)[0]))
             seen.add(hop)
     return errs
 

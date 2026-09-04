@@ -1245,6 +1245,130 @@ class TestFleetStatePath(unittest.TestCase):
     def test_an_empty_config_path_puts_the_state_in_the_cwd(self):
         self.assertEqual(FF.fleet_state_path(""), "fleets.json")
 
+FLEETS = {"domestic": {"heavy": "chatgpt/responses/gpt-5.6-sol",
+                       "flash": "openrouter/~google/gemini-flash-latest",
+                       "super-flash": "openrouter/~google/gemini-flash-latest"},
+          "international": {"heavy": "anthropic/k3",
+                            "flash": "zai/glm-5.3-flash",
+                            "super-flash": "zai/glm-5.3-flash"}}
+
+
+class TestFleetState(unittest.TestCase):
+    """The file is the truth: four uvicorn workers share it, none owns it."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "fleets.json")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _state(self):
+        return FF.FleetState(self.path, FLEETS)
+
+    def _write(self, text):
+        with open(self.path, "w") as handle:
+            handle.write(text)
+
+    def test_missing_file_defaults_to_the_first_fleet(self):
+        st = self._state()
+        self.assertEqual(st.load(), {"default": "domestic", "clients": {}})
+        self.assertEqual(st.default(), "domestic")
+        self.assertIsNone(st.selection_for("host"))
+
+    def test_missing_file_with_no_fleets_has_an_empty_default(self):
+        st = FF.FleetState(self.path, {})
+        self.assertEqual(st.load(), {"default": "", "clients": {}})
+
+    def test_reads_an_existing_document(self):
+        self._write('{"default": "international", "clients": {"host": "domestic"}}')
+        st = self._state()
+        self.assertEqual(st.default(), "international")
+        self.assertEqual(st.selection_for("host"), "domestic")
+        self.assertIsNone(st.selection_for("stephens-laptop"))
+
+    def test_an_unparsable_file_raises_with_the_path(self):
+        # Never a silent fall-through to the default: a corrupt state file is
+        # an operator problem and has to say which file.
+        self._write("{not json")
+        with self.assertRaises(FF.FleetStateError) as caught:
+            self._state().load()
+        self.assertIn(self.path, str(caught.exception))
+
+    def test_a_non_object_document_raises(self):
+        self._write("[1, 2]")
+        with self.assertRaises(FF.FleetStateError) as caught:
+            self._state().load()
+        self.assertIn(self.path, str(caught.exception))
+
+    def test_reloads_when_the_mtime_changes(self):
+        self._write('{"default": "domestic", "clients": {}}')
+        st = self._state()
+        self.assertEqual(st.default(), "domestic")
+        self._write('{"default": "international", "clients": {}}')
+        # Force a distinct mtime: two writes inside one filesystem timestamp
+        # tick would otherwise make this test prove nothing.
+        stamp = os.stat(self.path).st_mtime + 5
+        os.utime(self.path, (stamp, stamp))
+        self.assertEqual(st.default(), "international")
+
+    def test_two_instances_sharing_one_file_see_each_others_writes(self):
+        # This is the four-workers property. A writes, B reads, no shared
+        # memory between them.
+        a, b = self._state(), self._state()
+        self.assertEqual(b.default(), "domestic")
+        a.set_selection("stephens-laptop", "international")
+        self.assertEqual(b.selection_for("stephens-laptop"), "international")
+        a.set_default("international")
+        self.assertEqual(b.default(), "international")
+
+    def test_set_selection_none_clears_the_entry(self):
+        st = self._state()
+        st.set_selection("host", "international")
+        self.assertEqual(st.selection_for("host"), "international")
+        doc = st.set_selection("host", None)
+        self.assertEqual(doc["clients"], {})
+        self.assertIsNone(self._state().selection_for("host"))
+
+    def test_clearing_an_absent_entry_is_not_an_error(self):
+        st = self._state()
+        self.assertEqual(st.set_selection("nobody", None)["clients"], {})
+
+    def test_a_write_leaves_no_tmp_file_behind(self):
+        st = self._state()
+        st.set_selection("host", "international")
+        st.set_default("domestic")
+        self.assertEqual(sorted(os.listdir(self.dir)), ["fleets.json"])
+
+    def test_a_write_creates_the_file_when_it_was_missing(self):
+        self.assertFalse(os.path.exists(self.path))
+        self._state().set_default("international")
+        with open(self.path) as handle:
+            self.assertEqual(json.load(handle),
+                             {"default": "international", "clients": {}})
+
+    def test_the_document_shape(self):
+        st = self._state()
+        st.set_selection("host", "international")
+        doc = st.document("host")
+        self.assertEqual(doc["you"], "host")
+        self.assertEqual(doc["fleet"], "international")
+        self.assertEqual(doc["default"], "domestic")
+        self.assertEqual(doc["fleets"], FLEETS)
+        self.assertEqual(doc["clients"], {"host": "international"})
+        self.assertEqual(sorted(doc), ["clients", "default", "fleet", "fleets", "you"])
+
+    def test_the_document_falls_back_to_the_default_for_an_unknown_caller(self):
+        doc = self._state().document("stephens-laptop")
+        self.assertEqual(doc["fleet"], "domestic")
+        self.assertEqual(doc["you"], "stephens-laptop")
+
+    def test_a_document_written_by_a_write_is_returned_by_the_write(self):
+        st = self._state()
+        self.assertEqual(st.set_default("international"),
+                         {"default": "international", "clients": {}})
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

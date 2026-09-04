@@ -590,5 +590,35 @@ class ScriptContractTest(unittest.TestCase):
         self.assertEqual(reset.count('"${key_args[@]}"'), 2)
 
 
+class ClientNameTest(ClientHarness):
+    """v1.26.0 - client-bootstrap.sh writes this machine's own short hostname
+    into client.json as "name", consumed by lib/ferry-core.zsh as CLIENT_NAME
+    (Task 8) and baked into every generated config's fleet-identity header
+    (Tasks 10/11), per docs/superpowers/specs/2026-09-04-fleets-design.md §6.
+    """
+
+    def expected_name(self):
+        p = subprocess.run(["hostname", "-s"], capture_output=True, text=True)
+        return p.stdout.strip().lower()
+
+    def test_client_json_gains_the_lower_cased_short_hostname(self):
+        self.run_script(BOOTSTRAP, "--no-opencode")
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["name"], self.expected_name())
+
+    def test_the_profile_stays_valid_json_without_a_key(self):
+        self.run_script(BOOTSTRAP, "--no-opencode")
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertNotIn("master_key", prof)
+        self.assertEqual(prof["name"], self.expected_name())
+
+    def test_the_profile_stays_valid_json_with_a_key(self):
+        self.run_script(BOOTSTRAP, "--no-opencode",
+                        env=self.env(master_key="sk-test-name-and-key"))
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["master_key"], "sk-test-name-and-key")
+        self.assertEqual(prof["name"], self.expected_name())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

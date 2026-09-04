@@ -1,12 +1,12 @@
 {
-  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP. The host serves FIVE lanes from one endpoint: 'heavy' + 'flash' + 'super-flash' (cloud) and 'local-orch' + 'local-sub' (host GPU). A lane name is the stable contract - the host can swap the model behind it without any client edit. Point the main model at a driving lane ('heavy' or 'local-orch') and the worker/subagent model at its cheap partner ('flash', 'super-flash', or 'local-sub'). Client bootstrap also installs `opencode-cloud`, `opencode-local`, and `opencode-super` profiles. Easiest of all: just run `ferry opencode` on the client to write the opencode block below automatically (it detects whatever the host is serving).",
+  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP. The host serves FIVE lanes from one endpoint: 'heavy' + 'flash' + 'super-flash' (cloud) and 'local-orch' + 'local-sub' (host GPU). A lane name is the stable contract - the host can swap the model behind it without any client edit. Point the main model at a driving lane ('heavy' or 'local-orch') and the worker/subagent model at its cheap partner ('flash', 'super-flash', or 'local-sub'). Client bootstrap also installs `opencode-cloud`, `opencode-local`, and `opencode-super` profiles. Easiest of all: just run `ferry opencode` on the client to write the opencode block below automatically (it detects whatever the host is serving). Every generated config also carries a fleet-identity `headers` map under `options` — `X-Ferry-Client` (this machine's name) and `X-Ferry-Fleet` (from `$FERRY_FLEET`, for a one-shot pin) — which `ferry opencode` / `ferry claude` write for you; see the `options` block below for the shape.",
 
   "opencode": {
     "provider": {
       "ferry": {
         "npm": "@ai-sdk/openai-compatible",
         "name": "Ferry (host)",
-        "options": { "baseURL": "http://your-mac.local:8090/v1", "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>" },
+        "options": { "baseURL": "http://your-mac.local:8090/v1", "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>", "headers": {"X-Ferry-Client": "your-laptop", "X-Ferry-Fleet": "{env:FERRY_FLEET}"} },
         "models": {
           "orch": {},
           "flash": {},

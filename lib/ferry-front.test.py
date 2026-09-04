@@ -21,6 +21,7 @@ No litellm import is needed: the filter and the middleware are exercised
 directly, so the suite runs offline in milliseconds.
 """
 import asyncio
+import io
 import json
 import os
 import sys
@@ -1804,6 +1805,11 @@ class TestFleetMiddleware(FleetHarness):
         self.assertIn("domestic", doc["error"]["message"])
         self.assertIn("international", doc["error"]["message"])
         self.assertEqual(app.calls, 0)   # litellm never saw it
+        # The wire format is part of the spec, not an accident of _reply.
+        self.assertEqual(
+            payload,
+            b'{"error": {"message": "unknown fleet \'nope\'; fleets: '
+            b'domestic, international", "type": "ferry_fleet"}}')
 
     def test_content_length_is_replaced_to_match_the_new_body(self):
         raw = json.dumps({"model": "heavy", "messages": []}).encode()
@@ -1816,6 +1822,32 @@ class TestFleetMiddleware(FleetHarness):
         self.assertEqual(lengths, [str(len(app.body)).encode()])
         self.assertNotEqual(len(app.body), len(raw))
         self.assertIn((b"content-type", b"application/json"), scope["headers"])
+
+    def test_transfer_encoding_is_dropped_when_the_body_is_rewritten(self):
+        # After buffering, the request is no longer chunked: leaving
+        # transfer-encoding beside a fresh content-length is an invalid pair.
+        raw = json.dumps({"model": "heavy", "messages": []}).encode()
+        app = BodyApp()
+        scope, _ = self.drive_body(
+            self.mw(app), "/v1/chat/completions", raw,
+            headers=[(b"content-type", b"application/json"),
+                     (b"transfer-encoding", b"chunked")])
+        names = [k.lower() for k, _v in scope["headers"]]
+        self.assertNotIn(b"transfer-encoding", names)
+        lengths = [v for k, v in scope["headers"] if k.lower() == b"content-length"]
+        self.assertEqual(lengths, [str(len(app.body)).encode()])
+
+    def test_control_transfer_encoding_survives_an_untouched_body(self):
+        # The control: same headers, a model that resolves to itself, so the
+        # scope is not rewritten at all.
+        raw = json.dumps({"model": "local-orch"}).encode()
+        app = BodyApp()
+        scope, _ = self.drive_body(
+            self.mw(app), "/v1/chat/completions", raw,
+            headers=[(b"content-type", b"application/json"),
+                     (b"transfer-encoding", b"chunked")])
+        self.assertEqual(app.body, raw)
+        self.assertIn((b"transfer-encoding", b"chunked"), scope["headers"])
 
     def test_a_non_json_body_is_replayed_byte_identical(self):
         raw = b"<html>not json at all</html>"
@@ -1907,9 +1939,71 @@ class TestFleetMiddleware(FleetHarness):
         os.utime(self.state_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
         raw = json.dumps({"model": "heavy"}).encode()
         app = BodyApp()
-        _, sent = self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        # The warner is patched out only to keep the suite's output clean; that
+        # it FIRES on this path is asserted by test_the_fail_open_path_warns.
+        with unittest.mock.patch.object(FF, "_fleet_warn"):
+            _, sent = self.drive_body(self.mw(app), "/v1/chat/completions", raw)
         self.assertEqual(app.body, raw)
         self.assertEqual(collect(sent)[0]["status"], 200)
+
+    def test_the_fail_open_path_warns(self):
+        # Failing open must not be SILENT: a permanently broken fleets.json
+        # would otherwise degrade every client with no signal at all.
+        with open(self.state_path, "w") as handle:
+            handle.write("{ not json")
+        st = os.stat(self.state_path)
+        os.utime(self.state_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        raw = json.dumps({"model": "heavy"}).encode()
+        app = BodyApp()
+        with unittest.mock.patch.object(FF, "_fleet_warn") as warn:
+            self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(warn.call_count, 1)
+        self.assertIsInstance(warn.call_args[0][0], FF.FleetStateError)
+
+
+class TestFleetWarn(unittest.TestCase):
+    """One line per distinct failure per interval — a signal, not a flood."""
+
+    def setUp(self):
+        FF._FLEET_WARNED.clear()
+
+    def tearDown(self):
+        FF._FLEET_WARNED.clear()
+
+    def test_the_first_failure_writes_one_line(self):
+        out = io.StringIO()
+        self.assertTrue(FF._fleet_warn(ValueError("boom"), stream=out,
+                                       clock=lambda: 100.0))
+        self.assertEqual(len(out.getvalue().strip().splitlines()), 1)
+        self.assertIn("boom", out.getvalue())
+        self.assertIn("ValueError", out.getvalue())
+
+    def test_the_same_failure_inside_the_interval_is_silent(self):
+        out = io.StringIO()
+        FF._fleet_warn(ValueError("boom"), stream=out, clock=lambda: 100.0)
+        out.truncate(0)
+        out.seek(0)
+        self.assertFalse(FF._fleet_warn(ValueError("boom"), stream=out,
+                                        clock=lambda: 100.0 + 59))
+        self.assertEqual(out.getvalue(), "")
+
+    def test_the_same_failure_after_the_interval_writes_again(self):
+        out = io.StringIO()
+        FF._fleet_warn(ValueError("boom"), stream=out, clock=lambda: 100.0)
+        out.truncate(0)
+        out.seek(0)
+        self.assertTrue(FF._fleet_warn(ValueError("boom"), stream=out,
+                                       clock=lambda: 100.0 + 61))
+        self.assertIn("boom", out.getvalue())
+
+    def test_a_different_failure_writes_immediately(self):
+        out = io.StringIO()
+        FF._fleet_warn(ValueError("boom"), stream=out, clock=lambda: 100.0)
+        out.truncate(0)
+        out.seek(0)
+        self.assertTrue(FF._fleet_warn(ValueError("other"), stream=out,
+                                       clock=lambda: 100.0))
+        self.assertIn("other", out.getvalue())
 
 
 if __name__ == "__main__":

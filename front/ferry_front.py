@@ -43,6 +43,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 
 MODEL_LIST_PATHS = frozenset({"/v1/models", "/models"})
 
@@ -974,6 +975,30 @@ def _bearer_ok(headers: dict) -> bool:
     return len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == key
 
 
+_FLEET_WARNED: dict = {}
+FLEET_WARN_INTERVAL = 60.0
+
+
+def _fleet_warn(err, stream=None, clock=None) -> bool:
+    """One stderr line per distinct error per FLEET_WARN_INTERVAL seconds.
+
+    The resolver fails OPEN on a broken fleets.json, so without this the
+    degradation is invisible; with a per-request line it would be a flood on
+    the hot path. Returns True when a line was written. Never raises."""
+    try:
+        key = (type(err).__name__, str(err))
+        now = (clock or time.monotonic)()
+        last = _FLEET_WARNED.get(key)
+        if last is not None and now - last < FLEET_WARN_INTERVAL:
+            return False
+        _FLEET_WARNED[key] = now
+        print("ferry-front: fleet resolution failed open: %s: %s" % key,
+              file=stream or sys.stderr)
+        return True
+    except Exception:
+        return False
+
+
 def _header_map(scope) -> dict:
     """ASGI request headers as {lowercased name: value}, last value wins."""
     out = {}
@@ -991,10 +1016,15 @@ def _set_content_length(scope, length: int) -> None:
     litellm's stack reads the length from the scope, not from our replayed
     receive, so a rewrite that grows the body by the fleet prefix would be
     truncated to the original length without this.
+
+    `transfer-encoding` goes too: the body has been buffered and is replayed as
+    one non-chunked message, so leaving it beside a fresh content-length would
+    put an invalid header pair in the scope.
     """
     try:
         headers = [(k, v) for k, v in (scope.get("headers") or [])
-                   if bytes(k).lower() != b"content-length"]
+                   if bytes(k).lower() not in (b"content-length",
+                                               b"transfer-encoding")]
         headers.append((b"content-length", str(length).encode()))
         scope["headers"] = headers
     except Exception:
@@ -1212,9 +1242,11 @@ class LaneCatalogueFilter:
                 await self._reply(send, 400, {"error": {
                     "message": str(err.args[0]), "type": "ferry_fleet"}})
                 return None
-            except Exception:
+            except Exception as err:
                 # FleetStateError or anything else: fail open, exactly as an
-                # unreadable litellm.yaml does for the catalogue.
+                # unreadable litellm.yaml does for the catalogue — but say so
+                # once per interval, or the degradation is invisible.
+                _fleet_warn(err)
                 resolved = None
             if resolved and resolved != doc["model"]:
                 try:

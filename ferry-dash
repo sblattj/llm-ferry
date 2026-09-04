@@ -40,12 +40,14 @@ _TOPO_CACHE = {}            # (path -> (mtime, parsed)) so we re-parse only on c
 
 
 # ── HTTP helper (talks to the ferry/litellm proxy) ─────────────────────────
-def http_json(url, key, method="GET", body=None, timeout=8):
+def http_json(url, key, method="GET", body=None, timeout=8, headers=None):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", "Bearer %s" % key)
     if body is not None:
         req.add_header("Content-Type", "application/json")
+    for hk, hv in (headers or {}).items():
+        req.add_header(hk, hv)
     t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -937,6 +939,14 @@ def get_status():
         m = http_json(ferry + "/v1/models", key, timeout=4)
         if m.get("ok"):
             models = [x["id"] for x in m.get("json", {}).get("data", [])]
+    # The fleet document (GET /v1/ferry/fleet): who am I, my resolved fleet,
+    # the host default, and every client's selection. Only asked for while
+    # ferry is up — a down front door has no fleets to report, and asking
+    # anyway would just be a second timeout on top of the liveliness one.
+    fleet = {"error": "ferry is down"}
+    if up:
+        r = http_json(ferry + "/v1/ferry/fleet", key, timeout=4)
+        fleet = r.get("json") if r.get("ok") else {"error": _short_err(r)}
     CFG["activity"].poll()
     topo = load_topology(CFG["config_path"])
     live = _live()
@@ -945,6 +955,7 @@ def get_status():
         "ferry": {"up": up, "base": ferry, "host": CFG["host"], "port": CFG["ferry_port"]},
         "models": models,
         "topology": topo,
+        "fleet": fleet,
         "activity": CFG["activity"].snapshot(),
         "config_path": CFG["config_path"],
         # The live half. `tap` reports whether events are being written at all,
@@ -1121,6 +1132,31 @@ class Handler(BaseHTTPRequestHandler):
     # endpoint is not exposed to the LAN the way the ferry proxy itself is.
     def do_POST(self):
         route = self.path.split("?")[0]
+        # The fleet control plane. A thin forward to the loopback front door's
+        # own /v1/ferry/fleet — the dash never decides fleet membership or
+        # selection itself, it just carries the dash's own master key (the
+        # browser never sees it) and, for a client row, the identity header
+        # the front door resolves selections by.
+        if route == "/api/fleet":
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+                doc = json.loads(self.rfile.read(n) or b"{}")
+            except Exception as e:
+                self._send(400, json.dumps({"errors": ["bad request: %s" % e]}),
+                           "application/json")
+                return
+            body = {"fleet": doc.get("fleet")}
+            if "default" in doc:
+                body["default"] = doc.get("default")
+            identity = doc.get("identity")
+            headers = {"X-Ferry-Client": identity} if identity else None
+            r = http_json(CFG["ferry"] + "/v1/ferry/fleet", CFG["key"], "POST",
+                         body, headers=headers)
+            out = r.get("json")
+            if out is None:
+                out = {"error": _short_err(r) or "no response body"}
+            self._send(r.get("status") or 502, json.dumps(out), "application/json")
+            return
         # Legacy shape: {chains: {lane: [fallback, ...]}} (fallbacks only).
         # Unified shape: {order: {lane: [primary, ...fallbacks]}} — position 0
         # is the lane's current primary and must be sent back unchanged; only
@@ -1268,6 +1304,9 @@ PAGE = r"""<!doctype html>
   .lane:first-of-type{border-top:0}
   .lane h3{margin:0 0 6px;font-size:13px;font-weight:700}
   .lane h3 .kind{font-weight:400;color:var(--dim);font-size:11px;margin-left:8px}
+  h3.fleet{margin:14px 0 6px;font-size:11px;letter-spacing:.12em;
+           text-transform:uppercase;color:var(--dim)}
+  h3.fleet:first-child{margin-top:0}
   .hops{border-radius:8px}
   /* while dragging, ONLY the dragged hop's own lane lights up as a drop zone */
   .lane.dropping .hops{outline:1px dashed color-mix(in srgb,var(--blue) 55%,transparent);
@@ -1377,6 +1416,10 @@ PAGE = r"""<!doctype html>
     <span class="muted" style="margin-left:10px">actively calls each backend (spends a few tokens)</span>
     <div id="probebody" style="margin-top:10px"></div>
   </section>
+  <section id="fleets" class="card full">
+    <h2>Fleets</h2>
+    <div id="fleetsbody" class="muted">loading…</div>
+  </section>
   <section class="card full" id="routes">
     <h2>Routes <span class="muted" id="routespath"></span></h2>
     <div id="routesbody" class="muted">loading…</div>
@@ -1479,6 +1522,41 @@ function renderAct(st){
   if(a.last_event){ const secs=Math.round(Date.now()/1000-a.last_event.t);
     eb.appendChild(el('div','event','⚠ '+a.last_event.text+'  ·  '+secs+'s ago')); }
 }
+// ── fleets panel ─────────────────────────────────────────────────────────
+// One row for the host-wide default, one row per client with a sticky
+// selection of its own. Every row is the same control: a <select> of fleet
+// names that POSTs the change and re-fetches status, so the row never lies
+// about the fleet actually in effect for more than one poll interval.
+function renderFleets(st){
+  const box=$('#fleetsbody'); box.innerHTML=''; box.className='';
+  const fleet=st.fleet||{};
+  if(fleet.error){ box.className='muted'; box.textContent=fleet.error; return; }
+  const names=Object.keys(fleet.fleets||{});
+  const mkFleetRow=(label,current,onChange)=>{
+    const r=el('div','row');
+    r.appendChild(el('span',null,label));
+    const sel=el('select');
+    names.forEach(n=>{
+      const o=el('option',null,n); o.value=n;
+      if(n===current) o.selected=true;
+      sel.appendChild(o);
+    });
+    sel.onchange=()=>onChange(sel.value);
+    r.appendChild(sel);
+    return r;
+  };
+  box.appendChild(mkFleetRow('default', fleet.default,
+    v=>postFleet({fleet:v, default:true})));
+  Object.keys(fleet.clients||{}).forEach(name=>{
+    box.appendChild(mkFleetRow(name, fleet.clients[name],
+      v=>postFleet({fleet:v, identity:name})));
+  });
+}
+async function postFleet(body){
+  await fetch('/api/fleet',{method:'POST',headers:{'Content-Type':'application/json'},
+                            body:JSON.stringify(body)});
+  tick();
+}
 // ── route editor ───────────────────────────────────────────────────────────
 // The UNIFIED-ORDER model: EDIT holds each lane as one ordered list,
 // [primary, ...fallbacks]. Position 0 is the lane itself and is PINNED — the
@@ -1563,7 +1641,27 @@ function renderRoutes(st){
   const box=$('#routesbody'); box.innerHTML=''; box.className='';
   if(!lanes.length){ box.className='muted'; box.textContent=t.error||'no lanes found'; return; }
 
-  lanes.forEach(lane=>{
+  // Group the lane cards by fleet, in the fleets' own file order, with the
+  // unprefixed shared lanes last — the same partition parse_topology_text
+  // computed server-side, so the editor's grouping can never disagree with
+  // the validator's idea of which fleet a lane belongs to.
+  const laneSet=new Set(lanes);
+  const orderedLanes=[];
+  const headingBefore={};
+  Object.keys(t.fleets||{}).forEach(fname=>{
+    const ls=(t.fleets[fname]||[]).filter(l=>laneSet.has(l));
+    if(!ls.length) return;
+    headingBefore[ls[0]]=fname;
+    orderedLanes.push(...ls);
+  });
+  const sharedLanes=(t.shared||[]).filter(l=>laneSet.has(l));
+  if(sharedLanes.length){
+    headingBefore[sharedLanes[0]]='shared';
+    orderedLanes.push(...sharedLanes);
+  }
+
+  orderedLanes.forEach(lane=>{
+    if(headingBefore[lane]) box.appendChild(el('h3','fleet',headingBefore[lane]));
     const order=EDIT[lane]||(EDIT[lane]=[lane]);
     const sec=el('div','lane');
     const h=el('h3',null,lane);
@@ -1968,7 +2066,7 @@ async function tick(){
     const pill=$('#uppill'); pill.className='pill '+(f.up?'up':'down'); pill.textContent=f.up?'● UP':'● DOWN';
     $('#updated').textContent='updated '+new Date(st.ts*1000).toLocaleTimeString();
     $('#foot').innerHTML='config <code>'+st.config_path+'</code> &nbsp;·&nbsp; log <code>'+((st.activity||{}).log||'—')+'</code> &nbsp;·&nbsp; auto-refresh 5s (no tokens)';
-    renderOrch(st); renderWork(st); renderAct(st); renderLive(st);
+    renderOrch(st); renderWork(st); renderAct(st); renderLive(st); renderFleets(st);
     openStream(st);
     // Only reseed the editor when the user has no unsaved edit. A 5s poll that
     // re-rendered mid-edit would drop a half-built chain and reset the Apply

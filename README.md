@@ -241,9 +241,25 @@ ferry down           # stop all servers, proxies, and share servers
 The host's counterpart to `client-reset.sh`, and deliberately not its mirror — the host has nothing to download, because `~/.local/bin/ferry` is a symlink into the checkout. Its staleness comes from somewhere else: `ferry` out of sync with `lib/`, a `litellm.yaml` edit the running proxy never picked up, or a symlink that decayed into a plain copy.
 
 ```bash
-./host-reset.sh            # fast-forward, rebuild, re-link, bounce the proxy   (seconds)
-./host-reset.sh --full     # ...and reload the GPU lanes                        (minutes)
-./host-reset.sh --no-pull  # skip the git fast-forward (offline, or a dirty tree)
+ferry update --host         # update this existing host: rebuild, re-link, bounce proxy
+ferry update --host --full  # same, plus reload ~33GB of GPU weights (slow, optional)
+```
+
+Update the host first, then catch each existing client up from that host:
+
+```bash
+ferry update --client       # update this existing client from its configured host
+ferry status                 # verify host/client connectivity and served lanes
+curl -sS http://your-mac.local:8090/v1/models  # add Authorization if the host requires it
+```
+
+The lower-level and recovery forms remain available when needed:
+
+```bash
+./host-reset.sh --no-pull   # host recovery/offline form; skips the git fast-forward
+./host-reset.sh              # lower-level host reset (fast-forward, rebuild, re-link, bounce)
+./host-reset.sh --full      # lower-level reset plus the slow ~33GB GPU reload
+curl -fsSL http://your-mac.local:8095/client-reset.sh | zsh  # lower-level client reset
 ```
 
 By default the MLX lanes are **left running** — `ferry up --route` re-reads the same `litellm.yaml` the stack uses, and litellm reaches the GPU lanes over HTTP on loopback, so a lane does not care that its front door restarted. Only `--full` reloads ~33GB of weights.

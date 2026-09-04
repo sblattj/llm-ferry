@@ -1182,6 +1182,7 @@ class LaneCatalogueFilter:
                 return await self.app(scope, receive, self._stripping(send))
             return await self.app(scope, receive, send)
 
+        fleet = self._catalogue_fleet(scope)
         chunks: list[bytes] = []
         start_message: dict | None = None
 
@@ -1194,7 +1195,7 @@ class LaneCatalogueFilter:
                 chunks.append(message.get("body", b""))
                 if message.get("more_body"):
                     return
-                await self._flush(send, start_message, b"".join(chunks))
+                await self._flush(send, start_message, b"".join(chunks), fleet)
                 return
             await send(message)
 
@@ -1267,6 +1268,27 @@ class LaneCatalogueFilter:
             return await receive()
 
         return replay
+
+    def _catalogue_fleet(self, scope):
+        """The fleet whose lanes this caller's bare names should mean.
+
+        Same precedence as the inference path, minus the model-shaped rules:
+        header > sticky > default. Returns None — meaning "just filter, as
+        before" — for any unknown name or unreadable state, because a catalogue
+        read must never be the thing that takes the front door down.
+        """
+        if self.state is None or not self.fleets:
+            return None
+        try:
+            headers = _header_map(scope)
+            fleet = headers.get(FLEET_HEADER, b"").decode(
+                "utf-8", "replace").strip()
+            if not fleet:
+                fleet = self.state.selection_for(
+                    caller_identity(scope, headers)) or self.state.default()
+            return fleet if fleet in self.fleets else None
+        except Exception:
+            return None
 
     async def _reply(self, send, status, doc):
         body = json.dumps(doc).encode()
@@ -1351,8 +1373,11 @@ class LaneCatalogueFilter:
 
         return tapped
 
-    async def _flush(self, send, start_message, body: bytes) -> None:
-        filtered = filter_catalogue(body, self.public)
+    async def _flush(self, send, start_message, body: bytes, fleet=None) -> None:
+        if fleet is None:
+            filtered = filter_catalogue(body, self.public)
+        else:
+            filtered = synthesize_catalogue(body, self.public, self.fleets, fleet)
         out = body if filtered is None else filtered
 
         headers = []

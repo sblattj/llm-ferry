@@ -1416,7 +1416,7 @@ PAGE = r"""<!doctype html>
     <span class="muted" style="margin-left:10px">actively calls each backend (spends a few tokens)</span>
     <div id="probebody" style="margin-top:10px"></div>
   </section>
-  <section id="fleets" class="card full">
+  <section class="card full" id="fleets">
     <h2>Fleets</h2>
     <div id="fleetsbody" class="muted">loading…</div>
   </section>
@@ -1641,23 +1641,32 @@ function renderRoutes(st){
   const box=$('#routesbody'); box.innerHTML=''; box.className='';
   if(!lanes.length){ box.className='muted'; box.textContent=t.error||'no lanes found'; return; }
 
-  // Group the lane cards by fleet, in the fleets' own file order, with the
-  // unprefixed shared lanes last — the same partition parse_topology_text
-  // computed server-side, so the editor's grouping can never disagree with
-  // the validator's idea of which fleet a lane belongs to.
+  // Group the lane cards by fleet, in the fleets' own file order, then every
+  // lane no fleet claimed — the unprefixed shared lanes, plus any lane a
+  // failed topology parse left unplaced — alphabetically under one `shared`
+  // heading. When no fleet owns a lane (a pre-fleets litellm.yaml, or a
+  // topology the parser could not read), nothing changes at all: the same
+  // plain alphabetical list this card has always rendered.
   const laneSet=new Set(lanes);
-  const orderedLanes=[];
+  // Fleets that own at least one editable lane. When there are none (a
+  // pre-fleets litellm.yaml, or a topology the parser could not read) the
+  // card renders exactly as it always has: alphabetical, no headings.
+  const fleetNames=Object.keys(t.fleets||{}).filter(f=>(t.fleets[f]||[]).some(l=>laneSet.has(l)));
+  let orderedLanes=lanes;
   const headingBefore={};
-  Object.keys(t.fleets||{}).forEach(fname=>{
-    const ls=(t.fleets[fname]||[]).filter(l=>laneSet.has(l));
-    if(!ls.length) return;
-    headingBefore[ls[0]]=fname;
-    orderedLanes.push(...ls);
-  });
-  const sharedLanes=(t.shared||[]).filter(l=>laneSet.has(l));
-  if(sharedLanes.length){
-    headingBefore[sharedLanes[0]]='shared';
-    orderedLanes.push(...sharedLanes);
+  if(fleetNames.length){
+    orderedLanes=[];
+    fleetNames.forEach(fname=>{
+      const ls=t.fleets[fname].filter(l=>laneSet.has(l));
+      headingBefore[ls[0]]=fname;
+      orderedLanes.push(...ls);
+    });
+    // Everything a fleet did not claim — the unprefixed shared lanes and any
+    // lane the topology failed to place — follows under one heading, so no
+    // lane can vanish from the editor whatever t.shared holds.
+    const seen=new Set(orderedLanes);
+    const rest=lanes.filter(l=>!seen.has(l));
+    if(rest.length){ headingBefore[rest[0]]='shared'; orderedLanes.push(...rest); }
   }
 
   orderedLanes.forEach(lane=>{

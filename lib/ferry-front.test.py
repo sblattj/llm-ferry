@@ -211,6 +211,45 @@ class TestMiddleware(unittest.TestCase):
         self.assertIn(b"x-litellm-response-cost", keys)
         self.assertIn(b"content-type", keys)
 
+    def test_the_inference_path_strips_provider_headers_but_keeps_backoff_hints(self):
+        # The llm_provider-* family forwards the upstream's own headers — its
+        # set-cookie Domain names the vendor, the cf-ray names the PoP. Strip it
+        # all EXCEPT the rate-limit / retry hints a client uses to back off.
+        app = RecordingApp(b"whatever", headers=[
+            (b"llm_provider-server", b"cloudflare"),
+            (b"llm_provider-set-cookie", b"__cf_bm=x; Domain=kimi.com"),
+            (b"llm_provider-cf-ray", b"a35a-LAX"),
+            (b"llm_provider-x-trace-id", b"4768a4"),
+            (b"llm_provider-x-ratelimit-remaining", b"59"),
+            (b"llm_provider-retry-after", b"2"),
+            (b"retry-after", b"3"),
+            (b"content-type", b"application/json"),
+        ])
+        mw = LaneCatalogueFilter(app, LANES)
+        sent, _ = asyncio.run(drive(mw, "/v1/chat/completions"))
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        keys = [k for k, _ in start["headers"]]
+        for gone in (b"llm_provider-server", b"llm_provider-set-cookie",
+                     b"llm_provider-cf-ray", b"llm_provider-x-trace-id"):
+            self.assertNotIn(gone, keys)
+        # backoff/rate-limit hints survive.
+        self.assertIn(b"llm_provider-x-ratelimit-remaining", keys)
+        self.assertIn(b"llm_provider-retry-after", keys)
+        self.assertIn(b"retry-after", keys)
+        self.assertIn(b"content-type", keys)
+
+    def test_strip_header_predicate(self):
+        sh = FF._strip_header
+        # identity + provider-identity stripped
+        for n in (b"x-litellm-model-name", b"llm_provider-set-cookie",
+                  b"llm_provider-cf-ray", b"llm-provider-server"):
+            self.assertTrue(sh(n), n)
+        # optimization/backoff + cost kept
+        for n in (b"llm_provider-x-ratelimit-limit", b"llm_provider-retry-after",
+                  b"retry-after", b"x-litellm-response-cost",
+                  b"content-type", b"x-litellm-attempted-fallbacks"):
+            self.assertFalse(sh(n), n)
+
     def test_the_strip_keeps_headers_for_a_loopback_client(self):
         # ferry-dash's probe reads x-litellm-model-name over 127.0.0.1 — the
         # control plane keeps full headers.

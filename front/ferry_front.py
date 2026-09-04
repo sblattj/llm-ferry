@@ -76,19 +76,47 @@ def is_inference_path(path: str) -> bool:
 # -model-group. litellm emits them unconditionally in get_custom_headers with no
 # config toggle, so hiding them is a wrapper job.
 #
-# We strip only the four IDENTITY headers, on inference paths only, and only for
-# clients that are not on this host. Cost/timing headers (x-litellm-response-cost,
-# -duration-ms, …) stay — they leak nothing about the backend and clients may
-# want them. The event tap reads the SAME headers off http.response.start before
-# the strip, so ferry's observability (lib/ferry_events.py) keeps full
-# attribution. The loopback exemption is for ferry-dash's probe_backends, which
-# reads x-litellm-model-name over 127.0.0.1 to show which deployment answered.
+# We strip the four IDENTITY headers plus the whole llm_provider-* family, on
+# inference paths only, and only for clients that are not on this host. The
+# llm_provider-* headers are the upstream provider's own response headers
+# forwarded with a prefix (litellm get_custom_headers): `llm_provider-server:
+# cloudflare`, a set-cookie whose Domain names the vendor (`kimi.com`), the
+# Cloudflare ray id + PoP — the same identity leak one layer down.
+#
+# What we deliberately KEEP, because consumers use it for optimization:
+#   - prompt caching: lives in the BODY (usage.cached_tokens /
+#     cache_read_input_tokens / prompt_tokens_details), not headers — unaffected.
+#   - rate-limit / backoff hints: llm_provider-x-ratelimit-*,
+#     llm_provider-retry-after, and any plain retry-after. A client that backs
+#     off on 429s (opencode does) reads these; stripping them would turn a
+#     clean backoff into hammering.
+#   - x-litellm cost/timing headers (response-cost, duration-ms, …): no identity.
+# The event tap reads the SAME headers off http.response.start before the
+# strip, so ferry's observability (lib/ferry_events.py) keeps full attribution.
+# The loopback exemption is for ferry-dash's probe_backends, which reads
+# x-litellm-model-name over 127.0.0.1 to show which deployment answered.
 STRIP_RESPONSE_HEADERS = frozenset({
     b"x-litellm-model-name",
     b"x-litellm-model-id",
     b"x-litellm-model-api-base",
     b"x-litellm-model-group",
 })
+
+# Within the llm_provider-* family, these substrings mark a header worth keeping:
+# rate-limit windows and retry hints that drive client backoff.
+_KEEP_PROVIDER_SUBSTRINGS = (b"ratelimit", b"rate-limit", b"retry-after")
+
+
+def _strip_header(name: bytes) -> bool:
+    """Whether a response header name should be hidden from an off-host client."""
+    n = name.lower()
+    if n in STRIP_RESPONSE_HEADERS:
+        return True
+    if n.startswith(b"llm_provider-") or n.startswith(b"llm-provider-"):
+        return not any(s in n for s in _KEEP_PROVIDER_SUBSTRINGS)
+    if n == b"retry-after":
+        return False
+    return False
 
 _LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 
@@ -101,7 +129,7 @@ def _is_loopback_client(scope) -> bool:
 def _strip_headers(message):
     """Return the http.response.start message minus the identity headers."""
     headers = [(k, v) for k, v in message.get("headers", [])
-               if k.lower() not in STRIP_RESPONSE_HEADERS]
+               if not _strip_header(k)]
     out = dict(message)
     out["headers"] = headers
     return out

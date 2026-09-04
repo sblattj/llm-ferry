@@ -137,11 +137,15 @@ model_list:
   # /v1/chat/completions works (opencode streams), but a non-streamed call 500s
   # with "Unknown items in responses API response: []" and just rolls to the next
   # fallback. gpt-5.6-sol / gpt-5.4 work; codex-* ids are rejected for ChatGPT accounts.
+  # EFFORT: xhigh is the TOP value that reaches this backend. litellm's chat->responses
+  # bridge maps only none/minimal/low/medium/high/xhigh and returns None for anything
+  # else, so `max` is silently DROPPED and the lane runs at the backend default
+  # (verified litellm 1.99.0, 2026-09-04).
   # - model_name: heavy-fallback
   #   litellm_params:
   #     model: chatgpt/responses/gpt-5.6-sol
   #     api_key: "chatgpt-oauth"     # placeholder; provider reads auth.json
-  #     reasoning_effort: max
+  #     reasoning_effort: xhigh
   #     timeout: 600
 
   # -- flash: worker lane. ONE Google project, ONE key, MANY models. -----------

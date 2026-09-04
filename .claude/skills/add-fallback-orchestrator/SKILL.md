@@ -107,9 +107,13 @@ provider (it talks to `chatgpt.com/backend-api/codex`, the Responses API Codex u
        litellm_params:
          model: chatgpt/responses/gpt-5.6-sol   # gpt-5.6-sol / gpt-5.4 work; codex-* ids are rejected
          api_key: "chatgpt-oauth"               # placeholder; provider reads auth.json
-         reasoning_effort: max                  # backend accepts "max"
+         reasoning_effort: xhigh                # the TOP value that reaches the backend
          timeout: 600
    ```
+   **`max` does NOT work here (verified litellm 1.99.0, 2026-09-04):** the chat→responses
+   bridge's `_map_reasoning_effort` knows only `none/minimal/low/medium/high/xhigh` and
+   returns `None` for anything else, so `max` (or a typo) is silently dropped and the lane
+   runs at the backend default. Nothing errors and nothing logs it.
 3. **STREAMING-ONLY (litellm 1.97.0).** The Codex backend always streams and litellm only
    reassembles the reply on the STREAMING path. A STREAMED `/v1/chat/completions` returns 200
    (opencode + every agentic client streams — the real path). A NON-STREAMED call hits a

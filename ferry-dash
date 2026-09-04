@@ -251,6 +251,7 @@ def parse_topology_text(text):
 # every other byte through untouched. Editing a chain only ever changes that
 # line, which is why v1 edits chains and not deployments.
 FALLBACKS_RE = re.compile(r"^(\s*)fallbacks:\s*\[.*\]\s*$")
+CONTEXT_FALLBACKS_RE = re.compile(r"^(\s*)context_window_fallbacks:\s*\[.*\]\s*$")
 
 
 class SpliceError(Exception):
@@ -261,7 +262,17 @@ def splice_fallbacks(text, chains):
     """Return `text` with the fallbacks line rewritten to include `chains`.
 
     Lanes absent from `chains` keep their existing entry, so a caller editing one
-    lane cannot silently drop another's failover."""
+    lane cannot silently drop another's failover.
+
+    The config carries a SECOND chain map, `context_window_fallbacks` — the
+    chain litellm walks when the failure is a context overflow rather than an
+    error. This config keeps the two maps identical for the K3 lanes, so a
+    reorder that touched only `fallbacks` would leave the overflow order
+    pointing at the OLD first hop until the next hand edit. The same one-line
+    splice therefore updates the cw map for exactly the lanes it already has
+    an entry for: a lane being edited AND present in the cw map. No entries
+    are invented (a lane with no overflow chain stays without one), and a
+    config with no cw line at all is left untouched."""
     lines = text.splitlines()
     hits = [i for i, l in enumerate(lines) if FALLBACKS_RE.match(l)]
     if not hits:
@@ -286,8 +297,254 @@ def splice_fallbacks(text, chains):
     body = ", ".join("{%s: %s}" % (json.dumps(k), json.dumps(v))
                      for k, v in merged.items())
     lines[i] = "%sfallbacks: [%s]" % (indent, body)
+
+    # ── keep the context-window map consistent for lanes it already has ────
+    cw_hits = [j for j, l in enumerate(lines) if CONTEXT_FALLBACKS_RE.match(l)]
+    if cw_hits:
+        j = cw_hits[0]
+        cw_indent = CONTEXT_FALLBACKS_RE.match(lines[j]).group(1)
+        try:
+            cw = {}
+            for entry in json.loads(
+                    lines[j].split("context_window_fallbacks:", 1)[1].strip()):
+                cw.update(entry)
+        except Exception as e:
+            raise SpliceError(
+                "existing context_window_fallbacks line is not parseable "
+                "JSON: %s" % e)
+        touched = {k: v for k, v in chains.items() if k in cw}
+        if touched:
+            cw.update(touched)
+            cw_body = ", ".join("{%s: %s}" % (json.dumps(k), json.dumps(v))
+                                for k, v in cw.items())
+            lines[j] = "%scontext_window_fallbacks: [%s]" % (cw_indent, cw_body)
+
     out = "\n".join(lines)
     return out + "\n" if text.endswith("\n") else out
+
+
+# ── swapping two primaries back (the file half of a promote) ───────────────
+# A promote trades the BACKENDS behind two names: the lane's deployment block
+# and the hop's deployment block exchange their litellm_params bodies (and
+# their ids, which the caller supplies — minted fresh before the file write
+# so file and live router agree). Names, model_info keys, and chains are
+# untouched: only the LINES under litellm_params: move, plus the `id:` value
+# under model_info:, which takes the caller-supplied fresh id.
+#
+# Byte discipline, the point of this whole writer: lines move WITH their
+# exact bytes (a trailing space moves with its line; key order inside each
+# body stays the sender's own). The ONLY bytes that change anywhere in the
+# file are (a) the block addresses of the moved lines and (b) the two id:
+# values. Comments never move at all — they stay on their original line
+# numbers (or shift only by the net line-count delta when the two bodies
+# differ in length), so `diff` shows the moved lines as moved and a comment
+# never lands on the wrong side of a swap.
+#
+# Line-surgery, not YAML round-trip (same doctrine as splice_fallbacks): the
+# block boundaries come from the `  - model_name:` anchors at a shared indent,
+# which this config holds. Anything else — a missing anchor, a block without
+# litellm_params:, an id line that is not inside model_info: — raises instead
+# of guessing, because a half-swapped primary is a lane serving the wrong
+# provider under the right name.
+DEPLOY_ANCHOR_RE = re.compile(r"^(\s*)-\s*model_name:\s*(\S+)\s*$")
+
+
+def _deploy_blocks(lines):
+    """(anchor_indent, {name: (start, end)}) over the model_list blocks.
+
+    start is the anchor line itself, end the line before the next anchor (or
+    EOF). Duplicate names raise: after a swap the file must still resolve
+    each name to exactly one block."""
+    hits = [(i, m.group(1), m.group(2)) for i, l in enumerate(lines)
+            if (m := DEPLOY_ANCHOR_RE.match(l))]
+    if not hits:
+        raise SpliceError("no `model_name:` anchors found — not a shape we edit")
+    indents = {h[1] for h in hits}
+    if len(indents) != 1:
+        raise SpliceError("deploy anchors at %d indents — refusing to guess "
+                          "block boundaries" % len(indents))
+    names = [h[2] for h in hits]
+    dupes = {n for n in names if names.count(n) > 1}
+    if dupes:
+        raise SpliceError("duplicate model_name anchors: %s" % sorted(dupes))
+    blocks = {}
+    for k, (i, _, name) in enumerate(hits):
+        end = hits[k + 1][0] if k + 1 < len(hits) else len(lines)
+        blocks[name] = (i, end)
+    return hits[0][1], blocks
+
+
+def swap_primaries(text, lane, hop, lane_id, hop_id):
+    """Return `text` with lane's and hop's backends traded.
+
+    Moves the litellm_params: BODY lines verbatim (exact bytes, indent
+    intact) and rewrites the two model_info id: values to the supplied fresh
+    ids. `public:`, comments, max_input_tokens, and the fallbacks maps are
+    untouched — the shape of each deployment stays the lane's own, only the
+    backend behind it changes. Either block missing, or either block shaped
+    unexpectedly, raises SpliceError and the file is unwritten."""
+    lines = text.splitlines()
+    _, blocks = _deploy_blocks(lines)
+    for name in (lane, hop):
+        if name not in blocks:
+            raise SpliceError("no deployment block for %r" % (name,))
+
+    def section(block_lines, key):
+        """(start, end) of the indented body under `key:` within a block."""
+        head = next((k for k, l in enumerate(block_lines)
+                     if re.match(r"^\s*%s:\s*(#.*)?$" % key, l)), None)
+        if head is None:
+            return None
+        key_ind = len(block_lines[head]) - len(block_lines[head].lstrip())
+        end = head + 1
+        while end < len(block_lines):
+            l = block_lines[end]
+            if l.strip() and len(l) - len(l.lstrip()) <= key_ind:
+                break
+            end += 1
+        return head, end
+
+    swapped = {}
+    lane_fresh, hop_fresh = lane_id, hop_id
+    for name, fresh in ((lane, lane_id), (hop, hop_id)):
+        s, e = blocks[name]
+        body = lines[s:e]
+        lp = section(body, "litellm_params")
+        if lp is None:
+            raise SpliceError("block %r has no litellm_params: to swap" % (name,))
+        mi = section(body, "model_info")
+        if mi is None:
+            raise SpliceError("block %r has no model_info: to re-id" % (name,))
+        id_at = next((k for k in range(mi[0] + 1, mi[1])
+                      if re.match(r"^\s*id:\s*\S+", body[k])), None)
+        if id_at is None:
+            raise SpliceError("block %r has no id: line under model_info:" % (name,))
+        swapped[name] = (body, lp, mi, id_at, fresh)
+
+    (lane_body, lane_lp, _, _, _), \
+        (hop_body, hop_lp, _, _, _) = \
+        swapped[lane], swapped[hop]
+    lane_params = lane_body[lane_lp[0] + 1:lane_lp[1]]
+    hop_params = hop_body[hop_lp[0] + 1:hop_lp[1]]
+
+    # The id's OFFSET inside model_info: (mi[0]+1 .. mi[1]) is recomputed per
+    # rebuild, so only the offset relative to the section head is carried.
+    out = list(lines)
+    # Rebuild each block from the ORIGINAL lines (never from `out`, which the
+    # other block's splice already changed). Both spans are computed up front
+    # against the original, so they are only valid until the first splice
+    # moves something — hence the bottom-up order below.
+    new_spans = {}
+    for name, params, fresh in (
+            (hop, lane_params, hop_fresh),
+            (lane, hop_params, lane_fresh)):
+        s, e = blocks[name]
+        body = list(lines[s:e])
+        lp = section(body, "litellm_params")
+        new_body = body[:lp[0] + 1] + params + body[lp[1]:]
+        mi2 = section(new_body, "model_info")
+        id_rel = swapped[name][3] - (swapped[name][2][0] + 1)
+        id_line = new_body[mi2[0] + 1:mi2[1]][id_rel]
+        if not re.match(r"^\s*id:\s*\S+", id_line):
+            raise SpliceError(
+                "block %r: params swap moved the id: line — refusing a "
+                "half-swapped primary" % (name,))
+        idx = (mi2[0] + 1) + id_rel
+        new_body[idx] = re.sub(r"^(\s*id:\s*)\S+",
+                               lambda m: m.group(1) + fresh, new_body[idx])
+        new_spans[name] = (s, e, new_body)
+    # Splice the LATER block first. A slice assignment of a different length
+    # shifts every index after it, so splicing in dict order (hop, then lane)
+    # landed the second splice one line off whenever the hop's block sat
+    # above the lane's and the two bodies differed in length. 2026-09-04:
+    # that ate a blank line and doubled a comment on the promote, doubled the
+    # lane's anchor and overwrote the NEXT block's on the swap back, and
+    # litellm refused the file (KeyError: 'litellm_params') on the reload.
+    for name, (s, e, new_body) in sorted(new_spans.items(),
+                                         key=lambda kv: kv[1][0], reverse=True):
+        out[s:e] = new_body
+    text_out = "\n".join(out)
+    return text_out + "\n" if text.endswith("\n") else text_out
+
+
+def validate_promote_file(topo, lane, hop):
+    """Every reason to refuse a file-side primary swap, as readable strings.
+
+    Mirrors the live validator's trust rule on the file's view: both names
+    must be real deployments, and the hop must be in the lane's configured
+    chain — a promote never invents a backend. The live endpoint re-validates
+    against the ROUTER anyway, so a file/live disagreement still refuses at
+    apply time rather than diverging."""
+    names = set(topo.get("groups") or {})
+    errs = []
+    if lane not in names:
+        errs.append("lane %r is not a model_name in this config" % (lane,))
+        return errs
+    if hop not in names:
+        errs.append("hop %r is not a model_name in this config — promotion "
+                    "only re-seats a backend the config already runs" % (hop,))
+        return errs
+    if lane == hop:
+        errs.append("lane %r is already its own primary" % (lane,))
+        return errs
+    chain = (topo.get("fallbacks") or {}).get(lane, [])
+    if hop not in chain:
+        errs.append("hop %r is not in %s's fallback chain — promote only "
+                    "moves a trusted hop, never an unlisted backend" % (hop, lane))
+    return errs
+
+
+def diff_promote(path, lane, hop, lane_id, hop_id):
+    """(unified diff, errors) for a proposed primary swap. Reads; never writes."""
+    with open(path, errors="replace") as f:
+        old = f.read()
+    errs = validate_promote_file(parse_topology_text(old), lane, hop)
+    if errs:
+        return "", errs
+    try:
+        new = swap_primaries(old, lane, hop, lane_id, hop_id)
+    except SpliceError as e:
+        return "", [str(e)]
+    d = difflib.unified_diff(old.splitlines(), new.splitlines(),
+                             "current", "proposed", lineterm="", n=2)
+    return "\n".join(d), []
+
+
+def apply_promote(path, lane, hop, lane_id, hop_id):
+    """Validate, snapshot, swap. Returns (snapshot_path, unified_diff).
+
+    Validation runs BEFORE the snapshot so a rejected swap leaves no debris;
+    the write is the same atomic tmp+rename as apply_chains. The caller mints
+    lane_id/hop_id fresh (server-side, timestamped) BEFORE calling, so the
+    live promote that follows can echo the SAME ids."""
+    with open(path, errors="replace") as f:
+        old = f.read()
+    errs = validate_promote_file(parse_topology_text(old), lane, hop)
+    if errs:
+        raise SpliceError("; ".join(errs))
+    try:
+        new = swap_primaries(old, lane, hop, lane_id, hop_id)
+    except SpliceError:
+        raise
+    d = "\n".join(difflib.unified_diff(old.splitlines(), new.splitlines(),
+                                       "before", "after", lineterm="", n=2))
+    snap = snapshot_config(path)
+    tmp = path + ".ferry-dash.tmp"
+    with open(tmp, "w") as f:
+        f.write(new)
+    os.replace(tmp, path)
+    _TOPO_CACHE.pop(path, None)
+    return snap, d
+
+
+def _mint_file_ids(lane, hop):
+    """The fresh id pair for a file-first promote, minted server-side here.
+
+    Timestamped per name, distinct by construction (the lane/hop prefixes
+    differ), and never caller-supplied — the dash sends the SAME pair to the
+    live endpoint so file and router agree."""
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return "%s-promoted-%s" % (lane, ts), "%s-promoted-%s" % (hop, ts)
 
 
 def validate_chains(topo, chains):
@@ -363,6 +620,81 @@ def apply_chains(path, chains):
     os.replace(tmp, path)                # atomic: never a half-written config
     _TOPO_CACHE.pop(path, None)
     return snap, d
+
+
+def hotswap_promote(ferry_base, key, lane, hop, lane_id=None,
+                    hop_id=None, preview_only=False):
+    """POST a promote to the running proxy's hot-swap endpoint.
+
+    preview_only hits /v1/ferry/promote/preview (read-only: what the swap
+    WOULD do) and returns its verdict dict for the UI to display. Otherwise
+    hits /v1/ferry/promote with the file-first ids so file and router agree.
+    Never raises — same contract as hotswap_reorder: the file is durable, so
+    every outcome is a note."""
+    path = "/v1/ferry/promote/preview" if preview_only else "/v1/ferry/promote"
+    payload = {"lane": lane, "hop": hop}
+    if lane_id and hop_id and not preview_only:
+        payload["lane_id"] = lane_id
+        payload["hop_id"] = hop_id
+    try:
+        r = http_json(ferry_base + path, key, "POST", payload, timeout=10)
+    except Exception as e:
+        return ("live proxy unreachable (%s) — restart it to pick up the new "
+                "primary." % e) if not preview_only else {"error": str(e)}
+    if preview_only:
+        return r.get("json") or {"error": r.get("error") or
+                                 "HTTP %s" % r.get("status")}
+    if r.get("ok"):
+        return "live proxy hot-swapped, no restart needed."
+    errs = (r.get("json") or {}).get("errors") or [r.get("error") or
+                                                   "HTTP %s" % r.get("status")]
+    if r.get("status") in (404, 501, 503):
+        return ("live hot-swap unavailable (%s) — restart the proxy to pick "
+                "up the new primary." % "; ".join(errs))
+    return ("live proxy REFUSED the new primary (%s) — the file is updated, "
+            "so a restart would serve it; investigate the mismatch before "
+            "restarting." % "; ".join(errs))
+
+
+def hotswap_reorder(ferry_base, key, order_or_chains):
+    """POST a reorder to the running proxy's hot-swap endpoint.
+
+    Returns the human-readable half of the apply note: either the live chains
+    now serve the new order, or exactly why they do not (and that a restart
+    converges). Never raises — the file write already succeeded, so a failed
+    hot-swap is a degraded note, not a failed apply.
+
+    order_or_chains is the unified {lane: [primary, ...fallbacks]} map the UI
+    sends, or {"__chains__": chains} for the legacy bare-chains shape (which
+    has no position 0 to strip — order_to_chains would eat its first hop).
+    """
+    if isinstance(order_or_chains, dict) and "__chains__" in order_or_chains:
+        payload = {"chains": order_or_chains["__chains__"]}
+    else:
+        payload = {"order": order_or_chains}
+    try:
+        r = http_json(ferry_base + "/v1/ferry/reorder", key, "POST",
+                      payload, timeout=10)
+    except Exception as e:
+        return ("live proxy unreachable (%s) — restart it to pick up the new "
+                "order." % e)
+    if r.get("ok"):
+        return "live proxy hot-swapped, no restart needed."
+    errs = (r.get("json") or {}).get("errors") or [r.get("error") or
+                                                   "HTTP %s" % r.get("status")]
+    if r.get("status") in (404, 501, 503):
+        # 404: proxy predates the hot-swap endpoint (plain `litellm` without
+        # the ferry wrapper, or an older ferry_front.py). 503: router not
+        # ready yet. Either way the file is durable — a restart converges.
+        return ("live hot-swap unavailable (%s) — restart the proxy to pick "
+                "up the new order." % "; ".join(errs))
+    # 400/409: the LIVE router refused what the FILE accepted (it serves a
+    # different model set than the file declares). The file still won — say so
+    # plainly, with the router's reason, so the mismatch gets investigated
+    # instead of silently winning on next restart.
+    return ("live proxy REFUSED the new order (%s) — the file is updated, so "
+            "a restart would serve this order; investigate the mismatch "
+            "before restarting." % "; ".join(errs))
 
 
 # ── unified order: [primary, ...fallbacks] as one editable list ────────────
@@ -700,16 +1032,24 @@ class Handler(BaseHTTPRequestHandler):
         # Unified shape: {order: {lane: [primary, ...fallbacks]}} — position 0
         # is the lane's current primary and must be sent back unchanged; only
         # positions 1..n may be reordered (see ORDER_PRIMARY_ERR).
+        # Promote shape: {lane, hop} — swap the two backends, no restart.
         unified = route in ("/api/routes/order/preview", "/api/routes/order/apply")
-        if not (unified or route in ("/api/routes/preview", "/api/routes/apply")):
+        promote = route in ("/api/routes/promote/preview", "/api/routes/promote/apply")
+        if not (unified or promote or route in ("/api/routes/preview", "/api/routes/apply")):
             self._send(404, "not found", "text/plain")
             return
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            key = "order" if unified else "chains"
-            req = json.loads(self.rfile.read(n) or b"{}").get(key) or {}
-            if not isinstance(req, dict):
-                raise ValueError("%s must be an object" % key)
+            doc = json.loads(self.rfile.read(n) or b"{}")
+            if promote:
+                req = {k: doc.get(k) for k in ("lane", "hop")}
+                if not isinstance(req.get("lane"), str) or not isinstance(req.get("hop"), str):
+                    raise ValueError("promote needs {lane, hop} strings")
+            else:
+                key = "order" if unified else "chains"
+                req = doc.get(key) or {}
+                if not isinstance(req, dict):
+                    raise ValueError("%s must be an object" % key)
         except Exception as e:
             self._send(400, json.dumps({"errors": ["bad request: %s" % e]}),
                        "application/json")
@@ -718,18 +1058,56 @@ class Handler(BaseHTTPRequestHandler):
         path = CFG["config_path"]
         try:
             if route.endswith("/preview"):
-                diff, errs = (diff_order if unified else diff_chains)(path, req)
-                self._send(200, json.dumps({"diff": diff, "errors": errs}),
-                           "application/json")
+                if promote:
+                    lane_id, hop_id = _mint_file_ids(req["lane"], req["hop"])
+                    diff, errs = diff_promote(path, req["lane"], req["hop"],
+                                              lane_id, hop_id)
+                    # Preview ALSO asks the live proxy what it thinks: the
+                    # file/live disagreement (a hop the router does not serve)
+                    # shows up before anything is written.
+                    live = hotswap_promote(CFG["ferry"], CFG["key"],
+                                           req["lane"], req["hop"],
+                                           preview_only=True)
+                    self._send(200, json.dumps(
+                        {"diff": diff, "errors": errs, "live": live}),
+                        "application/json")
+                else:
+                    diff, errs = (diff_order if unified else diff_chains)(path, req)
+                    self._send(200, json.dumps({"diff": diff, "errors": errs}),
+                               "application/json")
             else:
+                if promote:
+                    # FILE FIRST, with freshly minted ids — then the live swap
+                    # echoes the SAME ids, so file and router agree. A live
+                    # failure after a file success still reports ok (the file
+                    # is durable; a restart converges), with the live refusal
+                    # quoted verbatim so the mismatch gets investigated.
+                    lane_id, hop_id = _mint_file_ids(req["lane"], req["hop"])
+                    snap, diff = apply_promote(path, req["lane"], req["hop"],
+                                               lane_id, hop_id)
+                    live_note = hotswap_promote(
+                        CFG["ferry"], CFG["key"], req["lane"], req["hop"],
+                        lane_id=lane_id, hop_id=hop_id)
+                    self._send(200, json.dumps({
+                        "ok": True, "snapshot": snap, "diff": diff,
+                        "ids": {"lane": lane_id, "hop": hop_id},
+                        "note": "Config written. " + live_note,
+                    }), "application/json")
+                    return
                 snap, diff = (apply_order if unified else apply_chains)(path, req)
+                # The running proxy keeps serving the OLD chains until it
+                # restarts — unless the hot-swap lands. POST the same order to
+                # /v1/ferry/reorder on the loopback proxy, which swaps
+                # router.fallbacks in place with no dropped connections. A
+                # failed or unreachable hot-swap never fails the apply: the
+                # FILE is the durable truth (a restart converges to it), so
+                # the response reports both halves honestly.
+                live_note = hotswap_reorder(CFG["ferry"], CFG["key"], req
+                                            if unified else
+                                            {"__chains__": req})
                 self._send(200, json.dumps({
                     "ok": True, "snapshot": snap, "diff": diff,
-                    # litellm has no reload endpoint for a file-backed config
-                    # (its reload paths are DB-backed), so the running proxy
-                    # keeps serving the OLD chains until it restarts.
-                    "note": "Config written. Run `ferry update` to restart the "
-                            "proxy — the running one still has the old chains.",
+                    "note": "Config written. " + live_note,
                 }), "application/json")
         except SpliceError as e:
             self._send(409, json.dumps({"errors": [str(e)]}), "application/json")
@@ -1148,6 +1526,14 @@ function renderRoutes(st){
       rm.setAttribute('aria-label','remove '+hop);
       rm.onclick=()=>{order.splice(i,1);redraw();};
       r.appendChild(up); r.appendChild(dn); r.appendChild(rm);
+      // Promote: swap this hop's backend with the lane's primary, live and
+      // in the file, with no restart. Preview first (what WOULD trade), then
+      // confirm — a primary swap moves real traffic, so it never fires on
+      // one click.
+      const pm=el('button','mini','⇈'); pm.title='promote to primary (swap backends, no restart)';
+      pm.setAttribute('aria-label','promote '+hop+' to primary of '+lane);
+      pm.onclick=()=>promoteFlow(lane,hop,pm);
+      r.appendChild(pm);
       r.addEventListener('dragstart',e=>{
         DRAG={lane:lane,from:i};
         try{e.dataTransfer.setData('text/plain',hop);}catch(err){}
@@ -1243,6 +1629,49 @@ function showDiff(d){
   });
 }
 function msg(text,cls){ const m=$('#routesmsg'); m.className=cls||''; m.textContent=text||''; }
+
+// ── promote flow ─────────────────────────────────────────────────────────
+// ⇈ on a hop row: preview the backend swap (file diff + live verdict), then
+// confirm. Two clicks by design — a promote moves real traffic the moment it
+// applies, so it never fires on one. PENDING holds the in-flight confirm
+// state; any new preview/apply/reset clears it.
+let PENDING=null;
+async function postPromote(url,lane,hop){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
+                           body:JSON.stringify({lane:lane,hop:hop})});
+  return {code:r.status, body:await r.json()};
+}
+async function promoteFlow(lane,hop,btn){
+  btn.disabled=true; msg('promote preview…'); showDiff('');
+  try{
+    const {code,body}=await postPromote('/api/routes/promote/preview',lane,hop);
+    if(code!==200||(body.errors&&body.errors.length)){
+      showDiff(''); msg(((body&&body.errors)||['preview failed']).join('  ·  '),'err');
+      btn.disabled=false; return;
+    }
+    showDiff(body.diff||'(no file change)');
+    const live=body.live||{};
+    const summary='swap '+lane+' ⇄ '+hop+': '+
+      shortModel(live.old_lane_model||'?')+' ⇄ '+shortModel(live.old_hop_model||'?')+
+      (live.ok===false?'  ·  LIVE REFUSES: '+((live.errors||[]).join(' · ')||live.error||'?'):'');
+    msg(summary+(live.ok===false?'':'  — confirm to swap backends (file + live, no restart).'),
+        live.ok===false?'err':'dirty');
+    if(live.ok===false){ btn.disabled=false; return; }
+    // Swap the button into a confirm: second click applies.
+    PENDING={lane:lane,hop:hop};
+    btn.textContent='confirm ⇈'; btn.disabled=false;
+    btn.onclick=async()=>{
+      btn.disabled=true; PENDING=null; msg('swapping backends…');
+      try{
+        const r2=await postPromote('/api/routes/promote/apply',lane,hop);
+        if(r2.code!==200){ msg(((r2.body&&r2.body.errors)||['failed']).join('  ·  '),'err'); return; }
+        msg('Swapped. Snapshot: '+r2.body.snapshot+'  ·  '+r2.body.note,'ok');
+        PICKER_OPEN=false; EDIT=null; showDiff(''); tick();
+      }catch(e){ msg('promote failed: '+e,'err'); }
+      finally{ btn.textContent='⇈'; btn.onclick=()=>promoteFlow(lane,hop,btn); }
+    };
+  }catch(e){ msg('promote preview failed: '+e,'err'); btn.disabled=false; }
+}
 
 // -- live view --------------------------------------------------------------
 // Fed by /api/events (per-request, sub-second) plus /status (topology and
@@ -1472,7 +1901,7 @@ $('#testbtn').onclick=async()=>{
   b.disabled=false; b.textContent='Test backends';
 };
 $('#previewbtn').onclick=async()=>{
-  msg('preview…'); showDiff('');
+  PENDING=null; msg('preview…'); showDiff('');
   try{
     const {body}=await postRoutes('/api/routes/order/preview');
     if(body.errors&&body.errors.length){ showDiff(''); msg(body.errors.join('  ·  '),'err');
@@ -1485,7 +1914,7 @@ $('#previewbtn').onclick=async()=>{
   }catch(e){ msg('preview failed: '+e,'err'); }
 };
 $('#applybtn').onclick=async()=>{
-  const b=$('#applybtn'); b.disabled=true; msg('writing…');
+  const b=$('#applybtn'); b.disabled=true; PENDING=null; msg('writing…');
   try{
     const {code,body}=await postRoutes('/api/routes/order/apply');
     if(code!==200){ msg((body.errors||['failed']).join('  ·  '),'err'); return; }
@@ -1493,7 +1922,7 @@ $('#applybtn').onclick=async()=>{
     PICKER_OPEN=false; EDIT=null; showDiff(''); tick();
   }catch(e){ msg('apply failed: '+e,'err'); b.disabled=false; }
 };
-$('#resetbtn').onclick=()=>{ PICKER_OPEN=false; EDIT=null; showDiff(''); msg(''); tick(); };
+$('#resetbtn').onclick=()=>{ PICKER_OPEN=false; PENDING=null; EDIT=null; showDiff(''); msg(''); tick(); };
 // Escape is a way out of an open picker that does not touch the mouse.
 document.addEventListener('keydown',e=>{
   if(e.key!=='Escape'||!PICKER_OPEN) return;

@@ -426,6 +426,372 @@ class TestShippedConfigTemplate(unittest.TestCase):
             )
 
 
+class TestReorderHotSwap(unittest.TestCase):
+    """POST /v1/ferry/reorder swaps router.fallbacks with no restart.
+
+    The rollout gate next to the byte-equivalence gate: a reorder must be
+    atomic (all lanes validated before any assignment), must refuse unknown
+    hops (litellm would silently skip them at 2am), and must never reach the
+    LAN (loopback-only). The middleware is driven with a fake router so the
+    suite stays offline; the live test below proves the real Router obeys.
+    """
+
+    NAMES = {"heavy", "orch-muse-spark", "orch-zai-glm53"}
+
+    class FakeRouter:
+        def __init__(self):
+            self.fallbacks = [{"heavy": ["orch-muse-spark"]}]
+
+        def get_model_groups(self):
+            return list(TestReorderHotSwap.NAMES)
+
+    def _mw(self, router):
+        mw = LaneCatalogueFilter(RecordingApp(b""), LANES)
+        prev = FF._live_router
+        FF._live_router = lambda: router
+        self.addCleanup(setattr, FF, "_live_router", prev)
+        return mw
+
+    def _scope(self, path, method="POST"):
+        return {"type": "http", "path": path, "method": method,
+                "client": ("127.0.0.1", 5000)}
+
+    async def _post(self, mw, doc, path="/v1/ferry/reorder"):
+        body = json.dumps(doc).encode()
+        msgs = [{"type": "http.request", "body": body, "more_body": False}]
+        sent = []
+
+        async def receive():
+            return msgs.pop(0) if msgs else {
+                "type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+        await mw(self._scope(path), receive, send)
+        start, payload = collect(sent)
+        return start["status"], json.loads(payload)
+
+    def test_parse_accepts_the_unified_order_shape(self):
+        chains, err = FF.parse_reorder_body(json.dumps(
+            {"order": {"heavy": ["heavy", "orch-zai-glm53"]}}).encode())
+        self.assertIsNone(err)
+        self.assertEqual(chains, {"heavy": ["orch-zai-glm53"]})
+
+    def test_parse_accepts_the_bare_chains_shape(self):
+        chains, err = FF.parse_reorder_body(json.dumps(
+            {"chains": {"heavy": ["orch-zai-glm53"]}}).encode())
+        self.assertIsNone(err)
+        self.assertEqual(chains, {"heavy": ["orch-zai-glm53"]})
+
+    def test_parse_rejects_a_non_json_body(self):
+        _, err = FF.parse_reorder_body(b"not json{")
+        self.assertTrue(err)
+
+    def test_parse_rejects_a_body_with_neither_shape(self):
+        _, err = FF.parse_reorder_body(json.dumps({"nope": {}}).encode())
+        self.assertIn("order", err)
+
+    def test_parse_rejects_promoting_a_fallback_to_primary(self):
+        _, err = FF.parse_reorder_body(json.dumps(
+            {"order": {"heavy": ["orch-zai-glm53"]}}).encode())
+        self.assertIn("primary changes not yet supported", err)
+
+    def test_validate_refuses_an_unknown_hop(self):
+        errs = FF.validate_reorder({"heavy": ["ghost"]}, self.NAMES)
+        self.assertTrue(any("ghost" in e for e in errs))
+
+    def test_validate_refuses_an_unknown_lane(self):
+        errs = FF.validate_reorder({"ghost": ["heavy"]}, self.NAMES)
+        self.assertTrue(any("ghost" in e for e in errs))
+
+    def test_validate_refuses_a_self_fallback(self):
+        self.assertTrue(FF.validate_reorder({"heavy": ["heavy"]}, self.NAMES))
+
+    def test_validate_refuses_a_duplicated_hop(self):
+        errs = FF.validate_reorder(
+            {"heavy": ["orch-muse-spark", "orch-muse-spark"]}, self.NAMES)
+        self.assertTrue(any("twice" in e for e in errs))
+
+    def test_validate_accepts_a_sane_chain(self):
+        self.assertEqual(FF.validate_reorder(
+            {"heavy": ["orch-muse-spark", "orch-zai-glm53"]}, self.NAMES), [])
+
+    def test_a_good_reorder_swaps_the_live_chain(self):
+        router = self.FakeRouter()
+        status, doc = asyncio.run(self._post(
+            self._mw(router), {"chains": {"heavy": ["orch-zai-glm53"]}}))
+        self.assertEqual(status, 200)
+        self.assertTrue(doc["ok"])
+        merged = {}
+        for e in router.fallbacks:
+            merged.update(e)
+        self.assertEqual(merged["heavy"], ["orch-zai-glm53"])
+
+    def test_a_bad_reorder_changes_nothing(self):
+        router = self.FakeRouter()
+        before = list(router.fallbacks)
+        status, doc = asyncio.run(self._post(
+            self._mw(router), {"chains": {"heavy": ["ghost"]}}))
+        self.assertEqual(status, 409)
+        self.assertTrue(doc["errors"])
+        self.assertEqual(router.fallbacks, before)
+
+    def test_a_failed_lane_leaves_the_good_lane_untouched(self):
+        router = self.FakeRouter()
+        before = list(router.fallbacks)
+        status, _ = asyncio.run(self._post(self._mw(router), {"chains": {
+            "heavy": ["orch-zai-glm53"], "ghost": ["heavy"]}}))
+        self.assertEqual(status, 409)
+        self.assertEqual(router.fallbacks, before)
+
+    def test_off_host_reorder_is_forbidden(self):
+        router = self.FakeRouter()
+        mw = self._mw(router)
+        scope = {"type": "http", "path": "/v1/ferry/reorder",
+                 "method": "POST", "client": ("192.168.1.50", 5000)}
+
+        async def receive():
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+        sent = []
+
+        async def send(m):
+            sent.append(m)
+        asyncio.run(mw(scope, receive, send))
+        start, _ = collect(sent)
+        self.assertEqual(start["status"], 403)
+        self.assertEqual(router.fallbacks, [{"heavy": ["orch-muse-spark"]}])
+
+    def test_chains_reads_back_the_live_state(self):
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+        sent = []
+
+        async def send(m):
+            sent.append(m)
+        asyncio.run(self._mw(self.FakeRouter())(
+            self._scope("/v1/ferry/chains", "GET"), receive, send))
+        start, payload = collect(sent)
+        self.assertEqual(start["status"], 200)
+        self.assertEqual(dict(json.loads(payload)["chains"]),
+                         {"heavy": ["orch-muse-spark"]})
+
+    def test_reorder_paths_are_never_tapped_as_inference(self):
+        for path in ("/v1/ferry/chains", "/v1/ferry/reorder",
+                     "/v1/ferry/promote", "/v1/ferry/promote/preview"):
+            self.assertFalse(FF.is_inference_path(path), path)
+
+
+class FakeLiveRouter:
+    """A litellm Router stand-in with real upsert/delete/index semantics.
+
+    Dict-backed model_list plus the two index maps litellm maintains, so the
+    promote tests exercise the same contract service_promote relies on: evict
+    by id, upsert under the lane name, resolve-by-group returns the first
+    member. If litellm ever changes that contract, the LIVE test (below) is
+    the one that catches it — this fake only guards our own logic."""
+
+    def __init__(self):
+        self.model_list = [
+            {"model_name": "heavy",
+             "litellm_params": {"model": "anthropic/k3"},
+             "model_info": {"id": "kimi-k3-heavy", "public": True}},
+            {"model_name": "orch-muse-spark",
+             "litellm_params": {"model": "openrouter/meta/muse-spark-1.3"},
+             "model_info": {"id": "or-muse-spark-1"}},
+        ]
+        self.fallbacks = [{"heavy": ["orch-muse-spark"]}]
+        self._reindex()
+
+    def _reindex(self):
+        self.model_id_to_deployment_index_map = {
+            d["model_info"]["id"]: i for i, d in enumerate(self.model_list)}
+        idx = {}
+        for i, d in enumerate(self.model_list):
+            idx.setdefault(d["model_name"], []).append(i)
+        self.model_name_to_deployment_indices = idx
+
+    def get_model_groups(self):
+        return [{"model_name": n} for n in self.model_name_to_deployment_indices]
+
+    def get_deployment_by_model_group_name(self, name):
+        ids = self.model_name_to_deployment_indices.get(name, [])
+        if not ids:
+            return None
+        d = self.model_list[ids[0]]
+        return type("Dep", (), {"to_json": lambda self, **k: dict(d)})()
+
+    def delete_deployment(self, id):
+        i = self.model_id_to_deployment_index_map.get(id)
+        if i is None:
+            return None
+        item = self.model_list.pop(i)
+        self._reindex()
+        return item
+
+    def upsert_deployment(self, deployment):
+        new = {"model_name": deployment.model_name,
+               "litellm_params": dict(deployment.litellm_params
+                                      if isinstance(deployment.litellm_params, dict)
+                                      else deployment.litellm_params),
+               "model_info": dict(deployment.model_info
+                                  if isinstance(deployment.model_info, dict)
+                                  else deployment.model_info)}
+        old = self.model_id_to_deployment_index_map.get(new["model_info"]["id"])
+        if old is not None:
+            self.model_list.pop(old)
+        self.model_list.append(new)
+        self._reindex()
+        return deployment
+
+
+class TestPromoteHotSwap(unittest.TestCase):
+    """POST /v1/ferry/promote swaps two backends with no restart.
+
+    The operation is a BACKEND SWAP, not a reseat: lane and hop trade
+    litellm_params under fresh ids, names and chains untouched. The guards
+    that matter: the hop must already be in the lane's chain (no inventing
+    backends), ids are minted server-side or freshness-checked (a reused id
+    inherits the old backend's cooldowns, usage, and provider client), and a
+    failed swap changes nothing."""
+
+    def _mw(self, router):
+        mw = LaneCatalogueFilter(RecordingApp(b""), LANES)
+        prev = FF._live_router
+        FF._live_router = lambda: router
+        self.addCleanup(setattr, FF, "_live_router", prev)
+        return mw
+
+    def _scope(self, path):
+        return {"type": "http", "path": path, "method": "POST",
+                "client": ("127.0.0.1", 5000)}
+
+    async def _post(self, mw, path, doc):
+        body = json.dumps(doc).encode()
+        msgs = [{"type": "http.request", "body": body, "more_body": False}]
+        sent = []
+
+        async def receive():
+            return msgs.pop(0) if msgs else {
+                "type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+        await mw(self._scope(path), receive, send)
+        start, payload = collect(sent)
+        return start["status"], json.loads(payload)
+
+    def test_parse_needs_lane_and_hop(self):
+        for doc, frag in (({"lane": "heavy"}, "hop"),
+                          ({"hop": "x"}, "lane"),
+                          ({"lane": "heavy", "hop": "heavy"}, "already its own")):
+            _, _, _, err = FF.parse_promote_body(json.dumps(doc).encode())
+            self.assertIn(frag, err)
+
+    def test_validate_refuses_a_hop_outside_the_chain(self):
+        router = FakeLiveRouter()
+        router.fallbacks = [{"heavy": []}]
+        errs = FF.validate_promote(router, "heavy", "orch-muse-spark")
+        self.assertTrue(any("not in" in e for e in errs), errs)
+
+    def test_validate_refuses_an_unknown_hop(self):
+        errs = FF.validate_promote(FakeLiveRouter(), "heavy", "ghost")
+        self.assertTrue(any("ghost" in e for e in errs))
+
+    def test_validate_refuses_an_unknown_lane(self):
+        errs = FF.validate_promote(FakeLiveRouter(), "ghost", "heavy")
+        self.assertTrue(any("ghost" in e for e in errs))
+
+    def test_validate_refuses_a_reused_id(self):
+        errs = FF.validate_promote(FakeLiveRouter(), "heavy", "orch-muse-spark",
+                                   {"lane_id": "kimi-k3-heavy"})
+        self.assertTrue(any("already served" in e for e in errs), errs)
+
+    def test_a_good_swap_trades_backends_under_fresh_ids(self):
+        router = FakeLiveRouter()
+        ok, errs, ids = FF.service_promote(router, "heavy", "orch-muse-spark")
+        self.assertTrue(ok, errs)
+        lane = router.get_deployment_by_model_group_name("heavy").to_json()
+        hop = router.get_deployment_by_model_group_name(
+            "orch-muse-spark").to_json()
+        self.assertEqual(lane["litellm_params"]["model"],
+                         "openrouter/meta/muse-spark-1.3")
+        self.assertEqual(hop["litellm_params"]["model"], "anthropic/k3")
+        # Fresh ids, minted server-side — neither old id survives.
+        self.assertNotIn(ids["lane"], ("kimi-k3-heavy", "or-muse-spark-1"))
+        self.assertNotIn(ids["hop"], ("kimi-k3-heavy", "or-muse-spark-1"))
+        self.assertNotEqual(ids["lane"], ids["hop"])
+        self.assertEqual(lane["model_info"]["id"], ids["lane"])
+        self.assertEqual(hop["model_info"]["id"], ids["hop"])
+        self.assertNotIn("kimi-k3-heavy",
+                         router.model_id_to_deployment_index_map)
+        self.assertNotIn("or-muse-spark-1",
+                         router.model_id_to_deployment_index_map)
+        # Chains untouched — the demoted backend still serves under the hop.
+        merged = {}
+        for e in router.fallbacks:
+            merged.update(e)
+        self.assertEqual(merged["heavy"], ["orch-muse-spark"])
+
+    def test_a_supplied_id_pair_is_honoured_for_file_echo(self):
+        # The dash echoes the LIVE ids into the file so the two agree; the
+        # pair still originates server-side (minted before the file write),
+        # never from the user's keyboard.
+        router = FakeLiveRouter()
+        ok, errs, ids = FF.service_promote(
+            router, "heavy", "orch-muse-spark",
+            {"lane_id": "heavy-promoted-X", "hop_id": "muse-promoted-X"})
+        self.assertTrue(ok, errs)
+        self.assertEqual(ids, {"lane": "heavy-promoted-X",
+                               "hop": "muse-promoted-X"})
+
+    def test_a_failed_swap_changes_nothing(self):
+        router = FakeLiveRouter()
+        before_list = [dict(d) for d in router.model_list]
+        before_fb = [dict(e) for e in router.fallbacks]
+        ok, errs, ids = FF.service_promote(router, "heavy", "ghost")
+        self.assertFalse(ok)
+        self.assertIsNone(ids)
+        self.assertEqual(router.model_list, before_list)
+        self.assertEqual(router.fallbacks, before_fb)
+
+    def test_promote_endpoint_swaps_live(self):
+        router = FakeLiveRouter()
+        status, doc = asyncio.run(self._post(
+            self._mw(router), "/v1/ferry/promote",
+            {"lane": "heavy", "hop": "orch-muse-spark"}))
+        self.assertEqual(status, 200)
+        self.assertTrue(doc["ok"])
+        self.assertIn("ids", doc)
+
+    def test_promote_preview_touches_nothing(self):
+        router = FakeLiveRouter()
+        before = [dict(d) for d in router.model_list]
+        status, doc = asyncio.run(self._post(
+            self._mw(router), "/v1/ferry/promote/preview",
+            {"lane": "heavy", "hop": "orch-muse-spark"}))
+        self.assertEqual(status, 200)
+        self.assertEqual(doc["old_lane_model"], "anthropic/k3")
+        self.assertEqual(doc["old_hop_model"],
+                         "openrouter/meta/muse-spark-1.3")
+        self.assertEqual(router.model_list, before)
+
+    def test_promote_is_loopback_only(self):
+        router = FakeLiveRouter()
+        mw = self._mw(router)
+        scope = {"type": "http", "path": "/v1/ferry/promote",
+                 "method": "POST", "client": ("192.168.1.50", 5000)}
+
+        async def receive():
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+        sent = []
+
+        async def send(m):
+            sent.append(m)
+        asyncio.run(mw(scope, receive, send))
+        start, _ = collect(sent)
+        self.assertEqual(start["status"], 403)
+
+
 import ferry_front as FF  # noqa: E402
 
 
@@ -624,13 +990,14 @@ class TestEventTap(unittest.TestCase):
         os.environ["FERRY_EVENTS"] = "on"
         self.assertTrue(FF.should_wrap(frozenset()))
 
-    def test_the_app_is_not_wrapped_when_there_is_nothing_to_do(self):
-        # The control: with no public lanes AND no tap AND no strip, plain
-        # litellm is handed back untouched — the behaviour that predates this
-        # change. The strip is on by default, so it must be held off here.
+    def test_the_app_is_always_wrapped_for_the_reorder_control_plane(self):
+        # The control plane (GET /v1/ferry/chains, POST /v1/ferry/reorder)
+        # lives in the middleware, so the app must wrap even with no lanes,
+        # no tap, and no strip — otherwise a config needing none of the other
+        # three loses its no-restart write path.
         os.environ["FERRY_EVENTS"] = "off"
         os.environ["FERRY_STRIP_HEADERS"] = "0"
-        self.assertFalse(FF.should_wrap(frozenset()))
+        self.assertTrue(FF.should_wrap(frozenset()))
 
     def test_the_app_is_wrapped_for_stripping_with_no_lanes_and_no_tap(self):
         # Header stripping (on by default) is itself a reason to wrap.

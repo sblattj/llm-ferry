@@ -29,22 +29,23 @@ model_list:
   - model_name: domestic.heavy          # was: heavy
   - model_name: domestic.flash          # was: flash
   - model_name: domestic.super-flash    # was: super-flash
-  - model_name: domestic.flash-luna     # was: flash-luna (hop)
+  - model_name: domestic.flash-terra    # was: flash-terra (hop, gpt-5.6-terra)
+  - model_name: domestic.flash-luna     # was: flash-luna (currently unchained)
   - model_name: domestic.super-flash-luna
   # ── international ─────────────────────────────────────────
   - model_name: international.heavy         # anthropic/k3 (Kimi K3)
   - model_name: international.heavy-glm     # zai/glm-5.3 (hop)
   - model_name: international.flash         # zai/glm-5.3-flash coding plan
-  - model_name: international.flash-or      # openrouter/z-ai/glm-5.3-flash (hop)
+  - model_name: international.flash-or      # openrouter/~z-ai/glm-flash-latest (hop)
   - model_name: international.super-flash   # zai/glm-5.3-flash, reasoning floor
-  - model_name: international.super-flash-or
+  - model_name: international.super-flash-or  # openrouter/~z-ai/glm-flash-latest (hop)
   # ── shared GPU lanes, no prefix ───────────────────────────
   - model_name: local-orch
   - model_name: local-sub
 
 router_settings:
   fallbacks:
-    - {"domestic.flash": ["domestic.flash-luna"]}
+    - {"domestic.flash": ["domestic.flash-terra"]}
     - {"domestic.super-flash": ["domestic.super-flash-luna"]}
     - {"international.heavy": ["international.heavy-glm"]}
     - {"international.flash": ["international.flash-or"]}
@@ -105,7 +106,7 @@ Two new routes answered by the middleware before litellm sees them, alongside th
 
 ```json
 {"you": "stephens-laptop", "fleet": "domestic", "default": "domestic",
- "fleets": {"domestic": {"heavy": "chatgpt/responses/gpt-5.6-sol", "flash": "openrouter/google/gemini-3.8-flash", "super-flash": "…"},
+ "fleets": {"domestic": {"heavy": "chatgpt/responses/gpt-5.6-sol", "flash": "openrouter/~google/gemini-flash-latest", "super-flash": "…"},
             "international": {"heavy": "anthropic/k3", "flash": "zai/glm-5.3-flash", "super-flash": "…"}},
  "clients": {"host": "international", "stephens-laptop": "domestic"}}
 ```
@@ -155,7 +156,7 @@ Verified 2026-09-04 against the installed opencode 1.18.x binary: the provider f
 
 ## 8. Migration on this host
 
-1. Snapshot `litellm.yaml` (the dash's `snapshot_config` shape), then rewrite: rename the five cloud deployments to `domestic.*`, delete `orch` and `orchestrator`, prefix the two fallback entries, and add the `international.*` deployments seeded from `litellm.yaml.20260904T152100Z.bak` (Kimi K3 as `anthropic/k3` for `heavy`, `zai/glm-5.3` as its hop; the Z.ai coding-plan `zai/glm-5.3-flash` for `flash` and `super-flash` with OpenRouter GLM hops). Reasoning settings per lane follow the recorded findings: the zai adapter drops `reasoning_effort: none`, so `super-flash` uses the lowest value the adapter honours.
+1. Snapshot `litellm.yaml` (the dash's `snapshot_config` shape), then rewrite: rename the six cloud deployments (`flash` and `super-flash` on `openrouter/~google/gemini-flash-latest`, the `flash-terra`, `flash-luna` and `super-flash-luna` hops, and `heavy`) to `domestic.*`, delete `orch` and `orchestrator`, prefix the two fallback entries, and add the `international.*` deployments seeded from `litellm.yaml.20260904T152100Z.bak` (Kimi K3 as `anthropic/k3` for `heavy`, `zai/glm-5.3` as its hop; the Z.ai coding-plan `zai/glm-5.3-flash` for `flash` and `super-flash` with `openrouter/~z-ai/glm-flash-latest` hops). OpenRouter models are addressed by OpenRouter's `~vendor/model-latest` alias wherever one exists, so a vendor's next flash release lands without a config edit. Reasoning settings per lane follow the recorded findings: the zai adapter drops `reasoning_effort: none`, so `super-flash` uses the lowest value the adapter honours.
 2. Write `fleets.json` as `{"default": "domestic", "clients": {"host": "international"}}`: clients run domestic unless they choose otherwise, and the host's own sessions run international. Because `host` is the loopback identity, this holds for every session on the host machine, including ones started before the configs were regenerated.
 3. `ferry reload`. The GPU lanes stay warm.
 4. `host-reset.sh` regenerates the host's opencode profiles and claude wrappers with the headers.

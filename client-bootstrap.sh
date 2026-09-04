@@ -117,6 +117,7 @@ fi
 HOST_NAME="${HOST_NAME:-HOST_MDNS_PLACEHOLDER}"
 HOST_PORT="${HOST_PORT:-8090}"
 SHARE_PORT="${SHARE_PORT:-SHARE_PORT_PLACEHOLDER}"
+CLIENT_NAME="$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')"
 
 # When served by `ferry share`, the host rewrites these placeholders with its live
 # mDNS name and share port. If you fetched this script another way, they stay as
@@ -281,6 +282,7 @@ cat <<EOF > "$HOME/.config/ferry/client.json"
   "host": "$HOST_NAME",
   "port": "$HOST_PORT",
   "share_port": "$SHARE_PORT",
+  "name": "$CLIENT_NAME",
   "opencode_mode": "$OC_MODE",
   "claude_mode": "$CLAUDE_MODE"${MASTER_KEY_JSON}
 }

@@ -257,6 +257,9 @@ cmd_opencode() {
   #   model       -> ferry/<driver>
   #   small_model -> ferry/<worker>
   #   agent       -> all seven built-ins pinned (see the AGENTS lists below)
+  # provider.ferry.options.headers is ours too, rewritten every run alongside
+  # baseURL/apiKey (see the prov["ferry"] block below) - it carries this
+  # machine's identity and a one-shot fleet override, never a real model id.
   # `plugin` gets the goal plugin appended only when no entry already IS that
   # plugin - which includes a LOCAL PATH to a fork of it, since opencode accepts
   # a filesystem path and a private fork can only be named that way. Every OTHER key in the
@@ -324,7 +327,7 @@ cmd_opencode() {
   # Flag wins over the boot-loaded profile key; both unset keeps the legacy token.
   [[ -z "$oc_key" ]] && oc_key="${CLIENT_MASTER_KEY:-}"
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" "$oc_key" <<'PYEOF'
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" "$oc_key" "$CLIENT_NAME" <<'PYEOF'
 import datetime, json, os, re, sys, shutil, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
@@ -334,6 +337,7 @@ force_write  = sys.argv[8] == "1"   # no-op; see the --force note above
 keep_snaps   = int(sys.argv[9])
 force_house  = sys.argv[10]
 oc_key       = sys.argv[11]
+client_name  = sys.argv[12]
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
@@ -481,6 +485,7 @@ cfg.setdefault("$schema", SCHEMA)
 prov = cfg.setdefault("provider", {})
 prev_ferry = prov.get("ferry") if isinstance(prov.get("ferry"), dict) else {}
 prev_models = prev_ferry.get("models") if isinstance(prev_ferry.get("models"), dict) else {}
+prev_options = prev_ferry.get("options") if isinstance(prev_ferry.get("options"), dict) else {}
 
 # dict.fromkeys: on the GPU pair the housekeeper IS the worker, and declaring
 # the same lane twice would be a duplicate key.
@@ -496,15 +501,30 @@ for lane, spec in prev_models.items():
         models[lane] = spec
 extra_lanes = [l for l in models if l not in (driver, worker, house)]
 
+# Only baseURL/apiKey/headers are ours; every other options key a user
+# hand-added (or a previous run wrote) survives untouched.
+options = dict(prev_options)
+# The bearer the front door expects: the master key when one is configured
+# (client.json / --key), else the legacy 'local' placeholder.
+options["baseURL"] = base
+options["apiKey"] = oc_key or "local"
+# Fleet identity, rewritten fresh every run - see front/ferry_front.py's
+# resolver (docs/superpowers/specs/2026-09-04-fleets-design.md §4/§6).
+# "{env:FERRY_FLEET}" is opencode's OWN env-substitution syntax; ferry must
+# never resolve it, so a one-shot `FERRY_FLEET=international opencode-super`
+# is read at opencode's load time, not at config-write time.
+options["headers"] = {
+    "X-Ferry-Client": client_name,
+    "X-Ferry-Fleet": "{env:FERRY_FLEET}",
+}
+
 prov["ferry"] = {
     "npm": "@ai-sdk/openai-compatible",
     # Regenerated, not preserved: this one is DERIVED from --host, and a name
     # carried over from a previous host would label the picker with a box the
     # baseURL no longer points at.
     "name": f"Ferry ({host})",
-    # The bearer the front door expects: the master key when one is configured
-    # (client.json / --key), else the legacy 'local' placeholder.
-    "options": {"baseURL": base, "apiKey": oc_key or "local"},
+    "options": options,
     "models": models,
 }
 

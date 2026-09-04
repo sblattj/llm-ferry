@@ -609,6 +609,74 @@ class TestPhantomScoutPin(unittest.TestCase):
         self.assertIn("ferry\" opencode", text)
 
 
+class TestFleetHeaders(FerryOpencodeCase):
+    """v1.26.0 — `ferry opencode` bakes X-Ferry-Client / X-Ferry-Fleet into
+    provider.ferry.options.headers so the front door's fleet resolver
+    (front/ferry_front.py, per docs/superpowers/specs/2026-09-04-fleets-design.md
+    §4/§6) can identify the caller and honour a one-shot FERRY_FLEET override.
+    """
+
+    def host_home(self):
+        # No ~/.config/ferry/client.json at all: CLIENT_MODE=0, so CLIENT_NAME
+        # resolves to the literal "host" (lib/ferry-core.zsh).
+        home = tempfile.mkdtemp(prefix="ferry-oc-hosthome-")
+        self.addCleanup(shutil.rmtree, home, True)
+        return home
+
+    def client_home_named(self, name):
+        home = tempfile.mkdtemp(prefix="ferry-oc-clienthome-")
+        self.addCleanup(shutil.rmtree, home, True)
+        fdir = os.path.join(home, ".config", "ferry")
+        os.makedirs(fdir)
+        prof = {"host": "127.0.0.1", "port": str(self.port), "name": name}
+        with open(os.path.join(fdir, "client.json"), "w") as f:
+            json.dump(prof, f)
+        return home
+
+    def test_headers_present_with_the_exact_fleet_placeholder(self):
+        home = self.host_home()
+        self.run_ferry(home=home)
+        with open(self.cfg) as f:
+            raw = f.read()
+        # Byte-for-byte on the RAW file text: opencode substitutes "{env:VAR}"
+        # itself at load time, so ferry must never resolve or mangle it.
+        self.assertIn('"X-Ferry-Fleet": "{env:FERRY_FLEET}"', raw)
+        headers = self.read()["provider"]["ferry"]["options"]["headers"]
+        self.assertEqual(headers, {
+            "X-Ferry-Client": "host",
+            "X-Ferry-Fleet": "{env:FERRY_FLEET}",
+        })
+
+    def test_a_pre_existing_options_key_survives_while_stale_headers_are_replaced(self):
+        home = self.host_home()
+        with open(self.cfg, "w") as f:
+            json.dump({
+                "provider": {"ferry": {"options": {
+                    "foo": "keep",
+                    "headers": {"X-Ferry-Client": "stale", "X-Stale-Only": "gone"},
+                }}},
+            }, f)
+        self.run_ferry(home=home)
+        opts = self.read()["provider"]["ferry"]["options"]
+        self.assertEqual(opts["foo"], "keep")
+        self.assertEqual(opts["headers"], {
+            "X-Ferry-Client": "host",
+            "X-Ferry-Fleet": "{env:FERRY_FLEET}",
+        })
+
+    def test_no_client_profile_names_the_caller_host(self):
+        home = self.host_home()
+        self.run_ferry(home=home)
+        headers = self.read()["provider"]["ferry"]["options"]["headers"]
+        self.assertEqual(headers["X-Ferry-Client"], "host")
+
+    def test_a_named_client_profile_names_the_client(self):
+        home = self.client_home_named("laptop")
+        self.run_ferry(home=home)
+        headers = self.read()["provider"]["ferry"]["options"]["headers"]
+        self.assertEqual(headers["X-Ferry-Client"], "laptop")
+
+
 if __name__ == "__main__":
     if not os.path.exists(FERRY):
         sys.exit("built ./ferry not found — run ./build.zsh first")

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 
 
@@ -186,6 +187,48 @@ def classify(rules, code, err_type, message):
         if state in STATES:
             return state
     return "unknown"
+
+
+# ── the proxy-log tap: one raw log line -> a backend event kind ────────────
+# `ferry-dash`'s Activity tailer and observ/ferry-metrics-exporter both read
+# the proxy's text log and surface "the last backend event". Until 2026-09-04
+# each carried its own copy of a vendor-specific test (Kimi's
+# `permission_error` + `usage limit` -> "kimi_quota"), which missed every
+# other provider's way of saying the same thing. The kinds are now two of the
+# classifier STATES above, the test lives here once, and the vendor wording
+# comes from the operator's event-rules.json exactly as it does for the
+# per-deployment view. A raw line is not a structured event, so the status
+# and exception class are recovered from litellm's own log shapes
+# (`'status_code': '401'`, `Error code: 429`, `litellm.RateLimitError`) and
+# a rule keyed on either still applies. The built-in floor below is
+# vendor-neutral: litellm's exception class name and two error CODES
+# providers emit as identifiers rather than prose.
+TAP_KINDS = ("quota_exhausted", "rate_limited")
+
+_TAP_STATUS = re.compile(
+    r"(?:status_code\W{1,4}|error code:\s*|HTTP/1\.[01]\"\s)(\d{3})\b", re.I)
+_TAP_TYPE = re.compile(r"litellm\.([A-Za-z]+Error)")
+
+
+def classify_log_line(rules, line):
+    """Return "quota_exhausted", "rate_limited" or None for one log line."""
+    if not line:
+        return None
+    low = line.lower()
+    m = _TAP_STATUS.search(line)
+    code = m.group(1) if m else None
+    t = _TAP_TYPE.search(line)
+    err_type = t.group(1) if t else ""
+    state = classify(rules or {"rules": []}, code, err_type, line)
+    if state in TAP_KINDS:
+        return state
+    if state != "unknown":
+        return None                 # a rule spoke (healthy/auth_dead/...): trust it
+    if "insufficient_quota" in low or "insufficient credits" in low:
+        return "quota_exhausted"
+    if "ratelimiterror" in low or "rate_limit" in low:
+        return "rate_limited"
+    return None
 
 
 class ExhaustionState:

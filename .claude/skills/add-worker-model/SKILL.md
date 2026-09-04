@@ -1,17 +1,28 @@
 ---
 name: add-worker-model
-description: Use when adding a worker lane or more worker keys to llm-ferry's load-balanced pool in ~/.config/ferry/litellm.yaml. Covers pool-vs-fallback, the per-project quota rule and the Google ToS line you must NOT cross, and lane naming/aliasing. For the orch lane's strict failover chain instead, use add-fallback-orchestrator; the local GPU lanes take neither.
+description: Use when adding a worker lane or more worker keys to llm-ferry's load-balanced pool in ~/.config/ferry/litellm.yaml. Covers pool-vs-fallback, the per-project quota rule and the Google ToS line you must NOT cross, and lane naming/aliasing. For the heavy driver lane's strict failover chain instead, use add-fallback-orchestrator; the local GPU lanes take neither.
 ---
 
 # Add a worker model to llm-ferry's route proxy
 
-Workers are the cheap, high-volume lanes (the shipped one is `flash`) that serve the bulk of traffic. They live in a **load-balanced pool** in `~/.config/ferry/litellm.yaml` and are served by `ferry up` (or `ferry up --route` for the cloud lanes alone).
+Workers are the cheap, high-volume lanes that serve the bulk of traffic. The shipped ones
+are **`flash`** and **`super-flash`** — both single OpenRouter Gemini 3.8 Flash deployments,
+routed to whichever upstream provider is fastest right now, each carrying one Luna fallback
+hop. They live in a **load-balanced pool** in `~/.config/ferry/litellm.yaml` and are served
+by `ferry up` (or `ferry up --route` for the cloud lanes alone).
 
-**Lane names are the contract.** Clients bind to a name (`orch`, `flash`, `local-orch`, `local-sub`), not to a model id — so prefer re-pointing an existing lane over minting a new name whenever the ROLE is unchanged. If you must rename one, alias the old name with `router_settings.model_group_alias: {old: {model: "new", hidden: true}}` so wired clients keep working while `/v1/models` shows only the real lanes.
+**Lane names are the contract.** Clients bind to a name (`heavy`, `flash`, `super-flash`,
+`local-orch`, `local-sub`), not to a model id — so prefer re-pointing an existing lane over
+minting a new name whenever the ROLE is unchanged. The current config has NO
+`model_group_alias` entries, and for good reason: an alias silently loses its whole fallback
+chain (a client that hits the alias never reaches the aliased lane's fallback hops). If you
+must rename a lane, keep it a REAL `model_name` — don't alias — and hide it from the public
+catalog with `public: false` instead; that controls `/v1/models` visibility without touching
+routing.
 
 **Pool vs. fallback — pick the right skill:**
 - **Worker pool (this skill):** multiple **identical** `model_name` deployments. `usage-based-routing-v2` proactively splits calls to the **least-used** key (an even split, not just error-triggered). Order does not matter; no `fallbacks:` entry.
-- **Orchestrator fallback (`add-fallback-orchestrator`):** **separate** `model_name`s wired into `router_settings.fallbacks`, reached **only on error**, in strict order. Use that skill for the `orch` lane's failover chain.
+- **Orchestrator fallback (`add-fallback-orchestrator`):** **separate** `model_name`s wired into `router_settings.fallbacks`, reached **only on error**, in strict order. Use that skill for a lane's failover hop — the worker lanes' single Luna hop, or the driver's chain if you decide to add one.
 
 ## Two things you might be doing
 - **A) Grow an existing pool** — add another key to a lane you already serve. Legitimate ONLY when the key represents a genuinely separate account or provider (see the ToS rule below). Append an identical-`model_name` deployment.
@@ -21,8 +32,8 @@ Workers are the cheap, high-volume lanes (the shipped one is `flash`) that serve
 1. Mint/obtain the key. Extra headroom must come from a genuinely **separate provider or account** — NEVER from a second Google Cloud project under the same Google account (see the ToS rule below).
 2. Export it under a distinctive env var (shell or `~/.config/ferry/secrets.env`). Never commit real keys.
 3. Edit `~/.config/ferry/litellm.yaml` — append a deployment block (A) or a new `model_name` (B).
-4. **Do NOT** add worker `model_name`s to `router_settings.fallbacks`. The pool self-balances. (The shipped config gives `flash` ONE fallback — pool-exhaustion overflow to `orch` — which is a spillover valve, not a failover chain.)
-5. Apply: `ferry down && ferry up`.
+4. **Do NOT** add a worker's OWN pool members (repeated identical `model_name` blocks) into `router_settings.fallbacks` — the pool self-balances via `usage-based-routing-v2`. The shipped config DOES give `flash` and `super-flash` each ONE outbound entry in `fallbacks` (to `flash-luna` / `super-flash-luna`), but that's the lane's failover hop, not pool routing — see `add-fallback-orchestrator` for how that hop is wired and why it's a single hop rather than another pool member.
+5. Apply: `ferry reload` (config-only). Use `ferry down && ferry up` for a full restart.
 6. Verify each key independently (below), spread out so you don't trip fresh-key rate limits.
 
 ## The quota rule AND the ToS line (READ THIS)
@@ -40,28 +51,56 @@ A multi-key pool IS still legitimate when the keys represent **genuinely separat
 
 Generalize it: **before assuming N keys = N× throughput, check (a) whether your provider meters by key or by account/project, and (b) whether pooling keys to multiply that meter is allowed at all.** Both questions gate how many deployments are worth adding.
 
-## Env var convention
-One env var per key, named for its provider: `GEMINI_API_KEY`, `FIREWORKS_API_KEY`, … Use `_N` suffixes only when you hold multiple keys that are **genuinely independent** — separate accounts or providers:
+## The shipped shape: a single OpenRouter deployment, not a pool
 
-```bash
-export GEMINI_API_KEY="..."          # the ONE Google project's key
-export FIREWORKS_API_KEY="..."       # a different provider — real extra capacity
-export GEMINI_API_KEY_2="..."        # ONLY if this is a DIFFERENT Google account
-```
-
-## A) Grow the pool — identical `model_name`, different (independent) key
-A pool is simply **repeated deployment blocks with the SAME `model_name`**. Add one block per genuinely independent key. On a 429/error litellm retries on another key and cools the failed one out for `cooldown_time`.
+`flash` and `super-flash` are each ONE deployment today — no pool — because OpenRouter's
+`provider.sort: throughput` already routes each call to whichever upstream is fastest, so
+there's no per-key headroom to buy by pooling here. This is the shape to copy for a new
+single-deployment worker lane:
 
 ```yaml
 model_list:
-  # -- Worker pool: the `flash` lane across INDEPENDENT keys/accounts --
-  # (same-queue identical models; each key a separate provider or account)
   - model_name: flash
+    litellm_params:
+      model: openrouter/google/gemini-3.8-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+      extra_body:
+        provider:
+          sort: throughput
+      timeout: 600
+
+  - model_name: super-flash
+    litellm_params:
+      model: openrouter/google/gemini-3.8-flash
+      api_key: os.environ/OPENROUTER_API_KEY
+      extra_body:
+        provider:
+          sort: throughput
+        reasoning:
+          effort: minimal          # Gemini 3.8 Flash via OpenRouter refuses to disable reasoning entirely — `minimal` is the floor
+      timeout: 600
+```
+
+Each carries its own one-hop Luna fallback (`flash-luna` / `super-flash-luna`) — wiring
+that hop is `add-fallback-orchestrator`'s job, not this skill's; don't duplicate it here.
+
+## When a pool IS the right shape (illustration)
+
+Not the shape of `flash`/`super-flash` above — this is what a legitimate multi-key pool
+looks like when the provider actually meters per key/account (unlike OpenRouter's
+throughput routing). Direct Gemini API access is the clearest example, and it's exactly
+where the quota-and-ToS rule above matters most:
+
+```yaml
+model_list:
+  # -- Worker pool: identical deployments across INDEPENDENT keys/accounts --
+  # (same-queue identical models; each key a separate provider or account)
+  - model_name: flash-direct
     litellm_params:
       model: gemini/gemini-3.8-flash
       api_key: os.environ/GEMINI_API_KEY        # the one Google project
 
-  - model_name: flash
+  - model_name: flash-direct
     litellm_params:
       model: gemini/gemini-3.8-flash
       api_key: os.environ/GEMINI_API_KEY_2      # a DIFFERENT Google account
@@ -70,7 +109,7 @@ model_list:
 `router_settings.routing_strategy: usage-based-routing-v2` handles the even split; nothing else to wire.
 
 ## B) Add a distinct worker model — a new `model_name`
-Give it a fresh `model_name` (single deployment shown; repeat the block with more independent keys for its own pool). Clients then select it by name via `/v1/models`.
+Give it a fresh `model_name` (single deployment shown; repeat the block with more independent keys for its own pool, if the provider's quota model actually justifies one — see above). Clients then select it by name via `/v1/models`.
 
 ```yaml
   - model_name: flash-lite
@@ -79,17 +118,46 @@ Give it a fresh `model_name` (single deployment shown; repeat the block with mor
       api_key: os.environ/GEMINI_API_KEY
 ```
 
-Still **no** `fallbacks:` entry — workers are never part of the `orch` lane's failover chain.
+Still **no** `fallbacks:` entry pointing INTO this lane from elsewhere — workers are never
+part of the driver's (`heavy`) failover chain. Give the new lane its own hop, if it needs
+one, via `add-fallback-orchestrator`.
+
+## Env var convention
+One env var per key, named for its provider: `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, … Use `_N` suffixes only when you hold multiple keys that are **genuinely independent** — separate accounts or providers:
+
+```bash
+export OPENROUTER_API_KEY="..."      # flash / super-flash and their Luna hops
+export GEMINI_API_KEY="..."          # only if you're building the direct-Gemini pool illustration above
+export GEMINI_API_KEY_2="..."        # ONLY if this is a DIFFERENT Google account
+```
 
 ## Apply + verify
 ```bash
-ferry down && ferry up
+ferry reload                        # config-only: re-reads litellm.yaml
+ferry down && ferry up              # full restart — use when ferry reload isn't enough
 ```
-Verify **each key independently** with a direct provider models-list call (HTTP 200 = key is live), one at a time:
+Verify **each key independently**, one at a time:
+
+OpenRouter (the shipped `flash`/`super-flash` shape):
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+  https://openrouter.ai/api/v1/models
+```
+
+Gemini direct API — only relevant if you built the pool illustration above:
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' \
   "https://generativelanguage.googleapis.com/v1beta/models?key=$GEMINI_API_KEY"
 ```
+
 Or watch the pool live with `ferry dash`.
+
+**Gemini 3.8 Flash via OpenRouter spends its mandatory reasoning tokens out of the SAME
+`max_tokens` budget as the visible reply.** A probe with a tiny budget (e.g. `max_tokens:
+50`) burns the whole budget on reasoning and comes back with `content: null` and
+`finish_reason: length` — that LOOKS like a broken lane but the lane is healthy, you just
+starved it. Probe with `max_tokens: 400` or more to get an actual reply back before
+concluding anything is wrong.
 
 **Warning:** hammering a fresh key with a burst can trip per-project RPM limits — that returns a **RateLimitError (429), NOT an auth failure**. The key is fine; you're just over the per-minute rate. Spread verification out rather than firing all keys at once.

@@ -65,6 +65,37 @@ def http_json(url, key, method="GET", body=None, timeout=8):
     return out
 
 
+def http_stream(url, key, method="POST", body=None, timeout=8):
+    """Like http_json, but for a request whose backend only answers on the
+    streaming path (litellm's `chatgpt/` bridge, 2026-09-04: a non-streamed
+    call 500s with "Unknown items in responses API response: []" even though
+    the deployment is healthy). urllib's `r.read()` blocks until the SSE
+    connection closes regardless, so health only needs the STATUS and the
+    headers litellm sets before the first chunk — the body is drained to
+    completion so the connection closes cleanly, never parsed as JSON, since
+    an SSE stream is not one JSON document."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", "Bearer %s" % key)
+    if body is not None:
+        req.add_header("Content-Type", "application/json")
+    t0 = time.monotonic()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw, code, hdrs = r.read(), r.status, r.headers
+    except urllib.error.HTTPError as e:
+        raw, code, hdrs = e.read(), e.code, e.headers
+    except Exception as e:
+        return {"ok": False, "status": 0, "ms": int((time.monotonic() - t0) * 1000),
+                "error": str(e), "headers": {}}
+    ok = 200 <= code < 300
+    out = {"ok": ok, "status": code, "ms": int((time.monotonic() - t0) * 1000),
+           "headers": {k.lower(): v for k, v in dict(hdrs).items()}}
+    if not ok:
+        out["error"] = raw.decode("utf-8", "replace")[:200]
+    return out
+
+
 def _short_err(r):
     j = r.get("json") or {}
     if isinstance(j, dict) and isinstance(j.get("error"), dict):
@@ -784,12 +815,33 @@ def apply_order(path, order):
 
 
 # ── proxy-log activity tail ────────────────────────────────────────────────
+def _classify_tap_line(rules, line, live):
+    """kind of backend event one raw proxy-log line reports, or None.
+
+    Delegates to the single-sourced classifier in lib/ferry_live.py
+    (`classify_log_line`), which both this tailer and observ/ferry-metrics-
+    exporter now read instead of each carrying its own vendor-specific test.
+    If that sibling module cannot be loaded, this floor is a manual COPY of
+    its vendor-neutral floor (ferry_live.classify_log_line is canonical) so
+    the tap still reports something rather than going dark.
+    """
+    if live is not None:
+        return live.classify_log_line(rules, line)
+    low = (line or "").lower()
+    if "ratelimiterror" in low or "rate_limit" in low:
+        return "rate_limited"
+    if "insufficient_quota" in low or "insufficient credits" in low:
+        return "quota_exhausted"
+    return None
+
+
 class Activity:
     # uvicorn access line: `INFO: 1.2.3.4:5678 - "POST /v1/chat/completions HTTP/1.1" 200 OK`
     ACCESS = re.compile(r'(\d+\.\d+\.\d+\.\d+):\d+ - "(\w+) (\S+) [^"]*" (\d+)')
 
-    def __init__(self, logpath):
+    def __init__(self, logpath, rules=None):
         self.logpath = logpath
+        self.rules = rules if isinstance(rules, dict) else {"rules": [], "ttl": {}}
         self.lock = threading.Lock()
         self.total = 0
         self.by_status = {}
@@ -816,6 +868,7 @@ class Activity:
         except Exception:
             return
         new = 0
+        live = _live()
         with self.lock:
             for line in chunk.splitlines():
                 m = self.ACCESS.search(line)
@@ -827,13 +880,14 @@ class Activity:
                         new += 1
                         self.by_status[status] = self.by_status.get(status, 0) + 1
                         self.by_client[ip] = self.by_client.get(ip, 0) + 1
-                low = line.lower()
-                if "permission_error" in low and "usage limit" in low:
-                    self.last_event = {"kind": "kimi_quota",
-                                       "text": "Kimi K3 quota exhausted (403) — falling back",
-                                       "t": time.time()}
-                elif "rate_limit" in low or "ratelimiterror" in low:
-                    self.last_event = {"kind": "rate_limit",
+                kind = _classify_tap_line(self.rules, line, live)
+                if kind == "quota_exhausted":
+                    self.last_event = {
+                        "kind": "quota_exhausted",
+                        "text": "a backend reported its quota or credits exhausted — check the lane",
+                        "t": time.time()}
+                elif kind == "rate_limited":
+                    self.last_event = {"kind": "rate_limited",
                                        "text": "a backend returned 429 (rate limit)",
                                        "t": time.time()}
             self.buckets.append(new)
@@ -889,20 +943,39 @@ def get_status():
 
 
 def probe_backends():
+    """Actively call every name the config topology serves — lanes AND hops.
+
+    A hop is not the operator's problem until it fires, so probing it too
+    (cheap: a 16-token ping) is exactly what surfaces a dead fallback before a
+    lane needs it. The ChatGPT-subscription driver (`heavy`/`orch`/
+    `orchestrator`) is STREAMING-ONLY on litellm 1.99.0 — a non-streamed call
+    500s ("Unknown items in responses API response: []") even though the
+    deployment is healthy — so every probe streams. Gemini via OpenRouter can
+    spend the whole `max_tokens` budget on reasoning, so `content` may come
+    back null on a tiny budget while the lane is fine: health here is judged
+    by HTTP status alone, never by body content.
+    """
     ferry, key = CFG["ferry"], CFG["key"]
+    topo = load_topology(CFG["config_path"])
+    names = list(topo.get("order") or [])
+    if topo.get("error") or not names:
+        # The config couldn't be parsed — fall back to whatever the proxy
+        # itself advertises (public lanes only; hops are never public).
+        m = http_json(ferry + "/v1/models", key, timeout=4)
+        if m.get("ok"):
+            names = [x["id"] for x in (m.get("json") or {}).get("data", [])]
     out = {}
-    # Probe every lane the stack serves. The local GPU lanes are included so a
-    # cold/stopped mlx_vlm.server shows up here as a red lane instead of only
-    # surfacing when a client call fails.
-    for label, model in (("orch", "orch"), ("flash", "flash"),
-                         ("local-orch", "local-orch"), ("local-sub", "local-sub")):
-        r = http_json(ferry + "/v1/chat/completions", key, "POST",
-                      {"model": model, "messages": [{"role": "user", "content": "ping"}],
-                       "max_tokens": 4}, timeout=60)
-        out[label] = {
+    for name in names:
+        r = http_stream(ferry + "/v1/chat/completions", key, "POST",
+                        {"model": name, "messages": [{"role": "user", "content": "ping"}],
+                         "max_tokens": 16, "stream": True}, timeout=60)
+        hdrs = r.get("headers", {}) or {}
+        out[name] = {
             "ok": r.get("ok"), "status": r.get("status"), "ms": r.get("ms"),
-            "served_by": (r.get("headers", {}) or {}).get("x-litellm-model-name"),
-            "error": None if r.get("ok") else _short_err(r),
+            "served_by": hdrs.get("x-litellm-model-name"),
+            "model_id": hdrs.get("x-litellm-model-id"),
+            "fallbacks": hdrs.get("x-litellm-attempted-fallbacks"),
+            "error": None if r.get("ok") else r.get("error"),
         }
     return out
 
@@ -1269,7 +1342,7 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="feed" id="feed"></div>
   </section>
-  <section class="card" id="orch"><h2>Orchestrator</h2><div id="orchbody" class="muted">loading…</div></section>
+  <section class="card" id="orch"><h2>Driver</h2><div id="orchbody" class="muted">loading…</div></section>
   <section class="card" id="work"><h2>Workers</h2><div id="workbody" class="muted">loading…</div></section>
   <section class="card full" id="act"><h2>Recent activity <span class="muted" id="since"></span></h2>
     <div class="stats" id="stats"></div>
@@ -1318,8 +1391,8 @@ function renderOrch(st){
   // primary
   const pg=groups[lane]||{models:[]};
   let pstate='blue', ptag='primary';
-  if(ev && ev.kind==='kimi_quota'){pstate='red';ptag='quota-exhausted (403)';}
-  const pr=PROBE.orch;
+  if(ev && ev.kind==='quota_exhausted'){pstate='red';ptag='quota-exhausted';}
+  const pr=PROBE[lane];
   if(pr && pr.served_by){ const served=shortModel(pr.served_by);
     if((pg.models[0]||'').includes(served)){pstate='green';ptag='serving ('+pr.ms+'ms)';}
     else{pstate='red';ptag='down → '+served;} }
@@ -1345,7 +1418,7 @@ function renderWork(st){
   const t=st.topology||{}, groups=t.groups||{};
   const box=$('#workbody'); box.innerHTML=''; box.className='';
   // Hide the driver lane and the hops of its own chain — those are the
-  // Orchestrator card's job, and the Routes card below shows every lane anyway.
+  // Driver card's job, and the Routes card below shows every lane anyway.
   // Derived from the config rather than matched on an `orch-` name prefix, which
   // stopped covering the driver's hops the moment the lane was renamed.
   const drv=driverLane(groups), hide=new Set([drv, ...((t.fallbacks||{})[drv]||[])]);
@@ -1977,19 +2050,23 @@ def main():
 
     ferry_port = args.ferry.rsplit(":", 1)[-1].split("/")[0]
     logpath = args.log or find_log(ferry_port)
-    CFG.update(ferry=args.ferry.rstrip("/"), key=args.key, config_path=args.config,
-               host=lan_ip(), ferry_port=ferry_port, activity=Activity(logpath))
 
     # ── the live half ──────────────────────────────────────────────────────
     # All optional. If lib/ferry_live.py is missing, or the tap has never run,
     # or there is no rules file, the dashboard still serves everything it did
     # before — it just says the tap is off instead of drawing an empty graph.
+    # Loaded before Activity so the tailer's classifier has the real table
+    # from its first poll, not just from whatever the next reload picks up.
     live = _live()
+    rules = live.load_rules(args.rules) if live else {"rules": [], "ttl": {}}
+
+    CFG.update(ferry=args.ferry.rstrip("/"), key=args.key, config_path=args.config,
+               host=lan_ip(), ferry_port=ferry_port, activity=Activity(logpath, rules))
     CFG["streams"] = 0
     CFG["stream_lock"] = threading.Lock()
     CFG["events_path"] = args.events
-    CFG["rules"] = live.load_rules(args.rules) if live else {"rules": [], "ttl": {}}
-    CFG["exhaustion"] = live.ExhaustionState(CFG["rules"]) if live else None
+    CFG["rules"] = rules
+    CFG["exhaustion"] = live.ExhaustionState(rules) if live else None
 
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)

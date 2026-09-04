@@ -105,14 +105,17 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # NOTE: 8091 is deliberately skipped — `ferry dash` binds it. The stack and the
 # dashboard are meant to run together, so the lanes start above it.
 
-# ---- The four served lanes ----
+# ---- The five served lanes ----
 # Lane names are the STABLE contract clients bind to; the model behind a lane is
 # swappable without touching a single client config.
 #
-#   orch        -> GLM 5.3 (Z.ai Coding Plan) + a 4-hop cloud fallback chain
-#   flash       -> Gemini 3.8 Flash across 10 per-project keys (load-balanced pool)
-#   local-orch  -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
-#   local-sub   -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
+#   heavy        -> GPT-5.6 Sol via the ChatGPT subscription, no fallback chain
+#                   (legacy names `orch`/`orchestrator` still resolve to it)
+#   flash        -> Gemini 3.8 Flash via OpenRouter, 1 fallback hop to GPT-5.6 Luna
+#   super-flash  -> same Gemini 3.8 Flash shape, minimal reasoning (housekeeping),
+#                   1 fallback hop to GPT-5.6 Luna with reasoning off
+#   local-orch   -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
+#   local-sub    -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
 #
 # The cloud lanes live in the litellm route config; the two local lanes are the
 # MLX servers this script launches, wired into that same config as
@@ -179,14 +182,16 @@ MDNS_NAME="$(detect_mdns_name)"
 # This one HAS to be a real provider/model id, not a lane name: --cloud runs a
 # bare `litellm --model "$DEFAULT_CLOUD_MODEL"` with no route config at all, so
 # there is no lane table to resolve against. It rides OpenRouter deliberately —
-# one env var (OPENROUTER_API_KEY) and the stock api_base, whereas the Z.ai
-# coding endpoint that backs the `flash` lane needs a custom api_base the bare
-# `litellm --model` form has nowhere to put.
+# one env var (OPENROUTER_API_KEY) and the stock api_base.
 #
 # Was `gemini/gemini-3.7-flash` (as DEFAULT_GEMINI) until v1.8.4. v1.8.0 retired
 # the multi-project Gemini key pool, so `--cloud` had been defaulting to a key
 # the host no longer holds and failing its own preflight check.
-DEFAULT_CLOUD_MODEL="openrouter/z-ai/glm-5.3-flash"
+#
+# Was `openrouter/z-ai/glm-5.3-flash` from v1.8.4 until 2026-09-04, when the
+# route config was simplified and the `flash` lane it mirrors moved to
+# OpenRouter Gemini 3.8 Flash.
+DEFAULT_CLOUD_MODEL="openrouter/google/gemini-3.8-flash"
 
 # Route mode: serve multiple models (orchestrator + failover workers) from a litellm config
 DEFAULT_ROUTE_CONFIG="$HOME/.config/ferry/litellm.yaml"

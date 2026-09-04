@@ -46,7 +46,7 @@ It goes further than serving inference: it can **ferry whole models and files** 
 | Cloud provider proxy | ✓ *(each device)* | — | ✓ | ✓ | ✓ |
 | Local **and** cloud on **one** endpoint | — | — | — | — | ✓ |
 | One-command LAN client onboarding | — | — | — | — | ✓ |
-| Orchestrator + strict fallback chain | — | — | ✓ *(hand-config)* | partial | ✓ *(+ bundled skills)* |
+| Named lanes + strict fallback hops | — | — | ✓ *(hand-config)* | partial | ✓ *(+ bundled skills)* |
 | Multi-key worker pool, least-used + auto-cooldown | — | — | ✓ *(hand-config)* | n/a | ✓ *(template)* |
 | Ferry models/files across LAN + forward proxy | — | — | — | — | ✓ |
 | Cost | — | free | free | paid markup | free · OSS |
@@ -58,7 +58,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 - 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too, so **Claude Code runs on the ferry backend** (`claude-ferry` wrapper, new in v1.20).
 - 🔑 **Keys stay on the host** — your *provider* keys never leave the host; clients hold one shared master key (v1.22) and never see a provider key.
 - ⚡ **Local GPU + cloud, same endpoint** — Apple MLX inference on the Mac, or a cloud proxy, or **both models on one route config**.
-- 🧠 **Orchestrator + strict fallback chain** — a big planning model with an ordered failover chain across **independent** providers (Kimi, Fireworks DeepSeek/GLM, a ChatGPT subscription).
+- 🧠 **Driver lane, no silent failover** — a big planning model (`heavy`) on the ChatGPT subscription with **no** fallback chain, by design: a driver call errors rather than silently continuing the session on a different model. The **worker** lanes (`flash`, `super-flash`) run OpenRouter Gemini 3.8 Flash, each with one strict fallback hop to GPT-5.6 Luna.
 - 🎛️ **Multi-key worker pool** — several API keys pooled with `usage-based-routing-v2` (proactive least-used spread) and automatic 429 cooldown/failover.
 - 🚀 **One-curl client onboarding** — `curl … | zsh` installs the CLI, writes the client profile, and auto-wires the editor (opencode / Continue / Cursor).
 - 📊 **Observability, new in v1.5** — a zero-dependency stdlib live page **and** a full Grafana + VictoriaMetrics + VictoriaLogs stack (per-model requests/tokens/spend/latency, a Failures & Fallbacks view, searchable logs).
@@ -83,7 +83,7 @@ cd llm-ferry
 For cloud mode, set a provider key (never commit it):
 
 ```bash
-export GEMINI_API_KEY="..."          # or drop it in ~/.config/ferry/secrets.env
+export OPENROUTER_API_KEY="..."      # or drop it in ~/.config/ferry/secrets.env
 ```
 
 Start serving, then advertise the client bootstrap over the LAN:
@@ -301,19 +301,19 @@ curl -s http://your-mac.local:8090/v1/chat/completions \
 
 **How it fits together.** LiteLLM on `:8090` is the only door. The two GPU lanes are `mlx_vlm.server` processes on internal loopback ports (`8092`, `8093`) that LiteLLM fronts as ordinary OpenAI-compatible backends — so a local model and a cloud model are indistinguishable to a client apart from the name it asks for.
 
-The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — set your model ids and export the keys it references (`KIMI_API_KEY`, `GEMINI_API_KEY`, `FIREWORKS_API_KEY`, in your shell or `~/.config/ferry/secrets.env`) — then re-run.
+The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — the `heavy`/`orchestrator` driver logs in once via device code (written to `~/.config/litellm/chatgpt/auth.json`, no API key needed), and `flash`/`super-flash` plus their `-luna` hops need `OPENROUTER_API_KEY` exported (in your shell or `~/.config/ferry/secrets.env`) — then re-run.
 
-**Worker pool (load-balanced).** The template ships `flash` as one deployment (Gemini 3.8 Flash); any deployments you add **sharing the `flash` model_name** form a pool: `usage-based-routing-v2` sends each call to the least-used one (proactive even split), and on a `429` it cools the dead deployment out (`cooldown_time`) and rolls traffic to another. **Widen it with model ids, never with keys.** Google says it plainly — *"Rate limits are applied per project, not per API key"* — so a second key in the same project shares one bucket and buys nothing, and a second *project* to multiply the limit is circumvention under Google APIs ToS §2.d (nine burst-created projects suspended in one night, 2026-08-25, and the account's OAuth APIs restricted). But the limit is per-project-**per-model**: every model id carries its own RPM/TPM/RPD bucket, so pooling `gemini-3.8-flash` with, say, `gemini-3.5-flash` on **one** key is two independent buckets and nothing to circumvent. Pick members that are interchangeable for the lane's *role*, so a caller cannot tell which one answered. The other sanctioned lever is raising the paid tier on that one project (Tier 3 = 20M TPM).
+**Worker pool (load-balanced).** The template ships `flash` as one deployment (Gemini 3.8 Flash through OpenRouter, routed to the fastest provider, so the provider spread is OpenRouter's problem); any deployments you add **sharing the `flash` model_name** form a pool: `usage-based-routing-v2` sends each call to the least-used one (proactive even split), and on a `429` it cools the dead deployment out (`cooldown_time`) and rolls traffic to another. If you pool Gemini on a **native** key instead, **widen it with model ids, never with keys.** Google says it plainly — *"Rate limits are applied per project, not per API key"* — so a second key in the same project shares one bucket and buys nothing, and a second *project* to multiply the limit is circumvention under Google APIs ToS §2.d (nine burst-created projects suspended in one night, 2026-08-25, and the account's OAuth APIs restricted). But the limit is per-project-**per-model**: every model id carries its own RPM/TPM/RPD bucket, so pooling `gemini-3.8-flash` with, say, `gemini-3.5-flash` on **one** key is two independent buckets and nothing to circumvent. Pick members that are interchangeable for the lane's *role*, so a caller cannot tell which one answered. The other sanctioned lever is raising the paid tier on that one project (Tier 3 = 20M TPM).
 
-**Only lanes are advertised.** `/v1/models` lists the lanes you mark `model_info: {public: true}` and nothing else. That matters more than it sounds: `router_settings.fallbacks` is keyed by model group, so `heavy` has a chain and `heavy-fallback` does not — a client that picks a fallback hop out of a model list gets a single provider with **no failover at all**, and only finds out when that hop is down, which is the case the chain exists for. litellm has no setting for this (`hidden` applies to `model_group_alias` entries only), so `ferry up` serves litellm's own app through a small ASGI filter (`front/ferry_front.py`) that trims the listing. It is not a second process and not a reverse proxy — every request that is not the model listing goes to litellm untouched, so nothing sits between a client and a streamed token. Hiding is not removing: an unadvertised hop is still callable by name if you ask for it. If the filter cannot start, ferry says so and serves litellm directly rather than leaving the endpoint down.
+**Only lanes are advertised.** `/v1/models` lists the lanes you mark `model_info: {public: true}` and nothing else. That matters more than it sounds: `router_settings.fallbacks` is keyed by model group, so `flash` has a chain and `flash-luna` does not — a client that picks a fallback hop out of a model list gets a single provider with **no failover at all**, and only finds out when that hop is down, which is the case the chain exists for. litellm has no setting for this (`hidden` applies to `model_group_alias` entries only), so `ferry up` serves litellm's own app through a small ASGI filter (`front/ferry_front.py`) that trims the listing. It is not a second process and not a reverse proxy — every request that is not the model listing goes to litellm untouched, so nothing sits between a client and a streamed token. Hiding is not removing: an unadvertised hop is still callable by name if you ask for it. If the filter cannot start, ferry says so and serves litellm directly rather than leaving the endpoint down.
 
-**Driver fallback (strict chain).** The `heavy` lane gets an *ordered* fallback chain: `heavy-fallback` deployments (example: **Fireworks DeepSeek V4 Pro** first, **GLM 5.2** as last resort, via `FIREWORKS_API_KEY`) that `router_settings.fallbacks` reroutes to **in order, only** when `heavy` errors — a `429`, a `5xx`, or a hard quota `403`. Choose fallbacks whose capacity is **independent** of the primary (a different provider or account): one that shares a rate-limit bucket with your primary — or with your own interactive use of that same account — will `429` exactly when you need it. A pay-per-token API like Fireworks has its own capacity and bills only when a hop actually fires. Put the fast model first, and keep `num_retries` low so a hard-down primary falls through quickly instead of burning retry-backoff first.
+**The driver lane has no fallback, by design.** `heavy` (and the legacy `orchestrator` alias) runs on the ChatGPT subscription via litellm's native `chatgpt/` provider (`chatgpt/responses/gpt-5.6-sol`, device-code login at `~/.config/litellm/chatgpt/auth.json` — not an API key) at `reasoning_effort: xhigh`, the top effort value litellm's chat→responses bridge actually forwards (it silently drops `max`). It carries **no** `router_settings.fallbacks` entry, on purpose: a driver call that fails should error, not silently continue the session on a different model the user never chose. The ChatGPT backend is also **streaming-only** on litellm 1.99.0 — a non-streamed call `500`s — which a streaming client never notices but rules out serving `heavy` to a non-streaming caller at all.
 
-A **ChatGPT Plus/Pro subscription** can serve a fallback hop too, via LiteLLM's `chatgpt/` provider (device-code login, not an API key) — though in litellm 1.97.0 it's **streaming-only** (a non-streamed call falls through to the next hop, which is harmless in a chain).
+**Each worker lane gets its own single strict fallback hop.** `flash` (`openrouter/google/gemini-3.8-flash`, routed to the fastest-throughput OpenRouter provider) and `super-flash` (the same model at `reasoning.effort: minimal` — Gemini refuses to disable reasoning entirely) each reroute, via `router_settings.fallbacks`, to their own `-luna` hop (`openrouter/openai/gpt-5.6-luna`) **in order, only** when the primary errors — a `429`, a `5xx`, or a hard quota `403`. `flash-luna` runs at `reasoning: high`; `super-flash-luna` runs at `reasoning: none` (zero reasoning tokens), matching the speed profile of the lane it backs up. Each hop is its own `model_name`, never `public`, so it stays out of `/v1/models` while the router can still reach it.
 
-**OpenRouter hops route to the fastest provider.** One OpenRouter model id is served by many providers — GLM 5.3 Flash by 22 on 2026-09-02, from 111 tok/s at the top to 17 at the bottom — and OpenRouter's default picks among the *cheapest* of them, weighted by inverse-square price. The template's OpenRouter deployments therefore carry `extra_body: {provider: {sort: throughput}}`, which is [OpenRouter's own provider-routing object](https://openrouter.ai/docs/features/provider-routing) forwarded verbatim by litellm: every request is re-ranked by each provider's p50 tokens/s over a rolling 5-minute window, on OpenRouter's side. Nothing in ferry polls or pins a provider name, so a provider that is rate-limited *this minute* is simply not at the top this minute — pinning `order: ["Baseten"]` (the fastest on the page) returned `429 temporarily rate-limited upstream` while `sort: throughput` on the same model was served by Friendli and Fireworks at once (verified 2026-09-02 through `ferry_front.py`, with an unsorted control lane landing on Z.AI). The trade is price: throughput sort ignores it, so a model with a discounted provider may be served at full rate instead. Drop the block from any deployment you would rather run cheap than fast.
+**OpenRouter hops route to the fastest provider.** One OpenRouter model id is served by many providers — GLM 5.3 Flash by 22 on 2026-09-02, from 111 tok/s at the top to 17 at the bottom — and OpenRouter's default picks among the *cheapest* of them, weighted by inverse-square price. **Gemini 3.8 Flash** — the model behind `flash` and `super-flash` (whose `flash-luna`/`super-flash-luna` hops ride OpenRouter too) — therefore carries `extra_body: {provider: {sort: throughput}}`, which is [OpenRouter's own provider-routing object](https://openrouter.ai/docs/features/provider-routing) forwarded verbatim by litellm: every request is re-ranked by each provider's p50 tokens/s over a rolling 5-minute window, on OpenRouter's side. Nothing in ferry polls or pins a provider name, so a provider that is rate-limited *this minute* is simply not at the top this minute — pinning `order: ["Baseten"]` (the fastest on the page) returned `429 temporarily rate-limited upstream` while `sort: throughput` on the same model was served by Friendli and Fireworks at once (verified 2026-09-02 through `ferry_front.py`, with an unsorted control lane landing on Z.AI). The trade is price: throughput sort ignores it, so a model with a discounted provider may be served at full rate instead. Drop the block from any deployment you would rather run cheap than fast.
 
-**The local lanes are deliberately outside every fallback chain.** The whole point of naming `local-orch` or `local-sub` is that the request stays on your machine — so a stopped GPU lane surfaces as an error rather than quietly spending a cloud quota. (`flash` pool overflow still spills to `heavy`, which is a cloud-to-cloud hop.)
+**The local lanes are deliberately outside every fallback chain.** The whole point of naming `local-orch` or `local-sub` is that the request stays on your machine — so a stopped GPU lane surfaces as an error rather than quietly spending a cloud quota. (`flash` still spills to its own `flash-luna` hop, a cloud-to-cloud fallback — just never off the host's GPU.)
 
 **⚠ An alias has no fallback chain.** `router_settings.model_group_alias` looks like the way to keep an old client-facing name working, and it does resolve — for *deployment selection* only. litellm reads the fallbacks map with the **raw model string the client sent, before any alias is resolved**:
 
@@ -325,20 +325,29 @@ router.py:6357   fallback_model_group is None -> raise original_exception
 
 Alias → target resolution lives at `router.py:9278`, on the deployment-selection path that lookup never reaches. So an aliased lane matches no `fallbacks:` entry, its primary's error goes straight to the client, and the entire chain is skipped — silently, because the config and `/v1/models` both look correct. Verified 2026-08-28 against a live stack whose primary was quota-blocked: the alias returned `500`; the real `model_name` returned `200` from the second hop.
 
-**Duplicate the deployment instead.** To keep a legacy name alive, give it a real `model_name` plus its **own identical `fallbacks:` entry** — one extra block, and it actually fails over:
+**Duplicate the deployment instead.** To keep a legacy name alive, give it a real `model_name` of its own rather than an alias — one extra block. `heavy`/`orchestrator` don't need a `fallbacks:` entry each (the driver carries none, by design); a worker lane like `flash` does, and it's `flash`'s **own** entry — not an alias of it — that keeps it failing over to its hop:
 
 ```yaml
 model_list:
-  - model_name: heavy            # the current name
-    litellm_params: {model: anthropic/k3, api_key: os.environ/KIMI_API_KEY}
-    model_info: {public: true, id: kimi-k3-heavy}
+  - model_name: heavy            # the current name — driver, no fallback chain
+    litellm_params: {model: chatgpt/responses/gpt-5.6-sol, api_key: "chatgpt-oauth", reasoning_effort: xhigh}
+    model_info: {public: true, id: chatgpt-heavy}
   - model_name: orchestrator     # the legacy name: same model, its OWN entry
-    litellm_params: {model: anthropic/k3, api_key: os.environ/KIMI_API_KEY}
-    model_info: {id: kimi-k3-legacy}        # no public: true — not advertised
+    litellm_params: {model: chatgpt/responses/gpt-5.6-sol, api_key: "chatgpt-oauth", reasoning_effort: xhigh}
+    model_info: {id: chatgpt-orchestrator}        # no public: true — not advertised
+
+  - model_name: flash
+    litellm_params: {model: openrouter/google/gemini-3.8-flash, api_key: os.environ/OPENROUTER_API_KEY}
+    model_info: {public: true, id: or-gemini-flash}
+  - model_name: flash-luna       # the fallback hop — a real model_name, never public
+    litellm_params: {model: openrouter/openai/gpt-5.6-luna, api_key: os.environ/OPENROUTER_API_KEY, reasoning_effort: high}
+    model_info: {id: or-luna-flash}
 
 router_settings:
-  fallbacks: [{"heavy": ["heavy-fallback"]}, {"orchestrator": ["heavy-fallback"]}]
+  fallbacks: [{"flash": ["flash-luna"]}, {"super-flash": ["super-flash-luna"]}]
 ```
+
+`chatgpt-heavy`, `chatgpt-orchestrator`, `or-gemini-flash`, and `or-luna-flash` above are just `model_info.id` — metric labels litellm stamps onto each deployment's Grafana series, not something a client ever sends.
 
 **Never let a real model id become the name clients type.** It is tempting to name a lane after the model currently behind it, and it goes wrong the first time you re-point that lane: clients keep sending a vendor's model name and get someone else's model back, and nothing in `/v1/models` reveals the discrepancy. Name the *role* instead — a role survives the model behind it changing, which is the entire reason clients address lanes. `ferry opencode` enforces the same rule from the client side: it writes only lane names, never a model id.
 
@@ -380,7 +389,7 @@ On the GPU pair there is no third lane, so the housekeeper shares `local-sub`. P
 
 **`agent` is replaced wholesale rather than merged**, which is the point — a stale per-agent pin is exactly the drift this ends. Before every write, the previous config is copied to `<name>.<UTC-timestamp>.jsonc` beside it (last 10 kept, `--keep N` to change), so a takeover is always reversible and any custom agent you had is recoverable. The `.jsonc` extension is deliberate: opencode's schema allows comments, and the snapshot is where they survive the rewrite.
 
-Only the **lane pair** is ever declared as a model — never the served catalogue. The host also advertises the fallback deployments (`flash-gem`, `flash-or`, `orch-deepseek`, …), but those are reached by the *router* on overflow, not by a client picking one out of a menu.
+Only the **lane pair** is ever declared as a model — never the served catalogue. The host does **not** advertise the fallback hops (`flash-luna`, `super-flash-luna`, …) — only lanes marked `model_info: {public: true}` make it into `/v1/models` — but a hop still routes by name: it's the *router* that reaches it on overflow, not a client picking one out of a menu.
 
 ## The local GPU lanes
 

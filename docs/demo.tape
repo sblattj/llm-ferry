@@ -29,7 +29,7 @@ Type `printf '#!/bin/sh\necho "        inet 192.168.7.20 netmask 0xffffff00 broa
 Type `chmod +x /tmp/ferry-demo/bin/scutil /tmp/ferry-demo/bin/ifconfig /tmp/ferry-demo/ferry` Enter
 Type `export PATH="/tmp/ferry-demo/bin:$PATH"; export HOME=/tmp/ferry-demo/home` Enter
 Type `for v in $(env | grep -iE "API_KEY|_TOKEN|SECRET" | cut -d= -f1); do unset "$v"; done` Enter
-Type `export GEMINI_API_KEY=demo GEMINI_API_KEY_2=demo KIMI_API_KEY=demo` Enter
+Type `export OPENROUTER_API_KEY=demo` Enter
 Type `alias ferry=/tmp/ferry-demo/ferry` Enter
 Type `cd /tmp/ferry-demo` Enter
 Type `precmd_functions=(); preexec_functions=(); PROMPT='ferry $ '; RPROMPT=''` Enter

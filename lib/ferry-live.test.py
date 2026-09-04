@@ -497,5 +497,63 @@ class TestExhaustion(unittest.TestCase):
             self.assertNotIn(vendor, text, vendor)
 
 
+class LogLineTapTests(unittest.TestCase):
+    """classify_log_line: the single-sourced test behind the dash's and the
+    exporter's "last backend event"."""
+
+    RULES = {"rules": [
+        {"state": "quota_exhausted", "status": [403],
+         "message_contains": ["usage limit"]},
+        {"state": "quota_exhausted", "status": [402]},
+        {"state": "rate_limited", "status": [429]},
+        {"state": "healthy", "message_contains": ["supports only"]},
+    ], "ttl": {}}
+
+    # litellm's real cooldown line: the status sits in a python-repr dict.
+    COOLDOWN = ("Cooldown Deployments=[('dep-1', {'exception_received': "
+                "'litellm.PermissionDeniedError: usage limit reached', "
+                "'status_code': '403', 'cooldown_time': 5})]")
+
+    def test_status_recovered_from_the_cooldown_line_shape(self):
+        self.assertEqual(L.classify_log_line(self.RULES, self.COOLDOWN),
+                         "quota_exhausted")
+
+    def test_status_recovered_from_error_code_and_access_log_shapes(self):
+        self.assertEqual(L.classify_log_line(
+            self.RULES, "Error code: 402 - {'error': 'no funds'}"),
+            "quota_exhausted")
+        self.assertEqual(L.classify_log_line(
+            self.RULES, '10.0.0.2 - "POST /v1/chat/completions HTTP/1.1" 429'),
+            "rate_limited")
+
+    def test_a_rule_that_says_healthy_wins_over_the_floor(self):
+        line = "litellm.RateLimitError: model supports only 256K context"
+        self.assertIsNone(L.classify_log_line(self.RULES, line))
+
+    def test_floor_with_no_rules_is_vendor_neutral(self):
+        empty = {"rules": [], "ttl": {}}
+        self.assertEqual(L.classify_log_line(empty, "litellm.RateLimitError: x"),
+                         "rate_limited")
+        self.assertEqual(L.classify_log_line(
+            empty, "{'error': {'code': 'insufficient_quota'}}"), "quota_exhausted")
+        self.assertEqual(L.classify_log_line(
+            empty, "Error code: 402 - Insufficient credits"), "quota_exhausted")
+        self.assertIsNone(L.classify_log_line(empty, "INFO: 200 OK"))
+        self.assertIsNone(L.classify_log_line(empty, ""))
+        self.assertIsNone(L.classify_log_line(None, "hello"))
+
+    def test_the_old_vendor_specific_line_still_classifies_through_rules(self):
+        # The shape the dash hardcoded before 2026-09-04, now reached only
+        # through a rule the operator owns.
+        line = ("litellm.AuthenticationError: {'type': 'permission_error', "
+                "'message': 'usage limit reached'} 'status_code': '403'")
+        self.assertEqual(L.classify_log_line(self.RULES, line), "quota_exhausted")
+        self.assertIsNone(L.classify_log_line({"rules": []}, line))
+
+    def test_kinds_are_classifier_states(self):
+        for kind in L.TAP_KINDS:
+            self.assertIn(kind, L.STATES)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

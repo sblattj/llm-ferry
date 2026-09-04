@@ -45,7 +45,10 @@ def closed_port():
 
 
 # A realistic mix: two client IPs, 200s + a 429, plus a /v1/models poll and a
-# /health poll that must NOT be counted, plus two backend-error log lines.
+# /health poll that must NOT be counted, plus two backend-error log lines —
+# one rate-limited, one quota-exhausted, both via the vendor-neutral floor
+# (this batch carries no rules, so lib/ferry_live.classify_log_line falls all
+# the way through to "insufficient_quota"/"ratelimiterror").
 ACCESS_BATCH_1 = """\
 INFO:     1.1.1.1:5001 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     1.1.1.1:5002 - "POST /v1/chat/completions HTTP/1.1" 200 OK
@@ -54,7 +57,7 @@ INFO:     2.2.2.2:6001 - "POST /v1/chat/completions HTTP/1.1" 200 OK
 INFO:     9.9.9.9:7001 - "GET /v1/models HTTP/1.1" 200 OK
 INFO:     9.9.9.9:7002 - "GET /health/liveliness HTTP/1.1" 200 OK
 2026-08-22 12:00:00 - LiteLLM:ERROR: litellm.RateLimitError: 429 from a gemini key
-2026-08-22 12:00:01 - ERROR permission_error: usage limit reached for Kimi K3
+2026-08-22 12:00:01 - ERROR litellm.APIError: insufficient_quota - backend account credits exhausted
 """
 
 ACCESS_BATCH_2 = """\
@@ -205,10 +208,10 @@ class TrafficCountersTest(unittest.TestCase):
         self.assertEqual(self.act.total, 4)
         self.assertNotIn(("9.9.9.9", "200"), cs)
         # backend events detected from the error log lines
-        self.assertEqual(snap["backend_events"]["rate_limit"], 1)
-        self.assertEqual(snap["backend_events"]["kimi_quota"], 1)
-        self.assertIn("rate_limit", snap["backend_event_ts"])
-        self.assertIn("kimi_quota", snap["backend_event_ts"])
+        self.assertEqual(snap["backend_events"]["rate_limited"], 1)
+        self.assertEqual(snap["backend_events"]["quota_exhausted"], 1)
+        self.assertIn("rate_limited", snap["backend_event_ts"])
+        self.assertIn("quota_exhausted", snap["backend_event_ts"])
 
     def test_counters_are_cumulative_across_polls(self):
         self._append(ACCESS_BATCH_1)
@@ -226,6 +229,31 @@ class TrafficCountersTest(unittest.TestCase):
         act = EXP.JointActivity(os.path.join(self.tmp, "nope.log"))
         act.poll()                            # must not raise
         self.assertEqual(act.traffic_snapshot()["by_client_status"], {})
+
+    def test_classify_via_rules_dict_increments_quota_exhausted(self):
+        """An operator's event-rules.json rule — not just the built-in floor —
+        must be able to drive the quota_exhausted counter, and it must be the
+        rules object passed to JointActivity (not a hardcoded string) that
+        decides it: a rule an operator writes for their own vendor's wording
+        works with no code change here."""
+        rules = {"version": 1, "rules": [
+            {"message_contains": ["out of prepaid credits"], "state": "quota_exhausted"}
+        ], "ttl": {}}
+        act = EXP.JointActivity(self.log, rules=rules)
+        self._append("2026-09-04 00:00:00 - ERROR: vendor says we are out of prepaid credits\n")
+        act.poll()
+        snap = act.traffic_snapshot()
+        self.assertEqual(snap["backend_events"].get("quota_exhausted"), 1)
+        self.assertNotIn("rate_limited", {k for k, n in snap["backend_events"].items() if n})
+
+    def test_rate_limit_error_with_no_rules_increments_rate_limited(self):
+        """The vendor-neutral floor alone (no event-rules.json at all) must
+        still catch litellm's own RateLimitError class name."""
+        act = EXP.JointActivity(self.log, rules=None)
+        self._append("2026-09-04 00:00:01 - LiteLLM:ERROR: litellm.RateLimitError: 429 from a backend\n")
+        act.poll()
+        snap = act.traffic_snapshot()
+        self.assertEqual(snap["backend_events"].get("rate_limited"), 1)
 
 
 class RenderTest(unittest.TestCase):
@@ -280,8 +308,8 @@ class RenderTest(unittest.TestCase):
 
     def test_backend_events_rendered(self):
         text = self.col.render()
-        self.assertRegex(text, r'ferry_backend_events_total\{kind="rate_limit"\} 1')
-        self.assertRegex(text, r'ferry_backend_events_total\{kind="kimi_quota"\} 1')
+        self.assertRegex(text, r'ferry_backend_events_total\{kind="rate_limited"\} 1')
+        self.assertRegex(text, r'ferry_backend_events_total\{kind="quota_exhausted"\} 1')
 
     def test_content_type_constant(self):
         self.assertEqual(EXP.CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")

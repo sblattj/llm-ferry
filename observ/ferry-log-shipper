@@ -20,8 +20,8 @@ What it emits — one JSON object per log line, POSTed as JSON-lines to
      "source": "proxy",                          # stream field
      "level":  "info" | "warn" | "error",        # stream field
      "status": "200",                            # HTTP code, "" if not an access line
-     "model":  "zai/glm-5.3",                    # backend model, "" if absent
-     "requested_model": "orchestrator",          # model group asked for, "" if absent
+     "model":  "openrouter/openai/gpt-5.6-luna", # backend model, "" if absent
+     "requested_model": "heavy",                 # model group asked for, "" if absent
      "attribution": "request" | "mention",       # did this line SERVE, or merely name?
      "client_ip": "1.2.3.4"}                     # "" if not an access line
 
@@ -121,8 +121,8 @@ WARN_HINT = re.compile(r"WARN|[Ff]allback|cool")
 
 _IDCHARS = r"[\w./:@-]+"
 # `litellm_model_name=x` / `model=x` / `model: x`. The lookbehind is what keeps
-# `register_model: model=zai/glm-5.3` from matching on the "model:" inside
-# "register_model:" (which would capture the literal word "model").
+# `register_model: model=openrouter/openai/gpt-5.6-luna` from matching on the
+# "model:" inside "register_model:" (which would capture the literal word "model").
 MODEL_PATTERNS = [
     re.compile(r"litellm_model_name['\"]?\s*[=:]\s*['\"]?(" + _IDCHARS + r")"),
     re.compile(r"(?<![\w.-])model['\"]?\s*[=:]\s*['\"]?(" + _IDCHARS + r")"),
@@ -134,22 +134,32 @@ REQUESTED_PATTERNS = [
     re.compile(r"model group[:=]?\s*['\"]?(" + _IDCHARS + r")"),
 ]
 # Known ferry backend ids (CONTRACT.md route topology), optionally provider-
-# prefixed: zai/glm-5.3, anthropic/k3, gemini/gemini-3.8-flash,
-# fireworks_ai/accounts/fireworks/models/deepseek-v4-pro-0813, gpt-5.6-sol …
+# prefixed. CURRENT (2026-09-04): chatgpt/responses/gpt-5.6-sol (heavy driver),
+# openrouter/google/gemini-3.8-flash (flash / super-flash), openrouter/openai/
+# gpt-5.6-luna (the flash-luna / super-flash-luna hops), and the two local GPU
+# ids mlx-community/Qwen3.8-27B-nvfp4 / mlx-community/NVIDIA-Nemotron-3-Nano-
+# 30B-A3B-NVFP4. The glm-/deepseek/k3/kimi alternatives below are RETIRED
+# vendors (Z.ai GLM, DeepSeek, Kimi K3) — kept only so a log line from an
+# older ferry build (or the test fixtures that model one) still scans; no
+# current deployment can emit them.
 KNOWN_MODEL = re.compile(
     r"(?<![\w.-])((?:[\w-]+/)*"
-    # `k3` is a WHOLE id on its own (the 1M-context Kimi deployment) as well as
-    # a prefix (`k3-256k`), so the suffix is optional and a trailing boundary
-    # keeps the bare form from biting a chunk out of some longer word.
-    r"(?:glm-[\w.-]+|gemini-[\w.-]+|deepseek[\w.-]*|gpt-[\w.-]+"
+    # `k3` is a WHOLE id on its own (the retired 1M-context Kimi deployment) as
+    # well as a prefix (`k3-256k`), so the suffix is optional and a trailing
+    # boundary keeps the bare form from biting a chunk out of some longer word.
+    r"(?:gemini-[\w.-]+|gpt-[\w.-]+|[Qq]wen[\w.-]*|NVIDIA-Nemotron[\w.-]*"
+    r"|glm-[\w.-]+|deepseek[\w.-]*"
     r"|k3(?:-[\w.-]+)?(?![\w-])"
     r"|kimi[\w.-]*|claude-[\w.-]+))")
 # Ferry's model GROUPS (what a client asks for) as opposed to a backend id.
-# Lane names: `orch` (+ its `orch-*` fallback hops), `flash`, and the two GPU
-# lanes `local-orch` / `local-sub`. `orchestrator` is the pre-rename name, kept
-# so log lines emitted by an older config still resolve to a group.
+# CURRENT lane names (2026-09-04): `heavy` (the driver), `flash` and
+# `super-flash` (each with its own `*-luna` fallback hop), and the two GPU
+# lanes `local-orch` / `local-sub`. `orch` / `orchestrator` (+ `orch-*` hops)
+# are the pre-rename driver names, kept so a log line from an older config, or
+# a session still pinned mid-run, still resolves to a group.
 KNOWN_GROUP = re.compile(
-    r"(?<![\w.-])((?:local-)?orch(?:estrator)?(?:-[\w.-]+)?|local-sub|flash)")
+    r"(?<![\w.-])((?:local-)?orch(?:estrator)?(?:-[\w.-]+)?"
+    r"|local-sub|heavy|super-flash(?:-luna)?|flash(?:-luna)?)")
 
 # A line that NAMES a model and a line that reports a model SERVING A REQUEST
 # are different facts, and `model` alone cannot tell them apart. litellm names

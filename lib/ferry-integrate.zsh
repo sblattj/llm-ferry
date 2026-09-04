@@ -374,9 +374,10 @@ worker = force_small or worker
 house  = force_house or house
 
 # --- Validate the pair against the host catalogue; never populate FROM it. ---
-# The catalogue also advertises the fallback deployments (flash-gem, orch-deepseek,
-# ...). Those are reached by the ROUTER on overflow, not by a client picking one
-# out of a menu, so they stay out of the config.
+# The catalogue does NOT advertise the fallback deployments (flash-luna,
+# super-flash-luna, ...): they route by name but are not `public`, so they never
+# appear in /v1/models. Those are reached by the ROUTER on overflow, not by a
+# client picking one out of a menu, so they stay out of the config.
 served = []
 try:
     # An authed front door rejects a bare catalogue request, which would read

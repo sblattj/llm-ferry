@@ -28,35 +28,65 @@ PROMPTS = {
 MAX_TOKENS = 1024   # thinking models burn budget on thoughts first (trap 1)
 
 # ---- Arms: edit these to the surfaces under comparison ----------------------
+# Every entry below hits a NAMED FERRY LANE through the ferry front (default
+# :8090), not a raw provider — each lane's actual backend model is noted in its
+# comment so a stale line here is easy to catch against ~/.config/ferry/litellm.yaml.
+# Active by default: `flash` against its own fallback hop `flash-luna` — the
+# pair most worth A/B'ing, since the hop only carries load when `flash` errors.
+#
+# `heavy`/`orch`/`orchestrator` ride the ChatGPT SUBSCRIPTION and are
+# STREAMING-ONLY (litellm's chat->responses bridge 500s a non-streamed call:
+# "Unknown items in responses API response: []"). This harness already sends
+# `"stream": True` on every arm (see run_openai below), so it benches those
+# lanes cleanly without a separate non-streaming probe.
 ARMS = {
-    "flash-glm-or": {
+    "flash": {
         "kind": "openai",
-        "url": "https://openrouter.ai/api/v1/chat/completions",
-        "key_env": "OPENROUTER_API_KEY",
-        "model": "z-ai/glm-5.3-flash",
-        "extra": {},  # OpenRouter makes reasoning mandatory; no knob survives (trap 3)
-    },
-    "flash-gem-or": {
-        "kind": "openai",
-        "url": "https://openrouter.ai/api/v1/chat/completions",
-        "key_env": "OPENROUTER_API_KEY",
-        "model": "google/gemini-3.8-flash",
+        "url": "http://127.0.0.1:8090/v1/chat/completions",
+        "key_env": None,   # set to "LITELLM_MASTER_KEY" if the front is keyed
+        "model": "flash",          # openrouter/google/gemini-3.8-flash
         "extra": {},
     },
-    # Examples of other kinds/surfaces:
-    # "flash-glm-zai": {  # direct Z.ai coding plan, thinking genuinely off
-    #     "kind": "openai", "url": "https://api.z.ai/api/coding/paas/v4/chat/completions",
-    #     "key_env": "GLM_API_KEY", "model": "glm-5.3-flash",
-    #     "extra": {"thinking": {"type": "disabled"}},
-    # },
-    # "flash-lane": {   # through the ferry itself — bench what clients get
+    "flash-luna": {
+        "kind": "openai",
+        "url": "http://127.0.0.1:8090/v1/chat/completions",
+        "key_env": None,
+        "model": "flash-luna",     # openrouter/openai/gpt-5.6-luna, effort high
+        "extra": {},
+    },
+    # Every other current lane, same shape — uncomment to swap into the A/B:
+    # "heavy": {          # chatgpt/responses/gpt-5.6-sol, ChatGPT subscription
     #     "kind": "openai", "url": "http://127.0.0.1:8090/v1/chat/completions",
-    #     "key_env": None, "model": "flash", "extra": {},
+    #     "key_env": None, "model": "heavy", "extra": {},
     # },
-    # "gemini-native": {
-    #     "kind": "gemini", "key_env": "GEMINI_API_KEY",
-    #     "model": "gemini-3.8-flash",
-    #     "extra": {"thinkingConfig": {"thinkingBudget": 0}},  # VERIFY: often ignored (trap 4)
+    # "super-flash": {    # same Gemini shape as `flash`, minimal reasoning
+    #     "kind": "openai", "url": "http://127.0.0.1:8090/v1/chat/completions",
+    #     "key_env": None, "model": "super-flash", "extra": {},
+    # },
+    # "super-flash-luna": {  # same Luna shape as `flash-luna`, reasoning off
+    #     "kind": "openai", "url": "http://127.0.0.1:8090/v1/chat/completions",
+    #     "key_env": None, "model": "super-flash-luna", "extra": {},
+    # },
+    # "local-orch": {     # Qwen 3.8-27B nvfp4 on the host GPU (mlx_vlm :8092)
+    #     "kind": "openai", "url": "http://127.0.0.1:8090/v1/chat/completions",
+    #     "key_env": None, "model": "local-orch", "extra": {},
+    # },
+    # "local-sub": {      # Nemotron 3 Nano 30B A3B nvfp4 on the host GPU (:8093)
+    #     "kind": "openai", "url": "http://127.0.0.1:8090/v1/chat/completions",
+    #     "key_env": None, "model": "local-sub", "extra": {},
+    # },
+    #
+    # Direct-provider arms (bypass ferry, hit the CURRENT upstream providers —
+    # the only two ferry itself rides today):
+    # "gemini-flash-or": {
+    #     "kind": "openai", "url": "https://openrouter.ai/api/v1/chat/completions",
+    #     "key_env": "OPENROUTER_API_KEY", "model": "google/gemini-3.8-flash",
+    #     "extra": {},
+    # },
+    # "luna-or": {
+    #     "kind": "openai", "url": "https://openrouter.ai/api/v1/chat/completions",
+    #     "key_env": "OPENROUTER_API_KEY", "model": "openai/gpt-5.6-luna",
+    #     "extra": {},
     # },
 }
 # ------------------------------------------------------------------------------

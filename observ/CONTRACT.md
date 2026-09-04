@@ -86,7 +86,7 @@ All gauges unless marked counter. HELP+TYPE once per metric name. Omit a series 
 
 ### Traffic (proxy log — CUMULATIVE counters kept in memory since exporter start; tail incrementally like ferry-dash)
 - `ferry_requests_total{client,status}` — **counter**, per client-IP × HTTP status (only `/v1/chat/completions`)
-- `ferry_backend_events_total{kind}` — **counter**, kind ∈ {kimi_quota, rate_limit} (from the log's event detection)
+- `ferry_backend_events_total{kind}` — **counter**, kind ∈ {quota_exhausted, rate_limited} (from the log's event detection, via `lib/ferry_live.classify_log_line`). Renamed 2026-09-04 from the vendor-specific {kimi_quota, rate_limit} — the old series names disappear outright (not aliased), so a Grafana query or alert still keyed on `kind="kimi_quota"` or `kind="rate_limit"` returns nothing after this release and must be updated to the names above
 - `ferry_backend_event_timestamp_seconds{kind}` — epoch of the last such event
 
 VM derives RPS = `rate(sum(ferry_requests_total))`, error rate = `sum(rate(ferry_requests_total{status=~"[45].."})) / sum(rate(ferry_requests_total))`, per-client, per-status.

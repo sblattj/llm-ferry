@@ -11,6 +11,8 @@ big driver — `chatgpt/responses/gpt-5.6-sol` via the ChatGPT subscription brid
 OpenRouter Gemini 3.8 Flash. **`local-orch`**/**`local-sub`** are the host GPU lanes. You
 edit `~/.config/ferry/litellm.yaml` (seeded from `litellm-route-example.yaml`).
 
+Since fleets (2026-09-04) lane names are `<fleet>.<lane>`; chains never cross a fleet.
+
 **House policy on chains, stated explicitly: the DRIVER carries NO fallback chain; each
 WORKER lane carries exactly ONE hop.** `heavy` must error rather than silently move a
 session onto a different model mid-flight — that's a deliberate choice, not an oversight,

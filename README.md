@@ -277,6 +277,7 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 ## Contents
 
 - [The stack — five lanes on one endpoint](#the-stack--five-lanes-on-one-endpoint)
+- [Fleets](#fleets)
 - [The local GPU lanes](#the-local-gpu-lanes)
 - [Dashboards & observability](#dashboards--observability)
 - [Ports](#ports)
@@ -317,13 +318,13 @@ curl -s http://your-mac.local:8090/v1/chat/completions \
 
 **How it fits together.** LiteLLM on `:8090` is the only door. The two GPU lanes are `mlx_vlm.server` processes on internal loopback ports (`8092`, `8093`) that LiteLLM fronts as ordinary OpenAI-compatible backends — so a local model and a cloud model are indistinguishable to a client apart from the name it asks for.
 
-The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — the `heavy`/`orchestrator` driver logs in once via device code (written to `~/.config/litellm/chatgpt/auth.json`, no API key needed), and `flash`/`super-flash` plus their Terra/Luna hops need `OPENROUTER_API_KEY` exported (in your shell or `~/.config/ferry/secrets.env`) — then re-run.
+The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — the `domestic.heavy` driver (its legacy `orch`/`orchestrator` names still resolve to it — see [Fleets](#fleets)) logs in once via device code (written to `~/.config/litellm/chatgpt/auth.json`, no API key needed), and `domestic.flash`/`domestic.super-flash` plus their Terra/Luna hops need `OPENROUTER_API_KEY` exported (in your shell or `~/.config/ferry/secrets.env`) — then re-run.
 
 **Worker pool (load-balanced).** The template ships `flash` as one deployment (Gemini 3.8 Flash through OpenRouter, routed to the fastest provider, so the provider spread is OpenRouter's problem); any deployments you add **sharing the `flash` model_name** form a pool: `usage-based-routing-v2` sends each call to the least-used one (proactive even split), and on a `429` it cools the dead deployment out (`cooldown_time`) and rolls traffic to another. If you pool Gemini on a **native** key instead, **widen it with model ids, never with keys.** Google says it plainly — *"Rate limits are applied per project, not per API key"* — so a second key in the same project shares one bucket and buys nothing, and a second *project* to multiply the limit is circumvention under Google APIs ToS §2.d (nine burst-created projects suspended in one night, 2026-08-25, and the account's OAuth APIs restricted). But the limit is per-project-**per-model**: every model id carries its own RPM/TPM/RPD bucket, so pooling `gemini-3.8-flash` with, say, `gemini-3.5-flash` on **one** key is two independent buckets and nothing to circumvent. Pick members that are interchangeable for the lane's *role*, so a caller cannot tell which one answered. The other sanctioned lever is raising the paid tier on that one project (Tier 3 = 20M TPM).
 
 **Only lanes are advertised.** `/v1/models` lists the lanes you mark `model_info: {public: true}` and nothing else. That matters more than it sounds: `router_settings.fallbacks` is keyed by model group, so `flash` has a Terra chain and `super-flash` has a Luna chain — a client that picks a fallback hop out of a model list gets a single provider with **no failover at all**, and only finds out when that hop is down, which is the case the chain exists for. litellm has no setting for this (`hidden` applies to `model_group_alias` entries only), so `ferry up` serves litellm's own app through a small ASGI filter (`front/ferry_front.py`) that trims the listing. It is not a second process and not a reverse proxy — every request that is not the model listing goes to litellm untouched, so nothing sits between a client and a streamed token. Hiding is not removing: an unadvertised hop is still callable by name if you ask for it. If the filter cannot start, ferry says so and serves litellm directly rather than leaving the endpoint down.
 
-**The driver lane has no fallback, by design.** `heavy` (and the legacy `orchestrator` alias) runs on the ChatGPT subscription via litellm's native `chatgpt/` provider (`chatgpt/responses/gpt-5.6-sol`, device-code login at `~/.config/litellm/chatgpt/auth.json` — not an API key) at `reasoning_effort: xhigh`, the top effort value litellm's chat→responses bridge actually forwards (it silently drops `max`). It carries **no** `router_settings.fallbacks` entry, on purpose: a driver call that fails should error, not silently continue the session on a different model the user never chose. The ChatGPT backend is also **streaming-only** on litellm 1.99.0 — a non-streamed call `500`s — which a streaming client never notices but rules out serving `heavy` to a non-streaming caller at all.
+**The driver lane has no fallback, by design.** `heavy` (and the legacy `orch`/`orchestrator` names, resolved to `heavy` by the front door since fleets, 2026-09-04 — see [Fleets](#fleets)) runs on the ChatGPT subscription via litellm's native `chatgpt/` provider (`chatgpt/responses/gpt-5.6-sol`, device-code login at `~/.config/litellm/chatgpt/auth.json` — not an API key) at `reasoning_effort: xhigh`, the top effort value litellm's chat→responses bridge actually forwards (it silently drops `max`). It carries **no** `router_settings.fallbacks` entry, on purpose: a driver call that fails should error, not silently continue the session on a different model the user never chose. The ChatGPT backend is also **streaming-only** on litellm 1.99.0 — a non-streamed call `500`s — which a streaming client never notices but rules out serving `heavy` to a non-streaming caller at all.
 
 **Each worker lane gets its own single strict fallback hop.** `flash` (`openrouter/~google/gemini-flash-latest`, currently resolving to Gemini 3.8 Flash, routed to the fastest-throughput OpenRouter provider) uses `reasoning.effort: xhigh` and falls back to `flash-terra` (`openrouter/openai/gpt-5.6-terra`); `super-flash` uses the same primary at `reasoning.effort: minimal` and falls back to `super-flash-luna` (`openrouter/openai/gpt-5.6-luna`). Each fallback fires only when its primary errors — a `429`, a `5xx`, or a hard quota `403` — and is never public.
 
@@ -341,29 +342,26 @@ router.py:6357   fallback_model_group is None -> raise original_exception
 
 Alias → target resolution lives at `router.py:9278`, on the deployment-selection path that lookup never reaches. So an aliased lane matches no `fallbacks:` entry, its primary's error goes straight to the client, and the entire chain is skipped — silently, because the config and `/v1/models` both look correct. Verified 2026-08-28 against a live stack whose primary was quota-blocked: the alias returned `500`; the real `model_name` returned `200` from the second hop.
 
-**Duplicate the deployment instead.** To keep a legacy name alive, give it a real `model_name` of its own rather than an alias — one extra block. `heavy`/`orchestrator` don't need a `fallbacks:` entry each (the driver carries none, by design); a worker lane like `flash` does, and it's `flash`'s **own** entry — not an alias of it — that keeps it failing over to its hop:
+**Duplicate the deployment instead.** To keep a legacy name alive, give it a real `model_name` of its own rather than an alias — one extra block. (`heavy`'s own legacy names, `orch`/`orchestrator`, are the one case that needs no block at all: the front door's `LEGACY_HEAVY` map resolves them to `heavy` since fleets, 2026-09-04 — see [Fleets](#fleets).) A worker lane like `flash` still needs its **own** `fallbacks:` entry — not an alias of it — to keep failing over to its hop; here's the pattern for a hypothetical `flash-v1` rename:
 
 ```yaml
 model_list:
-  - model_name: heavy            # the current name — driver, no fallback chain
-    litellm_params: {model: chatgpt/responses/gpt-5.6-sol, api_key: "chatgpt-oauth", reasoning_effort: xhigh}
-    model_info: {public: true, id: chatgpt-heavy}
-  - model_name: orchestrator     # the legacy name: same model, its OWN entry
-    litellm_params: {model: chatgpt/responses/gpt-5.6-sol, api_key: "chatgpt-oauth", reasoning_effort: xhigh}
-    model_info: {id: chatgpt-orchestrator}        # no public: true — not advertised
+  - model_name: flash-v1         # a legacy rename: same model, its OWN entry
+    litellm_params: {model: openrouter/~google/gemini-flash-latest, api_key: os.environ/OPENROUTER_API_KEY, reasoning_effort: xhigh}
+    model_info: {id: or-gemini-flash-v1}        # no public: true — not advertised
 
   - model_name: flash
     litellm_params: {model: openrouter/~google/gemini-flash-latest, api_key: os.environ/OPENROUTER_API_KEY, reasoning_effort: xhigh}
     model_info: {public: true, id: or-gemini-flash}
   - model_name: flash-terra      # the fallback hop — a real model_name, never public
     litellm_params: {model: openrouter/openai/gpt-5.6-terra, api_key: os.environ/OPENROUTER_API_KEY, reasoning_effort: xhigh}
-    model_info: {id: or-luna-flash}
+    model_info: {id: or-terra-flash-fb}
 
 router_settings:
-  fallbacks: [{"flash": ["flash-terra"]}, {"super-flash": ["super-flash-luna"]}]
+  fallbacks: [{"flash": ["flash-terra"]}, {"flash-v1": ["flash-terra"]}, {"super-flash": ["super-flash-luna"]}]
 ```
 
-`chatgpt-heavy`, `chatgpt-orchestrator`, `or-gemini-flash`, and `or-luna-flash` above are just `model_info.id` — metric labels litellm stamps onto each deployment's Grafana series, not something a client ever sends.
+`or-gemini-flash-v1`, `or-gemini-flash`, and `or-terra-flash-fb` above are just `model_info.id` — metric labels litellm stamps onto each deployment's Grafana series, not something a client ever sends.
 
 **Never let a real model id become the name clients type.** It is tempting to name a lane after the model currently behind it, and it goes wrong the first time you re-point that lane: clients keep sending a vendor's model name and get someone else's model back, and nothing in `/v1/models` reveals the discrepancy. Name the *role* instead — a role survives the model behind it changing, which is the entire reason clients address lanes. `ferry opencode` enforces the same rule from the client side: it writes only lane names, never a model id.
 
@@ -406,6 +404,51 @@ On the GPU pair there is no third lane, so the housekeeper shares `local-sub`. P
 **`agent` is replaced wholesale rather than merged**, which is the point — a stale per-agent pin is exactly the drift this ends. Before every write, the previous config is copied to `<name>.<UTC-timestamp>.jsonc` beside it (last 10 kept, `--keep N` to change), so a takeover is always reversible and any custom agent you had is recoverable. The `.jsonc` extension is deliberate: opencode's schema allows comments, and the snapshot is where they survive the rewrite.
 
 Only the **lane pair** is ever declared as a model — never the served catalogue. The host does **not** advertise the fallback hops (`flash-terra`, `super-flash-luna`, …) — only lanes marked `model_info: {public: true}` make it into `/v1/models` — but a hop still routes by name: it's the *router* that reaches it on overflow, not a client picking one out of a menu.
+
+## Fleets
+
+**Fleets, new in v1.26.0.** A **fleet** is a complete routing set — a primary and a
+fallback CHAIN for every cloud lane (`heavy`, `flash`, `super-flash`) — living in the same
+`litellm.yaml` as every other fleet, distinguished only by a `<fleet>.<lane>` prefix on its
+deployment names. Clients keep sending bare lane names exactly as before; the front door
+resolves each request to a fleet, in order, from an explicit `X-Ferry-Fleet` header, the
+caller's own sticky selection, or the host-wide default recorded in
+`~/.config/ferry/fleets.json`. This host ships two: `domestic` (US-only models — GPT-5.6
+Sol drives `heavy`, OpenRouter Gemini Flash Latest drives the workers) and `international`
+(the cheapest lane across every model — flat-rate coding plans tried first, Kimi K3 and
+Z.ai GLM 5.3, per-token OpenRouter last on every chain). The Codex/ChatGPT subscription is
+**domestic-only**: `international` never touches it, so its shared usage limit stays
+reserved for `domestic`'s driver and its two ChatGPT-bridge fallback hops (Terra, Luna).
+Every chain is two hops now and, except `domestic.heavy` (which has none, by design), ends
+on OpenRouter's `~openai/gpt-latest` alias as the shared last resort. Any session can move
+between fleets without a config edit or a restart — the very next request after a switch
+resolves to the new fleet, in every worker process. The local GPU lanes (`local-orch`,
+`local-sub`) have no fleet variant; they stay unprefixed and shared, exactly as before
+fleets existed.
+
+| Fleet | `heavy` | `flash` | `super-flash` |
+|---|---|---|---|
+| `domestic` | GPT-5.6 Sol (ChatGPT subscription), no chain | `~google/gemini-flash-latest` via OpenRouter at `reasoning.effort: xhigh`, falls back to GPT-5.6 Terra (ChatGPT bridge, same subscription, `xhigh`), then OpenRouter GPT latest (`xhigh`) | same Gemini alias at `reasoning.effort: minimal`, falls back to GPT-5.6 Luna (ChatGPT bridge, reasoning off), then OpenRouter GPT latest (reasoning off) |
+| `international` | Kimi K3 (`anthropic/k3`, `xhigh`), falls back to Z.ai GLM 5.3 (`thinking: enabled`), then OpenRouter GPT latest (`xhigh`) | Z.ai GLM 5.3 Flash (coding plan, `thinking: enabled`), falls back to `~google/gemini-flash-latest` via OpenRouter (`xhigh`), then OpenRouter GPT latest (`xhigh`) | Z.ai GLM 5.3 Flash (`thinking: disabled`), falls back to `~google/gemini-flash-latest` via OpenRouter (`minimal`), then OpenRouter GPT latest (reasoning off) |
+
+```bash
+ferry fleet ls                    # list fleets, primaries, the default, and `keys missing` if unset
+ferry fleet show                  # who am I, my resolved fleet, every client's selection
+ferry fleet use international     # this caller follows `international` from now on
+```
+
+One-shot pin, regardless of the sticky selection:
+```bash
+FERRY_FLEET=international opencode-super
+```
+
+**Two things the CLI does not show.** `ferry fleet show` reports the sticky selection recorded on the host, not a `FERRY_FLEET` pin in your shell — the pin still wins for every request it is set on (it becomes the `X-Ferry-Fleet` header), it is just invisible to `show`. And `ferry opencode` rewrites the ferry provider's `options.headers` map wholesale on every run (`X-Ferry-Client` plus the `{env:FERRY_FLEET}` placeholder), so a header you added there by hand is replaced the next time the takeover runs — put custom headers on a different provider block.
+
+**Headerless Tailscale note.** A client reaching the host through `tailscale serve` (see
+[Remote access](#remote-access-tailscale)) arrives at the front door from loopback with no
+`X-Ferry-Client` header unless it has re-run bootstrap or reset since this release, so it
+resolves as `host` — the HOST's own fleet, not its own sticky selection — until it
+regenerates its config. This is documented behavior, not a bug to work around.
 
 ## The local GPU lanes
 

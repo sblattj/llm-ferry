@@ -2,12 +2,17 @@
 # It is a REAL litellm proxy config, but every model uses litellm's `mock_response`,
 # so the demo needs ZERO API keys and makes ZERO network calls — the OpenAI-compatible
 # endpoint and the /v1/chat/completions round-trip are genuine, the model replies are canned.
-# Mirrors the real ferry shape: an `orch` lane + a `flash` worker lane.
+# Mirrors the real ferry shape: a `heavy` driver lane + a `flash` worker lane.
+# Fleet-shaped since 2026-09-04: a real ferry config would name these
+# `domestic.heavy` / `domestic.flash`; this demo keeps bare `heavy`/`flash`
+# too so the recorded curl in the GIF still matches what a client actually
+# sends (the front door resolves bare names to a fleet — see the Fleets
+# section of README.md — but a single-fleet mock has nothing to resolve).
 model_list:
-  - model_name: orch
+  - model_name: heavy
     litellm_params:
-      model: openai/orch
-      mock_response: "Ferry online. I'm the orch lane, served from this one Mac to every device on your LAN through a single OpenAI-compatible endpoint. Your API keys never leave the host."
+      model: openai/heavy
+      mock_response: "Ferry online. I'm the heavy lane, served from this one Mac to every device on your LAN through a single OpenAI-compatible endpoint. Your API keys never leave the host."
   - model_name: flash
     litellm_params:
       model: openai/flash

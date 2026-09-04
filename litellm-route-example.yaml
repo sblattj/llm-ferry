@@ -94,7 +94,7 @@ model_list:
   # through a table that knows only none/minimal/low/medium/high/xhigh and
   # returns None for anything else — so `max` (or a typo) is silently DROPPED
   # and the lane runs at the backend's own default instead of erroring.
-  - model_name: heavy
+  - model_name: domestic.heavy
     litellm_params:
       model: chatgpt/responses/gpt-5.6-sol
       api_key: "chatgpt-oauth"     # placeholder; the chatgpt provider reads auth.json
@@ -104,19 +104,11 @@ model_list:
       public: true        # advertised in /v1/models — the canonical driver lane
       id: chatgpt-gpt56-sol-heavy
 
-  # Legacy driver name. Same backend as `heavy`, kept resolving so a session
-  # pinned to it mid-run does not 404 after a rename; its own `model_info.id`
-  # so metrics never conflate the two names into one series. Not `public`:
-  # front/ferry_front.py filters /v1/models on that flag, so this name still
-  # routes without being advertised — new clients should bind to `heavy`.
-  - model_name: orchestrator
-    litellm_params:
-      model: chatgpt/responses/gpt-5.6-sol
-      api_key: "chatgpt-oauth"     # placeholder; the chatgpt provider reads auth.json
-      reasoning_effort: xhigh
-      timeout: 600
-    model_info:
-      id: chatgpt-gpt56-sol-legacy
+  # `orchestrator` (and `orch`) deployments DELETED here (fleets, 2026-09-04):
+  # a config with a fleet-prefixed lane name (`domestic.heavy` above) makes
+  # `discover_fleets` non-empty, and once fleets exist the front door's
+  # LEGACY_HEAVY map resolves both legacy names to `heavy` in code — no
+  # deployment block required. See README.md's Fleets section.
 
   # -- Worker lane: cheap high-volume fan-out (example: Gemini 3.8 Flash via
   # OpenRouter) -------------------------------------------------------------
@@ -140,7 +132,7 @@ model_list:
   # lands on whichever provider is cheapest, and nothing downstream can tell.
   #
   # No `api_base`: litellm's `openrouter/` provider already knows the endpoint.
-  - model_name: flash
+  - model_name: domestic.flash
     litellm_params:
       model: openrouter/~google/gemini-flash-latest
       api_key: os.environ/OPENROUTER_API_KEY
@@ -188,7 +180,7 @@ model_list:
   # LOWEST value it accepts. Sent as OpenRouter's own native `reasoning`
   # object (not litellm's `reasoning_effort`) so no provider mapping sits in
   # between.
-  - model_name: super-flash
+  - model_name: domestic.super-flash
     litellm_params:
       model: openrouter/~google/gemini-flash-latest
       api_key: os.environ/OPENROUTER_API_KEY
@@ -215,7 +207,7 @@ model_list:
   # (pay-per-token, no idle cost). Not `public`: a hop routes by name but must
   # never be advertised — a client that selects a hop directly gets no
   # failover behind IT.
-  - model_name: super-flash-luna
+  - model_name: domestic.super-flash-luna
     litellm_params:
       model: openrouter/openai/gpt-5.6-luna
       api_key: os.environ/OPENROUTER_API_KEY
@@ -228,7 +220,7 @@ model_list:
     model_info:
       id: or-luna-sf-fb
 
-  - model_name: flash-terra
+  - model_name: domestic.flash-terra
     litellm_params:
       model: openrouter/openai/gpt-5.6-terra
       api_key: os.environ/OPENROUTER_API_KEY
@@ -388,11 +380,16 @@ router_settings:
   # model_group_alias:
   #   old-name: {model: "heavy", hidden: true}   # resolves, but WITHOUT heavy's chain
 
-  # SIMPLIFIED shape: no fallback chain on the driver lanes (`heavy` /
-  # `orchestrator`) or either local lane — each is ONE deployment by design and
-  # must ERROR, not spill onto a different model, when it fails. The two Gemini
-  # worker lanes each get exactly ONE hop, to their own Luna deployment above,
-  # so a fan-out or a compaction call survives a Gemini outage. litellm
+  # SIMPLIFIED shape: no fallback chain on the driver lane (`domestic.heavy`,
+  # or the `orch`/`orchestrator` names it resolves from) or either local lane —
+  # each is ONE deployment by design and must ERROR, not spill onto a
+  # different model, when it fails. The two Gemini worker lanes each get
+  # exactly ONE hop — `domestic.flash` to Terra, `domestic.super-flash` to
+  # Luna — so a fan-out or a compaction call survives a Gemini outage. litellm
   # fallbacks are single-hop (not transitive): the fallback target's own
-  # fallback list is never chained in, and neither Luna hop has one of its own.
-  fallbacks: [{"flash": ["flash-terra"]}, {"super-flash": ["super-flash-luna"]}]
+  # fallback list is never chained in, and neither hop has one of its own.
+  # Lane names are fleet-prefixed since 2026-09-04 — see README.md's Fleets
+  # section — so a second fleet added to this file would repeat this whole
+  # block under an `<other-fleet>.` prefix, never editing these entries in
+  # place.
+  fallbacks: [{"domestic.flash": ["domestic.flash-terra"]}, {"domestic.super-flash": ["domestic.super-flash-luna"]}]

@@ -42,6 +42,7 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 
 MODEL_LIST_PATHS = frozenset({"/v1/models", "/models"})
 
@@ -777,13 +778,20 @@ class FleetState:
         return self.load()["clients"].get(identity)
 
     def _write(self, doc: dict) -> dict:
-        """tmp + os.replace, so a concurrent worker never reads a half file."""
-        tmp = self.path + ".tmp"
+        """tmp + os.replace, so a concurrent worker never reads a half file.
+
+        The tmp name is UNIQUE PER WRITER, not `path + ".tmp"`: with four
+        workers, a shared name lets writer B truncate A's already-fsynced tmp
+        before A's os.replace, so A would rename B's bytes into place while A's
+        cache still held A's document."""
         directory = os.path.dirname(self.path)
         if directory:
             os.makedirs(directory, exist_ok=True)
+        # Same directory as the target, so os.replace stays same-filesystem.
+        fd, tmp = tempfile.mkstemp(dir=directory or ".",
+                                   prefix=os.path.basename(self.path) + ".")
         try:
-            with open(tmp, "w") as handle:
+            with os.fdopen(fd, "w") as handle:
                 json.dump(doc, handle)
                 handle.flush()
                 os.fsync(handle.fileno())

@@ -1370,5 +1370,251 @@ class TestFleetState(unittest.TestCase):
                          {"default": "international", "clients": {}})
 
 
+class TestCallerIdentity(unittest.TestCase):
+    """Header > loopback 'host' > peer IP, with a control per rank."""
+
+    def test_the_client_header_wins(self):
+        self.assertEqual(FF.caller_identity(
+            {"client": ("127.0.0.1", 5000)},
+            {FF.CLIENT_HEADER: b"stephens-laptop"}), "stephens-laptop")
+
+    def test_control_without_the_header_loopback_is_host(self):
+        self.assertEqual(FF.caller_identity({"client": ("127.0.0.1", 5000)}, {}),
+                         FF.HOST_IDENTITY)
+
+    def test_an_empty_header_is_absent(self):
+        # tailscale serve and an unset {env:FERRY_FLEET} both produce empty
+        # header values; empty must never become an identity of its own.
+        self.assertEqual(FF.caller_identity({"client": ("127.0.0.1", 5000)},
+                                            {FF.CLIENT_HEADER: b"   "}),
+                         FF.HOST_IDENTITY)
+
+    def test_control_off_host_without_the_header_is_the_peer_ip(self):
+        self.assertEqual(FF.caller_identity({"client": ("192.168.1.50", 5000)}, {}),
+                         "192.168.1.50")
+
+    def test_ipv6_loopback_is_host(self):
+        self.assertEqual(FF.caller_identity({"client": ("::1", 5000)}, {}),
+                         FF.HOST_IDENTITY)
+
+    def test_no_peer_at_all_is_the_empty_string(self):
+        self.assertEqual(FF.caller_identity({}, {}), "")
+
+
+class TestResolveModel(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "fleets.json")
+        with open(self.path, "w") as handle:
+            handle.write('{"default": "domestic", "clients": {"host": "international"}}')
+        self.state = FF.FleetState(self.path, FLEETS)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    # rank 1: an explicit fleet prefix
+    def test_an_explicit_fleet_lane_passes_through(self):
+        self.assertEqual(
+            FF.resolve_model("international.flash-or", "domestic", "host", self.state),
+            "international.flash-or")
+
+    def test_control_a_dotted_name_with_an_unknown_prefix_is_not_a_fleet(self):
+        # gpt-3.5-turbo has a dot and is not a fleet lane; it must fall through
+        # to the "not a cloud lane" rule and pass through untouched, never 400.
+        self.assertEqual(FF.resolve_model("gpt-3.5-turbo", "", "host", self.state),
+                         "gpt-3.5-turbo")
+
+    # rank 2: local lanes
+    def test_local_lanes_are_untouched(self):
+        for lane in ("local-orch", "local-sub"):
+            self.assertEqual(FF.resolve_model(lane, "domestic", "host", self.state), lane)
+
+    # rank 3: the header
+    def test_the_header_beats_the_sticky_selection(self):
+        self.assertEqual(FF.resolve_model("heavy", "domestic", "host", self.state),
+                         "domestic.heavy")
+
+    def test_control_no_header_uses_the_sticky_selection(self):
+        self.assertEqual(FF.resolve_model("heavy", "", "host", self.state),
+                         "international.heavy")
+
+    def test_an_empty_header_is_absent(self):
+        self.assertEqual(FF.resolve_model("heavy", "   ", "host", self.state),
+                         "international.heavy")
+
+    # rank 5: the default
+    def test_an_unknown_caller_gets_the_default(self):
+        self.assertEqual(FF.resolve_model("flash", "", "stephens-laptop", self.state),
+                         "domestic.flash")
+
+    def test_control_a_known_caller_does_not(self):
+        self.assertEqual(FF.resolve_model("flash", "", "host", self.state),
+                         "international.flash")
+
+    # the legacy names
+    def test_legacy_names_resolve_as_heavy(self):
+        for legacy in ("orch", "orchestrator"):
+            self.assertEqual(FF.resolve_model(legacy, "domestic", "host", self.state),
+                             "domestic.heavy")
+
+    # pass-through
+    def test_an_unknown_name_is_untouched(self):
+        # litellm 404s it exactly as it does today: the resolver never invents
+        # a lane for a name it does not recognise.
+        self.assertEqual(FF.resolve_model("gpt-4o", "", "host", self.state), "gpt-4o")
+
+    def test_an_empty_model_is_untouched(self):
+        self.assertEqual(FF.resolve_model("", "", "host", self.state), "")
+
+    # errors
+    def test_an_unknown_header_fleet_raises_with_the_list(self):
+        with self.assertRaises(FF.ResolveError) as caught:
+            FF.resolve_model("heavy", "nope", "host", self.state)
+        self.assertEqual(caught.exception.args[0],
+                         "unknown fleet 'nope'; fleets: domestic, international")
+
+    def test_a_stale_sticky_selection_raises_and_never_falls_through(self):
+        with open(self.path, "w") as handle:
+            handle.write('{"default": "domestic", "clients": {"host": "gone"}}')
+        stamp = os.stat(self.path).st_mtime + 5
+        os.utime(self.path, (stamp, stamp))
+        with self.assertRaises(FF.ResolveError) as caught:
+            FF.resolve_model("heavy", "", "host", self.state)
+        self.assertEqual(caught.exception.args[0],
+                         "unknown fleet 'gone'; fleets: domestic, international")
+
+    def test_a_fleet_missing_the_lane_raises(self):
+        state = FF.FleetState(self.path, {"domestic": {"heavy": "a"},
+                                          "international": {"heavy": "b"}})
+        with self.assertRaises(FF.ResolveError) as caught:
+            FF.resolve_model("flash", "domestic", "host", state)
+        self.assertEqual(caught.exception.args[0],
+                         "fleet 'domestic' has no lane 'flash'")
+
+
+class TestRewriteBodyModel(unittest.TestCase):
+    def test_replaces_the_model_and_keeps_every_other_key(self):
+        out = FF.rewrite_body_model(
+            json.dumps({"model": "heavy", "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True}).encode(),
+            "international.heavy")
+        doc = json.loads(out)
+        self.assertEqual(doc["model"], "international.heavy")
+        self.assertEqual(doc["messages"], [{"role": "user", "content": "hi"}])
+        self.assertIs(doc["stream"], True)
+
+    def test_uses_compact_separators(self):
+        out = FF.rewrite_body_model(b'{"model": "heavy", "n": 1}', "domestic.heavy")
+        self.assertEqual(out, b'{"model":"domestic.heavy","n":1}')
+
+    def test_returns_bytes(self):
+        self.assertIsInstance(FF.rewrite_body_model(b'{"model":"heavy"}', "domestic.heavy"),
+                              bytes)
+
+    def test_unicode_survives_the_round_trip(self):
+        out = FF.rewrite_body_model(
+            json.dumps({"model": "heavy", "q": "naïve — ok"}).encode(), "domestic.heavy")
+        self.assertEqual(json.loads(out)["q"], "naïve — ok")
+
+
+class TestSynthesizeCatalogue(unittest.TestCase):
+    """Bare lane names are synthesized from the caller's resolved fleet."""
+
+    PUBLIC = frozenset({"domestic.heavy", "domestic.flash", "domestic.super-flash",
+                        "international.heavy", "international.flash",
+                        "local-orch", "local-sub"})
+
+    def _payload(self, *names):
+        return json.dumps({"object": "list",
+                           "data": [{"id": n, "object": "model", "owned_by": "ferry"}
+                                    for n in names]}).encode()
+
+    def test_prepends_one_bare_entry_per_public_cloud_lane_of_the_fleet(self):
+        out = FF.synthesize_catalogue(
+            self._payload("domestic.heavy", "domestic.flash", "domestic.super-flash",
+                          "domestic.flash-luna", "international.heavy",
+                          "international.flash", "local-orch", "local-sub"),
+            self.PUBLIC, FLEETS, "domestic")
+        self.assertEqual(ids(out)[:3], ["heavy", "flash", "super-flash"])
+        self.assertNotIn("domestic.flash-luna", ids(out))
+        self.assertIn("domestic.heavy", ids(out))
+        self.assertIn("local-orch", ids(out))
+
+    def test_control_the_other_fleet_synthesizes_only_its_own_public_lanes(self):
+        # international.super-flash is NOT public here, so no bare
+        # "super-flash" may appear for a caller on international.
+        out = FF.synthesize_catalogue(
+            self._payload("domestic.heavy", "international.heavy", "international.flash",
+                          "international.super-flash", "local-orch"),
+            self.PUBLIC, FLEETS, "international")
+        self.assertEqual(ids(out)[:2], ["heavy", "flash"])
+        self.assertNotIn("super-flash", ids(out))
+        self.assertNotIn("international.super-flash", ids(out))
+
+    def test_a_bare_entry_copies_the_source_entry_with_the_id_replaced(self):
+        out = FF.synthesize_catalogue(
+            self._payload("domestic.heavy", "local-orch"), self.PUBLIC, FLEETS, "domestic")
+        entry = next(e for e in json.loads(out)["data"] if e["id"] == "heavy")
+        self.assertEqual(entry, {"id": "heavy", "object": "model", "owned_by": "ferry"})
+
+    def test_a_lane_absent_from_the_upstream_body_is_not_invented(self):
+        out = FF.synthesize_catalogue(
+            self._payload("domestic.heavy", "local-orch"), self.PUBLIC, FLEETS, "domestic")
+        self.assertEqual(ids(out), ["heavy", "domestic.heavy", "local-orch"])
+
+    def test_an_unknown_fleet_synthesizes_nothing_but_still_filters(self):
+        out = FF.synthesize_catalogue(
+            self._payload("domestic.heavy", "domestic.flash-luna"),
+            self.PUBLIC, FLEETS, "nope")
+        self.assertEqual(ids(out), ["domestic.heavy"])
+
+    def test_empty_public_set_returns_none(self):
+        self.assertIsNone(FF.synthesize_catalogue(
+            self._payload("domestic.heavy"), frozenset(), FLEETS, "domestic"))
+
+    def test_non_json_returns_none(self):
+        self.assertIsNone(FF.synthesize_catalogue(
+            b"<html>gateway timeout</html>", self.PUBLIC, FLEETS, "domestic"))
+
+    def test_unexpected_shape_returns_none(self):
+        self.assertIsNone(FF.synthesize_catalogue(
+            json.dumps({"error": "nope"}).encode(), self.PUBLIC, FLEETS, "domestic"))
+        self.assertIsNone(FF.synthesize_catalogue(
+            json.dumps([1, 2]).encode(), self.PUBLIC, FLEETS, "domestic"))
+
+    def test_would_empty_a_populated_catalogue_returns_none(self):
+        self.assertIsNone(FF.synthesize_catalogue(
+            self._payload("a", "b"), self.PUBLIC, FLEETS, "domestic"))
+
+    def test_nothing_to_do_returns_none(self):
+        # Every entry public and nothing to synthesize: hand back the upstream
+        # bytes rather than re-serializing them.
+        self.assertIsNone(FF.synthesize_catalogue(
+            self._payload("local-orch", "local-sub"), self.PUBLIC, FLEETS, "nope"))
+
+
+class TestBearerOk(unittest.TestCase):
+    def test_no_master_key_lets_everything_through(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("LITELLM_MASTER_KEY", None)
+            self.assertTrue(FF._bearer_ok({}))
+
+    def test_an_empty_master_key_lets_everything_through(self):
+        with unittest.mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": ""}):
+            self.assertTrue(FF._bearer_ok({}))
+
+    def test_a_master_key_requires_the_matching_bearer(self):
+        with unittest.mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": "sk-ferry"}):
+            self.assertTrue(FF._bearer_ok({b"authorization": b"Bearer sk-ferry"}))
+            self.assertFalse(FF._bearer_ok({b"authorization": b"Bearer wrong"}))
+            self.assertFalse(FF._bearer_ok({b"authorization": b"sk-ferry"}))
+            self.assertFalse(FF._bearer_ok({}))
+
+    def test_the_bearer_scheme_is_case_insensitive(self):
+        with unittest.mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": "sk-ferry"}):
+            self.assertTrue(FF._bearer_ok({b"authorization": b"bearer sk-ferry"}))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

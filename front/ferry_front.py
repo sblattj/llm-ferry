@@ -836,6 +836,129 @@ class FleetState:
         }
 
 
+class ResolveError(Exception):
+    """A fleet or lane named by a request does not exist.
+
+    Answered as HTTP 400 with the message verbatim. Nothing ever falls through
+    to the default on a bad name: silently serving a different lineup than the
+    one asked for is the one failure mode this feature must not have."""
+
+
+def _header_text(headers: dict, name: bytes) -> str:
+    value = (headers or {}).get(name)
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("utf-8", "replace")
+        except Exception:
+            return ""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def caller_identity(scope, headers: dict) -> str:
+    """Who is asking: X-Ferry-Client > 'host' on loopback > the peer IP.
+
+    A headerless client reaching the host through `tailscale serve` arrives
+    from loopback and is therefore 'host'. That is documented, not worked
+    around: regenerated client configs carry the header."""
+    named = _header_text(headers, CLIENT_HEADER)
+    if named:
+        return named
+    scope = scope or {}
+    if _is_loopback_client(scope):
+        return HOST_IDENTITY
+    client = scope.get("client")
+    return str(client[0]) if client else ""
+
+
+def resolve_model(model: str, header_fleet: str, identity: str,
+                  state: "FleetState") -> str:
+    """The bare lane name a client sent, rewritten to a real fleet lane.
+
+    Precedence, first match wins (spec §4): an explicit fleet prefix, a local
+    lane, the X-Ferry-Fleet header, the caller's sticky selection, the
+    host-wide default. `orch`/`orchestrator` are folded into `heavy` first.
+    Anything that is not a cloud lane after that fold passes through untouched
+    so litellm answers it exactly as it does today."""
+    if not isinstance(model, str) or not model:
+        return model
+    fleets = state.fleets
+    if "." in model and model.split(".", 1)[0] in fleets:
+        return model
+    if model in LOCAL_LANES:
+        return model
+    lane = "heavy" if model in LEGACY_HEAVY else model
+    if lane not in CLOUD_LANES:
+        return model
+    fleet = (header_fleet or "").strip() or state.selection_for(identity) or state.default()
+    if fleet not in fleets:
+        raise ResolveError("unknown fleet %r; fleets: %s"
+                           % (fleet, ", ".join(fleets)))
+    if lane not in fleets[fleet]:
+        raise ResolveError("fleet %r has no lane %r" % (fleet, lane))
+    return "%s.%s" % (fleet, lane)
+
+
+def rewrite_body_model(body: bytes, model: str) -> bytes:
+    """The request body with its top-level `model` replaced.
+
+    Compact separators because the body is regenerated anyway and every byte
+    is re-sent upstream; the ASGI content-length is recomputed by the caller
+    from what this returns."""
+    doc = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
+    doc["model"] = model
+    return json.dumps(doc, separators=(",", ":")).encode()
+
+
+def synthesize_catalogue(payload: bytes, public: frozenset, fleets: dict,
+                         fleet: str) -> "bytes | None":
+    """filter_catalogue, plus a bare entry per public cloud lane of `fleet`.
+
+    A client on `international` lists heavy/flash/super-flash (its own, bare)
+    alongside every public fleet lane, so `ferry opencode`'s catalogue check,
+    `ferry status` and host-reset's verifier keep matching bare names while a
+    curious client can still see and pin a specific fleet lane.
+
+    Same fail-open contract as filter_catalogue: None means "send the upstream
+    bytes untouched"."""
+    if not public:
+        return None
+    try:
+        doc = json.loads(payload)
+    except Exception:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), list):
+        return None
+    kept = [item for item in doc["data"]
+            if isinstance(item, dict) and item.get("id") in public]
+    if doc["data"] and not kept:
+        return None
+    bare = []
+    by_id = {item["id"]: item for item in kept}
+    for lane in CLOUD_LANES:
+        name = "%s.%s" % (fleet, lane)
+        if name in public and name in by_id:
+            entry = dict(by_id[name])
+            entry["id"] = lane
+            bare.append(entry)
+    if not bare and len(kept) == len(doc["data"]):
+        return None
+    doc["data"] = bare + kept
+    return json.dumps(doc).encode()
+
+
+def _bearer_ok(headers: dict) -> bool:
+    """Whether a control-plane request carries the configured master key.
+
+    No key configured means no check — the same posture litellm itself takes,
+    and the host's own loopback tooling relies on it."""
+    key = (os.environ.get("LITELLM_MASTER_KEY") or "").strip()
+    if not key:
+        return True
+    auth = _header_text(headers, b"authorization")
+    parts = auth.split(None, 1)
+    return len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == key
+
+
 class LaneCatalogueFilter:
     """ASGI middleware that filters the model listing and nothing else."""
 

@@ -47,7 +47,7 @@ Sleep 3500ms
 Type `curl -s --retry 30 --retry-connrefused http://127.0.0.1:8190/v1/models | python3 -c "import sys,json;print('serving:', ', '.join(m['id'] for m in json.load(sys.stdin)['data']))"` Enter
 Sleep 6500ms
 
-Type `curl -s http://127.0.0.1:8190/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"orchestrator","messages":[{"role":"user","content":"who are you?"}]}' | python3 -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['message']['content'])"` Enter
+Type `curl -s http://127.0.0.1:8190/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"heavy","messages":[{"role":"user","content":"who are you?"}]}' | python3 -c "import sys,json;print(json.load(sys.stdin)['choices'][0]['message']['content'])"` Enter
 Sleep 4500ms
 
 Type `# Any laptop, editor, or device on the LAN points here. The keys stay on the host.` Enter

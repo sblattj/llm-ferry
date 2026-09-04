@@ -47,7 +47,8 @@ INSTALL_PORT = "8090"
 # carry ambient ANTHROPIC_* values (this host wires its own agents through
 # ferry), which would fake both the behavioral assertions and the control.
 ANTHROPIC_VARS = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL",
-                  "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_THINKING")
+                  "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CLAUDE_CODE_DISABLE_THINKING",
+                  "ANTHROPIC_CUSTOM_HEADERS")
 
 
 def _monolith_supports_claude():
@@ -445,6 +446,92 @@ class ScriptContractTest(unittest.TestCase):
             claude, main,
             "the claude module must assemble before ferry-main.zsh (dispatch last)",
         )
+
+
+class CustomHeadersTest(ClaudeHarness):
+    """v1.26.0 - the wrappers carry X-Ferry-Client / X-Ferry-Fleet so the front
+    door's fleet resolver (front/ferry_front.py) can identify the caller and
+    honour a one-shot FERRY_FLEET override, per
+    docs/superpowers/specs/2026-09-04-fleets-design.md §6.
+    """
+
+    def write_client_profile_named(self, name):
+        fdir = os.path.join(self.home, ".config", "ferry")
+        os.makedirs(fdir, exist_ok=True)
+        with open(os.path.join(fdir, "client.json"), "w") as f:
+            json.dump({"host": INSTALL_HOST, "port": INSTALL_PORT, "name": name}, f)
+
+    def test_a_host_install_bakes_the_host_identity(self):
+        # No client.json in this throwaway $HOME: CLIENT_MODE=0, so
+        # CLIENT_NAME resolves to the literal "host" (lib/ferry-core.zsh).
+        self.assertEqual(self.run_install().returncode, 0)
+        text = self.rc_text()
+        self.assertEqual(
+            text.count('ANTHROPIC_CUSTOM_HEADERS="X-Ferry-Client: host'), 3)
+
+    def test_a_named_client_profile_bakes_the_client_name(self):
+        self.write_client_profile_named("laptop")
+        self.assertEqual(self.run_install().returncode, 0)
+        text = self.rc_text()
+        self.assertEqual(
+            text.count('ANTHROPIC_CUSTOM_HEADERS="X-Ferry-Client: laptop'), 3)
+
+    def test_the_fleet_conditional_survives_install_time_substitution_unexpanded(self):
+        # The template is a QUOTED heredoc (<<'EOF' in
+        # _ferry_install_claude_wrappers), so ${FERRY_FLEET:+...} must reach
+        # ~/.zshrc byte-for-byte and only expand when the wrapper FUNCTION runs.
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertIn("${FERRY_FLEET:+", self.rc_text())
+
+    def test_the_installed_block_parses_on_its_own(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        block = self.canonical_block()
+        frag = os.path.join(self.home, "block-fragment.zsh")
+        with open(frag, "w") as f:
+            f.write(block)
+        r = subprocess.run(["zsh", "-n", frag], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, f"the installed block does not parse: {r.stderr}")
+
+    def test_fleet_header_only_appears_when_ferry_fleet_is_set(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        bindir = os.path.join(self.home, "bin")
+        os.makedirs(bindir)
+        # The wrappers invoke `command claude "$@"`, which bypasses a shell
+        # FUNCTION of the same name - so the fake claude must be a real
+        # executable on PATH, not a function (same pattern as
+        # test_the_functions_actually_select_the_right_lanes above).
+        stub = os.path.join(bindir, "claude")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\necho "HEADERS=$ANTHROPIC_CUSTOM_HEADERS"\n')
+        os.chmod(stub, 0o755)
+
+        probe = os.path.join(self.home, "probe.zsh")
+        with open(probe, "w") as f:
+            f.write(f"source {self.rc}\nclaude-ferry\n")
+
+        env_with_fleet = self.env(path_prefix=bindir)
+        # An ambient ANTHROPIC_CUSTOM_HEADERS would fake this test's own
+        # control (see the ANTHROPIC_VARS step above) - scrub it explicitly
+        # here too, belt and suspenders with the harness-wide scrub.
+        env_with_fleet.pop("ANTHROPIC_CUSTOM_HEADERS", None)
+        env_with_fleet["FERRY_FLEET"] = "international"
+        r_with = subprocess.run(["zsh", probe], capture_output=True, text=True,
+                                env=env_with_fleet)
+
+        env_without_fleet = self.env(path_prefix=bindir)
+        env_without_fleet.pop("ANTHROPIC_CUSTOM_HEADERS", None)
+        env_without_fleet.pop("FERRY_FLEET", None)
+        r_without = subprocess.run(["zsh", probe], capture_output=True, text=True,
+                                   env=env_without_fleet)
+
+        self.assertEqual(r_with.returncode, 0, r_with.stderr)
+        self.assertEqual(r_without.returncode, 0, r_without.stderr)
+        self.assertNotEqual(r_with.stdout, r_without.stdout)
+        # The real newline between the two headers, not just the fleet
+        # header's own text - a construct that emits the five literal bytes
+        # `$'\n'` instead of a newline would still contain the substring
+        # "X-Ferry-Fleet: international" and pass a weaker assertion.
+        self.assertIn("X-Ferry-Client: host\nX-Ferry-Fleet: international", r_with.stdout)
 
 
 if __name__ == "__main__":

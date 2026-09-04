@@ -2266,5 +2266,61 @@ class TestFleetControlPlane(FleetHarness):
         self.assertFalse(FF.is_inference_path(FF.FLEET_PATH))
 
 
+class TestFleetGapLog(unittest.TestCase):
+    """build_app imports litellm and cannot run here, so its one piece of
+    logic — the startup gap report — is a module function the suite drives
+    directly."""
+
+    def test_a_fleet_missing_a_cloud_lane_is_reported(self):
+        import io
+        buf = io.StringIO()
+        gaps = FF.log_fleet_gaps(
+            {"domestic": {"heavy": "a", "flash": "b", "super-flash": "c"},
+             "international": {"heavy": "a"}}, stream=buf)
+        self.assertEqual(len(gaps), 2)
+        text = buf.getvalue()
+        self.assertIn("international", text)
+        self.assertIn("flash", text)
+        self.assertIn("super-flash", text)
+        self.assertNotIn("domestic", text)
+
+    def test_a_complete_lineup_prints_nothing(self):
+        import io
+        buf = io.StringIO()
+        gaps = FF.log_fleet_gaps(
+            {"domestic": {"heavy": "a", "flash": "b", "super-flash": "c"}},
+            stream=buf)
+        self.assertEqual(gaps, [])
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_no_fleets_prints_nothing(self):
+        import io
+        buf = io.StringIO()
+        self.assertEqual(FF.log_fleet_gaps({}, stream=buf), [])
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_a_broken_stream_never_raises(self):
+        # Startup logging must not be able to take the front door down.
+        class Boom:
+            def write(self, _):
+                raise IOError("no stderr")
+
+        self.assertEqual(
+            FF.log_fleet_gaps({"x": {}}, stream=Boom()),
+            FF.fleet_gaps({"x": {}}))
+
+    def test_state_is_none_when_there_are_no_fleets(self):
+        # The wiring build_app performs, asserted on the same expression.
+        fleets = FF.discover_fleets("/nonexistent/litellm.yaml")
+        self.assertEqual(fleets, {})
+        state = FF.FleetState(FF.fleet_state_path("/tmp/x/litellm.yaml"),
+                              fleets) if fleets else None
+        self.assertIsNone(state)
+        mw = LaneCatalogueFilter(RecordingApp(b""), LANES,
+                                 fleets=fleets, state=state)
+        self.assertIsNone(mw.state)
+        self.assertEqual(mw.fleets, {})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

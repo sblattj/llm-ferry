@@ -1485,6 +1485,27 @@ def should_wrap(public) -> bool:
     return bool(public) or tap_enabled() or strip_headers_enabled() or True
 
 
+def log_fleet_gaps(fleets, stream=None) -> list:
+    """Print each fleet's missing cloud lane to stderr; return the gap list.
+
+    A typo in a fleet prefix degrades ONE lane in ONE fleet (that lane 400s
+    with the fleet's real lane list) rather than taking the front door down,
+    so the only thing left to do about it is say so at startup, loudly, once
+    per worker. Never raises: a startup log is not worth an outage.
+    """
+    gaps = fleet_gaps(fleets)
+    try:
+        out = stream if stream is not None else sys.stderr
+        for gap in gaps:
+            out.write("ferry_front: %s\n" % gap)
+        flush = getattr(out, "flush", None)
+        if flush is not None:
+            flush()
+    except Exception:
+        pass
+    return gaps
+
+
 def build_app():
     """Import litellm's proxy app and wrap it. Used as the uvicorn app factory.
 
@@ -1494,11 +1515,17 @@ def build_app():
     """
     from litellm.proxy.proxy_server import app as litellm_app
 
-    public = _public_lane_names(os.environ.get("CONFIG_FILE_PATH", ""))
+    config_path = os.environ.get("CONFIG_FILE_PATH", "")
+    public = _public_lane_names(config_path)
+    fleets = discover_fleets(config_path)
+    log_fleet_gaps(fleets)
+    # No fleets discovered => state is None => the middleware never reads a
+    # request body and behaves exactly as it did before fleets existed.
+    state = FleetState(fleet_state_path(config_path), fleets) if fleets else None
     if not should_wrap(public):
         # Nothing to do — behave exactly like plain litellm.
         return litellm_app
-    return LaneCatalogueFilter(litellm_app, public)
+    return LaneCatalogueFilter(litellm_app, public, fleets=fleets, state=state)
 
 
 def _prepare_multiproc_metrics(port: int) -> None:

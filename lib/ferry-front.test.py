@@ -2006,5 +2006,91 @@ class TestFleetWarn(unittest.TestCase):
         self.assertIn("other", out.getvalue())
 
 
+class TestFleetCatalogue(FleetHarness):
+    PUBLIC = frozenset({
+        "domestic.heavy", "domestic.flash", "domestic.super-flash",
+        "international.heavy", "international.flash", "international.super-flash",
+        "local-orch", "local-sub"})
+
+    def _payload(self, *names):
+        # Own builder, not the shared `body()` helper: `body()` emits only
+        # `{"id": i, "object": "model"}`, which is byte-identical across
+        # fleets, so a fleet-carrying field is needed for the dom/intl and
+        # sticky/plain assertions below to mean anything. Mirrors Task 3's
+        # `_payload`, with `owned_by` set to the real per-lane model string
+        # (from FLEETS) so `domestic.flash` and `international.flash` differ.
+        def owner(name):
+            if "." in name:
+                fleet, lane = name.split(".", 1)
+                return FLEETS.get(fleet, {}).get(lane, name)
+            return name
+        return json.dumps({"object": "list",
+                           "data": [{"id": n, "object": "model", "owned_by": owner(n)}
+                                    for n in names]}).encode()
+
+    def _list(self, headers=None, client=("192.168.1.50", 5000), state="use"):
+        payload = self._payload("domestic.heavy", "domestic.flash", "domestic.super-flash",
+                       "international.heavy", "international.flash",
+                       "international.super-flash", "local-orch", "local-sub",
+                       "domestic.flash-luna")
+        app = RecordingApp(payload)
+        mw = self.mw(app, state=state, public=self.PUBLIC)
+        scope = {"type": "http", "path": "/v1/models", "method": "GET",
+                 "client": client, "headers": list(headers or [])}
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(m):
+            sent.append(m)
+
+        asyncio.run(mw(scope, receive, send))
+        return collect(sent)
+
+    def test_the_default_fleet_gets_bare_lanes_prepended(self):
+        _, payload = self._list()
+        listed = ids(payload)
+        self.assertEqual(listed[:3], ["heavy", "flash", "super-flash"])
+        self.assertIn("international.flash", listed)
+        self.assertNotIn("domestic.flash-luna", listed)   # hops stay hidden
+
+    def test_the_header_fleet_decides_which_lane_the_bare_name_shadows(self):
+        # Same request, one header apart: the CONTROL for the test above. The
+        # bare names are identical; what differs is which fleet they came from,
+        # which the entry's own copied fields carry.
+        _, dom = self._list(headers=[(b"x-ferry-fleet", b"domestic")])
+        _, intl = self._list(headers=[(b"x-ferry-fleet", b"international")])
+        self.assertEqual(ids(dom)[:3], ids(intl)[:3])
+        self.assertNotEqual(dom, intl)
+
+    def test_a_sticky_selection_picks_the_fleet(self):
+        self.write_state({"default": "domestic", "clients": {"laptop": "international"}})
+        _, sticky = self._list(headers=[(b"x-ferry-client", b"laptop")])
+        _, plain = self._list(headers=[(b"x-ferry-client", b"other")])
+        self.assertNotEqual(sticky, plain)
+        self.assertEqual(ids(sticky)[:3], ["heavy", "flash", "super-flash"])
+
+    def test_state_none_still_only_filters(self):
+        _, payload = self._list(state=None)
+        listed = ids(payload)
+        self.assertNotIn("heavy", listed)
+        self.assertIn("domestic.heavy", listed)
+        self.assertNotIn("domestic.flash-luna", listed)
+
+    def test_an_unknown_header_fleet_falls_back_to_plain_filtering(self):
+        # Fail-open: the catalogue is a read, not a routing decision. A bad
+        # header gets its 400 on the next inference call, where it matters.
+        _, payload = self._list(headers=[(b"x-ferry-fleet", b"nope")])
+        listed = ids(payload)
+        self.assertNotIn("heavy", listed)
+        self.assertIn("domestic.heavy", listed)
+
+    def test_content_length_matches_the_synthesized_body(self):
+        start, payload = self._list()
+        length = dict((k.lower(), v) for k, v in start["headers"])[b"content-length"]
+        self.assertEqual(int(length), len(payload))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

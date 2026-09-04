@@ -2214,6 +2214,27 @@ class TestFleetControlPlane(FleetHarness):
         self.assertEqual(status, 400)
         self.assertEqual(doc["error"]["type"], "ferry_fleet")
 
+    def test_default_true_with_a_null_fleet_is_400(self):
+        status, doc = self.call("POST", {"fleet": None, "default": True},
+                                client=("127.0.0.1", 5000))
+        self.assertEqual(status, 400)
+        self.assertEqual(doc["error"]["type"], "ferry_fleet")
+        self.assertIn("needs a fleet name, not null", doc["error"]["message"])
+        with open(self.state_path) as handle:
+            self.assertEqual(json.load(handle)["default"], "domestic")
+
+    def test_a_string_default_is_not_the_default(self):
+        # `default` is honoured only as the literal True, so the STRING "true"
+        # sets the caller's own selection instead. Pinned so a future
+        # bool(doc.get("default")) refactor trips here.
+        status, _ = self.call("POST", {"fleet": "international", "default": "true"},
+                              client=("127.0.0.1", 5000))
+        self.assertEqual(status, 200)
+        with open(self.state_path) as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["default"], "domestic")
+        self.assertEqual(saved["clients"], {"host": "international"})
+
     def test_post_a_non_json_body_is_400(self):
         app = RecordingApp(b"{}")
         mw = self.mw(app)

@@ -1536,6 +1536,15 @@ function renderFleets(st){
     const r=el('div','row');
     r.appendChild(el('span',null,label));
     const sel=el('select');
+    // A sticky selection naming a fleet the yaml no longer has matches no
+    // <option>, and a <select> with nothing selected displays its FIRST
+    // option — so the row would claim the wrong fleet is in effect. Show the
+    // real value instead, disabled because it is not a thing to switch back to.
+    if(current && !names.includes(current)){
+      const o=el('option',null,current+' (unknown)');
+      o.value=current; o.disabled=true; o.selected=true;
+      sel.appendChild(o);
+    }
     names.forEach(n=>{
       const o=el('option',null,n); o.value=n;
       if(n===current) o.selected=true;

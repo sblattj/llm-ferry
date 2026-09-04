@@ -12,6 +12,7 @@ case "$COMMAND" in
   install)       cmd_install ;;
   up)            cmd_up "$@" ;;
   down)          cmd_down ;;
+  reload)        cmd_reload ;;
   status)        cmd_status ;;
   share)         cmd_share ;;
   msg)           cmd_msg "$@" ;;

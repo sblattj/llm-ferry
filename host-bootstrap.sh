@@ -34,13 +34,18 @@ echo ">>> Installing/Updating 'mlx-vlm' tool via uv..."
 uv tool install mlx-vlm --with jinja2 --force
 
 # 4. Install litellm for cloud proxying
-# Pin litellm + fastapi as a matched, tested set. litellm 1.97.0's proxy imports
-# fastapi.dependencies.utils.get_flat_dependant, which FastAPI removed after
-# 0.136.3. Left unpinned, uv resolves fastapi 0.141+ and the proxy dies at
-# startup with a misleading "ModuleNotFoundError: No module named 'proxy_server'".
+# Pin litellm to the version the stack is verified against. 1.99.0 restamps the
+# response `model` field to the client-requested lane name (the lane abstraction
+# clients rely on) and uses fastapi's current get_flat_params API, so fastapi is
+# deliberately NOT pinned (1.99.0 runs with 0.141+). Two non-default deps the
+# proxy imports at runtime even in a no-DB setup:
+#   prisma            — the auth-error handler imports it; without it an authed
+#                       request 500s instead of 401ing. Required since v1.22.0.
+#   prometheus_client — litellm's native /metrics (callbacks: ["prometheus"])
+#                       crashes startup without it.
 # The [proxy] extra is what pulls fastapi/uvicorn in the first place.
 echo ">>> Installing/Updating 'litellm' via uv..."
-uv tool install 'litellm[proxy]==1.97.0' --with 'fastapi==0.136.3' --force
+uv tool install 'litellm[proxy]==1.99.0' --with 'prisma' --with 'prometheus_client' --force
 
 # 5. Download high-performance default models (using hf tool if available, else huggingface-cli)
 # Note: the LAN "ferry" transfer commands (offer/pull/get/send/receive) need no extra installs —

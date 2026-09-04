@@ -81,18 +81,22 @@ cmd_install() {
     uv tool install mlx-vlm --with jinja2 --force
   fi
 
-  # Install litellm for cloud proxying
-  # Pin litellm + fastapi as a matched, tested set. litellm 1.97.0's proxy imports
-  # fastapi.dependencies.utils.get_flat_dependant, which FastAPI removed after
-  # 0.136.3. Left unpinned, uv resolves fastapi 0.141+ and the proxy dies at
-  # startup with a misleading "ModuleNotFoundError: No module named 'proxy_server'".
+  # Install litellm for cloud proxying.
+  # Pin litellm to the version the stack is verified against. 1.99.0 restamps
+  # the response `model` field to the client-requested lane name (the lane-name
+  # abstraction clients rely on), uses fastapi's current get_flat_params API
+  # (fastapi is deliberately NOT pinned — 1.99.0 runs with 0.141+), and needs
+  # two non-default deps the proxy imports at runtime even in a no-DB setup:
+  #   prisma            — the auth-error handler imports it (auth_exception_handler
+  #                       -> db/exception_handler); without it an authed request
+  #                       500s instead of 401ing. Required since v1.22.0.
+  #   prometheus_client — litellm's native /metrics; without it, setting
+  #                       `callbacks: ["prometheus"]` in litellm.yaml crashes
+  #                       startup. Lets the observ Grafana stack chart per-model
+  #                       usage, failures, and fallback events.
   # The [proxy] extra is what pulls fastapi/uvicorn in the first place.
-  # prometheus_client is what litellm's native /metrics needs: without it, setting
-  # `callbacks: ["prometheus"]` in litellm.yaml crashes startup with
-  # "ModuleNotFoundError: No module named 'prometheus_client'". Bundling it here lets
-  # the observ Grafana stack chart per-model usage, failures, and fallback events.
   echo ">>> Installing 'litellm' via uv..."
-  uv tool install 'litellm[proxy]==1.97.0' --with 'fastapi==0.136.3' --with 'prometheus_client' --force
+  uv tool install 'litellm[proxy]==1.99.0' --with 'prisma' --with 'prometheus_client' --force
 
   # Download default local models (macOS only — Linux has no local MLX serving).
   if (( IS_MAC )); then

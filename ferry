@@ -3898,8 +3898,10 @@ unalias claude-ferry claude-ferry-local claude-ferry-super 2>/dev/null
 # claude-ferry: the CLOUD pair — heavy drives, flash runs subagents and the
 # haiku-slot background calls.
 claude-ferry() {
+  local nl=$'\n'
   env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
       ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
+      ANTHROPIC_CUSTOM_HEADERS="X-Ferry-Client: __FERRY_CL_NAME__${FERRY_FLEET:+${nl}X-Ferry-Fleet: $FERRY_FLEET}" \
       ANTHROPIC_MODEL=heavy \
       ANTHROPIC_DEFAULT_HAIKU_MODEL=flash \
       CLAUDE_CODE_SUBAGENT_MODEL=flash \
@@ -3914,8 +3916,10 @@ claude-ferry() {
 # count against max_tokens AND the GPU lanes' KV budget, which is the same
 # reason `ferry opencode` caps local-lane output at 8k.
 claude-ferry-local() {
+  local nl=$'\n'
   env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
       ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
+      ANTHROPIC_CUSTOM_HEADERS="X-Ferry-Client: __FERRY_CL_NAME__${FERRY_FLEET:+${nl}X-Ferry-Fleet: $FERRY_FLEET}" \
       ANTHROPIC_MODEL=local-orch \
       ANTHROPIC_DEFAULT_HAIKU_MODEL=local-sub \
       CLAUDE_CODE_SUBAGENT_MODEL=local-sub \
@@ -3929,8 +3933,10 @@ claude-ferry-local() {
 # claude-ferry-super: heavy drives; super-flash covers background tasks AND
 # subagents. The cheapest cloud profile.
 claude-ferry-super() {
+  local nl=$'\n'
   env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
       ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
+      ANTHROPIC_CUSTOM_HEADERS="X-Ferry-Client: __FERRY_CL_NAME__${FERRY_FLEET:+${nl}X-Ferry-Fleet: $FERRY_FLEET}" \
       ANTHROPIC_MODEL=heavy \
       ANTHROPIC_DEFAULT_HAIKU_MODEL=super-flash \
       CLAUDE_CODE_SUBAGENT_MODEL=super-flash \
@@ -3945,6 +3951,7 @@ EOF
   block="${block//__FERRY_CL_HOST__/$cl_host}"
   block="${block//__FERRY_CL_PORT__/$cl_port}"
   block="${block//__FERRY_CL_KEY__/$cl_key}"
+  block="${block//__FERRY_CL_NAME__/$CLIENT_NAME}"
   print -r -- "$block" >> "$rc"
 
   echo ">>> claude shell wrappers installed in $rc:"

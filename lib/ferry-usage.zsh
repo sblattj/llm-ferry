@@ -44,6 +44,9 @@ Commands:
                        claude-ferry / claude-ferry-local wrappers (cloud: heavy/flash,
                        local: local-orch/local-sub) and records the lane map
                         ferry claude [--host H] [--port P] [--wrappers]
+  fleet              [Dual] Read or switch which fleet (routing set) bare lane
+                       names resolve to
+                        ferry fleet ls | show | use <fleet> [--default] | use --clear
 
 Ferrying models & files across the LAN:
   offer <path>...    [Host] Record files/dirs in ~/.config/ferry/offered.json for clients to fetch

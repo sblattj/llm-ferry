@@ -32,6 +32,7 @@ case "$COMMAND" in
   env)           cmd_env "$@" ;;
   opencode)      cmd_opencode "$@" ;;
   claude)        cmd_claude "$@" ;;
+  fleet)         cmd_fleet "$@" ;;
   update)        cmd_update "$@" ;;
   dash)          cmd_dash "$@" ;;
   --help|-h)     usage ;;

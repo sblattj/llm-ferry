@@ -1467,6 +1467,13 @@ class TestResolveModel(unittest.TestCase):
     def test_an_empty_model_is_untouched(self):
         self.assertEqual(FF.resolve_model("", "", "host", self.state), "")
 
+    def test_with_no_fleets_the_resolver_is_a_no_op(self):
+        # Pre-fleets config: no dotted names, nothing is rewritten and
+        # nothing raises, whatever the header or sticky selection says.
+        state = FF.FleetState(self.path, {})
+        for name in ("heavy", "orch", "flash", "local-orch", "anything"):
+            self.assertEqual(FF.resolve_model(name, "domestic", "host", state), name)
+
     # errors
     def test_an_unknown_header_fleet_raises_with_the_list(self):
         with self.assertRaises(FF.ResolveError) as caught:

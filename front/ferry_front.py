@@ -882,6 +882,11 @@ def resolve_model(model: str, header_fleet: str, identity: str,
     if not isinstance(model, str) or not model:
         return model
     fleets = state.fleets
+    if not fleets:
+        # Fail-open: a config with no dotted names discovers no fleets, and
+        # with no fleets there is nothing to resolve to. Without this, the
+        # default falls back to the empty string and every cloud lane 400s.
+        return model
     if "." in model and model.split(".", 1)[0] in fleets:
         return model
     if model in LOCAL_LANES:
@@ -903,7 +908,12 @@ def rewrite_body_model(body: bytes, model: str) -> bytes:
 
     Compact separators because the body is regenerated anyway and every byte
     is re-sent upstream; the ASGI content-length is recomputed by the caller
-    from what this returns."""
+    from what this returns.
+
+    Caller contract: only call this when the body is a JSON OBJECT carrying a
+    top-level string `model`, and wrap the call in `except Exception` — a
+    non-JSON body raises, and an object without a `model` key silently GAINS
+    one rather than being left alone."""
     doc = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
     doc["model"] = model
     return json.dumps(doc, separators=(",", ":")).encode()
@@ -917,6 +927,11 @@ def synthesize_catalogue(payload: bytes, public: frozenset, fleets: dict,
     alongside every public fleet lane, so `ferry opencode`'s catalogue check,
     `ferry status` and host-reset's verifier keep matching bare names while a
     curious client can still see and pin a specific fleet lane.
+
+    `fleets` is RESERVED and intentionally unused: what gets a bare entry is
+    `public` ∩ CLOUD_LANES ∩ upstream-advertised, and since discovery and the
+    upstream catalogue both derive from the same `model_list` they cannot
+    diverge. Do not gate on it.
 
     Same fail-open contract as filter_catalogue: None means "send the upstream
     bytes untouched"."""

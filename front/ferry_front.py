@@ -704,6 +704,130 @@ def fleet_gaps(fleets: dict) -> list:
     return out
 
 
+class FleetStateError(Exception):
+    """The selection file exists and cannot be understood.
+
+    Loud on purpose: falling through to the default would silently move every
+    client's lane set, which is exactly the surprise this feature must not
+    produce."""
+
+
+class FleetState:
+    """The per-client fleet selections, read from and written to one file.
+
+    The front door runs four uvicorn workers, so process memory cannot be the
+    truth. Each instance caches the parsed document and the file's
+    st_mtime_ns, and re-reads whenever that moves — one os.stat per request,
+    which is cheaper than the json parse it usually avoids.
+
+    A MISSING file is not an error: it means "nobody has chosen anything yet",
+    whose default is the first fleet in discovery order (which is file order,
+    dicts having kept insertion order since 3.7). It is written on the first
+    mutation.
+    """
+
+    def __init__(self, path: str, fleets: dict) -> None:
+        self.path = path
+        self.fleets = fleets or {}
+        self._doc = None
+        self._mtime = None
+
+    def _first_fleet(self) -> str:
+        for name in self.fleets:
+            return name
+        return ""
+
+    def _empty(self) -> dict:
+        return {"default": self._first_fleet(), "clients": {}}
+
+    def load(self) -> dict:
+        try:
+            mtime = os.stat(self.path).st_mtime_ns
+        except FileNotFoundError:
+            self._doc = self._empty()
+            self._mtime = None
+            return self._doc
+        except OSError as exc:
+            raise FleetStateError("%s: %s" % (self.path, exc))
+        if self._doc is not None and self._mtime == mtime:
+            return self._doc
+        try:
+            with open(self.path) as handle:
+                doc = json.load(handle)
+        except Exception as exc:
+            raise FleetStateError("%s: %s" % (self.path, exc))
+        if not isinstance(doc, dict):
+            raise FleetStateError("%s: not a JSON object" % (self.path,))
+        default = doc.get("default")
+        clients = doc.get("clients")
+        self._doc = {
+            "default": default if isinstance(default, str) and default
+            else self._first_fleet(),
+            "clients": {k: v for k, v in (clients or {}).items()
+                        if isinstance(k, str) and isinstance(v, str)}
+            if isinstance(clients, dict) else {},
+        }
+        self._mtime = mtime
+        return self._doc
+
+    def default(self) -> str:
+        return self.load()["default"]
+
+    def selection_for(self, identity: str):
+        return self.load()["clients"].get(identity)
+
+    def _write(self, doc: dict) -> dict:
+        """tmp + os.replace, so a concurrent worker never reads a half file."""
+        tmp = self.path + ".tmp"
+        directory = os.path.dirname(self.path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        try:
+            with open(tmp, "w") as handle:
+                json.dump(doc, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        self._doc = doc
+        try:
+            self._mtime = os.stat(self.path).st_mtime_ns
+        except OSError:
+            self._mtime = None
+        return doc
+
+    def set_selection(self, identity: str, fleet) -> dict:
+        doc = dict(self.load())
+        clients = dict(doc["clients"])
+        if fleet is None:
+            clients.pop(identity, None)
+        else:
+            clients[identity] = fleet
+        doc["clients"] = clients
+        return self._write(doc)
+
+    def set_default(self, fleet: str) -> dict:
+        doc = dict(self.load())
+        doc["clients"] = dict(doc["clients"])
+        doc["default"] = fleet
+        return self._write(doc)
+
+    def document(self, identity: str) -> dict:
+        doc = self.load()
+        return {
+            "you": identity,
+            "fleet": doc["clients"].get(identity) or doc["default"],
+            "default": doc["default"],
+            "fleets": self.fleets,
+            "clients": dict(doc["clients"]),
+        }
+
+
 class LaneCatalogueFilter:
     """ASGI middleware that filters the model listing and nothing else."""
 

@@ -214,6 +214,13 @@ CLIENT_SHARE_PORT="8095"
 # Absent => the generators bake the legacy 'local' bearer, so a keyless LAN
 # setup is unchanged. Held in a variable, never echoed.
 CLIENT_MASTER_KEY=""
+# v1.26.0: CLIENT_NAME identifies this caller to the front door's fleet
+# resolver (X-Ferry-Client). On the host it is the literal 'host', matching
+# the loopback identity the front door already assigns; on a client it comes
+# from client.json's 'name', falling back to the short hostname (lower-cased)
+# so a profile bootstrapped before this field existed still resolves an
+# identity.
+CLIENT_NAME="host"
 
 CLIENT_CONF="$HOME/.config/ferry/client.json"
 if [[ -f "$CLIENT_CONF" ]]; then
@@ -222,6 +229,8 @@ if [[ -f "$CLIENT_CONF" ]]; then
   CLIENT_PORT=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('port', '8090'))" 2>/dev/null || echo "8090")
   CLIENT_SHARE_PORT=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('share_port', '8095'))" 2>/dev/null || echo "8095")
   CLIENT_MASTER_KEY=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('master_key') or '')" 2>/dev/null || echo "")
+  CLIENT_NAME=$(python3 -c "import json, os; print(json.load(open(os.path.expanduser('$CLIENT_CONF'))).get('name') or '')" 2>/dev/null || echo "")
+  [[ -z "$CLIENT_NAME" ]] && CLIENT_NAME=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')
 fi
 
 # Logging locations (Host Mode only)

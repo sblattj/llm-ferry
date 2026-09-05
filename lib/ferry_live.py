@@ -110,7 +110,7 @@ def sse_frame(record):
 def bps_of(record):
     """Bytes per second for one request, or None when it cannot be known.
 
-    resp_bytes over duration_ms — a throughput PROXY expressed in bytes, never
+    resp_bytes over total_duration_ms — a throughput PROXY expressed in bytes, never
     a claim about tokens. A missing count, a missing or non-numeric duration,
     or a non-positive either yields None, and the view treats None as "no
     data" rather than 0: an old event file or an untapped proxy must not
@@ -118,10 +118,12 @@ def bps_of(record):
     """
     try:
         b = record.get("resp_bytes")
-        ms = record.get("duration_ms")
+        ms = record.get("total_duration_ms")
         if not isinstance(b, (int, float)) or not isinstance(ms, (int, float)):
             return None
-        if b <= 0 or ms <= 0:
+        if isinstance(b, bool) or isinstance(ms, bool):
+            return None
+        if not (0 < b < float("inf") and 0 < ms < float("inf")):
             return None
         return b * 1000.0 / ms
     except Exception:

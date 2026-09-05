@@ -25,19 +25,16 @@ the first token.
 
 WHAT IT DOES NOT DO
 
-It never reads a RESPONSE body. The record is built from the header list and
-nothing else, which is what lets the tap sit on the streaming path without
-buffering. Token counts are therefore absent — the headers do not carry them,
-and they stay the metrics pipeline's job. The one body-derived number,
-`resp_bytes`, is counted by the tap itself — length only, never content — and
-attached to the record before it is written; this module's default for it is 0.
-
-It DOES touch the REQUEST body, since 2026-09-04, and only there:
+Header attribution is combined by the front door with timing and numeric usage
+from a bounded passive response parser. No prompts or generated text are stored.
+`duration_ms` remains the legacy LiteLLM header; `total_duration_ms` measures the
+request through downstream completion. Unknown metrics remain null.
+Request schema repair has been active since 2026-09-04:
 `comply_tool_schemas` rewrites `tools[].function.parameters` in place, only for
 the shapes named in SCHEMA_RULES, only via that rule's registered fix. Messages,
 model, and every other key are untouched, and a request with nothing to fix is
-left byte-identical. The record key set is unchanged: the findings still land
-under `schema_warnings`, now with a `fixed` flag per entry that was patched.
+left byte-identical. Findings land under `schema_warnings`, with a `fixed` flag per entry
+that was patched.
 
 Standard library only: ferry-dash runs under any python3, and everything it
 reaches imports the same way.
@@ -57,6 +54,10 @@ _EMPTY = {
     "t": "", "call_id": "", "lane": "unknown", "deployment": "", "model": "",
     "provider": "", "api_base": "", "status": 0, "fallbacks": 0, "retries": 0,
     "hop_errors": [], "duration_ms": None, "overhead_ms": None, "cost": None,
+    "stream": None, "response_start_ms": None, "first_text_ms": None,
+    "total_duration_ms": None, "input_tokens": None, "output_tokens": None,
+    "reasoning_tokens": None, "cached_input_tokens": None,
+    "response_complete": None,
     "resp_bytes": 0, "client_ip": "", "path": "", "schema_warnings": [],
 }
 

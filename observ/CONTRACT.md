@@ -153,3 +153,44 @@ Extend `cmd_dash` in `lib/ferry-dash.zsh`: if args include `--grafana`, delegate
 `$APP_DIR/observ/bringup.sh` (add `--down` → `observ/teardown.sh`), passing `--open` through and
 stripping `--grafana`/`--down`; otherwise keep today's behavior (exec the `ferry-dash` python page).
 Update the `dash` line in `lib/ferry-usage.zsh`'s banner and the Dashboard section of the root `README.md`.
+
+## Request timing and token fields
+
+The front-door NDJSON event and `/api/events` SSE record carry these additive fields.
+Existing records without them remain unknown; consumers must not manufacture zeros.
+Durations are nonnegative milliseconds from the gateway request start, measured with
+its monotonic clock. Token counts are provider-reported nonnegative numbers or null.
+
+| Field | Meaning |
+|---|---|
+| `stream` | Requested streaming mode, boolean or null if unknown. |
+| `response_start_ms` | Time until response headers are observed. |
+| `first_text_ms` | Time until first nonempty output text is observed. Reasoning and tool calls are excluded; no text means null. For nonstreaming this is the completed text response observation, not internal generation TTFT. |
+| `total_duration_ms` | Elapsed time through the final response body, or until interruption. |
+| `response_complete` | True when response completion is observed, false for interrupted/incomplete responses; null or absent means unknown. |
+| `input_tokens` | Wire-API input count: OpenAI includes cached input, Anthropic excludes it. |
+| `output_tokens` | Wire-API output count; reasoning is a subset when reported. |
+| `reasoning_tokens` | Reported reasoning subset of output, never an additional term; omitted provider detail means null, not zero. |
+| `cached_input_tokens` | Separately reported cached-input read count; do not blindly add it to input across APIs. |
+
+`duration_ms` remains a legacy LiteLLM response-header value. It is neither end-to-end
+stream duration nor first-text latency and must never fill missing new timing fields.
+The live dashboard labels First text and Total separately, preserves explicit zeros,
+and marks `response_complete: false` visibly incomplete. Per-deployment median total
+and weighted byte throughput use `total_duration_ms`; throughput is
+`sum(resp_bytes) * 1000 / sum(total_duration_ms)` over records with positive valid
+byte/time pairs. Old records cannot produce a rate from legacy `duration_ms`.
+
+Parsing is passive and bounded: observe copies of response fragments, extract only
+numeric usage/timing, and forward the original bytes. No response payloads are
+persisted by the metric collector. Unsupported, malformed, oversized, or truncated
+payloads can leave fields null; collection must not block or fail an inference request.
+No extra inference calls are made. With events enabled, OpenAI chat streams request
+usage on the existing response through `stream_options.include_usage=true`. A
+synchronous LiteLLM adapter hook recovers Anthropic reasoning counts before the
+adapter drops that detail. Synthetic Anthropic zero/zero-only usage remains unknown
+unless there is evidence of provider-reported usage, even on a complete response.
+These fields extend the live feed; they do not add Prometheus exporter series.
+
+Regression commands: `python3 lib/ferry-metrics.test.py`,
+`python3 lib/ferry-live.test.py`, `node lib/ferry-dashui.test.mjs`.

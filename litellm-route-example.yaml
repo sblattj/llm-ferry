@@ -10,7 +10,7 @@
 # reason the names are roles (`heavy`, `flash`) and not model ids.
 #
 #   heavy             -> DRIVER: the big planning/driving model, via a ChatGPT
-#                        SUBSCRIPTION (example: GPT-5.6 Sol). ONE deployment,
+#                        SUBSCRIPTION (example: GPT-6 Astra). ONE deployment,
 #                        NO fallback chain — a driver that fails must ERROR,
 #                        never silently move a session onto another model.
 #   orchestrator       -> LEGACY driver name, same backend as `heavy`, its own
@@ -64,7 +64,7 @@
 
 model_list:
   # -- Driver lane: the big planning/driving model, via a ChatGPT SUBSCRIPTION
-  # (example: GPT-5.6 Sol) ------------------------------------------------
+  # (example: GPT-6 Astra) -----------------------------------------------
   # Auth is a device-code login at ~/.config/litellm/chatgpt/auth.json (NOT
   # OPENAI_API_KEY, which is pay-per-token) — this draws on a ChatGPT PLAN
   # rather than metered OpenAI billing, so `api_key` below is a
@@ -96,13 +96,13 @@ model_list:
   # and the lane runs at the backend's own default instead of erroring.
   - model_name: domestic.heavy
     litellm_params:
-      model: chatgpt/responses/gpt-5.6-sol
+      model: chatgpt/responses/gpt-6-astra
       api_key: "chatgpt-oauth"     # placeholder; the chatgpt provider reads auth.json
       reasoning_effort: xhigh
       timeout: 600
     model_info:
       public: true        # advertised in /v1/models — the canonical driver lane
-      id: chatgpt-gpt56-sol-heavy
+      id: chatgpt-gpt6-astra-heavy
 
   # `orchestrator` (and `orch`) deployments DELETED here (fleets, 2026-09-04):
   # a config with a fleet-prefixed lane name (`domestic.heavy` above) makes

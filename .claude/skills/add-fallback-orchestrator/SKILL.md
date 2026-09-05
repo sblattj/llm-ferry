@@ -6,7 +6,7 @@ description: Use when adding a fallback hop to a lane in llm-ferry's route proxy
 # Add a fallback hop to a ferry lane
 
 Ferry's house shape (since 2026-09-04): **`heavy`** (legacy `orch`/`orchestrator`) is the
-big driver — `chatgpt/responses/gpt-5.6-sol` via the ChatGPT subscription bridge,
+big driver — `chatgpt/responses/gpt-6-astra` via the ChatGPT subscription bridge,
 `reasoning_effort: xhigh`. **`flash`** and **`super-flash`** are the worker lanes — both
 OpenRouter Gemini 3.8 Flash. **`local-orch`**/**`local-sub`** are the host GPU lanes. You
 edit `~/.config/ferry/litellm.yaml` (seeded from `litellm-route-example.yaml`).
@@ -142,7 +142,7 @@ true on litellm 1.99.0 (2026-09-04):
    ```yaml
      - model_name: heavy
        litellm_params:
-         model: chatgpt/responses/gpt-5.6-sol   # gpt-5.6-sol / gpt-5.4 work; codex-* ids are rejected
+         model: chatgpt/responses/gpt-6-astra   # real ids come from GET chatgpt.com/backend-api/codex/models (gpt-6-astra, gpt-5.6-sol/-terra/-luna, ...); codex-* ids are rejected
          api_key: "chatgpt-oauth"               # placeholder; provider reads auth.json
          reasoning_effort: xhigh                # the TOP value that reaches the backend
          timeout: 600

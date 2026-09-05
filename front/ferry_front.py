@@ -1669,14 +1669,52 @@ def _load_state_or_die(state):
     return state
 
 
+def install_chatgpt_system_compat(config_class=None):
+    """Preserve system prompts as developer messages on ChatGPT Responses.
+
+    LiteLLM's Anthropic bridge emits system-role input items for block-list
+    system prompts (as sent by Claude Code). The ChatGPT subscription endpoint
+    rejects that role. Patch only its final provider transformation, after
+    routing/fallback selection, so other providers retain their own semantics.
+    Copy changed items: requests may be reused by a retry or another provider.
+    """
+    if config_class is None:
+        from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
+        config_class = ChatGPTResponsesAPIConfig
+    original = config_class.transform_responses_api_request
+    if getattr(original, "_ferry_system_compat", False):
+        return
+
+    from functools import wraps
+
+    @wraps(original)
+    def transform(self, *args, **kwargs):
+        request = original(self, *args, **kwargs)
+        items = request.get("input")
+        if isinstance(items, list):
+            request = dict(request)
+            request["input"] = [
+                dict(item, role="developer")
+                if isinstance(item, dict) and item.get("role") == "system"
+                and item.get("type", "message") == "message" else item
+                for item in items
+            ]
+        return request
+
+    transform._ferry_system_compat = True
+    config_class.transform_responses_api_request = transform
+
+
 def build_app():
     """Import litellm's proxy app and wrap it. Used as the uvicorn app factory.
 
     litellm resolves its own config from CONFIG_FILE_PATH, so importing its app
     here is the same startup the `litellm` CLI performs — this module adds the
-    wrapper and nothing else.
+    wrapper and the ChatGPT system-role compatibility hook.
     """
     from litellm.proxy.proxy_server import app as litellm_app
+
+    install_chatgpt_system_compat()
 
     config_path = os.environ.get("CONFIG_FILE_PATH", "")
     public = _public_lane_names(config_path)

@@ -379,5 +379,139 @@ class TestSchemaWarnings(unittest.TestCase):
         self.assertEqual(line["schema_warnings"][0]["path"], "args")
 
 
+class TestComplyToolSchemas(unittest.TestCase):
+    """comply_tool_schemas PATCHES what tool_schema_warnings only names.
+
+    Same traversal, same finding shape, plus `fixed: True` per entry the
+    registry knew how to repair. The one rule today writes `items: {}` — the
+    exact one-line change that ended the 2026-09-04 outage, valid JSON Schema
+    and inert for every provider that never had the problem.
+    """
+
+    OUTAGE = TestSchemaWarnings.OUTAGE
+
+    def test_the_outage_payload_is_patched_in_place_and_reported_fixed(self):
+        doc = {"tools": [json.loads(json.dumps(self.OUTAGE))]}
+        found = E.comply_tool_schemas(doc)
+        self.assertEqual(found, [{"tool": "cdp-toolkit_evaluate_script",
+                                  "path": "args",
+                                  "rule": "array_without_items",
+                                  "fixed": True}])
+        props = doc["tools"][0]["function"]["parameters"]["properties"]
+        self.assertEqual(props["args"]["items"], {})
+        # The patch is additive: nothing else about the property moved.
+        self.assertEqual(props["args"]["description"],
+                         "Positional JSON arguments.")
+        # And a second pass finds nothing left to do.
+        self.assertEqual(E.comply_tool_schemas(doc), [])
+
+    def test_a_clean_document_is_returned_byte_identical(self):
+        doc = {"model": "flash", "tools": [tool("t", {
+            "args": {"type": "array", "items": {"type": "string"}},
+            "name": {"type": "string"}})]}
+        before = json.dumps(doc, sort_keys=True)
+        self.assertEqual(E.comply_tool_schemas(doc), [])
+        self.assertEqual(json.dumps(doc, sort_keys=True), before)
+
+    def test_an_array_that_already_has_items_is_untouched(self):
+        doc = {"tools": [tool("t", {"a": {"type": "array", "items": False}})]}
+        self.assertEqual(E.comply_tool_schemas(doc), [])
+        self.assertIs(doc["tools"][0]["function"]["parameters"]
+                      ["properties"]["a"]["items"], False)
+
+    def test_a_root_level_array_parameters_schema_is_patched(self):
+        params = {"type": "array"}
+        doc = {"tools": [{"type": "function", "function": {
+            "name": "t", "parameters": params}}]}
+        found = E.comply_tool_schemas(doc)
+        self.assertEqual(found, [{"tool": "t", "path": "(root)",
+                                  "rule": "array_without_items",
+                                  "fixed": True}])
+        self.assertEqual(params, {"type": "array", "items": {}})
+
+    def test_nested_arrays_under_items_anyof_and_additional_properties(self):
+        t = tool("t", {
+            "fields": {"type": "array", "items": {
+                "type": "object", "properties": {
+                    "options": {"type": "array"}}}},
+            "either": {"anyOf": [{"type": "string"}, {"type": "array"}]},
+            "bag": {"type": "object",
+                    "additionalProperties": {"type": "array"}},
+        })
+        doc = {"tools": [t]}
+        found = E.comply_tool_schemas(doc)
+        self.assertEqual([f["path"] for f in found],
+                         ["fields[].options", "either<anyOf 1>", "bag.*"])
+        self.assertTrue(all(f["fixed"] for f in found))
+        props = t["function"]["parameters"]["properties"]
+        self.assertEqual(
+            props["fields"]["items"]["properties"]["options"]["items"], {})
+        self.assertEqual(props["either"]["anyOf"][1]["items"], {})
+        self.assertEqual(props["bag"]["additionalProperties"]["items"], {})
+        self.assertEqual(E.comply_tool_schemas(doc), [])
+
+    def test_a_nullable_type_list_containing_array_is_patched_too(self):
+        doc = {"tools": [tool("t", {"xs": {"type": ["array", "null"]}})]}
+        self.assertEqual(E.comply_tool_schemas(doc)[0]["fixed"], True)
+        self.assertEqual(doc["tools"][0]["function"]["parameters"]
+                         ["properties"]["xs"]["items"], {})
+
+    def test_findings_are_capped_like_the_scan(self):
+        many = [tool("t%d" % i, {"a": {"type": "array"}}) for i in range(50)]
+        self.assertEqual(len(E.comply_tool_schemas({"tools": many})),
+                         E.SCHEMA_WARNINGS_LIMIT)
+        many2 = [tool("t%d" % i, {"a": {"type": "array"}}) for i in range(50)]
+        self.assertEqual(
+            len(E.comply_tool_schemas({"tools": many2}, limit=3)), 3)
+
+    def test_malformed_input_never_raises(self):
+        junk = [None, 3, "x", {"function": "nope"}, {"function": {"name": 7}},
+                {"type": "function", "function": {"name": "p",
+                                                  "parameters": "str"}},
+                json.loads(json.dumps(self.OUTAGE))]
+        found = E.comply_tool_schemas({"tools": junk})
+        self.assertEqual([f["tool"] for f in found],
+                         ["cdp-toolkit_evaluate_script"])
+        self.assertEqual(E.comply_tool_schemas(None), [])
+        self.assertEqual(E.comply_tool_schemas("not a dict"), [])
+        self.assertEqual(E.comply_tool_schemas({"tools": "nope"}), [])
+        self.assertEqual(E.comply_tool_schemas({"messages": []}), [])
+
+    def test_a_self_referencing_schema_terminates(self):
+        loop = {"type": "object", "properties": {}}
+        loop["properties"]["self"] = loop
+        doc = {"tools": [{"type": "function",
+                          "function": {"name": "t", "parameters": loop}}]}
+        self.assertEqual(E.comply_tool_schemas(doc), [])
+
+    def test_every_rule_has_a_description_and_the_fix_is_registered(self):
+        # The registry is the extension point: a newly discovered silent
+        # rejection is a description here plus, when repairable, a fix.
+        self.assertIn("array_without_items", E.SCHEMA_RULES)
+        self.assertEqual(set(E.SCHEMA_FIXES) - set(E.SCHEMA_RULES), set())
+        self.assertTrue(callable(E.SCHEMA_FIXES["array_without_items"]))
+
+    def test_a_rule_with_no_fix_is_reported_without_the_fixed_flag(self):
+        saved = E.SCHEMA_FIXES.pop("array_without_items")
+        try:
+            doc = {"tools": [json.loads(json.dumps(self.OUTAGE))]}
+            found = E.comply_tool_schemas(doc)
+            self.assertEqual(found, [{"tool": "cdp-toolkit_evaluate_script",
+                                      "path": "args",
+                                      "rule": "array_without_items"}])
+            self.assertNotIn("items", doc["tools"][0]["function"]
+                             ["parameters"]["properties"]["args"])
+        finally:
+            E.SCHEMA_FIXES["array_without_items"] = saved
+
+    def test_the_patched_findings_ride_in_a_record_unchanged_in_shape(self):
+        rec = E.record_from_headers([], "", "/v1/chat/completions", 200)
+        rec["schema_warnings"] = E.comply_tool_schemas(
+            {"tools": [json.loads(json.dumps(self.OUTAGE))]})
+        line = json.loads(json.dumps(rec))
+        self.assertEqual(line["schema_warnings"][0]["fixed"], True)
+        self.assertEqual(set(line), set(E._EMPTY))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

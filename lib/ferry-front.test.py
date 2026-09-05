@@ -1104,7 +1104,7 @@ class TestEventTap(unittest.TestCase):
         rec = self._record()
         self.assertEqual(rec["schema_warnings"], [{
             "tool": "cdp-toolkit_evaluate_script", "path": "args",
-            "rule": "array_without_items"}])
+            "rule": "array_without_items", "fixed": True}])
         # The response-side attribution is untouched by the request-side scan.
         self.assertEqual(rec["lane"], "flash")
         self.assertEqual(rec["deployment"], "flash-alt-1")
@@ -1126,23 +1126,61 @@ class TestEventTap(unittest.TestCase):
         self.assertEqual(len(reads), 1)
         self.assertEqual(scope[FF.SCHEMA_WARNINGS_KEY][0]["path"], "args")
 
-    def test_the_upstream_app_receives_the_body_unmodified(self):
-        # Observability, never a gate: the offending schema goes upstream
-        # exactly as the client sent it. Rewriting it would hide the very
-        # thing the record exists to expose.
+    def test_the_upstream_app_receives_the_patched_body(self):
+        # Since 2026-09-04 the scan is also a FIX: the front cannot know which
+        # fallback hop litellm will pick, so every request leaves compliant.
         body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
-        app, _, _, _ = self._drive_body(body)
+        app, _, scope, _ = self._drive_body(body)
+        msg = asyncio.run(app.seen_receive())
+        self.assertNotEqual(msg["body"], body)
+        doc = json.loads(msg["body"])
+        self.assertEqual(
+            doc["tools"][0]["function"]["parameters"]["properties"]["args"]
+            ["items"], {})
+        self.assertEqual(doc["model"], "flash")
+        self.assertFalse(msg.get("more_body"))
+        # litellm reads the length off the SCOPE, not off our replayed
+        # receive: a stale one truncates the body it just grew.
+        headers = dict((bytes(k).lower(), bytes(v))
+                       for k, v in scope["headers"])
+        self.assertEqual(headers[b"content-length"],
+                         str(len(msg["body"])).encode())
+
+    def test_a_clean_request_still_reaches_the_app_byte_identical(self):
+        # Control for the patch above: nothing to fix, nothing rewritten, and
+        # no content-length recomputation either.
+        body = json.dumps({"model": "flash", "tools": [self.GOOD_TOOL]}).encode()
+        app, _, scope, _ = self._drive_body(body)
         msg = asyncio.run(app.seen_receive())
         self.assertEqual(msg["body"], body)
-        self.assertFalse(msg.get("more_body"))
+        self.assertEqual(scope.get("headers", []), [])
 
-    def test_with_the_tap_off_the_body_is_not_read_at_all(self):
-        # The pre-tap contract holds when the tap is off: no fleets, no tap,
-        # no buffering — the app gets the caller's own receive by identity.
+    def test_the_patch_lands_with_the_tap_disabled(self):
+        # The record is optional; the fix is not. FERRY_EVENTS is off by
+        # default, and the outage it prevents does not care.
         body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
         app, _, scope, reads = self._drive_body(body, enabled=False)
-        self.assertEqual(reads, [])
+        self.assertEqual(len(reads), 1)
         self.assertNotIn(FF.SCHEMA_WARNINGS_KEY, scope)
+        doc = json.loads(asyncio.run(app.seen_receive())["body"])
+        self.assertEqual(
+            doc["tools"][0]["function"]["parameters"]["properties"]["args"]
+            ["items"], {})
+
+    def test_a_toolless_body_is_not_read_when_the_tap_is_off(self):
+        # The pre-tap contract survives for everything the comply pass has no
+        # business touching: no tools, no tap, no rewrite.
+        body = json.dumps({"model": "flash", "messages": []}).encode()
+        app, _, scope, _ = self._drive_body(body, enabled=False)
+        self.assertEqual(asyncio.run(app.seen_receive())["body"], body)
+        self.assertNotIn(FF.SCHEMA_WARNINGS_KEY, scope)
+
+    def test_the_record_names_the_finding_as_fixed(self):
+        body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
+        self._drive_body(body)
+        self.assertEqual(self._record()["schema_warnings"], [{
+            "tool": "cdp-toolkit_evaluate_script", "path": "args",
+            "rule": "array_without_items", "fixed": True}])
 
     def test_a_non_json_body_records_an_event_with_no_warnings(self):
         self._drive_body(b"\x00not json")
@@ -1150,16 +1188,19 @@ class TestEventTap(unittest.TestCase):
         self.assertEqual(rec["schema_warnings"], [])
         self.assertEqual(rec["lane"], "flash")
 
-    def test_a_raising_scan_costs_the_warning_not_the_request(self):
+    def test_a_raising_comply_pass_costs_the_fix_not_the_request(self):
+        # Fail-open, and fail-open to the ORIGINAL BYTES: a pass that blows up
+        # halfway must not send a half-patched document upstream.
         body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
         os.environ["FERRY_EVENTS"] = "on"
         FF.reset_tap(self.path)
-        FF._tap().tool_schema_warnings = mock.Mock(side_effect=RuntimeError("boom"))
+        FF._tap().comply_tool_schemas = mock.Mock(side_effect=RuntimeError("boom"))
         app, sent, _, _ = self._drive_body(body, reset=False)
         start, payload = collect(sent)
         self.assertEqual(start["status"], 200)
         self.assertEqual(payload, b"abbccc")
         self.assertEqual(self._record()["schema_warnings"], [])
+        self.assertEqual(asyncio.run(app.seen_receive())["body"], body)
 
     def test_the_byte_stream_is_identical_with_a_scanned_request(self):
         # The rollout gate, re-run with a body worth scanning: tap on and tap
@@ -2027,6 +2068,42 @@ class TestFleetMiddleware(FleetHarness):
             "client": ("192.168.1.50", 5000), "headers": []}, receive, send))
         self.assertEqual(json.loads(app.body)["model"], "domestic.heavy")
         self.assertEqual(app.more, [False])      # one chunk, not two
+
+    def test_the_fleet_rewrite_and_the_schema_patch_compose(self):
+        # Both edits land on the SAME parsed document and are serialized once:
+        # the model is fleet-qualified AND the array property gains `items`.
+        bad = {"type": "function", "function": {
+            "name": "evaluate_script", "parameters": {
+                "type": "object",
+                "properties": {"args": {"type": "array"}}}}}
+        raw = json.dumps({"model": "heavy", "messages": [],
+                          "tools": [bad]}).encode()
+        app = BodyApp()
+        scope, _ = self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        doc = json.loads(app.body)
+        self.assertEqual(doc["model"], "domestic.heavy")
+        self.assertEqual(
+            doc["tools"][0]["function"]["parameters"]["properties"]["args"]
+            ["items"], {})
+        self.assertEqual(app.more, [False])      # one chunk, one serialization
+        headers = dict((bytes(k).lower(), bytes(v)) for k, v in scope["headers"])
+        self.assertEqual(headers[b"content-length"],
+                         str(len(app.body)).encode())
+
+    def test_the_schema_patch_alone_still_recomputes_content_length(self):
+        # Control: fleet rewrite is a no-op (already qualified), so only the
+        # schema patch moves the bytes — and the length must follow it.
+        bad = {"type": "function", "function": {
+            "name": "t", "parameters": {"type": "array"}}}
+        raw = json.dumps({"model": "domestic.heavy", "tools": [bad]}).encode()
+        app = BodyApp()
+        scope, _ = self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        doc = json.loads(app.body)
+        self.assertEqual(doc["model"], "domestic.heavy")
+        self.assertEqual(doc["tools"][0]["function"]["parameters"]["items"], {})
+        headers = dict((bytes(k).lower(), bytes(v)) for k, v in scope["headers"])
+        self.assertEqual(headers[b"content-length"],
+                         str(len(app.body)).encode())
 
     def test_a_non_inference_path_is_not_body_read(self):
         # /health must never be buffered: it is polled every few seconds.

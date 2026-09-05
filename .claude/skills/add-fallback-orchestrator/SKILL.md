@@ -13,11 +13,14 @@ edit `~/.config/ferry/litellm.yaml` (seeded from `litellm-route-example.yaml`).
 
 Since fleets (2026-09-04) lane names are `<fleet>.<lane>`; chains never cross a fleet.
 
-**House policy on chains, stated explicitly: the DRIVER carries NO fallback chain; each
-WORKER lane carries exactly ONE hop.** `heavy` must error rather than silently move a
-session onto a different model mid-flight — that's a deliberate choice, not an oversight,
-so don't "helpfully" add one without consciously deciding to override the policy (see the
-driver case below). Each worker lane spills to one independent Luna deployment on error:
+**House policy on chains, stated explicitly: the DRIVER carries at most ONE hop to its own
+previous model; each WORKER lane carries a short chain.** Since 2026-09-05 `domestic.heavy`
+(GPT-6 Astra) spills once to `domestic.heavy-sol` (GPT-5.6 Sol, same bridge, same effort)
+— a deliberate override of the older no-chain rule, made because a same-posture hop covers
+a model-specific outage without changing how the session behaves. Beyond that one hop
+`heavy` must error rather than silently move a session onto a different model mid-flight,
+so don't "helpfully" extend the chain without consciously deciding to (see the driver case
+below). Each worker lane spills to one independent Luna deployment on error:
 `flash` -> `flash-luna`, `super-flash` -> `super-flash-luna`. The two local lanes get
 neither — the point of naming a local lane is that the request stays on the machine, so a
 dead GPU lane must error rather than silently spend a cloud quota. Do not "helpfully" add
@@ -111,9 +114,10 @@ For a plain OpenAI-compatible fallback instead (no `api_base`):
 
 ## If you decide the driver needs a chain (overriding house policy)
 
-House policy is that `heavy` has no fallback — a driver that silently reroutes mid-session
-onto a different model is worse than one that errors loudly. If you've decided to override
-that for a specific reason, the mechanics are identical to the worker case: a new
+House policy is that `heavy` has at most the one same-posture hop above — a driver that
+silently reroutes mid-session onto a materially different model is worse than one that
+errors loudly. If you've decided to extend that for a specific reason, the mechanics are
+identical to the worker case: a new
 `model_name` per hop, independent capacity (rule 1 above — this is exactly where the Claude
 subscription-token trap tends to bite, since a Claude model is the obvious first thing
 people reach for as a `heavy` fallback), ordered fast-first in `fallbacks`, e.g.:
@@ -157,8 +161,8 @@ true on litellm 1.99.0 (2026-09-04):
    path). A NON-STREAMED call hits a litellm bridge bug (`ChatgptException - Unknown items
    in responses API response: []`, HTTP 500). That's benign in a fallback chain — a
    non-streaming caller that reaches this hop just rolls on to the next fallback — but on
-   `heavy` (no chain) it's a hard failure for any non-streaming caller. Don't chase the 500
-   as a config error.
+   `heavy`, whose only hop is the same bridge, it's still a hard failure for any
+   non-streaming caller. Don't chase the 500 as a config error.
 4. **The token-refresh trap.** litellm trusts `expires_at` inside
    `~/.config/litellm/chatgpt/auth.json` and does NOT refresh on a server-side 401
    `token_expired` — a stale token just fails every call until something else refreshes it.

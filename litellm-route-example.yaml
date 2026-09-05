@@ -10,9 +10,9 @@
 # reason the names are roles (`heavy`, `flash`) and not model ids.
 #
 #   heavy             -> DRIVER: the big planning/driving model, via a ChatGPT
-#                        SUBSCRIPTION (example: GPT-6 Astra). ONE deployment,
-#                        NO fallback chain — a driver that fails must ERROR,
-#                        never silently move a session onto another model.
+#                        SUBSCRIPTION (example: GPT-6 Astra). ONE hop, to
+#                        `heavy-sol` (GPT-5.6 Sol, same bridge, same effort) —
+#                        a deliberate override of the older no-chain policy.
 #   orchestrator       -> LEGACY driver name, same backend as `heavy`, its own
 #                        id so metrics never conflate the two, kept resolving
 #                        so a session pinned to the old name mid-run does not
@@ -38,12 +38,13 @@
 # is doing, on the lane least likely to have headroom. On the GPU pair there is
 # no third lane, so the housekeeper shares local-sub.
 #
-# NO FALLBACK CHAINS on the driver, deliberately simplified: a driver that
-# fails must error loudly rather than have litellm silently move a live session
-# onto a different model mid-run. The two Gemini worker lanes keep exactly ONE
-# hop each, to an upstream-independent model via OpenRouter, so a fan-out or a
-# compaction call survives a Gemini outage without the driver's identity ever
-# moving.
+# The driver carries ONE hop, added 2026-09-05 as a deliberate override of the
+# older no-chain policy: `domestic.heavy-sol` is the previous driver model (GPT-5.6
+# Sol) on the same bridge at the same effort, so a spill changes the model but
+# not the posture. It shares the primary's subscription bucket, so it covers a
+# model-specific outage or a bad rollout, not an account-level quota 429. The
+# worker lanes keep their own short chains, so a fan-out or a compaction call
+# survives a provider outage.
 #
 # Do NOT rebuild a multi-project Gemini key pool: limits are per Google Cloud
 # project, and spreading load across projects to multiply them violates Google
@@ -77,8 +78,8 @@ model_list:
   # streams and the bridge only reassembles a reply on the streaming path. A
   # STREAMED call returns 200 (opencode and every agentic client streams by
   # default). A NON-STREAMED call hits a litellm bug ("Unknown items in
-  # responses API response: []", HTTP 500) — and with no fallback chain, the
-  # caller sees that 500 directly. Probe this lane with `"stream": true`.
+  # responses API response: []", HTTP 500) — and since the one hop is the same
+  # bridge, the caller still sees a 500. Probe this lane with `"stream": true`.
   #
   # TOKEN TRAP (verified 2026-09-04): litellm trusts `expires_at` in
   # ~/.config/litellm/chatgpt/auth.json and never refreshes on a server-side
@@ -104,6 +105,18 @@ model_list:
     model_info:
       public: true        # advertised in /v1/models — the canonical driver lane
       id: chatgpt-gpt6-astra-heavy
+
+  # -- domestic.heavy fallback hop 1: GPT-5.6 Sol via the ChatGPT bridge ------
+  # POLICY OVERRIDE (2026-09-05, deliberate): see the header note. Same bridge,
+  # same effort, same STREAMING-ONLY caveat as `domestic.heavy`. Not `public`.
+  - model_name: domestic.heavy-sol
+    litellm_params:
+      model: chatgpt/responses/gpt-5.6-sol
+      api_key: "chatgpt-oauth"     # placeholder; the chatgpt provider reads auth.json
+      reasoning_effort: xhigh
+      timeout: 600
+    model_info:
+      id: chatgpt-gpt56-sol-heavy-fb
 
   # `orchestrator` (and `orch`) deployments DELETED here (fleets, 2026-09-04):
   # a config with a fleet-prefixed lane name (`domestic.heavy` above) makes
@@ -422,10 +435,11 @@ router_settings:
   # model_group_alias:
   #   old-name: {model: "heavy", hidden: true}   # resolves, but WITHOUT heavy's chain
 
-  # SIMPLIFIED shape: no fallback chain on the driver lane (`domestic.heavy`,
-  # or the `orch`/`orchestrator` names it resolves from) or either local lane —
-  # each is ONE deployment by design and must ERROR, not spill onto a
-  # different model, when it fails. `domestic.flash` (Luna) falls to the
+  # SIMPLIFIED shape: the driver lane (`domestic.heavy`, or the `orch`/
+  # `orchestrator` names it resolves from) has ONE hop to `domestic.heavy-sol`
+  # (policy override, 2026-09-05); neither local lane has any — each is ONE
+  # deployment by design and must ERROR, not spill onto a different model,
+  # when it fails. `domestic.flash` (Luna) falls to the
   # Gemini alias, then Terra; `domestic.super-flash` (Gemini) gets exactly ONE
   # hop to Luna — so a fan-out or a compaction call survives a provider
   # outage. litellm fallbacks are single-hop (not transitive): the fallback
@@ -435,4 +449,4 @@ router_settings:
   # section — so a second fleet added to this file would repeat this whole
   # block under an `<other-fleet>.` prefix, never editing these entries in
   # place.
-  fallbacks: [{"domestic.flash": ["domestic.flash-gemini", "domestic.flash-terra"]}, {"domestic.super-flash": ["domestic.super-flash-luna"]}]
+  fallbacks: [{"domestic.heavy": ["domestic.heavy-sol"]}, {"domestic.flash": ["domestic.flash-gemini", "domestic.flash-terra"]}, {"domestic.super-flash": ["domestic.super-flash-luna"]}]

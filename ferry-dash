@@ -1265,15 +1265,11 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ferry dash</title>
+<title>Ferry — Signal Studio</title>
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
     --green:#3fb950; --red:#f85149; --amber:#d29922; --blue:#58a6ff; --accent:#1f6feb;
-  }
-  @media (prefers-color-scheme: light){
-    :root{ --bg:#f6f8fa; --panel:#fff; --line:#d0d7de; --fg:#1f2328; --dim:#656d76;
-           --green:#1a7f37; --red:#cf222e; --amber:#9a6700; --blue:#0969da; --accent:#0969da; }
   }
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);
@@ -1397,59 +1393,75 @@ PAGE = r"""<!doctype html>
   .fr .w{flex:1 1 180px;min-width:0;white-space:normal;overflow-wrap:anywhere}
   .fr .metrics{min-width:0;display:flex;flex-wrap:wrap;gap:4px 16px;width:100%;color:var(--dim);white-space:normal}
   .fr .metrics span{max-width:100%;white-space:normal;overflow-wrap:anywhere}
+
+  /* Signal Studio: live model library, connected routing canvas and route summary. */
+  :root{color-scheme:dark;--bg:#111614;--panel:#191f1c;--surface:#191f1c;--raised:#222b25;--line:#323d35;--fg:#ecf2eb;--ink:#ecf2eb;--dim:#a0aea3;--muted:#a0aea3;--green:#c0f78b;--mint:#c0f78b;--red:#ff9690;--amber:#eac987;--blue:#b5d7a2;--accent:#c0f78b;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  html{scroll-behavior:smooth;scroll-padding-top:20px}body{font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}body:has(dialog[open]){overflow:hidden}
+  button,input,select{font:inherit}button,a,input,select,summary,[tabindex]{outline-offset:4px}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible,[tabindex]:focus-visible{outline:2px solid var(--mint)}
+  button{border:1px solid var(--line);border-radius:5px;padding:9px 12px;background:transparent;color:var(--fg);font-size:12px;font-weight:500;transition:background .15s,border-color .15s}button:hover:not(:disabled){background:#2c3930;border-color:#69825b}button:disabled{opacity:.4;cursor:default}button.primary,#applybtn{background:var(--mint);border-color:var(--mint);color:#17220f;font-weight:650}button.primary:hover:not(:disabled),#applybtn:hover:not(:disabled){background:#d1ffa8}
+  input,select{max-width:100%;background:#121915;color:var(--fg);border:1px solid var(--line);border-radius:5px;padding:9px 11px}a{color:var(--mint)}p{margin:0;color:var(--dim);line-height:1.7}
+  .topbar{height:68px;padding:0 28px;gap:28px;flex-wrap:nowrap;background:var(--bg)}.brand{display:flex;align-items:center;gap:10px;font-size:26px;letter-spacing:-1px;font-weight:720;text-decoration:none;color:var(--fg)}.brand svg{color:var(--mint);flex:none}.edition{font:10px var(--mono);letter-spacing:1.2px;border-left:1px solid var(--line);padding-left:20px;color:var(--dim);white-space:nowrap}.toplinks{display:flex;height:100%;align-items:stretch;gap:23px}.toplinks a{display:flex;align-items:center;font-size:12px;color:var(--dim);text-decoration:none;border-bottom:2px solid transparent}.toplinks a.current{color:var(--mint);border-bottom-color:var(--mint)}.connection{margin-left:auto;display:flex;align-items:center;gap:12px;min-width:0;font:10px var(--mono)}#host{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#updated{font-size:10px}.pill{font:10px var(--mono);padding:5px 8px;white-space:nowrap;border:1px solid var(--line);border-radius:4px}
+  main{display:block;max-width:1800px;width:100%;padding:29px 28px 22px;margin:auto;min-width:0}.intro{display:flex;align-items:center;justify-content:space-between;gap:22px;margin-bottom:25px}.eyebrow{font:10px var(--mono);letter-spacing:1.8px;color:var(--mint);text-transform:uppercase}h1{font-size:33px;font-weight:530;line-height:1.2;letter-spacing:-1.25px;margin:9px 0 8px}.intro p{font-size:12px}.actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}.actions button{font-size:11px;white-space:nowrap}.studio-grid{display:grid;grid-template-columns:224px minmax(0,1fr) 200px;gap:14px;align-items:start;min-width:0}
+  .library{background:#1c2420;border:1px solid #3b483d;border-radius:7px;padding:17px 13px;min-width:0;display:flex;flex-direction:column}.library h2{margin:0 0 8px;font:11px var(--mono);letter-spacing:1px;text-transform:uppercase}.library p{font-size:11px}.library input{width:100%;margin:15px 0 12px;font-size:11px}.models{display:flex;flex-direction:column;gap:7px;max-height:650px;overflow:auto;padding:2px 3px 5px 1px;scrollbar-width:thin;scrollbar-color:#52634e transparent}.model-card{display:flex;align-items:center;gap:10px;min-height:59px;width:100%;flex:none;padding:11px 9px;border-color:#354137;background:#222c25;text-align:left;cursor:grab}.model-card:active{cursor:grabbing}.model-card:after{content:'⠿';margin-left:auto;color:#82927c;font-size:16px}.model-symbol{width:21px;flex:none;color:var(--mint);font:20px var(--mono);text-align:center}.model-copy{min-width:0;flex:1}.model-copy b{display:block;font-size:11px;font-weight:550;overflow-wrap:anywhere;line-height:1.45}.model-copy span{display:block;font:9px/1.5 var(--mono);color:var(--dim);overflow-wrap:anywhere;margin-top:5px}.library-bottom{padding-top:18px;margin-top:12px;border-top:1px solid var(--line);font-size:10px;color:var(--dim);line-height:1.8}.library-bottom b{color:var(--mint);font-weight:500}
+  .editor-column{min-width:0}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:60px;padding:11px 13px;border:1px solid var(--line);border-bottom:0;border-radius:7px 7px 0 0;background:var(--panel)}.segmented{display:flex;gap:4px;min-width:0;overflow:auto;scrollbar-width:thin}.fleet-tab{border:0;padding:8px 11px;color:var(--dim);font-size:11px;white-space:nowrap}.fleet-tab.selected,.fleet-tab[aria-pressed="true"]{color:var(--fg);background:#344332}.route-meta{font:9px var(--mono);letter-spacing:.5px;color:var(--dim);white-space:nowrap}.workspace{border:1px solid var(--line);padding:0 16px;background-image:radial-gradient(#354038 .7px,transparent .7px);background-size:14px 14px;min-width:0;max-height:880px;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#51634f transparent}.workspace:empty{min-height:180px}
+  #routesbody>.muted,#routesbody.muted{padding-top:16px;padding-bottom:16px}.lane{display:block;padding:17px 0 0;min-width:0;border-top:1px solid #303b33}.lane h3{display:flex;align-items:baseline;gap:9px;flex-wrap:wrap;margin:0;font-size:12px;font-weight:550;color:var(--fg);overflow-wrap:anywhere}.lane h3 .kind{margin:0;font:10px var(--mono);color:var(--dim)}h3.fleet{margin:18px 0 0;color:var(--mint);font:10px var(--mono);letter-spacing:1px}h3.fleet:first-child{margin-top:16px}.hops{display:flex;align-items:center;flex-wrap:nowrap;overflow-x:auto;min-height:148px;padding:15px 2px 18px;scrollbar-width:thin;scrollbar-color:#51634f transparent;border-radius:0}.hop.hoprow{position:relative;display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:9px;flex:0 0 174px;min-width:174px;min-height:111px;padding:11px;margin:0;border:1px solid #46563f;border-radius:6px;background:#1a231d;box-shadow:0 4px 16px #0002;color:var(--fg)}.hop.hoprow.primary{background:#283625;border-color:#71845e}.hop .who{flex:1;min-width:0}.hop .who b{display:block;font-size:11px;font-weight:550;line-height:1.45;overflow-wrap:anywhere}.hop.primary .who b{color:var(--fg)}.hop .who span{display:block;font:9px/1.5 var(--mono);margin:5px 0 0;overflow-wrap:anywhere}.hop-top{display:flex;align-items:center;justify-content:space-between;gap:6px;font:9px var(--mono);letter-spacing:.7px;color:var(--dim)}.primary .hop-top{color:var(--mint)}.hop-actions{display:flex;gap:5px;margin-top:auto}.hop-actions .mini{padding:4px 8px;font-size:12px;line-height:1.2;border-radius:4px}.hop-actions .mini:last-child{margin-left:auto}.grip{font-size:16px}.ptag{font:8px var(--mono);color:var(--mint);letter-spacing:.5px}.pinhint.show{max-height:5em}.mini{color:var(--dim);font-weight:500;border-radius:4px}.hop.dragging{opacity:.45}
+  .route-gap{position:relative;display:flex;align-items:center;justify-content:center;flex:0 0 40px;width:40px;min-width:40px;height:100px;min-height:100px;padding:0;border:0;border-radius:4px;transition:background .12s,box-shadow .12s}.route-gap:before{content:'';position:absolute;left:0;right:0;height:1px;background:#4a6043;pointer-events:none}.route-gap button{position:relative;z-index:1;display:grid;place-items:center;width:26px;min-width:26px;height:34px;min-height:34px;padding:0;background:#182219;border:1px dashed #688356;border-radius:4px;font-size:19px;line-height:1;color:#bed9a9}.route-gap.end button{height:66px}.route-gap:hover{background:#c0f78b0a}.route-gap.valid{background:#c0f78b0b;box-shadow:inset 0 0 0 1px #84a96570}.route-gap.over{background:#34482d;box-shadow:inset 0 0 0 2px var(--mint)}.route-gap.invalid{opacity:.35}.route-gap.invalid.over{background:#61332d;box-shadow:inset 0 0 0 2px var(--red)}.route-gap .ghost{position:absolute;z-index:4;left:50%;top:0;transform:translateX(-50%);width:max-content;max-width:160px;padding:5px 7px;border-radius:4px;background:#263523;color:var(--mint);font:9px var(--mono);overflow-wrap:anywhere;pointer-events:none}.workspace-foot{display:flex;gap:9px;padding:12px 14px;background:#17201b;border:1px solid var(--line);border-top:0;border-radius:0 0 7px 7px;color:var(--dim);font-size:10px;line-height:1.7}.workspace-foot b{color:var(--mint);font-weight:500}.editor-note{margin-top:14px;border:1px solid #2b372e;border-radius:6px;padding:18px;background:linear-gradient(115deg,#1b261d,#151d18)}.editor-note span{font:9px var(--mono);letter-spacing:1px;color:#b1c3a6}.editor-note p{font-size:11px;margin-top:8px}
+  .inspector{border:1px solid var(--line);border-radius:7px;background:#181f1b;padding:18px 15px;min-width:0}.inspector-heading{display:flex;justify-content:space-between;gap:8px;color:var(--mint)}.inspector .eyebrow{font-size:9px;letter-spacing:1px;color:#b5c4ad}.inspector-title{font-size:21px;letter-spacing:-.7px;margin:23px 0 7px}.inspector>p{font-size:11px;line-height:1.8}.inspector-stats{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:25px}.inspector-stats strong{display:block;font-size:29px;font-weight:400;letter-spacing:-1px;line-height:1.1}.inspector-stats span{display:block;color:var(--dim);font:9px var(--mono);margin-top:8px}.inspector-divider{height:1px;background:var(--line);margin:23px 0}.inspector-label{font:9px var(--mono);letter-spacing:1px;color:var(--dim);margin-bottom:13px}.coverage-row{margin-top:15px;font-size:11px}.coverage-row>div:first-child{display:flex;justify-content:space-between;gap:8px;overflow-wrap:anywhere}.coverage-row small{font:9px var(--mono);color:var(--dim);white-space:nowrap}.coverage-pips{display:flex;gap:4px;margin-top:8px}.coverage-pips i{height:4px;background:#92bb70;flex:1;border-radius:1px}.coverage-pips i:first-child{background:var(--mint)}#editstate{color:var(--mint);font-size:11px;line-height:1.8}.inspector-note{margin-top:20px;font-size:10px;color:var(--dim);line-height:1.8}.review-area{margin-top:14px;min-width:0}.review-meta{font:10px/1.7 var(--mono);color:var(--dim);overflow-wrap:anywhere}.review-meta b{font-weight:500;color:#b5c4ad}.diff{margin:12px 0 0;padding:16px;background:#18211b;font:11px/1.75 var(--mono);border-radius:6px;max-height:360px}#routesmsg:not(:empty){padding:13px 16px;margin-top:10px;border:1px solid currentColor;border-radius:6px;font-size:12px;overflow-wrap:anywhere}
+  .operations{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;margin-top:27px}.card{padding:18px 20px;border-radius:7px;min-width:0;overflow-wrap:anywhere}.card h2{font:11px var(--mono);letter-spacing:1.2px;color:var(--fg);margin-bottom:16px}.card h2 .muted{font-size:10px;letter-spacing:0}.row{padding:10px 0;gap:9px;border-top:1px solid var(--line);align-items:center}.row>div{min-width:0}.row .name{font-size:12px;overflow-wrap:anywhere}.row .sub{font:10px/1.6 var(--mono);overflow-wrap:anywhere}.row .tag{font:9px/1.5 var(--mono);white-space:normal;text-align:right;max-width:42%;flex-shrink:0}.row .step{font:10px var(--mono);width:12px}.dot{width:7px;height:7px}.sub{font-size:11px}.stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;margin:0 0 18px}.stat{border-right:1px solid var(--line)}.stat:last-child{border:0}.stat b{font-size:28px;font-weight:450;letter-spacing:-1px}.stat span{font:10px var(--mono);margin-top:5px}.spark{height:45px;margin:14px 0 16px}.spark i{background:#a0c77f}.codes{font-family:var(--mono)}.code{font-size:10px;border-radius:4px}.event{border-radius:5px;font-size:11px}.chain{gap:0;row-gap:8px;margin:9px 0 14px}.hopb{background:#1b251e;border-radius:5px;max-width:100%;padding:9px 11px}.hopb b{font-size:11px;overflow-wrap:anywhere}.hopb .pool{font:9px var(--mono)}.chip{font:9px/1.6 var(--mono);border-radius:3px}.lanehdr{flex-wrap:wrap}.lanehdr b{font-size:12px}.edge{font-size:10px}.feed{font:10px/1.7 var(--mono);max-height:320px;border-radius:5px}.fr{padding:7px 10px;border-top:1px solid #29362c}.feed-bar{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin-top:14px}.toggle{border:0;background:transparent;padding:3px 0;font-size:11px;text-decoration:underline;text-underline-offset:3px}.probe-controls{display:flex;align-items:center;gap:13px;flex-wrap:wrap}.probe-controls span{font-size:11px}.probe-results{margin-top:13px}.footer{max-width:1800px;margin:auto;padding:0 28px 26px;font:10px/1.8 var(--mono);overflow-wrap:anywhere}.footer-brand{display:flex;justify-content:space-between;gap:14px;padding:21px 0 14px;border-top:1px solid var(--line);letter-spacing:.6px}.footer #foot{opacity:.8}
+  dialog{border:1px solid #57704d;color:var(--fg);background:var(--panel);padding:24px;border-radius:10px;max-width:600px;width:calc(100% - 32px);max-height:85vh;overflow:auto;box-shadow:0 18px 90px #0009}dialog::backdrop{background:#050b08cf;backdrop-filter:blur(5px)}dialog h2{font-size:23px;font-weight:500;line-height:1.3;letter-spacing:-.5px;margin:0 0 9px;overflow-wrap:anywhere}dialog p{font-size:12px}.picker-options{display:grid;gap:8px;margin:20px 0;max-height:52vh;overflow:auto;padding:4px}.picker-options button{text-align:left;overflow-wrap:anywhere}.dialog-actions{display:flex;justify-content:flex-end;gap:8px}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+  @media(min-width:1600px){.hop.hoprow{flex-basis:190px;min-width:190px}}
+  @media(max-width:1200px){.studio-grid{grid-template-columns:210px minmax(0,1fr)}.inspector{grid-column:1/-1;display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:10px 22px;align-items:start}.inspector-heading{grid-column:1/-1}.inspector-title{margin-top:3px}.inspector-stats{margin-top:5px}.inspector-divider{display:none}.inspector>p{grid-column:1;grid-row:3}.coverage-block{grid-column:3;grid-row:2/5}.session-block{grid-column:2;grid-row:3/5}.inspector-note{margin-top:8px}.topbar{gap:20px}.connection #host{display:none}.intro{align-items:flex-start}.actions{max-width:340px}.route-meta{display:none}}
+  @media(max-width:800px){.topbar{padding:0 18px;gap:18px}.edition{display:none}.toplinks{gap:17px}.connection #updated{display:none}main{padding:24px 18px}.intro{display:block}.actions{margin-top:18px;justify-content:flex-start;max-width:none}.studio-grid{grid-template-columns:180px minmax(0,1fr);gap:11px}.library{padding:14px 10px}.model-card{padding:10px 8px;gap:7px}.model-card:after{display:none}.workspace{padding:0 11px}.toolbar{padding:10px 8px}.fleet-tab{padding:8px}.footer{padding:0 18px 23px}.operations{gap:12px}.card{padding:16px}.row{flex-wrap:wrap}.row .tag{margin-left:28px;max-width:100%;text-align:left}.operations .full{grid-column:1/-1}}
+  @media(max-width:580px){.topbar{height:62px;padding:0 14px;gap:20px}.brand{font-size:23px}.brand svg{width:25px}.toplinks{gap:14px}.toplinks a{font-size:11px}.toplinks a:last-child{display:none}.connection{gap:0}.pill{font-size:9px;padding:4px 6px}main{padding:24px 12px}h1{font-size:29px}.intro p{font-size:11px}.eyebrow{font-size:9px}.actions{gap:6px}.actions button{padding:9px 10px;font-size:10px}.studio-grid{grid-template-columns:minmax(0,1fr);gap:12px}.library{padding:12px}.library h2{font-size:10px}.library input{margin:10px 0}.models{flex-direction:row;overflow:auto;max-height:none;padding-bottom:5px}.model-card{flex:0 0 170px;width:170px;min-height:58px}.library-bottom{display:none}.editor-column{grid-column:1}.workspace{max-height:760px}.hop.hoprow{flex-basis:160px;min-width:160px}.workspace-foot{font-size:10px}.editor-note{padding:15px}.inspector{grid-column:1;grid-template-columns:1fr 1fr;gap:12px 18px}.inspector>p{grid-column:1;grid-row:3}.coverage-block{grid-column:1;grid-row:4}.session-block{grid-column:2;grid-row:3/5}.inspector-stats strong{font-size:26px}.operations{grid-template-columns:minmax(0,1fr);gap:12px;margin-top:22px}.card{padding:16px 13px}.stats{gap:12px}.stat b{font-size:25px}.stat span{font-size:9px}.feed{font-size:9px}.fr{gap:7px;padding:7px}.footer{padding:0 12px 20px;font-size:9px}.footer-brand{display:block}.footer-brand span{display:block;margin-top:6px}.review-meta{font-size:9px}}
+  /* Keep review evidence adjacent to the actions, before the route workspace. */
+  .review-area{margin:-9px 0 17px;padding:0;min-width:0}.review-meta{display:flex;align-items:baseline;gap:6px 10px;flex-wrap:wrap;font-size:9px;line-height:1.6}.review-meta b{flex:none;font-size:8px;letter-spacing:.7px}.review-meta #routespath{min-width:0;overflow-wrap:anywhere}.snapshot-note{margin-left:auto;color:var(--dim)}
+  #routesdiff{max-height:300px;margin:12px 0 0;border-color:#748966;box-shadow:inset 3px 0 0 var(--mint);background:#1b261d}#routesdiff:before{content:'REVIEW CHANGES BEFORE APPLYING';display:block;color:var(--mint);font:10px var(--mono);letter-spacing:1px;margin-bottom:13px}#routesmsg:not(:empty){background:#1b261d}
+  .hop-top .star{width:auto;min-width:0;flex:none;white-space:nowrap;font:8px var(--mono);letter-spacing:.3px;color:var(--mint)}.hop-top>span:first-child{min-width:0;overflow-wrap:anywhere}.hop-top .grip{width:14px}
+  @media(max-width:580px){.review-area{margin-top:-9px}.review-meta{font-size:9px;gap:4px 8px}.snapshot-note{margin-left:0;flex-basis:100%}#routesdiff{max-height:260px;padding:13px;font-size:10px}#routesdiff:before{font-size:9px;letter-spacing:.5px}}
+  /* Event rows can carry additional timing and token fields without clipping. */
+  .feed .fr{flex-wrap:wrap;align-items:baseline;white-space:normal;row-gap:3px}.feed .fr .t,.feed .fr .st{white-space:nowrap}.feed .fr .w{flex:1 1 180px;overflow:visible;text-overflow:clip;overflow-wrap:anywhere}.feed .fr>span{max-width:100%;overflow-wrap:anywhere}
+  /* Touch layouts: tap to edit, swipe routes, and let the page own vertical scrolling. */
+  @media(max-width:1200px),(pointer:coarse){
+    input,select,#modelsearch{font-size:16px}
+    button,input,select{min-height:44px}button{min-width:44px}.actions button{min-height:44px;padding:10px 12px}.fleet-tab{min-height:44px;padding:10px 13px}.toggle{min-height:44px;padding:10px 4px}.toplinks a{min-height:44px}
+    .library{grid-column:1/-1;display:block;padding:14px}.library input{margin:10px 0 12px}.models{flex-direction:row;max-height:none;overflow-x:auto;padding:3px 3px 9px;gap:9px;scrollbar-width:auto;scrollbar-color:#759361 #18211b;-webkit-overflow-scrolling:touch}.model-card{flex:0 0 190px;width:190px;min-height:64px}.library-bottom{display:none}.editor-column{grid-column:1/-1}.inspector{grid-column:1/-1}
+    .workspace{max-height:none;overflow-y:visible}.hops{padding-bottom:15px;scrollbar-width:auto;scrollbar-color:#759361 #18211b;-webkit-overflow-scrolling:touch}.hops::-webkit-scrollbar,.models::-webkit-scrollbar,.segmented::-webkit-scrollbar{height:7px}.hops::-webkit-scrollbar-thumb,.models::-webkit-scrollbar-thumb,.segmented::-webkit-scrollbar-thumb{background:#759361;border-radius:6px}.hops::-webkit-scrollbar-track,.models::-webkit-scrollbar-track,.segmented::-webkit-scrollbar-track{background:#18211b}
+    .hop.hoprow{flex:0 0 190px;min-width:190px;min-height:125px}.hop-actions{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:6px;width:100%}.hop-actions .mini{min-width:44px;min-height:44px;padding:8px 5px;white-space:normal;line-height:1.2;font-size:13px}.hop-actions .mini:last-child{margin-left:0}.route-gap{flex-basis:50px;width:50px;min-width:50px;height:100px;min-height:100px}.route-gap button{width:44px;min-width:44px;height:44px;min-height:44px;font-size:22px}.route-gap.end button{height:66px}
+    .workspace-foot{display:block}.workspace-foot:after{content:'Swipe horizontally to explore each route. Tap + or the arrow buttons to edit.';display:block;margin-top:4px;color:#c1d5b4}.segmented{scrollbar-width:auto;scrollbar-color:#759361 #18211b}.picker-options button{min-height:48px}.feed{max-height:none}.review-meta{line-height:1.8}
+  }
+  @media(min-width:581px) and (max-width:1200px){.intro{display:block}.actions{display:flex;flex-wrap:nowrap;justify-content:flex-start;max-width:none;margin-top:18px;gap:8px}.actions button{flex:none}}
+  @media(max-width:580px){.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.actions button{width:100%;font-size:11px}.model-card{flex-basis:180px;width:180px}.hop.hoprow{flex-basis:180px;min-width:180px}.workspace-foot{font-size:10px}.library{padding:12px}}
+  @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*:before,*:after{transition:none!important}}
 </style></head><body>
-<header>
-  <h1>FERRY</h1>
-  <span id="host" class="muted"></span>
-  <span id="uppill" class="pill down">…</span>
-  <span class="grow"></span>
-  <span id="updated" class="muted"></span>
+<header class="topbar">
+  <a class="brand" href="#routes" aria-label="Ferry home"><svg width="30" height="28" viewBox="0 0 30 28" fill="none" aria-hidden="true"><path d="M3 6h24M3 13h17M3 20h10" stroke="currentColor" stroke-width="4"/><path d="m21 14 6 6-6 6" stroke="currentColor" stroke-width="2"/></svg>ferry</a>
+  <span class="edition">SIGNAL / STUDIO</span>
+  <nav class="toplinks" aria-label="Dashboard sections"><a class="current" href="#routes">Routes</a><a href="#live">Traffic</a><a href="#probe">Backends</a></nav>
+  <div class="connection"><span id="host" class="muted"></span><span id="uppill" class="pill down">Connecting…</span><span id="updated" class="muted"></span></div>
 </header>
 <main>
-  <section class="card full" id="live">
-    <h2>Live traffic <span class="muted" id="livemeta"></span></h2>
-    <div id="tapoff" class="event" style="display:none"></div>
-    <div id="tpsnote" class="sub" style="display:none"></div>
-    <div id="livelanes" class="muted">loading&hellip;</div>
-    <div style="display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;margin-top:10px">
-      <span class="sub" id="feedmeta"></span>
-      <span class="toggle" id="showall">show all lanes</span>
+  <section id="routes" aria-labelledby="routes-heading">
+    <div class="intro"><div><div class="eyebrow">Signal Studio / Routing workspace</div><h1 id="routes-heading">Your routes. Within reach.</h1><p>A model library at your side. A clear path for every request.</p></div>
+      <div class="actions" id="routesact" style="display:none"><button id="undobtn" title="Undo (⌘ / Ctrl Z)" disabled>↶ Undo</button><button id="resetbtn">Discard edits</button><button id="previewbtn">Preview changes ↗</button><button id="applybtn" disabled>Apply</button></div>
     </div>
-    <div class="feed" id="feed"></div>
-  </section>
-  <section class="card" id="orch"><h2>Driver</h2><div id="orchbody" class="muted">loading…</div></section>
-  <section class="card" id="work"><h2>Workers</h2><div id="workbody" class="muted">loading…</div></section>
-  <section class="card full" id="act"><h2>Recent activity <span class="muted" id="since"></span></h2>
-    <div class="stats" id="stats"></div>
-    <div class="spark" id="spark"></div>
-    <div class="codes" id="codes"></div>
-    <div id="clients" class="sub" style="margin-top:8px"></div>
-    <div id="event"></div>
-  </section>
-  <section class="card full" id="probe">
-    <h2>Backends</h2>
-    <button id="testbtn">Test backends</button>
-    <span class="muted" style="margin-left:10px">actively calls each backend (spends a few tokens)</span>
-    <div id="probebody" style="margin-top:10px"></div>
-  </section>
-  <section class="card full" id="fleets">
-    <h2>Fleets</h2>
-    <div id="fleetsbody" class="muted">loading…</div>
-  </section>
-  <section class="card full" id="routes">
-    <h2>Routes <span class="muted" id="routespath"></span></h2>
-    <div id="routesbody" class="muted">loading…</div>
-    <div id="routesact" style="margin-top:12px;display:none">
-      <button id="previewbtn">Preview changes</button>
-      <button id="applybtn" disabled>Apply</button>
-      <button id="resetbtn">Discard edits</button>
-      <span class="muted" style="margin-left:10px">a snapshot is written before any change</span>
+    <div class="review-area" aria-label="Review and apply route changes"><div class="review-meta"><b>ROUTE CONFIG</b> <span id="routespath"></span><span class="snapshot-note">Snapshot saved before applying.</span></div><pre id="routesdiff" class="diff" aria-label="Route configuration change preview" tabindex="0" style="display:none"></pre><div id="routesmsg" role="status" aria-live="polite"></div></div>
+    <div class="studio-grid">
+      <aside class="library" aria-labelledby="library-heading"><h2 id="library-heading">Model library</h2><p>Drag into a + slot, or click to add.</p><label class="sr-only" for="modelsearch">Search model library</label><input id="modelsearch" type="search" placeholder="Find a model…" autocomplete="off"><div class="models" id="modellibrary"><p>Loading models…</p></div><div class="library-bottom"><b>One model, many routes.</b><br>Dragging between routes copies it.<br>Your primary always stays pinned.</div></aside>
+      <div class="editor-column"><div class="toolbar"><div class="segmented" id="routefilters" role="group" aria-label="Filter visible routes by fleet"></div><span class="route-meta">SEQUENTIAL FAILOVER</span></div><div class="workspace" id="routesbody">Loading routes…</div><div class="workspace-foot"><span><b>+</b> Add in any slot. Drag fallbacks to reorder, or use their arrow buttons.</span></div><div class="editor-note"><span>01 / BUILD YOUR PATH</span><p>Start with a pinned primary. Add resilience one fallback at a time.</p></div></div>
+      <aside class="inspector" aria-label="Route summary"><div class="inspector-heading"><span class="eyebrow">Workspace overview</span><span aria-hidden="true">↗</span></div><div class="inspector-title">Ready to flow.</div><p>Your visible routes, at a glance.</p><div class="inspector-stats"><div><strong id="routecount">—</strong><span>visible lanes</span></div><div><strong id="hopcount">—</strong><span>model hops</span></div></div><div class="inspector-divider"></div><div class="coverage-block"><div class="inspector-label">ROUTE COVERAGE</div><div id="coverage"></div></div><div class="inspector-divider"></div><div class="session-block"><div class="inspector-label">EDITING SESSION</div><div id="editstate" role="status" aria-live="polite">Loading baseline…</div><div class="inspector-note">Fallbacks run from left to right.<br>⌘ / Ctrl Z to undo.<br>Preview before applying.</div></div></aside>
     </div>
-    <pre id="routesdiff" class="diff" style="display:none"></pre>
-    <div id="routesmsg" style="margin-top:8px"></div>
   </section>
+  <div class="operations">
+    <section class="card full" id="live"><h2>Live traffic <span class="muted" id="livemeta"></span></h2><div id="tapoff" class="event" style="display:none"></div><div id="tpsnote" class="sub" style="display:none"></div><div id="livelanes" class="muted">Loading…</div><div class="feed-bar"><span class="sub" id="feedmeta"></span><button type="button" class="toggle" id="showall">show all lanes</button></div><div class="feed" id="feed"></div></section>
+    <section class="card" id="orch"><h2>Driver</h2><div id="orchbody" class="muted">Loading…</div></section>
+    <section class="card" id="work"><h2>Workers</h2><div id="workbody" class="muted">Loading…</div></section>
+    <section class="card full" id="act"><h2>Recent activity <span class="muted" id="since"></span></h2><div class="stats" id="stats"></div><div class="spark" id="spark"></div><div class="codes" id="codes"></div><div id="clients" class="sub" style="margin-top:8px"></div><div id="event"></div></section>
+    <section class="card full" id="probe"><h2>Backends</h2><div class="probe-controls"><button id="testbtn">Test backends</button><span class="muted">Actively calls each backend (spends a few tokens).</span></div><div id="probebody" class="probe-results"></div></section>
+    <section class="card full" id="fleets"><h2>Fleets</h2><div id="fleetsbody" class="muted">Loading…</div></section>
+  </div>
 </main>
-<footer id="foot"></footer>
+<footer class="footer"><div class="footer-brand">FERRY / SIGNAL STUDIO <span>LOCAL INTELLIGENCE, IN MOTION</span></div><div id="foot"></div></footer>
+<dialog id="routepicker" aria-labelledby="routepicker-title"><h2 id="routepicker-title">Add a fallback</h2><p>Primaries stay pinned. Choose a model or route below.</p><div class="picker-options" id="routepicker-options"></div><div class="dialog-actions"><button type="button" id="routepicker-close">Cancel</button></div></dialog>
 <script>
 const $=s=>document.querySelector(s);
 const el=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e;};
@@ -1583,25 +1595,12 @@ async function postFleet(body){
   tick();
 }
 // ── route editor ───────────────────────────────────────────────────────────
-// The UNIFIED-ORDER model: EDIT holds each lane as one ordered list,
-// [primary, ...fallbacks]. Position 0 is the lane itself and is PINNED — the
-// backend validates it as unchanged ("primary changes not yet supported:" on
-// anything else) and rewrites only the tail, so the UI never offers a
-// position-0 move at all: the primary row is not draggable and not a drop
-// target, and every drop slot clamps into 1..n.
-//
-// EDIT is seeded from the server once and then LEFT ALONE: tick() runs every
-// 5s, and reseeding on each poll would silently discard an edit mid-drag.
-// SERVER keeps the last server truth so "dirty" is a real comparison rather
-// than a flag we hope stays in sync.
-let EDIT=null, SERVER=null, GROUPS={};
-
-// While a hop is in flight: {lane, from}. A 5s tick that rebuilt the DOM
-// under a live drag would kill the drag, so renderRoutes skips while this is
-// set and the dragend/drop handlers clear it. PICKER_OPEN does the same for
-// the "+ add hop" picker, which is mid-interaction even though EDIT is clean.
-let DRAG=null;
-let PICKER_OPEN=false;
+// Orders always include pinned position zero. Fleet selection filters only the
+// view; every preview and apply carries the complete authoritative lane map.
+let EDIT=null, SERVER=null, GROUPS={}, DRAG=null, PICKER_OPEN=false;
+let HISTORY=[], REVISION=0, REVIEWED=null, PENDING=null, BUSY=false;
+let ROUTE_STATUS=null, VIEW=null, VISIBLE=[];
+const ROUTE_SCROLL=new Map();
 
 // ── pure order helpers — also exercised by lib/ferry-dashui.test.mjs ──────
 // moveHop: insert the hop at `from` (>= 1; position 0 is pinned) before the
@@ -1633,269 +1632,199 @@ function availHops(groups,lane,order){
   return Object.keys(groups).filter(g=>g!==lane&&!order.includes(g)).sort();
 }
 function sameJSON(a,b){return JSON.stringify(a)===JSON.stringify(b);}
+function cloneOrders(orders){return Object.fromEntries(Object.entries(orders||{}).map(([k,v])=>[k,v.slice()]));}
+function insertHop(order,group,before){
+  const next=order.slice();
+  if(!group||next.includes(group)) return next;
+  const index=Number.isFinite(before)?Math.max(1,Math.min(next.length,Math.round(before))):next.length;
+  next.splice(index,0,group); return next;
+}
+function eligibleHop(lane,group,fleets){
+  const prefix=lane.split('.')[0];
+  return !lane.includes('.')||!Object.prototype.hasOwnProperty.call(fleets||{},prefix)||group.startsWith(prefix+'.');
+}
+function transferHop(orders,source,lane,before,fleets){
+  const next=cloneOrders(orders);
+  if(!source||!next[lane]) return next;
+  const group=source.lane?((orders[source.lane]||[])[source.from]):source.group;
+  if(!group||!eligibleHop(lane,group,fleets))return next;
+  if(source.lane){
+    const origin=orders[source.lane];
+    if(!origin||!Number.isInteger(source.from)||source.from<1||source.from>=origin.length) return next;
+    if(source.lane===lane){next[lane]=moveHop(next[lane],source.from,before);return next;}
+    next[lane]=insertHop(next[lane],origin[source.from],before);
+  }else next[lane]=insertHop(next[lane],source.group,before);
+  return next;
+}
 // ── end pure order helpers ─────────────────────────────────────────────────
 
-const laneKind=g=>(GROUPS[g]&&GROUPS[g].count>1)
-  ? 'pool · '+GROUPS[g].count+' deployments share this name'
-  : 'ordered chain';
+const laneKind=g=>(GROUPS[g]&&GROUPS[g].count>1)?'pool · '+GROUPS[g].count+' deployments':'ordered chain';
 const modelOf=g=>shortModel(((GROUPS[g]||{}).models||[])[0]||'');
-
-function routesDirty(){
-  if(!EDIT||!SERVER) return false;
-  return !sameJSON(EDIT,SERVER);
-}
-
-function renderRoutes(st){
-  if(DRAG||PICKER_OPEN) return;   // never rebuild the DOM under a live gesture
-  const t=st.topology||{}; GROUPS=t.groups||{};
-  const fb=t.fallbacks||{};
-  // Editable lanes: anything with a chain, plus anything the catalogue serves.
-  // A served lane with no chain (the local GPU lanes) belongs here too — its
-  // empty chain is a deliberate choice worth SEEING, not an absence.
-  const lanes=[...new Set([...Object.keys(fb),...(st.models||[])])]
-    .filter(l=>GROUPS[l]).sort();
-  // SERVER must carry the SAME key set as EDIT or the dirty comparison is
-  // unequal from the first render: a lane with no fallbacks entry is just the
-  // lane itself ([lane]) here, not missing. Getting this wrong made the
-  // editor claim unsaved edits on load, which also froze the poll (tick skips
-  // reseeding while dirty).
-  SERVER={}; lanes.forEach(l=>SERVER[l]=[l,...(fb[l]||[])]);
-  if(EDIT===null){ EDIT={}; lanes.forEach(l=>EDIT[l]=[l,...(fb[l]||[])]); }
-
-  $('#routespath').textContent=st.config_path||'';
-  const box=$('#routesbody'); box.innerHTML=''; box.className='';
-  if(!lanes.length){ box.className='muted'; box.textContent=t.error||'no lanes found'; return; }
-
-  // Group the lane cards by fleet, in the fleets' own file order, then every
-  // lane no fleet claimed — the unprefixed shared lanes, plus any lane a
-  // failed topology parse left unplaced — alphabetically under one `shared`
-  // heading. When no fleet owns a lane (a pre-fleets litellm.yaml, or a
-  // topology the parser could not read), nothing changes at all: the same
-  // plain alphabetical list this card has always rendered.
-  const laneSet=new Set(lanes);
-  // Fleets that own at least one editable lane. When there are none (a
-  // pre-fleets litellm.yaml, or a topology the parser could not read) the
-  // card renders exactly as it always has: alphabetical, no headings.
-  const fleetNames=Object.keys(t.fleets||{}).filter(f=>(t.fleets[f]||[]).some(l=>laneSet.has(l)));
-  let orderedLanes=lanes;
-  const headingBefore={};
-  if(fleetNames.length){
-    orderedLanes=[];
-    fleetNames.forEach(fname=>{
-      const ls=t.fleets[fname].filter(l=>laneSet.has(l));
-      headingBefore[ls[0]]=fname;
-      orderedLanes.push(...ls);
-    });
-    // Everything a fleet did not claim — the unprefixed shared lanes and any
-    // lane the topology failed to place — follows under one heading, so no
-    // lane can vanish from the editor whatever t.shared holds.
-    const seen=new Set(orderedLanes);
-    const rest=lanes.filter(l=>!seen.has(l));
-    if(rest.length){ headingBefore[rest[0]]='shared'; orderedLanes.push(...rest); }
-  }
-
-  orderedLanes.forEach(lane=>{
-    if(headingBefore[lane]) box.appendChild(el('h3','fleet',headingBefore[lane]));
-    const order=EDIT[lane]||(EDIT[lane]=[lane]);
-    const sec=el('div','lane');
-    const h=el('h3',null,lane);
-    h.appendChild(el('span','kind',laneKind(lane)));
-    if(!sameJSON(order,SERVER[lane])) h.appendChild(el('span','dirty',' · modified'));
-    sec.appendChild(h);
-
-    const list=el('div','hops'); list.setAttribute('role','list');
-    // Position 0 — the primary. Pinned: not draggable, never a drop target,
-    // so the pinned posture the backend enforces is impossible to violate
-    // rather than merely error-prone.
-    const p=el('div','hop hoprow primary'); p.setAttribute('role','listitem');
-    p.appendChild(el('span','idx','0'));
-    const star=el('span','star','★'); star.title='primary — pinned'; p.appendChild(star);
-    const pw=el('div','who'); pw.appendChild(el('b',null,modelOf(lane)||lane));
-    pw.appendChild(el('span',null,lane));
-    p.appendChild(pw);
-    p.appendChild(el('span','ptag','PRIMARY'));
-    // draggable=false means no dragstart ever fires, so the hint rides a
-    // mousedown + pull instead: the moment the user hauls on the row, say why
-    // nothing happens.
-    p.addEventListener('mousedown',e=>{
-      const sx=e.clientX, sy=e.clientY;
-      const mv=ev=>{ if(Math.abs(ev.clientX-sx)+Math.abs(ev.clientY-sy)>6){pinHint(sec);cleanup();} };
-      const cleanup=()=>{document.removeEventListener('mousemove',mv);
-                         document.removeEventListener('mouseup',up);};
-      const up=()=>cleanup();
-      document.addEventListener('mousemove',mv); document.addEventListener('mouseup',up);
-    });
-    list.appendChild(p);
-
-    // Positions 1..n — the fallback hops, one draggable row each. ↑/↓ stay as
-    // the keyboard-accessible path; drag is the primary gesture.
-    const fbrows=[];
-    const centers=()=>fbrows.map(r=>{const b=r.getBoundingClientRect();
-                                     return b.top+b.height/2;});
-    for(let i=1;i<order.length;i++){
-      const hop=order[i];
-      const r=el('div','hop hoprow'); r.setAttribute('role','listitem');
-      r.draggable=true;
-      r.appendChild(el('span','idx',String(i)));
-      const grip=el('span','grip','⠿'); grip.title='drag to reorder'; r.appendChild(grip);
-      const w=el('div','who'); w.appendChild(el('b',null,modelOf(hop)||hop));
-      w.appendChild(el('span',null,hop+(GROUPS[hop]&&GROUPS[hop].count>1?' · pool':'')));
-      r.appendChild(w);
-      const up=el('button','mini','↑'); up.title='move up';
-      up.setAttribute('aria-label','move '+hop+' up'); up.disabled=(i===1);
-      up.onclick=()=>{EDIT[lane]=moveHop(order,i,i-1);redraw();};
-      const dn=el('button','mini','↓'); dn.title='move down';
-      dn.setAttribute('aria-label','move '+hop+' down'); dn.disabled=(i===order.length-1);
-      dn.onclick=()=>{EDIT[lane]=moveHop(order,i,i+2);redraw();};
-      const rm=el('button','mini rm','×'); rm.title='remove hop';
-      rm.setAttribute('aria-label','remove '+hop);
-      rm.onclick=()=>{order.splice(i,1);redraw();};
-      r.appendChild(up); r.appendChild(dn); r.appendChild(rm);
-      // Promote: swap this hop's backend with the lane's primary, live and
-      // in the file, with no restart. Preview first (what WOULD trade), then
-      // confirm — a primary swap moves real traffic, so it never fires on
-      // one click.
-      const pm=el('button','mini','⇈'); pm.title='promote to primary (swap backends, no restart)';
-      pm.setAttribute('aria-label','promote '+hop+' to primary of '+lane);
-      pm.onclick=()=>promoteFlow(lane,hop,pm);
-      r.appendChild(pm);
-      r.addEventListener('dragstart',e=>{
-        DRAG={lane:lane,from:i};
-        try{e.dataTransfer.setData('text/plain',hop);}catch(err){}
-        e.dataTransfer.effectAllowed='move';
-        r.classList.add('dragging'); sec.classList.add('dropping');
-      });
-      r.addEventListener('dragend',()=>endDrag(sec));
-      list.appendChild(r); fbrows.push(r);
-    }
-
-    // The drop zone is THIS lane's list and nothing else: a hop from another
-    // lane never preventDefaults here, so the browser refuses the drop and a
-    // chain cannot leak across lanes.
-    list.addEventListener('dragover',e=>{
-      if(!DRAG||DRAG.lane!==lane) return;
-      e.preventDefault(); e.dataTransfer.dropEffect='move';
-      const idx=dropIndexFromY(centers(),e.clientY);
-      fbrows.forEach((row,k)=>{
-        const on=row!==fbrows[DRAG.from-1];
-        row.classList.toggle('drop-before',on&&idx===k+1);
-        row.classList.toggle('drop-after',on&&idx===fbrows.length+1&&k===fbrows.length-1);
-      });
-    });
-    list.addEventListener('dragleave',e=>{
-      if(e.relatedTarget&&list.contains(e.relatedTarget)) return;
-      fbrows.forEach(row=>row.classList.remove('drop-before','drop-after'));
-    });
-    list.addEventListener('drop',e=>{
-      if(!DRAG||DRAG.lane!==lane) return;
-      e.preventDefault();
-      const idx=dropIndexFromY(centers(),e.clientY);
-      EDIT[lane]=moveHop(order,DRAG.from,idx);
-      endDrag(sec); redraw();
-    });
-    sec.appendChild(list);
-    sec.appendChild(el('div','pinhint',
-      'the primary (position 0) is pinned — drag the fallback hops below it to reorder'));
-
-    const avail=availHops(GROUPS,lane,order);
-    if(avail.length){
-      const add=el('div','addhop');
-      const btn=el('button','mini add','+ add hop');
-      btn.setAttribute('aria-expanded','false');
-      const pick=el('div','picker'); pick.style.display='none';
-      btn.onclick=()=>{
-        PICKER_OPEN=pick.style.display==='none';
-        pick.style.display=PICKER_OPEN?'':'none';
-        btn.setAttribute('aria-expanded',String(PICKER_OPEN));
-      };
-      avail.forEach(g=>{
-        const b=el('button','mini pick',g+'  ·  '+(modelOf(g)||'?'));
-        b.onclick=()=>{PICKER_OPEN=false;order.push(g);redraw();};
-        pick.appendChild(b);
-      });
-      add.appendChild(btn); add.appendChild(pick);
-      sec.appendChild(add);
-    }
-    box.appendChild(sec);
-  });
-
+function routesDirty(){return !!EDIT&&!!SERVER&&!sameJSON(EDIT,SERVER);}
+function invalidateReview(){REVISION++;REVIEWED=null;PENDING=null;showDiff('');}
+function controls(){
+  const dirty=routesDirty();
   $('#routesact').style.display='';
-  $('#applybtn').disabled=true;          // Apply unlocks only after a preview
-  $('#previewbtn').disabled=!routesDirty();
+  $('#previewbtn').disabled=BUSY||!dirty;
+  $('#applybtn').disabled=BUSY||!REVIEWED||REVIEWED.key!==JSON.stringify(EDIT);
+  $('#resetbtn').disabled=BUSY||!dirty;
+  $('#undobtn').disabled=BUSY||!HISTORY.length;
+  $('#editstate').textContent=BUSY?'Request in progress':dirty?'Unsaved changes':'All changes saved';
 }
-function endDrag(sec){
-  if(sec){ sec.classList.remove('dropping');
-    sec.querySelectorAll('.hop').forEach(r=>r.classList.remove('drop-before','drop-after')); }
-  const d=document.querySelector('.dragging'); if(d) d.classList.remove('dragging');
-  DRAG=null;
+function editOrders(next,note){
+  if(BUSY||sameJSON(next,EDIT)) return false;
+  HISTORY.push(cloneOrders(EDIT)); EDIT=next; invalidateReview();
+  redraw();msg(note||'Route updated. Preview before applying.','dirty');return true;
 }
-function pinHint(sec){
-  const h=sec&&sec.querySelector('.pinhint'); if(!h) return;
-  h.classList.add('show'); clearTimeout(h._t);
-  h._t=setTimeout(()=>h.classList.remove('show'),2400);
+function undo(){
+  if(BUSY||!HISTORY.length)return;
+  EDIT=HISTORY.pop();invalidateReview();redraw();msg('Last edit undone.');
 }
-function redraw(){ renderRoutes(LAST||{}); }
-
-async function postRoutes(url){
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
-                           body:JSON.stringify({order:EDIT})});
-  return {code:r.status, body:await r.json()};
+function renderRoutes(st){
+  if(DRAG||PICKER_OPEN||BUSY)return;
+  const t=st.topology||{}, groups=t.groups||{}, fb=t.fallbacks||{};
+  const lanes=[...new Set([...Object.keys(fb),...(st.models||[])])].filter(l=>groups[l]).sort();
+  const next=Object.fromEntries(lanes.map(l=>[l,[l,...(fb[l]||[])]]));
+  const wasDirty=routesDirty();
+  const changed=SERVER&&!sameJSON(SERVER,next);
+  if(changed)invalidateReview();
+  SERVER=next;GROUPS=groups;ROUTE_STATUS=st;
+  if(EDIT===null||!wasDirty){EDIT=cloneOrders(SERVER);if(changed)HISTORY=[];}
+  drawRoutes();
+}
+function redraw(){if(EDIT)drawRoutes();}
+function drawRoutes(){
+  const workspace=$('#routesbody'),workspaceTop=workspace.scrollTop;
+  workspace.querySelectorAll('.lane').forEach(section=>{
+    const hops=section.querySelector('.hops');
+    if(hops)ROUTE_SCROLL.set(section.dataset.lane,hops.scrollLeft);
+  });
+  const st=ROUTE_STATUS||{}, t=st.topology||{};
+  const lanes=Object.keys(EDIT), owned=new Set(Object.values(t.fleets||{}).flat());
+  const views=[['*','All lanes',lanes],...Object.entries(t.fleets||{}).map(([f,ls])=>['fleet:'+f,f,ls.filter(l=>lanes.includes(l))])];
+  const shared=lanes.filter(l=>!owned.has(l));if(shared.length)views.push(['shared','Shared',shared]);
+  if(VIEW===null){
+    const known='fleet:'+((st.fleet||{}).fleet||'');
+    VIEW=(views.find(([id,,ls])=>id===known&&ls.length)||views.find(([id,,ls])=>id.startsWith('fleet:')&&ls.length)||views[0])[0];
+  }
+  if(!views.some(([id])=>id===VIEW))VIEW='*';
+  VISIBLE=views.find(([id])=>id===VIEW)[2];
+  const filters=$('#routefilters');filters.replaceChildren();
+  views.forEach(([id,label,ls])=>{const b=el('button','fleet-tab'+(VIEW===id?' selected':''),label+' · '+ls.length);
+    b.setAttribute('aria-pressed',String(VIEW===id));b.disabled=BUSY;b.onclick=()=>{VIEW=id;redraw();};filters.appendChild(b);});
+  $('#routespath').textContent=st.config_path||'';
+  const box=$('#routesbody');box.replaceChildren();box.classList.remove('loading','muted');
+  if(!VISIBLE.length)box.appendChild(el('p','muted',t.error||'No lanes in this view.'));
+  VISIBLE.forEach(lane=>{
+    const order=EDIT[lane],sec=el('div','lane');sec.dataset.lane=lane;
+    const h=el('h3',null,lane);h.appendChild(el('span','kind',laneKind(lane)));
+    if(!sameJSON(order,SERVER[lane]))h.appendChild(el('span','dirty','modified'));
+    sec.appendChild(h);const list=el('div','hops');list.setAttribute('role','list');list.setAttribute('aria-label',lane+' route');
+    order.forEach((hop,i)=>{
+      if(i)list.appendChild(routeGap(lane,i));
+      const r=el('div','hop hoprow'+(i?'':' primary'));r.setAttribute('role','listitem');
+      Object.assign(r.dataset,{lane,index:String(i),group:hop});
+      const top=el('div','hop-top');top.appendChild(el('span',null,i?'FALLBACK '+i:'PRIMARY'));
+      top.appendChild(el('span',i?'grip':'star',i?'⠿':'⌑ PINNED'));r.appendChild(top);
+      const who=el('div','who');who.appendChild(el('b',null,modelOf(hop)||hop));who.appendChild(el('span',null,hop));r.appendChild(who);
+      if(i){
+        const actions=el('div','hop-actions');
+        const button=(label,title,fn,disabled)=>{const b=el('button','mini',label);b.title=title;b.setAttribute('aria-label',title);b.disabled=BUSY||!!disabled;b.onclick=fn;actions.appendChild(b);return b;};
+        const move=before=>{const next=cloneOrders(EDIT);next[lane]=moveHop(next[lane],i,before);editOrders(next);};
+        button('←','Move '+hop+' earlier in '+lane,()=>move(i-1),i===1);
+        button('→','Move '+hop+' later in '+lane,()=>move(i+2),i===order.length-1);
+        button('×','Remove '+hop+' from '+lane,()=>{const next=cloneOrders(EDIT);next[lane].splice(i,1);editOrders(next,'Fallback removed. Undo is available.');});
+        const promote=button('⇈','Promote '+hop+' to primary of '+lane,()=>promoteFlow(lane,hop),routesDirty());
+        if(routesDirty())promote.title='Apply or discard route edits before promoting a primary.';
+        if(PENDING&&PENDING.lane===lane&&PENDING.hop===hop){promote.textContent='Confirm ⇈';promote.onclick=confirmPromote;}
+        r.appendChild(actions);r.draggable=!BUSY;
+        r.addEventListener('dragstart',e=>startDrag(e,{lane,from:i,group:hop},r));
+        r.addEventListener('dragend',endDrag);
+      }
+      list.appendChild(r);
+    });
+    list.appendChild(routeGap(lane,order.length,true));sec.appendChild(list);box.appendChild(sec);
+    list.scrollLeft=ROUTE_SCROLL.get(lane)||0;
+  });
+  $('#routecount').textContent=String(VISIBLE.length);
+  $('#hopcount').textContent=String(VISIBLE.reduce((n,l)=>n+EDIT[l].length,0));
+  const coverage=$('#coverage');coverage.replaceChildren();
+  VISIBLE.forEach(l=>{const row=el('div','coverage-row'),heading=el('div');heading.appendChild(el('span',null,l));heading.appendChild(el('small',null,EDIT[l].length+' HOPS'));row.appendChild(heading);
+    const pips=el('div','coverage-pips');EDIT[l].forEach(()=>pips.appendChild(el('i')));row.appendChild(pips);coverage.appendChild(row);});
+  workspace.scrollTop=workspaceTop;
+  renderLibrary();controls();
+}
+function renderLibrary(){
+  const q=$('#modelsearch').value.toLowerCase().trim(),box=$('#modellibrary');box.replaceChildren();
+  Object.keys(GROUPS).sort().filter(g=>(g+' '+(GROUPS[g].models||[]).join(' ')).toLowerCase().includes(q)).forEach(g=>{
+    const b=el('button','model-card');b.dataset.group=g;b.draggable=!BUSY;b.disabled=BUSY;
+    b.setAttribute('aria-label','Add '+g+' to a route');b.appendChild(el('span','model-symbol','◈'));
+    const copy=el('span','model-copy');copy.appendChild(el('b',null,modelOf(g)||g));copy.appendChild(el('span',null,g));b.appendChild(copy);
+    b.onclick=()=>openPicker(null,null,g);b.addEventListener('dragstart',e=>startDrag(e,{group:g},b));b.addEventListener('dragend',endDrag);box.appendChild(b);
+  });
+  if(!box.childElementCount)box.appendChild(el('p','muted','No models match this search.'));
+}
+function fleetRules(){return ((ROUTE_STATUS||{}).topology||{}).fleets||{};}
+function validDrop(lane){return DRAG&&eligibleHop(lane,DRAG.group,fleetRules())&&(DRAG.lane===lane||!EDIT[lane].includes(DRAG.group));}
+function startDrag(e,source,node){
+  if(BUSY){e.preventDefault();return;}DRAG=source;node.classList.add('dragging');
+  e.dataTransfer.setData('text/plain',source.group);e.dataTransfer.effectAllowed=source.lane?'copyMove':'copy';
+  document.querySelectorAll('.route-gap').forEach(g=>g.classList.add(validDrop(g.dataset.lane)?'valid':'invalid'));
+}
+function endDrag(){
+  DRAG=null;document.querySelectorAll('.dragging,.route-gap').forEach(n=>n.classList.remove('dragging','valid','invalid','over'));
+}
+function routeGap(lane,before,end){
+  const gap=el('div','route-gap'+(end?' end':''));Object.assign(gap.dataset,{lane,before:String(before)});
+  const b=el('button',null,'+');b.disabled=BUSY;b.setAttribute('aria-label','Add fallback to '+lane+' at position '+before);b.onclick=()=>openPicker(lane,before);gap.appendChild(b);
+  gap.addEventListener('dragover',e=>{if(!validDrop(lane))return;e.preventDefault();e.dataTransfer.dropEffect=DRAG.lane===lane?'move':'copy';gap.classList.add('over');});
+  gap.addEventListener('dragleave',e=>{if(!gap.contains(e.relatedTarget))gap.classList.remove('over');});
+  gap.addEventListener('drop',e=>{if(!DRAG)return;e.preventDefault();const source=DRAG,valid=validDrop(lane);endDrag();
+    if(valid)editOrders(transferHop(EDIT,source,lane,before,fleetRules()),source.lane&&source.lane!==lane?'Fallback copied. Source route unchanged.':'Route updated.');
+    else msg(eligibleHop(lane,source.group,fleetRules())?'That model group is already in this route.':'Fleet routes only accept model groups from the same fleet.');});return gap;
+}
+function closePicker(){PICKER_OPEN=false;$('#routepicker').close();}
+function openPicker(lane,before,group){
+  if(BUSY)return;const dialog=$('#routepicker'),options=$('#routepicker-options');options.replaceChildren();
+  $('#routepicker-title').textContent=group?'Place '+group:'Add fallback · '+lane;
+  const entries=group?VISIBLE:Object.keys(GROUPS).sort();
+  entries.forEach(value=>{const target=group?value:lane,g=group||value,duplicate=EDIT[target].includes(g),unavailable=!eligibleHop(target,g,fleetRules());
+    const b=el('button','pick',group?target+' · '+(duplicate?'Already in route':'Add at end'):g+' · '+modelOf(g)+(duplicate?' · Already in route':''));
+    b.disabled=duplicate||unavailable;if(unavailable){b.textContent+=' · Different fleet';b.title='Fleet routes only accept groups in the same fleet.';}b.onclick=()=>{closePicker();const next=cloneOrders(EDIT);next[target]=insertHop(next[target],g,group?next[target].length:before);editOrders(next);};options.appendChild(b);});
+  PICKER_OPEN=true;dialog.showModal();
+}
+async function postRoutes(url,order){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order})});return {code:r.status,body:await r.json()};
 }
 function showDiff(d){
-  const pre=$('#routesdiff'); pre.innerHTML=''; pre.style.display=d?'':'none';
-  (d||'').split('\n').forEach(l=>{
-    // `+++ proposed` / `--- current` are FILE HEADERS, not changed lines. Test
-    // them before the single-character checks or the diff reads as two extra
-    // edits that are not in the config.
-    const c=(l.startsWith('+++')||l.startsWith('---'))?'hunk'
-           :l.startsWith('+')?'add':l.startsWith('-')?'del'
-           :l.startsWith('@')?'hunk':'';
-    pre.appendChild(el('div',c,l));
-  });
+  const pre=$('#routesdiff');pre.replaceChildren();pre.style.display=d?'':'none';
+  (d||'').split('\n').forEach(l=>{const c=(l.startsWith('+++')||l.startsWith('---'))?'hunk':l.startsWith('+')?'add':l.startsWith('-')?'del':l.startsWith('@')?'hunk':'';pre.appendChild(el('div',c,l));});
 }
-function msg(text,cls){ const m=$('#routesmsg'); m.className=cls||''; m.textContent=text||''; }
-
-// ── promote flow ─────────────────────────────────────────────────────────
-// ⇈ on a hop row: preview the backend swap (file diff + live verdict), then
-// confirm. Two clicks by design — a promote moves real traffic the moment it
-// applies, so it never fires on one. PENDING holds the in-flight confirm
-// state; any new preview/apply/reset clears it.
-let PENDING=null;
+function msg(text,cls){const m=$('#routesmsg');m.className=cls||'';m.textContent=text||'';}
 async function postPromote(url,lane,hop){
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},
-                           body:JSON.stringify({lane:lane,hop:hop})});
-  return {code:r.status, body:await r.json()};
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lane,hop})});return {code:r.status,body:await r.json()};
 }
-async function promoteFlow(lane,hop,btn){
-  btn.disabled=true; msg('promote preview…'); showDiff('');
+async function promoteFlow(lane,hop){
+  if(BUSY||routesDirty()){msg('Apply or discard route edits before promoting a primary.');return;}
+  invalidateReview();const revision=REVISION;BUSY=true;redraw();msg('Promote preview…');
   try{
     const {code,body}=await postPromote('/api/routes/promote/preview',lane,hop);
-    if(code!==200||(body.errors&&body.errors.length)){
-      showDiff(''); msg(((body&&body.errors)||['preview failed']).join('  ·  '),'err');
-      btn.disabled=false; return;
-    }
-    showDiff(body.diff||'(no file change)');
-    const live=body.live||{};
-    const summary='swap '+lane+' ⇄ '+hop+': '+
-      shortModel(live.old_lane_model||'?')+' ⇄ '+shortModel(live.old_hop_model||'?')+
-      (live.ok===false?'  ·  LIVE REFUSES: '+((live.errors||[]).join(' · ')||live.error||'?'):'');
-    msg(summary+(live.ok===false?'':'  — confirm to swap backends (file + live, no restart).'),
-        live.ok===false?'err':'dirty');
-    if(live.ok===false){ btn.disabled=false; return; }
-    // Swap the button into a confirm: second click applies.
-    PENDING={lane:lane,hop:hop};
-    btn.textContent='confirm ⇈'; btn.disabled=false;
-    btn.onclick=async()=>{
-      btn.disabled=true; PENDING=null; msg('swapping backends…');
-      try{
-        const r2=await postPromote('/api/routes/promote/apply',lane,hop);
-        if(r2.code!==200){ msg(((r2.body&&r2.body.errors)||['failed']).join('  ·  '),'err'); return; }
-        msg('Swapped. Snapshot: '+r2.body.snapshot+'  ·  '+r2.body.note,'ok');
-        PICKER_OPEN=false; EDIT=null; showDiff(''); tick();
-      }catch(e){ msg('promote failed: '+e,'err'); }
-      finally{ btn.textContent='⇈'; btn.onclick=()=>promoteFlow(lane,hop,btn); }
-    };
-  }catch(e){ msg('promote preview failed: '+e,'err'); btn.disabled=false; }
+    if(revision!==REVISION)return;
+    if(code!==200||(body.errors||[]).length)throw new Error((body.errors||['Preview failed']).join(' · '));
+    showDiff(body.diff||'(no file change)');const live=body.live||{};
+    if(live.ok===false)throw new Error('Live refuses: '+((live.errors||[]).join(' · ')||live.error||'Unknown error'));
+    PENDING={lane,hop,revision};msg('Swap '+lane+' ⇄ '+hop+': '+shortModel(live.old_lane_model||'?')+' ⇄ '+shortModel(live.old_hop_model||'?')+'. Confirm to swap backends (file + live, no restart).','dirty');
+  }catch(e){msg('Promote preview failed: '+e.message,'err');}
+  finally{BUSY=false;redraw();}
+}
+async function confirmPromote(){
+  const p=PENDING;if(BUSY||!p||p.revision!==REVISION||routesDirty())return;
+  BUSY=true;PENDING=null;redraw();msg('Swapping backends…');
+  try{const {code,body}=await postPromote('/api/routes/promote/apply',p.lane,p.hop);
+    if(code!==200||(body.errors||[]).length)throw new Error((body.errors||['Swap failed']).join(' · '));
+    EDIT=null;HISTORY=[];invalidateReview();msg('Swapped. Snapshot: '+body.snapshot+' · '+body.note,'ok');
+  }catch(e){msg('Promote failed: '+e.message,'err');}
+  finally{BUSY=false;redraw();tick();}
 }
 
 // -- live view --------------------------------------------------------------
@@ -2122,11 +2051,11 @@ async function tick(){
     const st=await (await fetch('/status')).json();
     LAST=st;
     const f=st.ferry;
-    $('#host').innerHTML='<span class="muted">'+f.host+':'+f.port+'</span> &nbsp; '+
-      '<span class="muted">groups:</span> '+(st.models||[]).map(m=>'<code>'+m+'</code>').join(' ');
+    const host=$('#host');host.replaceChildren(el('span','muted',f.host+':'+f.port+' · groups: '));
+    (st.models||[]).forEach(m=>{host.appendChild(el('code',null,m));host.appendChild(document.createTextNode(' '));});
     const pill=$('#uppill'); pill.className='pill '+(f.up?'up':'down'); pill.textContent=f.up?'● UP':'● DOWN';
     $('#updated').textContent='updated '+new Date(st.ts*1000).toLocaleTimeString();
-    $('#foot').innerHTML='config <code>'+st.config_path+'</code> &nbsp;·&nbsp; log <code>'+((st.activity||{}).log||'—')+'</code> &nbsp;·&nbsp; auto-refresh 5s (no tokens)';
+    const foot=$('#foot');foot.replaceChildren(document.createTextNode('config '),el('code',null,st.config_path||''),document.createTextNode(' · log '),el('code',null,(st.activity||{}).log||'—'),document.createTextNode(' · auto-refresh 5s (no tokens)'));
     renderOrch(st); renderWork(st); renderAct(st); renderLive(st); renderFleets(st);
     openStream(st);
     // Only reseed the editor when the user has no unsaved edit. A 5s poll that
@@ -2152,33 +2081,42 @@ $('#testbtn').onclick=async()=>{
   }catch(e){ pb.textContent='probe failed: '+e; }
   b.disabled=false; b.textContent='Test backends';
 };
+$('#modelsearch').addEventListener('input',renderLibrary);
+$('#routepicker-close').onclick=closePicker;
+$('#routepicker').addEventListener('close',()=>{PICKER_OPEN=false;});
+$('#routepicker').addEventListener('cancel',()=>{PICKER_OPEN=false;});
+$('#undobtn').onclick=undo;
 $('#previewbtn').onclick=async()=>{
-  PENDING=null; msg('preview…'); showDiff('');
-  try{
-    const {body}=await postRoutes('/api/routes/order/preview');
-    if(body.errors&&body.errors.length){ showDiff(''); msg(body.errors.join('  ·  '),'err');
-                                         $('#applybtn').disabled=true; return; }
-    showDiff(body.diff||'(no change)');
-    // Apply is reachable ONLY through a preview that validated, so the diff on
-    // screen is always the diff that gets written.
-    $('#applybtn').disabled=!body.diff;
-    msg(body.diff?'Reviewed the diff? Apply writes it, after a snapshot.':'No change to apply.');
-  }catch(e){ msg('preview failed: '+e,'err'); }
+  if(BUSY||!routesDirty())return;
+  invalidateReview();const revision=REVISION,order=cloneOrders(EDIT),key=JSON.stringify(order);
+  // Preview remains editable; a later edit makes this response obsolete.
+  msg('Preview…');redraw();
+  try{const {code,body}=await postRoutes('/api/routes/order/preview',order);
+    if(revision!==REVISION||key!==JSON.stringify(EDIT))return;
+    if(code!==200||(body.errors||[]).length)throw new Error((body.errors||['Preview failed']).join(' · '));
+    showDiff(body.diff||'(no change)');REVIEWED=body.diff?{key,order,revision}:null;
+    msg(body.diff?'Review the diff. Apply writes this exact order after a snapshot.':'No change to apply.');
+  }catch(e){if(revision===REVISION)msg('Preview failed: '+e.message,'err');}
+  finally{controls();}
 };
 $('#applybtn').onclick=async()=>{
-  const b=$('#applybtn'); b.disabled=true; PENDING=null; msg('writing…');
-  try{
-    const {code,body}=await postRoutes('/api/routes/order/apply');
-    if(code!==200){ msg((body.errors||['failed']).join('  ·  '),'err'); return; }
-    msg('Written. Snapshot: '+body.snapshot+'  ·  '+body.note,'ok');
-    PICKER_OPEN=false; EDIT=null; showDiff(''); tick();
-  }catch(e){ msg('apply failed: '+e,'err'); b.disabled=false; }
+  const reviewed=REVIEWED;
+  if(BUSY||!reviewed||reviewed.revision!==REVISION||reviewed.key!==JSON.stringify(EDIT))return;
+  BUSY=true;PENDING=null;redraw();msg('Writing…');
+  try{const {code,body}=await postRoutes('/api/routes/order/apply',reviewed.order);
+    if(code!==200||(body.errors||[]).length)throw new Error((body.errors||['Apply failed']).join(' · '));
+    EDIT=null;HISTORY=[];invalidateReview();msg('Written. Snapshot: '+body.snapshot+' · '+body.note,'ok');
+  }catch(e){invalidateReview();msg('Apply failed: '+e.message+'. Preview again before retrying.','err');}
+  finally{BUSY=false;redraw();tick();}
 };
-$('#resetbtn').onclick=()=>{ PICKER_OPEN=false; PENDING=null; EDIT=null; showDiff(''); msg(''); tick(); };
-// Escape is a way out of an open picker that does not touch the mouse.
+$('#resetbtn').onclick=()=>{
+  if(BUSY)return;closePicker();endDrag();
+  if(routesDirty()){HISTORY.push(cloneOrders(EDIT));EDIT=cloneOrders(SERVER);}
+  invalidateReview();redraw();msg('Draft discarded. Undo is available.');tick();
+};
 document.addEventListener('keydown',e=>{
-  if(e.key!=='Escape'||!PICKER_OPEN) return;
-  PICKER_OPEN=false; redraw();
+  if(e.key==='Escape'){endDrag();if(PICKER_OPEN)closePicker();}
+  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'&&!e.target.closest('input,textarea,select,[contenteditable]')&&!PICKER_OPEN){e.preventDefault();undo();}
 });
 renderFeed(); tick(); setInterval(tick, 5000);
 </script>

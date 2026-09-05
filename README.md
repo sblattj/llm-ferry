@@ -14,18 +14,23 @@
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI--compatible-412991.svg">
 </p>
 
-<!--
-  Replace docs/demo.gif with a fresh screen recording of `ferry up` on the host +
-  the one-line client curl bootstrap. A ~30s GIF above the fold is worth 1000 words.
-  The one committed here is a placeholder-quality capture — swap it freely.
--->
-<p align="center"><img src="docs/demo.gif" alt="llm-ferry demo" width="760"></p>
+<p align="center">
+  <a href="docs/signal-studio.md"><img src="docs/images/signal-studio-desktop.png" alt="Signal Studio desktop: searchable model library, editable fallback routes, and route overview" width="1100"></a><br>
+  <sub><b>Signal Studio</b> — build fallback routes, preview changes, and follow live requests.<br>Actual dashboard capture with synthetic demonstration data.</sub>
+</p>
 
 You have a strong Mac. You have other laptops. You have a drawer full of API keys copied onto every device. **llm-ferry** collapses all of that into one host: it runs models on your Mac's GPU (via [MLX](https://github.com/ml-explore/mlx)) **and/or** proxies to cloud providers behind the host's own keys, then exposes a single standard **OpenAI-compatible** API (`/v1/chat/completions`, `/v1/models`) that any laptop, editor, or device on the LAN can point at. One command on the host, one `curl | zsh` on each client, and everyone's tools just work — with the API keys staying on exactly one machine.
 
 It goes further than serving inference: it can **ferry whole models and files** from the host to clients and **route a client's downloads through the host** — all over your private LAN.
 
 ---
+
+<details>
+<summary>Watch the terminal workflow</summary>
+
+<p align="center"><img src="docs/demo.gif" alt="llm-ferry terminal workflow demo" width="760"></p>
+
+</details>
 
 ## Is this for you?
 
@@ -58,10 +63,11 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 - 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too, so **Claude Code runs on the ferry backend** (`claude-ferry` wrapper, new in v1.20).
 - 🔑 **Keys stay on the host** — your *provider* keys never leave the host; clients hold one shared master key (v1.22) and never see a provider key.
 - ⚡ **Local GPU + cloud, same endpoint** — Apple MLX inference on the Mac, or a cloud proxy, or **both models on one route config**.
-- 🧠 **Driver lane, no silent failover** — a big planning model (`heavy`) on the ChatGPT subscription with **no** fallback chain, by design: a driver call errors rather than silently continuing the session on a different model. The **worker** lanes (`flash`, `super-flash`) run OpenRouter's `~google/gemini-flash-latest` alias (currently Gemini 3.8 Flash), with `flash` using xhigh reasoning and a Terra fallback, and `super-flash` using minimal reasoning and a Luna fallback.
+- 🧠 **Named lanes with explicit fallback chains** — the checked-in domestic template runs `heavy` on GPT-6 Astra with one GPT-5.6 Sol hop; `flash` runs GPT-5.6 Luna → Gemini Flash Latest → GPT-5.6 Terra; `super-flash` runs Gemini Flash Latest → GPT-5.6 Luna. Clients keep their lane names when you change the backends.
 - 🎛️ **Multi-key worker pool** — several API keys pooled with `usage-based-routing-v2` (proactive least-used spread) and automatic 429 cooldown/failover.
 - 🚀 **One-curl client onboarding** — `curl … | zsh` installs the CLI, writes the client profile, and auto-wires the editor (opencode / Continue / Cursor).
-- 📊 **Observability, new in v1.5** — a zero-dependency stdlib live page **and** a full Grafana + VictoriaMetrics + VictoriaLogs stack (per-model requests/tokens/spend/latency, a Failures & Fallbacks view, searchable logs).
+- 🎨 **Signal Studio route editor** — search your configured model library, add/reorder/copy fallback hops, undo, and review the YAML diff before applying. Desktop, tablet, and phone layouts include tap and keyboard controls. [Tour the workspace →](docs/signal-studio.md)
+- 📊 **See each request clearly** — first-text latency, full response duration, streaming mode, and reported input/output/reasoning tokens in the live dashboard; optional Grafana + VictoriaMetrics + VictoriaLogs for persistent observability.
 - 📦 **Ferry models & files across the LAN** — stream whole models from the host's HuggingFace cache, offer/fetch arbitrary files, or push over netcat.
 - 🕳️ **Forward proxy for offline clients** — route a client's uv/PyPI/HuggingFace/git downloads through the host's connection.
 - 🔄 **Reverse tunnel for locked-down clients** — publish one of a client's own local ports through the host, with the client only ever dialling out (`ferry relay` on the host, `ferry expose <port>` on the client).
@@ -306,8 +312,8 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 
 | Lane | Where it runs | What it is |
 |---|---|---|
-| **`heavy`** | cloud | The big driving model, with a strict **fallback chain** to independent providers |
-| **`flash`** | cloud | Cheap high-volume worker (`~google/gemini-flash-latest`, currently Gemini 3.8 Flash); xhigh reasoning, Terra fallback |
+| **`heavy`** | cloud | The driving model; the domestic template has one fallback on the same ChatGPT subscription |
+| **`flash`** | cloud | High-volume worker; the domestic template runs GPT-5.6 Luna at xhigh, then Gemini Flash Latest, then Terra |
 | **`super-flash`** | cloud | Housekeeping — `title`, `summary`, `compaction`, on their own chain |
 | **`local-orch`** | host GPU | The smart local model (Qwen 3.8-27B nvfp4 + MTP speculative draft) |
 | **`local-sub`** | host GPU | The cheap local fan-out model (Nemotron 3 Nano 30B A3B NVFP4) |
@@ -328,7 +334,7 @@ curl -s http://your-mac.local:8090/v1/chat/completions \
 
 The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — the `domestic.heavy` driver (its legacy `orch`/`orchestrator` names still resolve to it — see [Fleets](#fleets)) logs in once via device code (written to `~/.config/litellm/chatgpt/auth.json`, no API key needed), and `domestic.flash`/`domestic.super-flash` plus their Terra/Luna hops need `OPENROUTER_API_KEY` exported (in your shell or `~/.config/ferry/secrets.env`) — then re-run.
 
-**Worker pool (load-balanced).** The template ships `flash` as one deployment (Gemini 3.8 Flash through OpenRouter, routed to the fastest provider, so the provider spread is OpenRouter's problem); any deployments you add **sharing the `flash` model_name** form a pool: `usage-based-routing-v2` sends each call to the least-used one (proactive even split), and on a `429` it cools the dead deployment out (`cooldown_time`) and rolls traffic to another. If you pool Gemini on a **native** key instead, **widen it with model ids, never with keys.** Google says it plainly — *"Rate limits are applied per project, not per API key"* — so a second key in the same project shares one bucket and buys nothing, and a second *project* to multiply the limit is circumvention under Google APIs ToS §2.d (nine burst-created projects suspended in one night, 2026-08-25, and the account's OAuth APIs restricted). But the limit is per-project-**per-model**: every model id carries its own RPM/TPM/RPD bucket, so pooling `gemini-3.8-flash` with, say, `gemini-3.5-flash` on **one** key is two independent buckets and nothing to circumvent. Pick members that are interchangeable for the lane's *role*, so a caller cannot tell which one answered. The other sanctioned lever is raising the paid tier on that one project (Tier 3 = 20M TPM).
+**Worker pool (load-balanced).** The template ships `domestic.flash` as one primary deployment (GPT-5.6 Luna through OpenRouter, with throughput-based provider routing); any deployments you add **sharing the `domestic.flash` model_name** form a pool: `usage-based-routing-v2` sends each call to the least-used one (proactive even split), and on a `429` it cools the dead deployment out (`cooldown_time`) and rolls traffic to another. If you pool Gemini on a **native** key instead, **widen it with model ids, never with keys.** Google says it plainly — *"Rate limits are applied per project, not per API key"* — so a second key in the same project shares one bucket and buys nothing, and a second *project* to multiply the limit is circumvention under Google APIs ToS §2.d (nine burst-created projects suspended in one night, 2026-08-25, and the account's OAuth APIs restricted). But the limit is per-project-**per-model**: every model id carries its own RPM/TPM/RPD bucket, so pooling `gemini-3.8-flash` with, say, `gemini-3.5-flash` on **one** key is two independent buckets and nothing to circumvent. Pick members that are interchangeable for the lane's *role*, so a caller cannot tell which one answered. The other sanctioned lever is raising the paid tier on that one project (Tier 3 = 20M TPM).
 
 **Only lanes are advertised.** `/v1/models` lists the lanes you mark `model_info: {public: true}` and nothing else. That matters more than it sounds: `router_settings.fallbacks` is keyed by model group, so `flash` has a Terra chain and `super-flash` has a Luna chain — a client that picks a fallback hop out of a model list gets a single provider with **no failover at all**, and only finds out when that hop is down, which is the case the chain exists for. litellm has no setting for this (`hidden` applies to `model_group_alias` entries only), so `ferry up` serves litellm's own app through a small ASGI filter (`front/ferry_front.py`) that trims the listing. It is not a second process and not a reverse proxy — every request that is not the model listing goes to litellm untouched, so nothing sits between a client and a streamed token. Hiding is not removing: an unadvertised hop is still callable by name if you ask for it. If the filter cannot start, ferry says so and serves litellm directly rather than leaving the endpoint down.
 
@@ -336,7 +342,7 @@ The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.
 
 **Each worker lane gets its own strict fallback chain.** `flash` runs GPT-5.6 Luna at `xhigh` (since 2026-09-05; `chatgpt/responses/gpt-5.6-luna` on this host, `openrouter/openai/gpt-5.6-luna` in the example) and falls back to `flash-gemini` (`openrouter/~google/gemini-flash-latest`, currently resolving to Gemini 3.8 Flash, routed to the fastest-throughput OpenRouter provider, `reasoning.effort: xhigh`), then `flash-terra` (GPT-5.6 Terra, `xhigh`); `super-flash` runs the Gemini alias at `reasoning.effort: minimal` and falls back to `super-flash-luna` (GPT-5.6 Luna, reasoning off). Each fallback fires only when its primary errors — a `429`, a `5xx`, or a hard quota `403` — and is never public.
 
-**OpenRouter hops route to the fastest provider.** One OpenRouter model id is served by many providers — GLM 5.3 Flash by 22 on 2026-09-02, from 111 tok/s at the top to 17 at the bottom — and OpenRouter's default picks among the *cheapest* of them, weighted by inverse-square price. **Gemini 3.8 Flash** — the model behind `flash` and `super-flash` (whose `flash-luna`/`super-flash-luna` hops ride OpenRouter too) — therefore carries `extra_body: {provider: {sort: throughput}}`, which is [OpenRouter's own provider-routing object](https://openrouter.ai/docs/features/provider-routing) forwarded verbatim by litellm: every request is re-ranked by each provider's p50 tokens/s over a rolling 5-minute window, on OpenRouter's side. Nothing in ferry polls or pins a provider name, so a provider that is rate-limited *this minute* is simply not at the top this minute — pinning `order: ["Baseten"]` (the fastest on the page) returned `429 temporarily rate-limited upstream` while `sort: throughput` on the same model was served by Friendli and Fireworks at once (verified 2026-09-02 through `ferry_front.py`, with an unsorted control lane landing on Z.AI). The trade is price: throughput sort ignores it, so a model with a discounted provider may be served at full rate instead. Drop the block from any deployment you would rather run cheap than fast.
+**OpenRouter hops route to the fastest provider.** One OpenRouter model id is served by many providers — GLM 5.3 Flash by 22 on 2026-09-02, from 111 tok/s at the top to 17 at the bottom — and OpenRouter's default picks among the *cheapest* of them, weighted by inverse-square price. **The OpenRouter deployments in the template**, including the `flash` primary and its Gemini/Terra hops, therefore carry `extra_body: {provider: {sort: throughput}}`, which is [OpenRouter's own provider-routing object](https://openrouter.ai/docs/features/provider-routing) forwarded verbatim by litellm: every request is re-ranked by each provider's p50 tokens/s over a rolling 5-minute window, on OpenRouter's side. Nothing in ferry polls or pins a provider name, so a provider that is rate-limited *this minute* is simply not at the top this minute — pinning `order: ["Baseten"]` (the fastest on the page) returned `429 temporarily rate-limited upstream` while `sort: throughput` on the same model was served by Friendli and Fireworks at once (verified 2026-09-02 through `ferry_front.py`, with an unsorted control lane landing on Z.AI). The trade is price: throughput sort ignores it, so a model with a discounted provider may be served at full rate instead. Drop the block from any deployment you would rather run cheap than fast.
 
 **The local lanes are deliberately outside every fallback chain.** The whole point of naming `local-orch` or `local-sub` is that the request stays on your machine — so a stopped GPU lane surfaces as an error rather than quietly spending a cloud quota. (`flash` still spills to its own `flash-terra` hop, and `super-flash` to `super-flash-luna`, cloud-to-cloud fallbacks — just never off the host's GPU.)
 
@@ -421,23 +427,19 @@ fallback CHAIN for every cloud lane (`heavy`, `flash`, `super-flash`) — living
 deployment names. Clients keep sending bare lane names exactly as before; the front door
 resolves each request to a fleet, in order, from an explicit `X-Ferry-Fleet` header, the
 caller's own sticky selection, or the host-wide default recorded in
-`~/.config/ferry/fleets.json`. This host ships two: `domestic` (US-only models — GPT-6
-Sol drives `heavy`, OpenRouter Gemini Flash Latest drives the workers) and `international`
-(the cheapest lane across every model — flat-rate coding plans tried first, Kimi K3 and
-Z.ai GLM 5.3, per-token OpenRouter last on every chain). The Codex/ChatGPT subscription is
-**domestic-only**: `international` never touches it, so its shared usage limit stays
-reserved for `domestic`'s driver and its two ChatGPT-bridge fallback hops (Terra, Luna).
-Every chain is two hops now and, except `domestic.heavy` (which has none, by design), ends
-on OpenRouter's `~openai/gpt-latest` alias as the shared last resort. Any session can move
+`~/.config/ferry/fleets.json`. The checked-in [route template](litellm-route-example.yaml) supplies a `domestic` fleet plus the two local GPU lanes. Add other fleet-prefixed deployments and fallback chains to your host config to make additional fleets available. For example, an `international` fleet can use Kimi or Z.ai primaries with OpenRouter fallbacks. Fleet names and models come from your config; selecting a view in the dashboard does not provision a provider.
+
+The template's domestic routes are shown below. `heavy` has one fallback on the same ChatGPT subscription, so it does not provide independent account-level quota capacity. Any session can move
 between fleets without a config edit or a restart — the very next request after a switch
 resolves to the new fleet, in every worker process. The local GPU lanes (`local-orch`,
 `local-sub`) have no fleet variant; they stay unprefixed and shared, exactly as before
 fleets existed.
 
-| Fleet | `heavy` | `flash` | `super-flash` |
+| Template fleet | `heavy` | `flash` | `super-flash` |
 |---|---|---|---|
-| `domestic` | GPT-6 Astra (ChatGPT subscription), one hop to GPT-5.6 Sol (same bridge, `xhigh`) | GPT-5.6 Luna (ChatGPT bridge, same subscription, `xhigh`), falls back to `~google/gemini-flash-latest` via OpenRouter at `reasoning.effort: xhigh`, then GPT-5.6 Terra (ChatGPT bridge, `xhigh`) | same Gemini alias at `reasoning.effort: minimal`, falls back to GPT-5.6 Luna (ChatGPT bridge, reasoning off), then OpenRouter GPT latest (reasoning off) |
-| `international` | Kimi K3 (`anthropic/k3`, `xhigh`), falls back to Z.ai GLM 5.3 (`thinking: enabled`), then OpenRouter GPT latest (`xhigh`) | Z.ai GLM 5.3 Flash (coding plan, `thinking: enabled`), falls back to `~google/gemini-flash-latest` via OpenRouter (`xhigh`), then OpenRouter GPT latest (`xhigh`) | Z.ai GLM 5.3 Flash (`thinking: disabled`), falls back to `~google/gemini-flash-latest` via OpenRouter (`minimal`), then OpenRouter GPT latest (reasoning off) |
+| `domestic` | GPT-6 Astra → GPT-5.6 Sol, both on the ChatGPT subscription at `xhigh` | OpenRouter GPT-5.6 Luna (`xhigh`) → Gemini Flash Latest (`xhigh`) → GPT-5.6 Terra (`xhigh`) | OpenRouter Gemini Flash Latest (`minimal`) → GPT-5.6 Luna (reasoning off) |
+
+The commands below use `international` as an example of a second fleet you have configured.
 
 ```bash
 ferry fleet ls                    # list fleets, primaries, the default, and `keys missing` if unset
@@ -478,7 +480,17 @@ Both are just **defaults** — swap either for any MLX-compatible model your Mac
 ferry dash --open        # live web dashboard at http://localhost:8091
 ```
 
-A live local dashboard for the route proxy — it runs on the host, no browser polling of the LAN. It shows ferry up/down, the served model groups, the **orchestrator topology read from your `litellm.yaml`** (primary → the `fallbacks` chain), the worker pool, and **recent request activity parsed from the proxy log** (rate, status breakdown, per-client, a sparkline). **Auto-refresh costs nothing** — it only reads the local log plus `/health/liveliness` and `/v1/models`. A **"Test backends"** button is the only thing that spends tokens: it actively pings each backend and reports *which fallback hop actually served* + latency. Pure Python **standard library**, so it runs under any `python3` — no venv, no pip. (Also available standalone as `ferry-dash`.)
+**Signal Studio, new in v1.28.0,** puts the configured model library, editable fallback routes, and live traffic in one local workspace. Search a model, drag it into a **+** slot, or tap to place it. Reorder fallbacks within a lane, copy them between eligible lanes, and keep the primary pinned until you explicitly promote another backend. **Edit → Preview changes → Apply** gives each edit a reviewable path to the config, with a snapshot saved before writing.
+
+Fleet tabs filter the routes you see; the separate **Fleets** controls change routing selections. The dashboard also shows service health, worker pools, recent activity, and per-request timing and usage when the event tap is enabled. Refreshing reads local state and makes no inference calls. **Test backends** actively calls providers and can spend tokens. The dashboard uses Python's standard library and is also available as `ferry-dash`.
+
+<p align="center">
+  <a href="docs/images/signal-studio-ipad.png"><img src="docs/images/signal-studio-ipad.png" alt="Signal Studio at an iPad-sized viewport with a horizontal model library and touch controls" width="650"></a>
+  <a href="docs/images/signal-studio-mobile.png"><img src="docs/images/signal-studio-mobile.png" alt="Signal Studio phone layout with tap controls and horizontally scrollable fallback routes" width="230"></a><br>
+  <sub>Actual dashboard captures with synthetic demonstration data, at tablet and phone viewport sizes in Chrome.</sub>
+</p>
+
+[Open the Signal Studio guide](docs/signal-studio.md) for the full screenshot gallery, route editing steps, promotion behavior, and metric definitions. After applying, read the result message: it reports both the saved config and whether the running proxy accepted the live update.
 
 **Full stack — `ferry dash --grafana` (new in v1.5):**
 
@@ -752,7 +764,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up. Detects the role from `~/.config/ferry/client.json` and runs that side's reset: a **host** rebuilds the CLI from its own checkout, re-links it, and bounces the proxy; a **client** re-pulls the CLI from its host. `--full` also reloads the GPU lanes (host only) |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |
-| — | — | The dashboard's **Routes** panel edits each lane's failover chain in place: reorder, add or remove hops, preview the exact YAML diff, then apply. A timestamped snapshot is written first, only the `fallbacks:` line is rewritten (every comment in your config is left as-is), and the proxy picks the change up on the next `ferry update` |
+| — | — | The dashboard's **Signal Studio** edits each lane's failover chain: search the hop library, drag or use keyboard controls to add/reorder/copy hops, undo, preview the exact YAML diff, apply, or promote a fallback to primary. Fleet tabs filter the lanes in view; separate fleet controls change the fleet actually in effect. A timestamped snapshot is written before an apply |
 | `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`). Clients pass the endpoint key through the one-liner as `FERRY_MASTER_KEY=…` so the new client's profile carries it |
 | `msg <text>` | client | Send a text note to the host's `~/.config/ferry/client_logs.txt` |
 | `log` | client | Pipe stdin straight to the host's `~/.config/ferry/client_logs.txt` |
@@ -774,7 +786,7 @@ Run `ferry --help` for the built-in usage banner.
 
 ## Development
 
-`ferry` is assembled from per-domain modules so the CLI isn't one file to reason about. Source lives in [`lib/`](lib/) as **15 modules**: `ferry-core` (bootstrap, LAN/mDNS discovery, config, secrets), `ferry-usage`, `ferry-install`, `ferry-serve` (up/down/status/catalog), `ferry-share` (LAN share server + telemetry), `ferry-inbox` (read the telemetry back), `ferry-relay` (reverse expose), `ferry-transfer` (pull/get/send/receive/offer), `ferry-drop` (encrypted off-LAN transfer), `ferry-proxy` (serve-hf/serve-proxy), `ferry-integrate` (env/opencode), `ferry-claude` (Claude Code wiring), `ferry-dash`, `ferry-update`, and `ferry-main` (dispatch). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules and regenerate:
+`ferry` is assembled from per-domain modules so the CLI isn't one file to reason about. Source lives in [`lib/`](lib/) as **16 modules**: `ferry-core` (bootstrap, LAN/mDNS discovery, config, secrets), `ferry-usage`, `ferry-install`, `ferry-serve` (up/down/status/catalog), `ferry-share` (LAN share server + telemetry), `ferry-inbox` (read the telemetry back), `ferry-relay` (reverse expose), `ferry-transfer` (pull/get/send/receive/offer), `ferry-drop` (encrypted off-LAN transfer), `ferry-proxy` (serve-hf/serve-proxy), `ferry-integrate` (env/opencode), `ferry-claude` (Claude Code wiring), `ferry-fleet` (fleet selection), `ferry-dash`, `ferry-update`, and `ferry-main` (dispatch). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules and regenerate:
 
 ```bash
 ./build.zsh            # regenerate ./ferry from lib/ferry-*.zsh
@@ -785,25 +797,21 @@ Commit both `lib/` and the regenerated `ferry`; don't hand-edit `ferry` (the syn
 
 ### Tests
 
-Stdlib `unittest`, no dependencies, each suite runnable on its own:
+Run every Python suite, the dashboard JavaScript checks, and the generated CLI guard from the repository root. Python tests use stdlib `unittest`; integration cases can invoke the project's command-line dependencies such as zsh and OpenSSL. The UI checks use Node.js.
 
 ```bash
-python3 lib/ferry-serve.test.py            # lane ports, launch flags, KV governor
-python3 lib/ferry-front.test.py            # the front door: /v1/models advertises lanes only
-python3 lib/ferry-integrate.test.py        # the opencode takeover: scope, lane split, snapshots
-python3 lib/ferry-claude.test.py           # the Claude Code wiring: wrappers, lane map, snapshot
-python3 lib/ferry-hostwrappers.test.py     # host-side opencode wrappers: marker strip, baked host/port
-python3 lib/ferry-share.test.py            # share server + client-script placeholder injection
-python3 lib/ferry-hostreset.test.py        # host-reset: route-config validation, endpoint verify
-python3 lib/ferry-clientbootstrap.test.py  # client scope: bootstrap / reset / cleanup
-python3 lib/ferry-update.test.py           # `ferry update`: role detection, client/host dispatch
-python3 lib/ferry-inbox.test.py            # inbox: the receipt/entry join, host-only guard
-python3 lib/ferry-relay.test.py            # reverse tunnel: byte round-trip, teardown on disconnect, refusals
-python3 lib/ferry-drop.test.py             # drop/pickup: encrypt, authenticate, decrypt, refuse tampering
-python3 lib/ferry-dashroutes.test.py       # the dash route editor: the fallbacks writer + snapshots
-python3 lib/ferry-events.test.py           # ferry_events.py: the per-request event record and writer
-python3 lib/ferry-metrics.test.py          # bounded response timing/usage parser
-python3 lib/ferry-live.test.py             # the live view: topology parse + the event tail
+for suite in lib/*.test.py observ/*.test.py; do
+  python3 "$suite" || exit 1
+done
+node lib/ferry-dashui.test.mjs
+zsh build.zsh --check
+```
+
+Each Python suite is also runnable on its own. The ChatGPT compatibility and usage-hook suites exercise installed LiteLLM adapters when available; their installed-adapter cases skip when LiteLLM is absent. Optionally rerun both with the host's LiteLLM Python environment:
+
+```bash
+"$(uv tool dir)/litellm/bin/python" lib/ferry-chatgpt-compat.test.py
+"$(uv tool dir)/litellm/bin/python" lib/ferry-usage-hook.test.py
 ```
 
 The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.

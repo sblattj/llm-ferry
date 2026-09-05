@@ -136,7 +136,15 @@ class TestRecord(unittest.TestCase):
             "t", "call_id", "lane", "deployment", "model", "provider",
             "api_base", "status", "fallbacks", "retries", "hop_errors",
             "duration_ms", "overhead_ms", "cost", "resp_bytes",
-            "client_ip", "path"})
+            "client_ip", "path", "schema_warnings"})
+
+    def test_schema_warnings_default_to_empty_until_the_front_door_scans(self):
+        # record_from_headers never sees a request body; the front door attaches
+        # what its scan found. [] means "nothing found or nothing scanned".
+        r = E.record_from_headers([], "", "/v1/chat/completions", 200)
+        self.assertEqual(r["schema_warnings"], [])
+        r2 = E.record_from_headers([], "", "/v1/chat/completions", 200)
+        self.assertIsNot(r["schema_warnings"], r2["schema_warnings"])
 
     def test_resp_bytes_defaults_to_zero_until_the_tap_counts(self):
         # record_from_headers never sees a body; the tap attaches the count it
@@ -247,6 +255,128 @@ class TestEventLog(unittest.TestCase):
         # find_log() discovers cloud-proxy-<port>.log; a .log suffix here would
         # risk the shipper tailing the event stream back into itself.
         self.assertFalse(p.endswith(".log"))
+
+
+def tool(name, properties):
+    """One OpenAI-shaped tool entry, the form every client here sends."""
+    return {"type": "function", "function": {
+        "name": name,
+        "parameters": {"type": "object", "properties": properties}}}
+
+
+class TestSchemaWarnings(unittest.TestCase):
+    """tool_schema_warnings names the payload shape a provider rejects silently.
+
+    The rule set is empirical, not a JSON-Schema validator: each entry is a
+    shape that was SEEN to hang a lane. The first is the 2026-09-04 one — an
+    array property with no `items`, which Gemini's function-declaration
+    validator rejects and which OpenRouter then answered with no headers at
+    all for the deployment's full 600s timeout.
+    """
+
+    # The exact property that hung every opencode flash call: cdp-toolkit's
+    # evaluate_script `args`, captured from the wire that day.
+    OUTAGE = tool("cdp-toolkit_evaluate_script", {
+        "expression": {"type": "string"},
+        "args": {"type": "array", "description": "Positional JSON arguments."},
+    })
+
+    def test_the_outage_payload_is_named_by_tool_and_path(self):
+        found = E.tool_schema_warnings({"tools": [self.OUTAGE]})
+        self.assertEqual(found, [{"tool": "cdp-toolkit_evaluate_script",
+                                  "path": "args",
+                                  "rule": "array_without_items"}])
+
+    def test_control_the_fixed_payload_is_clean(self):
+        # The one-line fix that ended the outage: `items: {}`. Same tool,
+        # same everything else — one factor varied, and the finding must go.
+        fixed = tool("cdp-toolkit_evaluate_script", {
+            "expression": {"type": "string"},
+            "args": {"type": "array", "items": {},
+                     "description": "Positional JSON arguments."},
+        })
+        self.assertEqual(E.tool_schema_warnings({"tools": [fixed]}), [])
+
+    def test_every_rule_key_is_documented(self):
+        found = E.tool_schema_warnings({"tools": [self.OUTAGE]})
+        for f in found:
+            self.assertIn(f["rule"], E.SCHEMA_RULES)
+
+    def test_a_body_with_no_tools_is_clean(self):
+        self.assertEqual(E.tool_schema_warnings({"messages": []}), [])
+        self.assertEqual(E.tool_schema_warnings({"tools": []}), [])
+        self.assertEqual(E.tool_schema_warnings({"tools": None}), [])
+
+    def test_arrays_nested_in_objects_and_arrays_are_found_with_a_path(self):
+        t = tool("fill_form", {
+            "fields": {"type": "array", "items": {
+                "type": "object", "properties": {
+                    "value": {"type": "string"},
+                    "options": {"type": "array"},
+                }}},
+            "meta": {"type": "object", "properties": {
+                "tags": {"type": "array"}}},
+        })
+        found = E.tool_schema_warnings({"tools": [t]})
+        self.assertEqual([f["path"] for f in found],
+                         ["fields[].options", "meta.tags"])
+        self.assertTrue(all(f["tool"] == "fill_form" for f in found))
+
+    def test_a_nullable_type_list_containing_array_still_counts(self):
+        t = tool("t", {"xs": {"type": ["array", "null"]}})
+        self.assertEqual([f["path"] for f in E.tool_schema_warnings({"tools": [t]})],
+                         ["xs"])
+
+    def test_alternatives_and_additional_properties_are_walked(self):
+        t = tool("t", {
+            "either": {"anyOf": [{"type": "string"}, {"type": "array"}]},
+            "bag": {"type": "object",
+                    "additionalProperties": {"type": "array"}},
+        })
+        paths = [f["path"] for f in E.tool_schema_warnings({"tools": [t]})]
+        self.assertEqual(paths, ["either<anyOf 1>", "bag.*"])
+
+    def test_a_bare_array_root_is_reported_as_root(self):
+        t = {"type": "function", "function": {
+            "name": "t", "parameters": {"type": "array"}}}
+        self.assertEqual(E.tool_schema_warnings({"tools": [t]})[0]["path"],
+                         "(root)")
+
+    def test_malformed_tools_never_raise_and_clean_neighbours_still_scan(self):
+        junk = [None, 3, "x", {"function": "nope"}, {"function": {"name": 7}},
+                {"type": "function", "function": {"name": "p",
+                                                   "parameters": "str"}},
+                self.OUTAGE]
+        found = E.tool_schema_warnings({"tools": junk})
+        self.assertEqual([f["tool"] for f in found],
+                         ["cdp-toolkit_evaluate_script"])
+        self.assertEqual(E.tool_schema_warnings(None), [])
+        self.assertEqual(E.tool_schema_warnings("not a dict"), [])
+        self.assertEqual(E.tool_schema_warnings({"tools": "nope"}), [])
+
+    def test_a_tool_with_no_usable_name_is_still_reported(self):
+        t = {"type": "function", "function": {"name": 7, "parameters": {
+            "type": "object", "properties": {"a": {"type": "array"}}}}}
+        self.assertEqual(E.tool_schema_warnings({"tools": [t]}),
+                         [{"tool": "", "path": "a", "rule": "array_without_items"}])
+
+    def test_findings_are_capped_so_one_request_cannot_inflate_its_record(self):
+        many = [tool("t%d" % i, {"a": {"type": "array"}}) for i in range(50)]
+        found = E.tool_schema_warnings({"tools": many})
+        self.assertEqual(len(found), E.SCHEMA_WARNINGS_LIMIT)
+        self.assertEqual(len(E.tool_schema_warnings({"tools": many}, limit=3)), 3)
+
+    def test_a_self_referencing_schema_terminates(self):
+        loop = {"type": "object", "properties": {}}
+        loop["properties"]["self"] = loop
+        t = {"type": "function", "function": {"name": "t", "parameters": loop}}
+        self.assertEqual(E.tool_schema_warnings({"tools": [t]}), [])
+
+    def test_a_finding_is_json_serialisable_as_part_of_a_record(self):
+        rec = E.record_from_headers([], "", "/v1/chat/completions", 200)
+        rec["schema_warnings"] = E.tool_schema_warnings({"tools": [self.OUTAGE]})
+        line = json.loads(json.dumps(rec))
+        self.assertEqual(line["schema_warnings"][0]["path"], "args")
 
 
 if __name__ == "__main__":

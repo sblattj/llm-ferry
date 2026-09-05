@@ -512,12 +512,23 @@ def service_promote(router, lane, hop, ids=None):
 # bytes are identical". `lib/ferry-front.test.py` asserts that equivalence
 # against a tap-disabled control, and that test is the rollout gate.
 #
-# `receive` is never wrapped: the lane comes from a RESPONSE header, so no
-# request body is ever read. The one body-derived field is `resp_bytes`, a
+# `receive` is never wrapped on the response path: the lane comes from a
+# RESPONSE header. The one response-body-derived field is `resp_bytes`, a
 # length counted on the way past (never buffered, never rewritten), attached
-# when the final body chunk forwards. Off unless FERRY_EVENTS says otherwise.
+# when the final body chunk forwards. The REQUEST body is read once, at the
+# same point the fleet rewrite already buffers it, for one request-side field:
+# `schema_warnings`, the tool schemas in this request that a provider is known
+# to reject without an error (lib/ferry_events.py SCHEMA_RULES). That is what
+# lets a lane that hangs for ONE client be traced to that client's payload
+# instead of being booked against the deployment — the 2026-09-04 outage was
+# exactly that shape, and nothing in the record could name it. Off unless
+# FERRY_EVENTS says otherwise.
 _TAP = None
 _TAP_PATH = None
+# Scope key the request-side scan writes and the response-side tap reads. A
+# scope is per request, so the two ends of one call share it without any
+# other state.
+SCHEMA_WARNINGS_KEY = "ferry.schema_warnings"
 
 
 def _events_module():
@@ -563,6 +574,7 @@ def _tap():
             events = _events_module()
             _TAP = events.EventLog(_TAP_PATH or events.default_path())
             _TAP.record_from_headers = events.record_from_headers
+            _TAP.tool_schema_warnings = events.tool_schema_warnings
         except Exception:
             return None
     return _TAP
@@ -1225,8 +1237,12 @@ class LaneCatalogueFilter:
         # request: metrics must group by `international.heavy`, not by `heavy`.
         # Only `receive` is replaced; `send` is untouched, so the streamed
         # response path gains no Python.
-        if (self.state is not None and scope.get("type") == "http"
-                and is_inference_path(path)):
+        # With the tap on, the same buffered body is also scanned for tool
+        # schemas a provider is known to reject silently (the finding rides on
+        # this request's event record), so the read happens even with no
+        # fleets configured.
+        if ((self.state is not None or tap_enabled())
+                and scope.get("type") == "http" and is_inference_path(path)):
             receive = await self._fleet_rewrite(scope, receive, send)
             if receive is None:
                 return
@@ -1312,7 +1328,19 @@ class LaneCatalogueFilter:
             doc = json.loads(body)
         except Exception:
             doc = None
-        if isinstance(doc, dict) and isinstance(doc.get("model"), str):
+        if isinstance(doc, dict) and tap_enabled():
+            # Request-side observability, never a gate: the findings are
+            # stashed on the scope for _tapped to attach to this request's
+            # record, and the body goes upstream exactly as sent. Fail-open —
+            # a scan that raises costs the warning, not the request.
+            try:
+                tap = _tap()
+                if tap is not None:
+                    scope[SCHEMA_WARNINGS_KEY] = tap.tool_schema_warnings(doc)
+            except Exception:
+                pass
+        if (self.state is not None and isinstance(doc, dict)
+                and isinstance(doc.get("model"), str)):
             headers = _header_map(scope)
             header_fleet = headers.get(FLEET_HEADER, b"").decode(
                 "utf-8", "replace").strip()
@@ -1450,6 +1478,9 @@ class LaneCatalogueFilter:
                             scope.get("path", ""),
                             message.get("status", 0),
                         )
+                        found = scope.get(SCHEMA_WARNINGS_KEY)
+                        if isinstance(found, list):
+                            rec["schema_warnings"] = found
                 except Exception:
                     pass
                 if strip:

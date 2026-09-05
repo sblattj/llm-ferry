@@ -132,6 +132,14 @@ untouched — it's your personal tool. The host gets the same wrappers via
 clients (re-run the bootstrap one-liner only if the shell block itself needs
 refreshing).
 
+For ChatGPT subscription deployments, the host preserves Claude Code's system
+prompt blocks as Responses `developer` messages. The ChatGPT endpoint rejects
+`system` input messages; this provider-specific compatibility hook runs after
+lane selection and also covers ChatGPT fallback hops. Other providers keep
+their normal role translation. The regression test
+`python lib/ferry-chatgpt-compat.test.py` exercises the actual translation
+adapters when run with the host's LiteLLM Python environment.
+
 **The host gets these too, as of v1.17.** `ferry opencode` deliberately wires the
 host to its own endpoint, so the host drives the local lanes exactly like a client
 does — but the wrappers were written only by `client-bootstrap.sh`, leaving a host

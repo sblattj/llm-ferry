@@ -1286,9 +1286,9 @@ PAGE = r"""<!doctype html>
   .pill.down{background:color-mix(in srgb,var(--red) 22%,transparent);color:var(--red)}
   .muted{color:var(--dim)}
   .grow{flex:1}
-  main{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:16px 20px;max-width:1080px}
-  @media (max-width:760px){main{grid-template-columns:1fr}}
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  main{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px;padding:16px 20px;max-width:1080px}
+  @media (max-width:760px){main{grid-template-columns:minmax(0,1fr)}}
+  .card{min-width:0;overflow-wrap:anywhere;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
   .card h2{margin:0 0 10px;font-size:11px;letter-spacing:.16em;color:var(--dim);text-transform:uppercase}
   .row{display:flex;align-items:center;gap:10px;padding:6px 0;border-top:1px dashed var(--line)}
   .row:first-of-type{border-top:0}
@@ -1367,7 +1367,7 @@ PAGE = r"""<!doctype html>
   a{color:var(--blue)}
   /* live view */
   .chain{display:flex;align-items:stretch;flex-wrap:wrap;margin:2px 0 6px}
-  .hopb{border:1px solid var(--line);border-radius:8px;padding:5px 9px;min-width:0}
+  .hopb{max-width:100%;overflow-wrap:anywhere;border:1px solid var(--line);border-radius:8px;padding:5px 9px;min-width:0}
   .hopb.served{border-color:var(--green);background:color-mix(in srgb,var(--green) 14%,transparent)}
   .hopb.failed{border-color:var(--red);background:color-mix(in srgb,var(--red) 14%,transparent)}
   .hopb.missing{border-style:dashed;border-color:var(--red)}
@@ -1376,25 +1376,27 @@ PAGE = r"""<!doctype html>
   .edge{align-self:center;color:var(--dim);padding:0 8px;font-size:11px;white-space:nowrap}
   .edge.failed{color:var(--red);font-weight:700}
   .chips{display:flex;gap:4px;flex-wrap:wrap;margin-top:4px}
-  .chip{font-size:11px;padding:1px 6px;border-radius:6px;border:1px solid var(--line);color:var(--dim)}
+  .chip{min-width:0;max-width:100%;overflow-wrap:anywhere;font-size:11px;padding:1px 6px;border-radius:6px;border:1px solid var(--line);color:var(--dim)}
   .chip.healthy{color:var(--green);border-color:var(--green)}
   .chip.rate_limited,.chip.unknown{color:var(--amber);border-color:var(--amber)}
   .chip.unreachable{color:var(--red);border-color:var(--red)}
   .chip.quota_exhausted,.chip.auth_dead{color:var(--red);border-color:var(--red);font-weight:700}
-  .lanehdr{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .lanehdr{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}
   .lanehdr:first-child{margin-top:0}
   .lanehdr b{font-size:13px}
   .toggle{margin-left:auto;font-size:11px;color:var(--dim);cursor:pointer;
           border-bottom:1px dotted var(--line)}
   .toggle:hover{color:var(--fg)}
-  .feed{max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:8px;
+  .feed{min-width:0;width:100%;max-width:100%;max-height:300px;overflow:auto;border:1px solid var(--line);border-radius:8px;
         margin-top:6px;font-size:12px}
-  .fr{display:flex;gap:10px;padding:3px 10px;border-top:1px dashed var(--line);white-space:nowrap}
+  .fr{display:flex;flex-wrap:wrap;gap:6px 10px;padding:3px 10px;border-top:1px dashed var(--line);white-space:nowrap}
   .fr:first-child{border-top:0}
   .fr .t{color:var(--dim);flex:none}
   .fr .st{flex:none;font-weight:700}
   .fr .st.ok{color:var(--green)} .fr .st.bad{color:var(--red)}
-  .fr .w{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .fr .w{flex:1 1 180px;min-width:0;white-space:normal;overflow-wrap:anywhere}
+  .fr .metrics{min-width:0;display:flex;flex-wrap:wrap;gap:4px 16px;width:100%;color:var(--dim);white-space:normal}
+  .fr .metrics span{max-width:100%;white-space:normal;overflow-wrap:anywhere}
 </style></head><body>
 <header>
   <h1>FERRY</h1>
@@ -1409,7 +1411,7 @@ PAGE = r"""<!doctype html>
     <div id="tapoff" class="event" style="display:none"></div>
     <div id="tpsnote" class="sub" style="display:none"></div>
     <div id="livelanes" class="muted">loading&hellip;</div>
-    <div style="display:flex;align-items:center;margin-top:10px">
+    <div style="display:flex;flex-wrap:wrap;gap:6px 12px;align-items:center;margin-top:10px">
       <span class="sub" id="feedmeta"></span>
       <span class="toggle" id="showall">show all lanes</span>
     </div>
@@ -1915,21 +1917,40 @@ const fmtBps=n=>!isFinite(n)||n<=0?null
   :n<1048576?(n/1024).toFixed(1)+' kB/s'
   :(n/1048576).toFixed(1)+' MB/s';
 
+// ── request metric helpers ──
+const validMetric=n=>typeof n==='number'&&Number.isFinite(n)&&n>=0;
+const fmtMs=n=>validMetric(n)?(n<1000?Math.round(n)+' ms':(n/1000).toFixed(2)+' s'):'—';
+const fmtTokens=n=>validMetric(n)?String(n):'—';
+function requestMetrics(e){
+  return [
+    ['Mode',e.stream===true?'streaming':e.stream===false?'nonstreaming':'unknown','Response mode requested by the client.'],
+    ['First text',fmtMs(e.first_text_ms),e.stream===false
+      ?'Time until the completed text response was observed at the gateway; not internal generation latency.'
+      :'Time until the first output text was observed at the gateway. Reasoning and tool calls do not count as text.'],
+    ['Total',fmtMs(e.total_duration_ms),'Time through the final response body, or until an interrupted response stopped.'],
+    ['In',fmtTokens(e.input_tokens),'Provider-reported input tokens: OpenAI includes cached input; Anthropic excludes it.'],
+    ['Out',fmtTokens(e.output_tokens),'Provider-reported output tokens, including reasoning when reported.'],
+    ['Reasoning',fmtTokens(e.reasoning_tokens),'Subset of output tokens; never added to Out. — means not reported, not zero.'],
+    ...(e.response_complete===false?[['Response','incomplete','The response did not complete; timing and usage may be partial.']]:[])
+  ];
+}
+// ── end request metric helpers ──
+
 // Stats come from the feed buffer, so they describe what THIS page has seen
 // since it loaded - never a claim about history the dash does not have.
 function depStats(id){
   if(!id) return {rpm:0,p50:null,bps:null};
   const now=Date.now(), rows=LIVE.events.filter(e=>e.deployment===id);
-  const durs=rows.slice(0,20).map(e=>e.duration_ms)
-                 .filter(v=>typeof v==='number').sort((a,b)=>a-b);
+  const durs=rows.slice(0,20).map(e=>e.total_duration_ms)
+                 .filter(v=>typeof v==='number'&&Number.isFinite(v)&&v>=0).sort((a,b)=>a-b);
   // bytes/s over the same ~20-event window: total bytes over total time, so
   // each request is weighted by how long it actually ran. Records without a
   // usable resp_bytes/duration pair (old files, untapped proxy) drop out, and
   // a window with none of them yields null — never a 0 B/s that looks idle.
   let bytes=0, ms=0;
   rows.slice(0,20).forEach(e=>{
-    if(typeof e.duration_ms==='number'&&e.duration_ms>0&&e.resp_bytes>0){
-      bytes+=e.resp_bytes; ms+=e.duration_ms;
+    if(validMetric(e.total_duration_ms)&&e.total_duration_ms>0&&validMetric(e.resp_bytes)&&e.resp_bytes>0){
+      bytes+=e.resp_bytes; ms+=e.total_duration_ms;
     }});
   return {rpm:rows.filter(e=>now-e._ms<60000).length,
           p50:durs.length?durs[Math.floor(durs.length/2)]:null,
@@ -1956,7 +1977,7 @@ function depChip(d,st){
   const s=depStats(d.id), bits=[shortModel(d.model||d.id||'?')];
   if(state) bits.push(state.replace(/_/g,' '));
   if(s.rpm) bits.push(s.rpm+'/min');
-  if(s.p50!=null) bits.push(Math.round(s.p50)+'ms');
+  if(s.p50!=null) bits.push('median total '+fmtMs(s.p50));
   const bps=fmtBps(s.bps); if(bps) bits.push(bps);
   if(info && info.code) bits.push(info.code);
   if(info && STICKY.indexOf(state)>=0) bits.push('since '+hhmm(info.since));
@@ -2006,9 +2027,9 @@ function renderLive(st){
   // must read as "cannot know", not as a relay moving zero bytes.
   const tps=$('#tpsnote');
   if(tap.path && tap.writing && LIVE.fails<=2 && LIVE.events.length
-     && !LIVE.events.some(e=>e.resp_bytes>0)){
+     && !LIVE.events.some(e=>validMetric(e.total_duration_ms)&&e.total_duration_ms>0&&validMetric(e.resp_bytes)&&e.resp_bytes>0)){
     tps.style.display='';
-    tps.textContent='no throughput data in the event stream — restart ferry so the tap counts bytes/s';
+    tps.textContent='throughput unavailable — requires response bytes and total duration';
   }else{ tps.style.display='none'; }
   $('#livemeta').textContent=tap.rules?'':'(no classifier table — every failure reads as "unknown")';
 
@@ -2051,8 +2072,16 @@ function renderFeed(){
       +(e.fallbacks?'  ↳ after '+e.fallbacks+' fallback'+(e.fallbacks>1?'s':''):'')
       +(e.retries?'  ↻'+e.retries:'');
     r.appendChild(w);
-    r.appendChild(el('span','t',e.duration_ms!=null?Math.round(e.duration_ms)+'ms':''));
-    r.appendChild(el('span','t',fmtBps(e.bps)||''));
+    const metrics=el('div','metrics');
+    requestMetrics(e).forEach(([label,value,title])=>{
+      const field=el('span',label==='Response'?'err':'',label+' '+value);
+      field.title=title; metrics.appendChild(field);
+    });
+    const rate=fmtBps(e.bps);
+    if(rate) metrics.appendChild(el('span','',rate));
+    metrics.title='Response start: '+fmtMs(e.response_start_ms)+' · Cached input: '+fmtTokens(e.cached_input_tokens)
+      +' · Completion: '+(e.response_complete===true?'complete':e.response_complete===false?'incomplete':'unknown');
+    r.appendChild(metrics);
     box.appendChild(r);
   });
   const n=LIVE.events.length;

@@ -2650,5 +2650,163 @@ class TestFleetStateWriteCache(unittest.TestCase):
         self.assertIs(self.state.load(), first)
 
 
+
+class TestRequestMetrics(unittest.TestCase):
+    def setUp(self):
+        self.env = mock.patch.dict(os.environ, {"FERRY_EVENTS": "on", "FERRY_STRIP_HEADERS": "0"})
+        self.env.start()
+        self.metrics = FF._metrics_module()
+        self.records = []
+        self.tap = mock.Mock()
+        self.tap.record_from_headers = FF._events_module().record_from_headers
+        self.tap.offer.side_effect = lambda rec: self.records.append(dict(rec))
+        self.tap_patch = mock.patch.object(FF, "_tap", return_value=self.tap)
+        self.tap_patch.start()
+        self.now = 10.0
+        self.clock_patch = mock.patch.object(FF.time, "monotonic", side_effect=lambda: self.now)
+        self.clock_patch.start()
+
+    def tearDown(self):
+        self.clock_patch.stop()
+        self.tap_patch.stop()
+        self.env.stop()
+        self.assertIsNone(self.metrics.CURRENT_METRICS.get())
+
+    def run_request(self, doc, messages, path="/v1/chat/completions", failure=None,
+                    send_failure=False):
+        seen = []
+        delivered = []
+        raw = json.dumps(doc).encode()
+        async def receive():
+            self.now += 0.1
+            return {"type": "http.request", "body": raw}
+        async def app(scope, recv, send):
+            seen.append(await recv())
+            for msg in messages:
+                self.now += 0.2
+                await send(msg)
+            if failure is not None:
+                raise failure
+        async def send(message):
+            self.now += 0.3
+            if send_failure and message["type"] == "http.response.body":
+                raise RuntimeError("send failed")
+            delivered.append(message)
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                self.assertEqual(self.records, [], "event must follow the final send")
+        scope = {"type": "http", "path": path, "headers": [], "client": ("127.0.0.1", 1)}
+        asyncio.run(LaneCatalogueFilter(app, LANES)(scope, receive, send))
+        return seen, delivered, raw
+
+    @staticmethod
+    def start(stream=False):
+        return {"type": "http.response.start", "status": 200, "headers": [
+            (b"content-type", b"text/event-stream" if stream else b"application/json"),
+            (b"x-litellm-response-duration-ms", b"42")]}
+
+    def test_nonstream_usage_and_wall_time_include_buffering_and_final_send(self):
+        body = json.dumps({"choices": [{"message": {"content": "PRIVATE TEXT"}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 3},
+                "completion_tokens_details": {"reasoning_tokens": 2}}}).encode()
+        messages = [self.start(), {"type": "http.response.body", "body": body}]
+        _, delivered, _ = self.run_request({"stream": False, "messages": ["PRIVATE PROMPT"]}, messages)
+        self.assertEqual(delivered, messages)
+        rec = self.records[0]
+        self.assertAlmostEqual(rec["response_start_ms"], 300)
+        self.assertAlmostEqual(rec["first_text_ms"], 800)
+        self.assertAlmostEqual(rec["total_duration_ms"], 1100)
+        self.assertEqual(rec["duration_ms"], 42)
+        self.assertEqual([rec[k] for k in ("input_tokens", "output_tokens", "reasoning_tokens", "cached_input_tokens")], [12, 7, 2, 3])
+        self.assertIs(rec["response_complete"], True)
+        self.assertIs(rec["stream"], False)
+        self.assertNotIn("PRIVATE", json.dumps(rec))
+        self.assertEqual(len(self.records), 1)
+
+    def test_stream_usage_observed_and_request_options_preserved(self):
+        chunk = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        usage = b'data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":4}}\n\ndata: [DONE]\n\n'
+        messages = [self.start(True), {"type": "http.response.body", "body": chunk, "more_body": True},
+                    {"type": "http.response.body", "body": usage}]
+        doc = {"model": "heavy", "stream": True, "stream_options": {"other": 7, "include_usage": False}}
+        seen, delivered, _ = self.run_request(doc, messages)
+        self.assertEqual(json.loads(seen[0]["body"]), {**doc, "stream_options": {"other": 7, "include_usage": True}})
+        self.assertEqual(delivered, messages)
+        self.assertEqual(self.records[0]["output_tokens"], 4)
+        self.assertIs(self.records[0]["stream"], True)
+        self.assertIsNone(self.records[0]["reasoning_tokens"])
+
+    def test_usage_injection_only_for_openai_chat_streams(self):
+        for path, streaming in [("/v1/messages", True), ("/v1/responses", True),
+                                ("/v1/chat/completions", False)]:
+            with self.subTest(path=path, stream=streaming):
+                seen, _, raw = self.run_request({"stream": streaming}, [], path=path)
+                self.assertEqual(seen[0]["body"], raw)
+        seen, _, _ = self.run_request({"stream": True}, [], path="/chat/completions")
+        self.assertIs(json.loads(seen[0]["body"])["stream_options"]["include_usage"], True)
+
+    def test_tap_off_never_constructs_metrics_or_changes_stream_options(self):
+        with mock.patch.dict(os.environ, {"FERRY_EVENTS": "off"}), mock.patch.object(FF, "_metrics_module", side_effect=AssertionError("must not load")):
+            seen, _, raw = self.run_request({"stream": True}, [])
+        self.assertEqual(seen[0]["body"], raw)
+        self.assertEqual(self.records, [])
+
+    def test_early_end_keeps_partial_usage_and_marks_incomplete(self):
+        messages = [self.start(True), {"type": "http.response.body", "more_body": True,
+            "body": b'data: {"usage":{"prompt_tokens":10,"completion_tokens":0}}\n\n'}]
+        self.run_request({"stream": True}, messages)
+        self.assertEqual(self.records[0]["input_tokens"], 10)
+        self.assertIs(self.records[0]["response_complete"], False)
+
+    def test_application_exception_and_cancellation_propagate_with_cleanup(self):
+        for error in [RuntimeError("app failed"), asyncio.CancelledError()]:
+            with self.subTest(error=type(error).__name__):
+                self.records.clear()
+                with self.assertRaises(type(error)):
+                    self.run_request({}, [self.start()], failure=error)
+                self.assertIs(self.records[0]["response_complete"], False)
+                self.assertIsNone(self.metrics.CURRENT_METRICS.get())
+
+    def test_send_failure_is_not_swallowed_and_is_incomplete(self):
+        with self.assertRaisesRegex(RuntimeError, "send failed"):
+            self.run_request({}, [self.start(), {"type": "http.response.body", "body": b"{}"}], send_failure=True)
+        self.assertIs(self.records[0]["response_complete"], False)
+        self.assertEqual(len(self.records), 1)
+
+    def test_missing_response_start_still_emits_incomplete(self):
+        with self.assertRaisesRegex(RuntimeError, "before start"):
+            self.run_request({}, [], failure=RuntimeError("before start"))
+        self.assertEqual(self.records[0]["status"], 0)
+        self.assertIs(self.records[0]["response_complete"], False)
+
+    def test_unavailable_or_failing_writer_still_releases_observer_buffer(self):
+        for mode in ("unavailable", "headers", "offer"):
+            with self.subTest(mode=mode):
+                collector = self.metrics.RequestMetrics(clock=lambda: self.now)
+                messages = [self.start(), {"type": "http.response.body", "body": b'{"partial":', "more_body": True}]
+                tap = mock.Mock()
+                tap.record_from_headers = self.tap.record_from_headers
+                if mode == "headers":
+                    tap.record_from_headers = mock.Mock(side_effect=RuntimeError("headers failed"))
+                if mode == "offer":
+                    tap.offer.side_effect = RuntimeError("offer failed")
+                with mock.patch.object(FF, "_tap", return_value=None if mode == "unavailable" else tap), mock.patch.object(self.metrics, "RequestMetrics", return_value=collector):
+                    with self.assertRaisesRegex(RuntimeError, "original"):
+                        self.run_request({}, messages, failure=RuntimeError("original"))
+                self.assertTrue(collector._finished)
+                self.assertEqual(collector._buffer, bytearray())
+                self.assertIsNone(self.metrics.CURRENT_METRICS.get())
+
+    def test_observer_failures_do_not_change_the_response(self):
+        broken = mock.Mock()
+        for name in ("set_request", "start_response", "feed", "finish"):
+            getattr(broken, name).side_effect = RuntimeError("observer failed")
+        messages = [self.start(), {"type": "http.response.body", "body": b"{}"}]
+        with mock.patch.object(self.metrics, "RequestMetrics", return_value=broken):
+            _, delivered, _ = self.run_request({}, messages)
+        self.assertEqual(delivered, messages)
+        self.assertIs(self.records[0]["response_complete"], True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

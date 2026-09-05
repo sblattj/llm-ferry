@@ -24,11 +24,10 @@ with `model_info: {public: true}` in the route config (`model_info` is
 `extra: allow`, so litellm accepts and ignores the key). Anything not so marked
 is dropped from the catalogue.
 
-The inference path is NOT proxied. For every request whose path is not the model
-listing, `__call__` hands scope/receive/send straight to the wrapped app and
-returns — no buffering, no response rewriting, nothing between the client and a
-streaming token. This is deliberately NOT Starlette's BaseHTTPMiddleware, which
-buffers and is a known way to break SSE.
+Inference requests are buffered once for fleet resolution and tool-schema
+repairs. Responses stream directly through pure ASGI sends. When event logging
+is enabled, a bounded passive parser observes timing and usage without retaining
+or rewriting response text. This is deliberately not BaseHTTPMiddleware.
 
 FAIL-OPEN, ALWAYS. A hop visible in the catalogue is a routing wart. A front
 door that refuses to answer is an outage. Every failure mode here — an
@@ -513,9 +512,8 @@ def service_promote(router, lane, hop, ids=None):
 # against a tap-disabled control, and that test is the rollout gate.
 #
 # `receive` is never wrapped on the response path: the lane comes from a
-# RESPONSE header. The one response-body-derived field is `resp_bytes`, a
-# length counted on the way past (never buffered, never rewritten), attached
-# when the final body chunk forwards. The REQUEST body is read once, at the
+# RESPONSE header. A bounded passive response parser reads text timing and
+# numeric usage; no response text is retained in records or rewritten. The REQUEST body is read once, at the
 # same point the fleet rewrite already buffers it — and the front no longer
 # just OBSERVES it. Every tool schema matching a rule in lib/ferry_events.py's
 # registry is PATCHED to a shape the provider accepts (`array_without_items` ->
@@ -545,6 +543,58 @@ def _events_module():
     sys.modules["ferry_events"] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _metrics_module():
+    """One process-wide module: middleware and adapter share its ContextVar."""
+    name = "ferry_metrics"
+    if name not in sys.modules:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "lib", "ferry_metrics.py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception:
+            sys.modules.pop(name, None)
+            raise
+    return sys.modules[name]
+
+
+def install_reasoning_usage_hook(adapter=None):
+    """Observe reasoning before Anthropic translation discards it, if available."""
+    try:
+        if adapter is None:
+            from litellm.llms.anthropic.experimental_pass_through.adapters.transformation import LiteLLMAnthropicMessagesAdapter
+            adapter = LiteLLMAnthropicMessagesAdapter
+        name = "_translate_openai_usage_to_anthropic_usage_delta"
+        original = adapter.__dict__[name].__func__
+        if getattr(original, "_ferry_reasoning_hook", False):
+            return True
+        metrics = _metrics_module()
+
+        def translate(adapter_cls, usage):
+            try:
+                collector = metrics.CURRENT_METRICS.get()
+                if collector is not None:
+                    details = (usage.get("completion_tokens_details") if isinstance(usage, dict)
+                               else getattr(usage, "completion_tokens_details", None))
+                    value = (details.get("reasoning_tokens") if isinstance(details, dict)
+                             else getattr(details, "reasoning_tokens", None))
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        collector.observe_openai_usage({
+                            "completion_tokens_details": {"reasoning_tokens": value}})
+            except Exception:
+                pass
+            return original(adapter_cls, usage)
+
+        translate._ferry_reasoning_hook = True
+        setattr(adapter, name, classmethod(translate))
+        return True
+    except Exception:
+        print("ferry: optional reasoning usage hook unavailable", file=sys.stderr)
+        return False
 
 
 def tap_enabled() -> bool:
@@ -1260,52 +1310,12 @@ class LaneCatalogueFilter:
                         "Apply in ferry-dash also writes litellm.yaml so a "
                         "restart keeps this order.",
             })
-        # Fleet resolution. This runs BEFORE the hot-path handover so the tap
-        # and the header strip below still see — and record — the REWRITTEN
-        # request: metrics must group by `international.heavy`, not by `heavy`.
-        # Only `receive` is replaced; `send` is untouched, so the streamed
-        # response path gains no Python.
-        # The same buffered body is also complied: tool schemas a provider is
-        # known to reject silently are patched to a shape it accepts, and the
-        # finding rides on this request's event record. That runs on EVERY
-        # inference request — no fleets and no tap needed — because the front
-        # cannot know which fallback hop litellm will pick, and the default
-        # config has the tap off.
         if scope.get("type") == "http" and is_inference_path(path):
-            receive = await self._fleet_rewrite(scope, receive, send)
-            if receive is None:
-                return
-        # The hot path: anything that is not the model listing is handed over
-        # untouched. With FERRY_EVENTS off — the default — there is no wrapper
-        # around `send` at all, so a streamed completion is byte-for-byte what
-        # litellm produced and the wrapped app receives the caller's own send by
-        # identity. With the tap on a wrapper does exist, but it forwards every
-        # message unmodified and only READS on the response path — the header
-        # list on http.response.start, body LENGTHS on http.response.body —
-        # and lib/ferry-front.test.py asserts the two are
-        # message-for-message equal.
-        if (
-            not self.public
-            or scope.get("type") != "http"
-            or scope.get("path") not in MODEL_LIST_PATHS
-        ):
-            # Only inference paths are tapped and header-stripped. The catalogue
-            # is excluded explicitly because when NO lane is marked public this
-            # branch also handles /v1/models; health and metrics are excluded
-            # because they are polled every few seconds and are not served model
-            # calls. The strip is for lane-name confidentiality; it is skipped
-            # for loopback clients (ferry-dash's control plane reads the headers).
-            http = scope.get("type") == "http"
-            infer = http and is_inference_path(scope.get("path", ""))
-            strip = (
-                infer
-                and strip_headers_enabled()
-                and not _is_loopback_client(scope)
-            )
-            if infer and tap_enabled():
-                return await self.app(scope, receive, self._tapped(scope, send, strip))
-            if strip:
-                return await self.app(scope, receive, self._stripping(send))
+            return await self._inference(scope, receive, send)
+        # Non-inference routes retain their direct handoff; only the catalogue
+        # buffers a response for filtering.
+        if (not self.public or scope.get("type") != "http"
+                or scope.get("path") not in MODEL_LIST_PATHS):
             return await self.app(scope, receive, send)
 
         fleet = self._catalogue_fleet(scope)
@@ -1327,6 +1337,35 @@ class LaneCatalogueFilter:
 
         await self.app(scope, receive, capture)
 
+    async def _inference(self, scope, receive, send):
+        """Own observation through buffering, downstream sends and cancellation."""
+        strip = strip_headers_enabled() and not _is_loopback_client(scope)
+        collector = module = token = None
+        tapped = None
+        if tap_enabled():
+            started_at = time.monotonic()
+            try:
+                module = _metrics_module()
+                collector = module.RequestMetrics(started_at=started_at, clock=time.monotonic)
+                token = module.CURRENT_METRICS.set(collector)
+            except Exception:
+                collector = None
+            tapped = self._tapped(scope, send, strip, collector)
+            send = tapped
+        elif strip:
+            send = self._stripping(send)
+        try:
+            receive = await self._fleet_rewrite(scope, receive, send, collector)
+            if receive is not None:
+                return await self.app(scope, receive, send)
+        finally:
+            try:
+                if tapped is not None:
+                    tapped.finish(False)
+            finally:
+                if token is not None:
+                    module.CURRENT_METRICS.reset(token)
+
     async def _read_body(self, receive, send):
         """Read a full request body, or reply 400 and return None."""
         body = b""
@@ -1341,7 +1380,7 @@ class LaneCatalogueFilter:
                 send, 400, {"errors": ["could not read request body"]})
             return None
 
-    async def _fleet_rewrite(self, scope, receive, send):
+    async def _fleet_rewrite(self, scope, receive, send, collector=None):
         """Resolve this request's fleet and return a one-shot replay `receive`.
 
         Returns None when a reply has already been sent (a 400 for an unknown
@@ -1357,6 +1396,11 @@ class LaneCatalogueFilter:
             doc = json.loads(body)
         except Exception:
             doc = None
+        if collector is not None:
+            try:
+                collector.set_request(doc, scope.get("path", ""))
+            except Exception:
+                pass
         found = []
         changed = False
         if isinstance(doc, dict) and isinstance(doc.get("tools"), list):
@@ -1416,6 +1460,15 @@ class LaneCatalogueFilter:
             if resolved and resolved != doc["model"]:
                 doc["model"] = resolved
                 changed = True
+        if (tap_enabled() and isinstance(doc, dict) and doc.get("stream") is True
+                and scope.get("path") in ("/v1/chat/completions", "/chat/completions")):
+            options = doc.get("stream_options")
+            if options is None or isinstance(options, dict):
+                options = dict(options or {})
+                if options.get("include_usage") is not True:
+                    options["include_usage"] = True
+                    doc["stream_options"] = options
+                    changed = True
         if changed:
             # One serialization for both edits — the fleet model and the
             # complied tool schemas live on the same parsed document. Compact
@@ -1505,21 +1558,42 @@ class LaneCatalogueFilter:
 
         return stripping
 
-    def _tapped(self, scope, send, strip=False):
-        """Wrap `send` to read attribution headers off http.response.start and
-        count response body bytes off http.response.body.
+    def _tapped(self, scope, send, strip=False, collector=None):
+        """Passively observe bounded response data; emit after final send.
 
-        The record is built from the headers BEFORE the optional strip, so
-        observability keeps full attribution even when the client sees fewer
-        headers. Bodies are never buffered or rewritten and no ordering is
-        altered; the only awaits are the forwarded sends. The record is written
-        when the FINAL body chunk passes so its `resp_bytes` count is complete;
-        a response that never finishes costs its event record, which is the
-        price of counting without buffering. Fail-open in every branch: a
-        broken tap must never fail, delay, or alter a request.
+        Original chunks and ordering survive unchanged. A failed/unfinished
+        response still emits observed numeric data; observation failures never
+        hide application or downstream-send exceptions.
         """
         rec = None
         nbytes = 0
+        emitted = False
+
+        def finish(complete):
+            nonlocal rec, emitted
+            if emitted:
+                return
+            emitted = True
+            observed = {}
+            if collector is not None:
+                try:
+                    observed = collector.finish(complete=complete)
+                except Exception:
+                    pass
+            try:
+                tap = _tap()
+                if tap is None:
+                    return
+                if rec is None:
+                    client = scope.get("client") or ("", 0)
+                    rec = tap.record_from_headers([], client[0], scope.get("path", ""), 0)
+                rec["schema_warnings"] = scope.get(SCHEMA_WARNINGS_KEY, [])
+                rec["resp_bytes"] = nbytes
+                rec["response_complete"] = bool(complete)
+                rec.update(observed)
+                tap.offer(rec)
+            except Exception:
+                pass
 
         async def tapped(message):
             nonlocal rec, nbytes
@@ -1529,17 +1603,15 @@ class LaneCatalogueFilter:
                     tap = _tap()
                     if tap is not None:
                         client = scope.get("client") or ("", 0)
-                        rec = tap.record_from_headers(
-                            message.get("headers") or [],
-                            client[0] if client else "",
-                            scope.get("path", ""),
-                            message.get("status", 0),
-                        )
-                        found = scope.get(SCHEMA_WARNINGS_KEY)
-                        if isinstance(found, list):
-                            rec["schema_warnings"] = found
+                        rec = tap.record_from_headers(message.get("headers") or [],
+                            client[0], scope.get("path", ""), message.get("status", 0))
                 except Exception:
                     pass
+                if collector is not None:
+                    try:
+                        collector.start_response(message.get("headers") or [], message.get("status", 0))
+                    except Exception:
+                        pass
                 if strip:
                     try:
                         message = _strip_headers(message)
@@ -1550,16 +1622,17 @@ class LaneCatalogueFilter:
                     nbytes += len(message.get("body", b""))
                 except Exception:
                     pass
-                if not message.get("more_body"):
+                if collector is not None:
                     try:
-                        tap = _tap()
-                        if tap is not None and rec is not None:
-                            rec["resp_bytes"] = nbytes
-                            tap.offer(rec)
+                        collector.feed(message.get("body", b""))
                     except Exception:
                         pass
-            return await send(message)
+            result = await send(message)
+            if mtype == "http.response.body" and not message.get("more_body"):
+                finish(True)
+            return result
 
+        tapped.finish = finish
         return tapped
 
     async def _flush(self, send, start_message, body: bytes, fleet=None) -> None:
@@ -1715,14 +1788,15 @@ def build_app():
     from litellm.proxy.proxy_server import app as litellm_app
 
     install_chatgpt_system_compat()
+    if tap_enabled():
+        install_reasoning_usage_hook()
 
     config_path = os.environ.get("CONFIG_FILE_PATH", "")
     public = _public_lane_names(config_path)
     fleets = discover_fleets(config_path)
     log_fleet_gaps(fleets)
     log_fleet_public_gap(fleets, public)
-    # No fleets discovered => state is None => the middleware never reads a
-    # request body and behaves exactly as it did before fleets existed.
+    # Fleet resolution is optional; request schema repair remains active.
     state = FleetState(fleet_state_path(config_path), fleets) if fleets else None
     _load_state_or_die(state)
     if not should_wrap(public):

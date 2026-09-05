@@ -136,7 +136,9 @@ class TestRecord(unittest.TestCase):
             "t", "call_id", "lane", "deployment", "model", "provider",
             "api_base", "status", "fallbacks", "retries", "hop_errors",
             "duration_ms", "overhead_ms", "cost", "resp_bytes",
-            "client_ip", "path", "schema_warnings"})
+            "client_ip", "path", "schema_warnings", "stream", "response_start_ms",
+            "first_text_ms", "total_duration_ms", "input_tokens", "output_tokens",
+            "reasoning_tokens", "cached_input_tokens", "response_complete"})
 
     def test_schema_warnings_default_to_empty_until_the_front_door_scans(self):
         # record_from_headers never sees a request body; the front door attaches

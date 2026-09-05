@@ -259,25 +259,25 @@ class TestThroughput(unittest.TestCase):
     """The per-request bytes/s proxy the dash renders.
 
     This is BYTES over duration, never a tokens/s claim: the tap counts body
-    lengths because the event headers carry no token counts. `bps_of` is the
+    lengths independently of any provider-reported token counts. `bps_of` is the
     one formula and it lives here, in python, so the browser never re-derives
     it — `ferry-dash` attaches the result to each SSE frame.
     """
 
     def test_bytes_over_duration_is_bytes_per_second(self):
-        self.assertEqual(L.bps_of({"resp_bytes": 3000, "duration_ms": 1500}),
+        self.assertEqual(L.bps_of({"resp_bytes": 3000, "total_duration_ms": 1500}),
                          2000.0)
 
     def test_a_non_positive_duration_cannot_produce_a_rate(self):
-        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "duration_ms": 0}))
-        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "duration_ms": -5}))
+        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "total_duration_ms": 0}))
+        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "total_duration_ms": -5}))
 
     def test_a_missing_or_null_duration_yields_no_rate(self):
-        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "duration_ms": None}))
+        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "total_duration_ms": None}))
         self.assertIsNone(L.bps_of({"resp_bytes": 3000}))
 
     def test_a_record_without_resp_bytes_yields_no_rate(self):
-        self.assertIsNone(L.bps_of({"duration_ms": 100}))
+        self.assertIsNone(L.bps_of({"total_duration_ms": 100}))
         self.assertIsNone(L.bps_of({}))
 
     def test_zero_bytes_is_no_data_not_zero_speed(self):
@@ -285,13 +285,23 @@ class TestThroughput(unittest.TestCase):
         # (old event file, untapped proxy) exactly as often as it means an
         # empty body. Rendering it as 0 B/s would dress "cannot know" up as a
         # relay that moved no bytes.
-        self.assertIsNone(L.bps_of({"resp_bytes": 0, "duration_ms": 100}))
+        self.assertIsNone(L.bps_of({"resp_bytes": 0, "total_duration_ms": 100}))
 
     def test_a_non_numeric_field_is_refused_not_coerced(self):
         # The record contract types both fields; a string would mean a
         # different producer, and guessing formats here would paper over it.
-        self.assertIsNone(L.bps_of({"resp_bytes": "100", "duration_ms": 100}))
-        self.assertIsNone(L.bps_of({"resp_bytes": 100, "duration_ms": "100"}))
+        self.assertIsNone(L.bps_of({"resp_bytes": "100", "total_duration_ms": 100}))
+        self.assertIsNone(L.bps_of({"resp_bytes": 100, "total_duration_ms": "100"}))
+
+    def test_legacy_duration_never_substitutes_for_total(self):
+        self.assertIsNone(L.bps_of({"resp_bytes": 3000, "duration_ms": 1}))
+        self.assertEqual(L.bps_of({"resp_bytes": 3000, "duration_ms": 1,
+                                   "total_duration_ms": 1500}), 2000)
+
+    def test_invalid_numeric_values_are_unknown(self):
+        for value in (True, float("nan"), float("inf")):
+            self.assertIsNone(L.bps_of({"resp_bytes": 3000, "total_duration_ms": value}))
+            self.assertIsNone(L.bps_of({"resp_bytes": value, "total_duration_ms": 10}))
 
 
 RULES = {

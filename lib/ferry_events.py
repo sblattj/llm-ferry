@@ -25,12 +25,19 @@ the first token.
 
 WHAT IT DOES NOT DO
 
-It never reads a request or response body. The caller hands over the header list
-and nothing else, which is what lets the tap sit on the streaming path without
+It never reads a RESPONSE body. The record is built from the header list and
+nothing else, which is what lets the tap sit on the streaming path without
 buffering. Token counts are therefore absent — the headers do not carry them,
 and they stay the metrics pipeline's job. The one body-derived number,
 `resp_bytes`, is counted by the tap itself — length only, never content — and
 attached to the record before it is written; this module's default for it is 0.
+
+It DOES touch the REQUEST body, since 2026-09-04, and only there:
+`comply_tool_schemas` rewrites `tools[].function.parameters` in place, only for
+the shapes named in SCHEMA_RULES, only via that rule's registered fix. Messages,
+model, and every other key are untouched, and a request with nothing to fix is
+left byte-identical. The record key set is unchanged: the findings still land
+under `schema_warnings`, now with a `fixed` flag per entry that was patched.
 
 Standard library only: ferry-dash runs under any python3, and everything it
 reaches imports the same way.
@@ -68,6 +75,25 @@ SCHEMA_RULES = {
         "declarations reject it, and through OpenRouter the request hangs "
         "with no response headers until the deployment timeout"),
 }
+
+
+def _fix_array_without_items(schema):
+    """`items: {}` — the one-line change that ended the 2026-09-04 outage.
+
+    Verified live that day: the identical request with `items: {}` is served
+    by Gemini directly with zero fallbacks, and without it falls back. An
+    empty schema is valid JSON Schema meaning "any item", so it is inert for
+    every provider that never had the problem.
+    """
+    schema["items"] = {}
+
+
+# rule name -> callable(schema_dict) that repairs the offending node IN PLACE.
+# A rule may be detect-only: an entry in SCHEMA_RULES with no entry here is
+# reported and left alone (the finding then carries no `fixed` flag).
+SCHEMA_FIXES = {
+    "array_without_items": _fix_array_without_items,
+}
 SCHEMA_WARNINGS_LIMIT = 20
 _SCHEMA_DEPTH = 32
 
@@ -81,7 +107,27 @@ def tool_schema_warnings(doc, limit=SCHEMA_WARNINGS_LIMIT):
     Total and best-effort: malformed input yields what was found so far, never
     an exception, and the list is capped so one pathological request cannot
     inflate its own record.
+
+    Observation only — `doc` is not touched. `comply_tool_schemas` is the
+    same walk with the registry's fixes applied.
     """
+    return _scan_tools(doc, limit, False)
+
+
+def comply_tool_schemas(doc, limit=SCHEMA_WARNINGS_LIMIT):
+    """Patch `doc`'s tool schemas to the known rules; return what was found.
+
+    Same traversal and same finding shape as `tool_schema_warnings`, plus
+    `"fixed": True` on every entry whose rule had a fix in `SCHEMA_FIXES`.
+    `doc` is mutated IN PLACE; a document with nothing to fix returns `[]`
+    and is left byte-identical. Total and best-effort in the same way: never
+    raises, capped by `limit`, bounded by `_SCHEMA_DEPTH`, and malformed
+    input yields whatever was found before the malformed part.
+    """
+    return _scan_tools(doc, limit, True)
+
+
+def _scan_tools(doc, limit, fix):
     out = []
     try:
         tools = doc.get("tools") if isinstance(doc, dict) else None
@@ -98,43 +144,61 @@ def tool_schema_warnings(doc, limit=SCHEMA_WARNINGS_LIMIT):
             name = fn.get("name")
             _walk_schema(fn.get("parameters"),
                          name if isinstance(name, str) else "",
-                         "", out, limit, 0)
+                         "", out, limit, 0, fix)
     except Exception:
         pass
     return out[:limit]
 
 
-def _walk_schema(schema, tool, path, out, limit, depth):
+def _walk_schema(schema, tool, path, out, limit, depth, fix=False):
     if (not isinstance(schema, dict) or depth > _SCHEMA_DEPTH
             or len(out) >= limit):
         return
     kind = schema.get("type")
     is_array = kind == "array" or (isinstance(kind, list) and "array" in kind)
     if is_array and "items" not in schema:
-        out.append({"tool": tool, "path": path or "(root)",
-                    "rule": "array_without_items"})
+        _hit(schema, "array_without_items", tool, path, out, fix)
     props = schema.get("properties")
     if isinstance(props, dict):
         for key, sub in props.items():
             _walk_schema(sub, tool, "%s.%s" % (path, key) if path else str(key),
-                         out, limit, depth + 1)
+                         out, limit, depth + 1, fix)
     items = schema.get("items")
     if isinstance(items, dict):
-        _walk_schema(items, tool, path + "[]", out, limit, depth + 1)
+        _walk_schema(items, tool, path + "[]", out, limit, depth + 1, fix)
     elif isinstance(items, list):
         for index, sub in enumerate(items):
             _walk_schema(sub, tool, "%s[%d]" % (path, index), out, limit,
-                         depth + 1)
+                         depth + 1, fix)
     for key in ("anyOf", "oneOf", "allOf"):
         alts = schema.get(key)
         if isinstance(alts, list):
             for index, sub in enumerate(alts):
                 _walk_schema(sub, tool, "%s<%s %d>" % (path, key, index),
-                             out, limit, depth + 1)
+                             out, limit, depth + 1, fix)
     extra = schema.get("additionalProperties")
     if isinstance(extra, dict):
         _walk_schema(extra, tool, path + ".*" if path else "*", out, limit,
-                     depth + 1)
+                     depth + 1, fix)
+
+
+def _hit(schema, rule, tool, path, out, fix):
+    """Record one finding, and repair the node when the caller asked for it.
+
+    A fix that raises costs the repair, not the finding: the entry is still
+    reported, just without `fixed`, so the record never claims a patch that
+    did not land.
+    """
+    found = {"tool": tool, "path": path or "(root)", "rule": rule}
+    if fix:
+        repair = SCHEMA_FIXES.get(rule)
+        if repair is not None:
+            try:
+                repair(schema)
+                found["fixed"] = True
+            except Exception:
+                pass
+    out.append(found)
 
 # `openai/` and friends are litellm API-DIALECT markers, not providers. Any
 # OpenAI-compatible endpoint is addressed as `openai/<model>` with an explicit

@@ -516,18 +516,21 @@ def service_promote(router, lane, hop, ids=None):
 # RESPONSE header. The one response-body-derived field is `resp_bytes`, a
 # length counted on the way past (never buffered, never rewritten), attached
 # when the final body chunk forwards. The REQUEST body is read once, at the
-# same point the fleet rewrite already buffers it, for one request-side field:
-# `schema_warnings`, the tool schemas in this request that a provider is known
-# to reject without an error (lib/ferry_events.py SCHEMA_RULES). That is what
-# lets a lane that hangs for ONE client be traced to that client's payload
-# instead of being booked against the deployment — the 2026-09-04 outage was
-# exactly that shape, and nothing in the record could name it. Off unless
-# FERRY_EVENTS says otherwise.
+# same point the fleet rewrite already buffers it — and the front no longer
+# just OBSERVES it. Every tool schema matching a rule in lib/ferry_events.py's
+# registry is PATCHED to a shape the provider accepts (`array_without_items` ->
+# `items: {}`), on every inference request, tap or no tap: the front cannot
+# know which fallback hop litellm will pick, and the 2026-09-04 outage was a
+# shape Gemini rejects with no response headers at all. The finding still lands
+# on the record as `schema_warnings`, now carrying `fixed` per entry, so a lane
+# that hangs for ONE client is still traceable to that client's payload instead
+# of being booked against the deployment. The RECORD is off unless FERRY_EVENTS
+# says otherwise; the PATCH is not.
 _TAP = None
 _TAP_PATH = None
-# Scope key the request-side scan writes and the response-side tap reads. A
-# scope is per request, so the two ends of one call share it without any
-# other state.
+# Scope key the request-side comply pass writes and the response-side tap
+# reads. A scope is per request, so the two ends of one call share it without
+# any other state.
 SCHEMA_WARNINGS_KEY = "ferry.schema_warnings"
 
 
@@ -575,9 +578,34 @@ def _tap():
             _TAP = events.EventLog(_TAP_PATH or events.default_path())
             _TAP.record_from_headers = events.record_from_headers
             _TAP.tool_schema_warnings = events.tool_schema_warnings
+            _TAP.comply_tool_schemas = events.comply_tool_schemas
         except Exception:
             return None
     return _TAP
+
+
+_COMPLY = None
+
+
+def _comply_fn():
+    """`comply_tool_schemas`, tap or no tap.
+
+    The patch must land with FERRY_EVENTS off — that is the default — so this
+    cannot go through the EventLog, which opens a file and starts a thread.
+    It still PREFERS the tap's bound attribute when a tap exists, so the two
+    ends of the feature stay one object to reach for (and to mock).
+    """
+    global _COMPLY
+    tap = _tap() if tap_enabled() else None
+    bound = getattr(tap, "comply_tool_schemas", None)
+    if bound is not None:
+        return bound
+    if _COMPLY is None:
+        try:
+            _COMPLY = _events_module().comply_tool_schemas
+        except Exception:
+            return None
+    return _COMPLY
 
 
 def _public_lane_names(config_path: str) -> frozenset[str]:
@@ -1237,12 +1265,13 @@ class LaneCatalogueFilter:
         # request: metrics must group by `international.heavy`, not by `heavy`.
         # Only `receive` is replaced; `send` is untouched, so the streamed
         # response path gains no Python.
-        # With the tap on, the same buffered body is also scanned for tool
-        # schemas a provider is known to reject silently (the finding rides on
-        # this request's event record), so the read happens even with no
-        # fleets configured.
-        if ((self.state is not None or tap_enabled())
-                and scope.get("type") == "http" and is_inference_path(path)):
+        # The same buffered body is also complied: tool schemas a provider is
+        # known to reject silently are patched to a shape it accepts, and the
+        # finding rides on this request's event record. That runs on EVERY
+        # inference request — no fleets and no tap needed — because the front
+        # cannot know which fallback hop litellm will pick, and the default
+        # config has the tap off.
+        if scope.get("type") == "http" and is_inference_path(path):
             receive = await self._fleet_rewrite(scope, receive, send)
             if receive is None:
                 return
@@ -1328,15 +1357,37 @@ class LaneCatalogueFilter:
             doc = json.loads(body)
         except Exception:
             doc = None
-        if isinstance(doc, dict) and tap_enabled():
-            # Request-side observability, never a gate: the findings are
-            # stashed on the scope for _tapped to attach to this request's
-            # record, and the body goes upstream exactly as sent. Fail-open —
-            # a scan that raises costs the warning, not the request.
+        found = []
+        changed = False
+        if isinstance(doc, dict) and isinstance(doc.get("tools"), list):
+            # Auto-comply. The front cannot know which fallback hop litellm
+            # will pick, so the patch is unconditional on the lane AND on the
+            # tap: FERRY_EVENTS is off by default and the outage it prevents
+            # does not care. `doc` is patched in place and re-serialized below,
+            # once, together with any fleet model rewrite.
+            #
+            # Fail-open, and fail-open to the ORIGINAL BYTES: a pass that blows
+            # up halfway could have mutated `doc`, so the document is reparsed
+            # rather than trusted. A comply pass that raises costs the fix, not
+            # the request.
             try:
-                tap = _tap()
-                if tap is not None:
-                    scope[SCHEMA_WARNINGS_KEY] = tap.tool_schema_warnings(doc)
+                comply = _comply_fn()
+                found = comply(doc) if comply is not None else []
+                changed = bool(found)
+            except Exception:
+                found = []
+                changed = False
+                try:
+                    doc = json.loads(body)
+                except Exception:
+                    doc = None
+        if isinstance(doc, dict) and tap_enabled():
+            # The record still NAMES what was found — now with `fixed` per
+            # entry — so a lane that hangs for one client stays traceable to
+            # that client's payload. Stashed on the scope for _tapped.
+            try:
+                if _tap() is not None:
+                    scope[SCHEMA_WARNINGS_KEY] = found
             except Exception:
                 pass
         if (self.state is not None and isinstance(doc, dict)
@@ -1363,10 +1414,16 @@ class LaneCatalogueFilter:
                 _fleet_warn(err)
                 resolved = None
             if resolved and resolved != doc["model"]:
-                try:
-                    out = rewrite_body_model(body, resolved)
-                except Exception:
-                    out = body
+                doc["model"] = resolved
+                changed = True
+        if changed:
+            # One serialization for both edits — the fleet model and the
+            # complied tool schemas live on the same parsed document. Compact
+            # separators, exactly as rewrite_body_model produces.
+            try:
+                out = json.dumps(doc, separators=(",", ":")).encode()
+            except Exception:
+                out = body
         if out != body:
             _set_content_length(scope, len(out))
 

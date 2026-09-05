@@ -1,6 +1,6 @@
 # Signal Studio
 
-Signal Studio is the route workspace inside `ferry dash`. It combines a searchable library of configured model groups, editable fallback chains, and a live request feed. The layout adapts from a desktop canvas to a horizontal model strip and tap controls on tablets and phones.
+Signal Studio is the route workspace inside `ferry dash`. It combines editable fallback chains and a live request feed with a searchable library that keeps every configured model group and also browses the live public OpenRouter catalog. The layout adapts from a desktop canvas to horizontal model strips and tap controls on tablets and phones.
 
 ```bash
 ferry dash --open            # opens http://localhost:8091 on the host
@@ -10,7 +10,7 @@ The dashboard binds to localhost by default. Its responsive layouts also work wh
 
 ## See the workspace
 
-These are actual captures of the dashboard using **synthetic demonstration data**. The models, traffic, latencies, and token counts illustrate the interface; they are not benchmark results or a production account's activity. Tablet and phone captures use Chrome viewport sizes, not physical iPad/Safari testing. Click an image for its full resolution.
+These are actual captures of the v1.28 route workspace, before the live OpenRouter catalog was added, using **synthetic demonstration data**. The models, traffic, latencies, and token counts illustrate the interface; they are not benchmark results or a production account's activity. Tablet and phone captures use Chrome viewport sizes, not physical iPad/Safari testing. Click an image for its full resolution.
 
 **Desktop — the library, route canvas, and overview together.**
 
@@ -26,16 +26,22 @@ These are actual captures of the dashboard using **synthetic demonstration data*
 
 ## Build a fallback route
 
-A lane is the name a client requests. Its first card is the **pinned primary**; the cards after it are fallback model groups, ordered from left to right. Multiple deployments within one group remain a pool. The library lists groups already present in the host's configuration: adding a card to a route does not create a provider deployment or supply credentials.
+A lane is the name a client requests. Its first card is the **pinned primary**; the cards after it are fallback model groups, ordered from left to right. Multiple deployments within one group remain a pool. The configured section of the library retains the groups already present in the host's configuration. These are the cards that can be added to routes with the existing drag, tap, and keyboard controls.
+
+The separate OpenRouter section retrieves the [public model catalog](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties). Search results show the model name and ID, context length, current prompt and completion prices per 1 million tokens, and reported input/output modalities and supported parameters. Open a result for its details, then use **Copy model ID** or **View on OpenRouter**. Catalog prices describe the current API result; they are not benchmarks or estimates. A missing value is shown as unknown and is distinct from a price explicitly reported as zero.
+
+Catalog cards are marked **OpenRouter · Not configured** or **OpenRouter · Configured match**. Browsing or refreshing them never creates a deployment, changes the ferry configuration, supplies credentials, or infers which provider you intended to use. A catalog-only result cannot be dragged into a route. When a result exactly matches an OpenRouter model already configured on the host, its details offer **Add _group_ to route** for the matching configured group.
 
 1. **Choose a view.** Use **All lanes**, a fleet tab, or **Shared** for unprefixed lanes when available. The overview counts the lanes and model hops in that view. Changing tabs changes only the editor view.
-2. **Find a model.** Search the library by group name or model name.
+2. **Find a model.** Search by configured group/model name or browse the separate OpenRouter results by name or ID.
 3. **Add it.** Drag a library card into a **+** slot to choose its position. Alternatively, click or keyboard-activate the card and choose a visible route to append it, or activate a route's **+** and choose a group for that exact slot.
 4. **Arrange the chain.** Drag a fallback to another slot in the same lane, or use its **← / →** buttons. Dragging a fallback into another eligible lane **copies** it; the source route stays intact. The tap equivalent is adding that same group from the library or **+** picker. Use **×** to remove a fallback.
 5. **Review.** Select **Preview changes** to validate the draft and inspect its YAML diff above the workspace. Any later edit invalidates that preview and disables **Apply** until you preview again.
 6. **Apply.** The server validates again, saves a timestamped copy of the previous config, writes the new fallback order, and attempts to update the running proxy.
 
 Duplicate groups cannot be added to the same route. Fleet-prefixed routes accept groups from that same fleet. The primary cannot be moved or removed by the fallback controls; changing it uses the separate promotion flow below.
+
+The OpenRouter catalog is cached for 15 minutes. **Refresh** requests a new public snapshot; a short cooldown prevents repeated fetches. If OpenRouter is temporarily unavailable after a successful fetch, Signal Studio keeps the last successful results visible and marks them **Stale catalog** instead of turning an upstream outage into an empty library. The configured model groups remain available regardless of catalog fetch status.
 
 **Read the Apply result.** A successful config write and a successful live update are separate outcomes. If the proxy accepts the hot-swap, no restart is needed. If it is unavailable or refuses the update, the saved file still contains the change and the message explains the live outcome. Investigate a file/router mismatch before restarting. The preview reviews the route order; it is not a lock against concurrent external config edits.
 

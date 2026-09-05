@@ -17,9 +17,10 @@
         "label": "Model",
         "description": "Model NAMED by the log line (the `model` field) — not necessarily one that served a request: litellm names models at startup too. Measured 2026-08-29 over 13182 real records, every model-naming line was a startup mention and none of the 13076 request lines named a model, so pair this with `attribution` rather than reading it as routing truth. Multi-select; All matches every log line via LogsQL `in(*)`.",
         "type": "custom",
-        "query": "gemini-3.8-flash,gpt-5.6-sol,gpt-5.6-luna,Qwen3.8-27B-nvfp4,NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+        "query": "gemini-3.8-flash,gpt-6-astra,gpt-5.6-sol,gpt-5.6-luna,Qwen3.8-27B-nvfp4,NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
         "options": [
           { "selected": false, "text": "gemini-3.8-flash", "value": "gemini-3.8-flash" },
+          { "selected": false, "text": "gpt-6-astra", "value": "gpt-6-astra" },
           { "selected": false, "text": "gpt-5.6-sol", "value": "gpt-5.6-sol" },
           { "selected": false, "text": "gpt-5.6-luna", "value": "gpt-5.6-luna" },
           { "selected": false, "text": "Qwen3.8-27B-nvfp4", "value": "Qwen3.8-27B-nvfp4" },

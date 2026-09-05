@@ -55,7 +55,7 @@ ARMS = {
         "extra": {},
     },
     # Every other current lane, same shape — uncomment to swap into the A/B:
-    # "heavy": {          # chatgpt/responses/gpt-5.6-sol, ChatGPT subscription
+    # "heavy": {          # chatgpt/responses/gpt-6-astra, ChatGPT subscription
     #     "kind": "openai", "url": "http://127.0.0.1:8090/v1/chat/completions",
     #     "key_env": None, "model": "heavy", "extra": {},
     # },

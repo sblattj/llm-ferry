@@ -137,6 +137,18 @@ model_list:
       model: openrouter/~google/gemini-flash-latest
       api_key: os.environ/OPENROUTER_API_KEY
       timeout: 600
+      # Streaming calls (every agentic client streams) wait at most this long
+      # for OpenRouter's response headers or the next chunk. OpenRouter keeps a
+      # live stream alive with `: OPENROUTER PROCESSING` comments, so this only
+      # trips when Gemini never answers at all -- which it did for the full
+      # 600s `timeout` on every call on 2026-09-04 (a tool schema it rejects:
+      # an array property with no `items`), and by the time the fallback hop
+      # ran, opencode had already given up and retried (every call 499).
+      # Non-streaming calls keep `timeout` above. litellm resolves it as
+      # deployment stream_timeout > router > request_timeout
+      # (router._get_stream_timeout), so without this line streaming calls
+      # inherit the 600s request_timeout.
+      stream_timeout: 60
       extra_body:
         provider:
           sort: throughput    # fastest provider this minute, ranked by OpenRouter
@@ -185,6 +197,18 @@ model_list:
       model: openrouter/~google/gemini-flash-latest
       api_key: os.environ/OPENROUTER_API_KEY
       timeout: 600
+      # Streaming calls (every agentic client streams) wait at most this long
+      # for OpenRouter's response headers or the next chunk. OpenRouter keeps a
+      # live stream alive with `: OPENROUTER PROCESSING` comments, so this only
+      # trips when Gemini never answers at all -- which it did for the full
+      # 600s `timeout` on every call on 2026-09-04 (a tool schema it rejects:
+      # an array property with no `items`), and by the time the fallback hop
+      # ran, opencode had already given up and retried (every call 499).
+      # Non-streaming calls keep `timeout` above. litellm resolves it as
+      # deployment stream_timeout > router > request_timeout
+      # (router._get_stream_timeout), so without this line streaming calls
+      # inherit the 600s request_timeout.
+      stream_timeout: 60
       extra_body:
         provider:
           sort: throughput    # fastest provider this minute, ranked by OpenRouter

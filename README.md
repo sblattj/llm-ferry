@@ -66,7 +66,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 - 🧠 **Named lanes with explicit fallback chains** — the checked-in domestic template runs `heavy` on GPT-6 Astra with one GPT-5.6 Sol hop; `flash` runs GPT-5.6 Luna → Gemini Flash Latest → GPT-5.6 Terra; `super-flash` runs Gemini Flash Latest → GPT-5.6 Luna. Clients keep their lane names when you change the backends.
 - 🎛️ **Multi-key worker pool** — several API keys pooled with `usage-based-routing-v2` (proactive least-used spread) and automatic 429 cooldown/failover.
 - 🚀 **One-curl client onboarding** — `curl … | zsh` installs the CLI, writes the client profile, and auto-wires the editor (opencode / Continue / Cursor).
-- 🎨 **Signal Studio route editor** — search your configured model library, add/reorder/copy fallback hops, undo, and review the YAML diff before applying. Desktop, tablet, and phone layouts include tap and keyboard controls. [Tour the workspace →](docs/signal-studio.md)
+- 🎨 **Signal Studio route editor** — keep your configured model library and browse live public OpenRouter results in one search, then add/reorder/copy configured fallback hops, undo, and review the YAML diff before applying. Desktop, tablet, and phone layouts include tap and keyboard controls. [Tour the workspace →](docs/signal-studio.md)
 - 📊 **See each request clearly** — first-text latency, full response duration, streaming mode, and reported input/output/reasoning tokens in the live dashboard; optional Grafana + VictoriaMetrics + VictoriaLogs for persistent observability.
 - 📦 **Ferry models & files across the LAN** — stream whole models from the host's HuggingFace cache, offer/fetch arbitrary files, or push over netcat.
 - 🕳️ **Forward proxy for offline clients** — route a client's uv/PyPI/HuggingFace/git downloads through the host's connection.
@@ -480,14 +480,16 @@ Both are just **defaults** — swap either for any MLX-compatible model your Mac
 ferry dash --open        # live web dashboard at http://localhost:8091
 ```
 
-**Signal Studio, new in v1.28.0,** puts the configured model library, editable fallback routes, and live traffic in one local workspace. Search a model, drag it into a **+** slot, or tap to place it. Reorder fallbacks within a lane, copy them between eligible lanes, and keep the primary pinned until you explicitly promote another backend. **Edit → Preview changes → Apply** gives each edit a reviewable path to the config, with a snapshot saved before writing.
+**Signal Studio, new in v1.28.0,** puts the configured model library, editable fallback routes, and live traffic in one local workspace. Its library now also searches the live [public OpenRouter model catalog](https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties), with model IDs, context length, current prompt/completion pricing per 1 million tokens, and reported capabilities. Open a catalog result for details, copy its ID, or visit its OpenRouter page. Catalog-only entries are for discovery and do not create deployments or modify configuration; exact matches to configured OpenRouter groups expose **Add _group_ to route** for those groups.
+
+Configured cards retain the existing workflow: drag one into a **+** slot or tap to place it, reorder fallbacks within a lane, copy them between eligible lanes, and keep the primary pinned until you explicitly promote another backend. **Edit → Preview changes → Apply** gives each edit a reviewable path to the config, with a snapshot saved before writing. OpenRouter results are cached for 15 minutes, can be refreshed independently, and retain the last successful snapshot with a stale marker when an update fails. Unknown catalog values remain distinct from values explicitly reported as zero.
 
 Fleet tabs filter the routes you see; the separate **Fleets** controls change routing selections. The dashboard also shows service health, worker pools, recent activity, and per-request timing and usage when the event tap is enabled. Refreshing reads local state and makes no inference calls. **Test backends** actively calls providers and can spend tokens. The dashboard uses Python's standard library and is also available as `ferry-dash`.
 
 <p align="center">
   <a href="docs/images/signal-studio-ipad.png"><img src="docs/images/signal-studio-ipad.png" alt="Signal Studio at an iPad-sized viewport with a horizontal model library and touch controls" width="650"></a>
   <a href="docs/images/signal-studio-mobile.png"><img src="docs/images/signal-studio-mobile.png" alt="Signal Studio phone layout with tap controls and horizontally scrollable fallback routes" width="230"></a><br>
-  <sub>Actual dashboard captures with synthetic demonstration data, at tablet and phone viewport sizes in Chrome.</sub>
+  <sub>Actual v1.28 route-workspace captures, before the live OpenRouter catalog was added, with synthetic demonstration data at tablet and phone viewport sizes in Chrome.</sub>
 </p>
 
 [Open the Signal Studio guide](docs/signal-studio.md) for the full screenshot gallery, route editing steps, promotion behavior, and metric definitions. After applying, read the result message: it reports both the saved config and whether the running proxy accepted the live update.

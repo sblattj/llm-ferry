@@ -155,6 +155,28 @@ def _live():
     return _LIVE or None
 
 
+_CATALOG = None
+
+
+def _catalog():
+    """Optional read-only OpenRouter catalog, loaded beside this executable."""
+    global _CATALOG
+    if _CATALOG is None:
+        try:
+            import importlib.machinery
+            import importlib.util
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lib", "ferry_catalog.py")
+            spec = importlib.util.spec_from_loader(
+                "ferry_catalog", importlib.machinery.SourceFileLoader("ferry_catalog", path))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            _CATALOG = module
+        except Exception:
+            _CATALOG = False
+    return _CATALOG or None
+
+
 def _provider_rule():
     """The provider derivation from lib/ferry_events.py, or a safe stand-in.
 
@@ -1076,6 +1098,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.split("?")[0] == "/":
             self._send(200, PAGE, "text/html; charset=utf-8")
+        elif self.path.split("?")[0] == "/api/models/openrouter":
+            from urllib.parse import parse_qs, urlsplit
+            catalog = _catalog()
+            try:
+                if catalog is None:
+                    raise RuntimeError("Catalog helper unavailable")
+                body = catalog.get_catalog(refresh=parse_qs(urlsplit(self.path).query).get("refresh") == ["1"])
+            except Exception as exc:
+                body = {"models": [], "fetched_at": None, "stale": True,
+                        "error": str(exc), "source": "https://openrouter.ai/api/v1/models", "total": 0}
+            self._send(200, json.dumps(body), "application/json")
         elif self.path.startswith("/status"):
             self._send(200, json.dumps(get_status()), "application/json")
         elif self.path.startswith("/probe"):
@@ -1432,6 +1465,7 @@ PAGE = r"""<!doctype html>
   @media(min-width:581px) and (max-width:1200px){.intro{display:block}.actions{display:flex;flex-wrap:nowrap;justify-content:flex-start;max-width:none;margin-top:18px;gap:8px}.actions button{flex:none}}
   @media(max-width:580px){.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%}.actions button{width:100%;font-size:11px}.model-card{flex-basis:180px;width:180px}.hop.hoprow{flex-basis:180px;min-width:180px}.workspace-foot{font-size:10px}.library{padding:12px}}
   @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*:before,*:after{transition:none!important}}
+  .library input{font-size:16px;min-height:44px}.catalog-toolbar{display:flex;align-items:center;justify-content:space-between;gap:8px;font:10px/1.5 var(--mono)}.catalog-toolbar button{min-height:44px;padding:8px 10px}.library #catalog-status{font:10px/1.5 var(--mono);margin:6px 0 12px;overflow-wrap:anywhere}.catalog-card{cursor:pointer}.catalog-card:active{cursor:pointer}.catalog-card:after{content:'↗';font-size:14px}.model-copy .source-badge{display:inline-block;color:var(--mint);font-size:9px;margin:0 0 5px}.catalog-card .model-copy b{font-size:12px}.catalog-card .model-copy span{font-size:10px}.catalog-facts{display:grid;grid-template-columns:100px minmax(0,1fr);gap:10px;margin:20px 0;font-size:12px}.catalog-facts dt{color:var(--dim)}.catalog-facts dd{margin:0;overflow-wrap:anywhere}.catalog-id{font:12px/1.7 var(--mono);overflow-wrap:anywhere;user-select:all}.catalog-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}.catalog-actions button,.catalog-actions a,#catalog-close{min-height:44px;display:inline-flex;align-items:center}.catalog-actions a{padding:8px;color:var(--mint)}#catalog-detail-body p{white-space:pre-wrap;overflow-wrap:anywhere}
 </style></head><body>
 <header class="topbar">
   <a class="brand" href="#routes" aria-label="Ferry home"><svg width="30" height="28" viewBox="0 0 30 28" fill="none" aria-hidden="true"><path d="M3 6h24M3 13h17M3 20h10" stroke="currentColor" stroke-width="4"/><path d="m21 14 6 6-6 6" stroke="currentColor" stroke-width="2"/></svg>ferry</a>
@@ -1446,7 +1480,7 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="review-area" aria-label="Review and apply route changes"><div class="review-meta"><b>ROUTE CONFIG</b> <span id="routespath"></span><span class="snapshot-note">Snapshot saved before applying.</span></div><pre id="routesdiff" class="diff" aria-label="Route configuration change preview" tabindex="0" style="display:none"></pre><div id="routesmsg" role="status" aria-live="polite"></div></div>
     <div class="studio-grid">
-      <aside class="library" aria-labelledby="library-heading"><h2 id="library-heading">Model library</h2><p>Drag into a + slot, or click to add.</p><label class="sr-only" for="modelsearch">Search model library</label><input id="modelsearch" type="search" placeholder="Find a model…" autocomplete="off"><div class="models" id="modellibrary"><p>Loading models…</p></div><div class="library-bottom"><b>One model, many routes.</b><br>Dragging between routes copies it.<br>Your primary always stays pinned.</div></aside>
+      <aside class="library" aria-labelledby="library-heading"><h2 id="library-heading">Model library</h2><p>Configured models: drag or tap to route.<br>OpenRouter catalog: tap to explore.</p><label class="sr-only" for="modelsearch">Search model library</label><input id="modelsearch" type="search" placeholder="Find a model…" autocomplete="off"><div class="catalog-toolbar"><span id="catalog-count">Loading library…</span><button type="button" id="catalog-refresh">Refresh</button></div><p id="catalog-status" role="status" aria-live="polite">Loading OpenRouter catalog…</p><div class="models" id="modellibrary"><p>Loading models…</p></div><div class="library-bottom"><b>One model, many routes.</b><br>Dragging between routes copies it.<br>Your primary always stays pinned.</div></aside>
       <div class="editor-column"><div class="toolbar"><div class="segmented" id="routefilters" role="group" aria-label="Filter visible routes by fleet"></div><span class="route-meta">SEQUENTIAL FAILOVER</span></div><div class="workspace" id="routesbody">Loading routes…</div><div class="workspace-foot"><span><b>+</b> Add in any slot. Drag fallbacks to reorder, or use their arrow buttons.</span></div><div class="editor-note"><span>01 / BUILD YOUR PATH</span><p>Start with a pinned primary. Add resilience one fallback at a time.</p></div></div>
       <aside class="inspector" aria-label="Route summary"><div class="inspector-heading"><span class="eyebrow">Workspace overview</span><span aria-hidden="true">↗</span></div><div class="inspector-title">Ready to flow.</div><p>Your visible routes, at a glance.</p><div class="inspector-stats"><div><strong id="routecount">—</strong><span>visible lanes</span></div><div><strong id="hopcount">—</strong><span>model hops</span></div></div><div class="inspector-divider"></div><div class="coverage-block"><div class="inspector-label">ROUTE COVERAGE</div><div id="coverage"></div></div><div class="inspector-divider"></div><div class="session-block"><div class="inspector-label">EDITING SESSION</div><div id="editstate" role="status" aria-live="polite">Loading baseline…</div><div class="inspector-note">Fallbacks run from left to right.<br>⌘ / Ctrl Z to undo.<br>Preview before applying.</div></div></aside>
     </div>
@@ -1461,6 +1495,7 @@ PAGE = r"""<!doctype html>
   </div>
 </main>
 <footer class="footer"><div class="footer-brand">FERRY / SIGNAL STUDIO <span>LOCAL INTELLIGENCE, IN MOTION</span></div><div id="foot"></div></footer>
+<dialog id="catalog-detail" aria-labelledby="catalog-title"><div class="dialog-actions"><button type="button" id="catalog-close" autofocus>Close</button></div><h2 id="catalog-title"></h2><div id="catalog-detail-body"></div></dialog>
 <dialog id="routepicker" aria-labelledby="routepicker-title"><h2 id="routepicker-title">Add a fallback</h2><p>Primaries stay pinned. Choose a model or route below.</p><div class="picker-options" id="routepicker-options"></div><div class="dialog-actions"><button type="button" id="routepicker-close">Cancel</button></div></dialog>
 <script>
 const $=s=>document.querySelector(s);
@@ -1600,6 +1635,27 @@ async function postFleet(body){
 let EDIT=null, SERVER=null, GROUPS={}, DRAG=null, PICKER_OPEN=false;
 let HISTORY=[], REVISION=0, REVIEWED=null, PENDING=null, BUSY=false;
 let ROUTE_STATUS=null, VIEW=null, VISIBLE=[];
+let CATALOG={models:[],fetched_at:null,stale:false,error:null}, CATALOG_LOADING=false;
+let LIBRARY_KEY=null;
+// ── pure catalog helpers ──────────────────────────────────────────────────
+function catalogPrice(value){
+  if(!['string','number'].includes(typeof value)||String(value).trim()==='')return 'Unknown';
+  const n=Number(value);if(!Number.isFinite(n)||n<0)return 'Unknown';
+  return '$'+(n*1000000).toLocaleString('en-US',{maximumFractionDigits:8});
+}
+function catalogContext(value){return Number.isFinite(value)&&value>0?value.toLocaleString('en-US')+' tokens':'Unknown';}
+function catalogGroups(groups,id){return Object.keys(groups).sort().filter(g=>(groups[g].models||[]).includes('openrouter/'+id));}
+function libraryMatches(groups,models,query){
+  const q=query.toLowerCase().trim();
+  return {configured:Object.keys(groups).sort().filter(g=>(g+' '+(groups[g].models||[]).join(' ')).toLowerCase().includes(q)),
+    catalog:models.filter(m=>(m.id+' '+m.name).toLowerCase().includes(q))};
+}
+function catalogResult(previous,next){
+  if(!next||!Array.isArray(next.models))return {...previous,stale:true,error:'Invalid catalog response'};
+  if(next.error&&!next.models.length&&previous.models.length)return {...previous,stale:true,error:next.error};
+  return next;
+}
+// ── end pure catalog helpers ──────────────────────────────────────────────
 const ROUTE_SCROLL=new Map();
 
 // ── pure order helpers — also exercised by lib/ferry-dashui.test.mjs ──────
@@ -1755,15 +1811,61 @@ function drawRoutes(){
   renderLibrary();controls();
 }
 function renderLibrary(){
-  const q=$('#modelsearch').value.toLowerCase().trim(),box=$('#modellibrary');box.replaceChildren();
-  Object.keys(GROUPS).sort().filter(g=>(g+' '+(GROUPS[g].models||[]).join(' ')).toLowerCase().includes(q)).forEach(g=>{
+  if(DRAG||PICKER_OPEN)return;
+  const q=$('#modelsearch').value,box=$('#modellibrary');
+  const key=JSON.stringify([q,GROUPS,CATALOG.models,BUSY]);
+  const matches=libraryMatches(GROUPS,CATALOG.models,q);
+  $('#catalog-count').textContent=matches.configured.length+' / '+Object.keys(GROUPS).length+' configured · '+matches.catalog.length+' / '+CATALOG.models.length+' OpenRouter';
+  $('#catalog-refresh').disabled=CATALOG_LOADING;
+  $('#catalog-refresh').textContent=CATALOG_LOADING?'Refreshing…':'Refresh';
+  const age=CATALOG.fetched_at?' · Updated '+new Date(CATALOG.fetched_at*1000).toLocaleString():'';
+  $('#catalog-status').textContent=CATALOG_LOADING?'Loading OpenRouter catalog…':CATALOG.error?(CATALOG.models.length?'Stale catalog · ':'Catalog unavailable · ')+CATALOG.error+age:(CATALOG.stale?'Stale catalog':'Live OpenRouter catalog')+age;
+  if(key===LIBRARY_KEY)return;LIBRARY_KEY=key;
+  const left=box.scrollLeft,top=box.scrollTop;box.replaceChildren();
+  matches.configured.forEach(g=>{
     const b=el('button','model-card');b.dataset.group=g;b.draggable=!BUSY;b.disabled=BUSY;
     b.setAttribute('aria-label','Add '+g+' to a route');b.appendChild(el('span','model-symbol','◈'));
-    const copy=el('span','model-copy');copy.appendChild(el('b',null,modelOf(g)||g));copy.appendChild(el('span',null,g));b.appendChild(copy);
+    const copy=el('span','model-copy');copy.appendChild(el('span','source-badge','Configured'));copy.appendChild(el('b',null,modelOf(g)||g));copy.appendChild(el('span',null,g));b.appendChild(copy);
     b.onclick=()=>openPicker(null,null,g);b.addEventListener('dragstart',e=>startDrag(e,{group:g},b));b.addEventListener('dragend',endDrag);box.appendChild(b);
   });
+  matches.catalog.forEach(m=>{
+    const b=el('button','model-card catalog-card');b.draggable=false;b.dataset.catalogId=m.id;
+    const copy=el('span','model-copy'),configured=catalogGroups(GROUPS,m.id);
+    copy.appendChild(el('span','source-badge','OpenRouter · '+(configured.length?'Configured match':'Not configured')));
+    copy.appendChild(el('b',null,m.name||m.id));copy.appendChild(el('span',null,m.id));
+    copy.appendChild(el('span',null,'Context: '+catalogContext(m.context_length)));
+    copy.appendChild(el('span',null,'In '+catalogPrice(m.pricing?.prompt)+' · Out '+catalogPrice(m.pricing?.completion)+' / 1M tokens'));
+    b.appendChild(copy);b.onclick=()=>openCatalog(m);box.appendChild(b);
+  });
   if(!box.childElementCount)box.appendChild(el('p','muted','No models match this search.'));
+  box.scrollLeft=left;box.scrollTop=top;
 }
+async function loadCatalog(refresh=false){
+  if(CATALOG_LOADING)return;CATALOG_LOADING=true;renderLibrary();
+  try{
+    const response=await fetch('/api/models/openrouter'+(refresh?'?refresh=1':''));
+    if(!response.ok)throw new Error('HTTP '+response.status);
+    CATALOG=catalogResult(CATALOG,await response.json());
+  }catch(e){CATALOG={...CATALOG,stale:true,error:e.message};}
+  finally{CATALOG_LOADING=false;renderLibrary();}
+}
+function openCatalog(m){
+  const dialog=$('#catalog-detail'),body=$('#catalog-detail-body');body.replaceChildren();
+  $('#catalog-title').textContent=m.name||m.id;
+  body.appendChild(el('p','catalog-id',m.id));
+  const matching=catalogGroups(GROUPS,m.id);
+  body.appendChild(el('p',null,matching.length?'Available through the configured groups below.':'Catalog only · Not configured. A configured deployment is required before this model can be added to a route.'));
+  body.appendChild(el('p',null,m.description||'No description supplied.'));
+  const facts=el('dl','catalog-facts');
+  [['Context',catalogContext(m.context_length)],['Input / 1M',catalogPrice(m.pricing?.prompt)],['Output / 1M',catalogPrice(m.pricing?.completion)],['Input types',(m.input_modalities||[]).join(', ')||'Unknown'],['Output types',(m.output_modalities||[]).join(', ')||'Unknown'],['Parameters',(m.supported_parameters||[]).join(', ')||'Not supplied']].forEach(([label,value])=>{facts.appendChild(el('dt',null,label));facts.appendChild(el('dd',null,value));});
+  body.appendChild(facts);body.appendChild(el('p','muted','Prices are USD per 1 million tokens as reported by OpenRouter. Other charges and provider differences may apply.'));
+  const actions=el('div','catalog-actions'),copy=el('button',null,'Copy model ID');copy.type='button';copy.onclick=async()=>{try{await navigator.clipboard.writeText(m.id);copy.textContent='Copied';}catch{copy.textContent='Select the ID above to copy';}};actions.appendChild(copy);
+  const link=el('a',null,'View on OpenRouter ↗');link.href='https://openrouter.ai/'+m.id.split('/').map(encodeURIComponent).join('/');link.target='_blank';link.rel='noopener noreferrer';actions.appendChild(link);
+  matching.forEach(g=>{const b=el('button',null,'Add '+g+' to route');b.disabled=BUSY;b.onclick=()=>{closeCatalog();openPicker(null,null,g);};actions.appendChild(b);});body.appendChild(actions);
+  PICKER_OPEN=true;dialog.showModal();
+}
+function syncPickerState(){PICKER_OPEN=$('#catalog-detail').open||$('#routepicker').open;renderLibrary();}
+function closeCatalog(){$('#catalog-detail').close();syncPickerState();}
 function fleetRules(){return ((ROUTE_STATUS||{}).topology||{}).fleets||{};}
 function validDrop(lane){return DRAG&&eligibleHop(lane,DRAG.group,fleetRules())&&(DRAG.lane===lane||!EDIT[lane].includes(DRAG.group));}
 function startDrag(e,source,node){
@@ -1773,6 +1875,7 @@ function startDrag(e,source,node){
 }
 function endDrag(){
   DRAG=null;document.querySelectorAll('.dragging,.route-gap').forEach(n=>n.classList.remove('dragging','valid','invalid','over'));
+  renderLibrary();
 }
 function routeGap(lane,before,end){
   const gap=el('div','route-gap'+(end?' end':''));Object.assign(gap.dataset,{lane,before:String(before)});
@@ -1783,7 +1886,7 @@ function routeGap(lane,before,end){
     if(valid)editOrders(transferHop(EDIT,source,lane,before,fleetRules()),source.lane&&source.lane!==lane?'Fallback copied. Source route unchanged.':'Route updated.');
     else msg(eligibleHop(lane,source.group,fleetRules())?'That model group is already in this route.':'Fleet routes only accept model groups from the same fleet.');});return gap;
 }
-function closePicker(){PICKER_OPEN=false;$('#routepicker').close();}
+function closePicker(){$('#routepicker').close();syncPickerState();}
 function openPicker(lane,before,group){
   if(BUSY)return;const dialog=$('#routepicker'),options=$('#routepicker-options');options.replaceChildren();
   $('#routepicker-title').textContent=group?'Place '+group:'Add fallback · '+lane;
@@ -2082,9 +2185,12 @@ $('#testbtn').onclick=async()=>{
   b.disabled=false; b.textContent='Test backends';
 };
 $('#modelsearch').addEventListener('input',renderLibrary);
+$('#catalog-refresh').onclick=()=>loadCatalog(true);
+$('#catalog-close').onclick=closeCatalog;
+$('#catalog-detail').addEventListener('close',syncPickerState);
 $('#routepicker-close').onclick=closePicker;
-$('#routepicker').addEventListener('close',()=>{PICKER_OPEN=false;});
-$('#routepicker').addEventListener('cancel',()=>{PICKER_OPEN=false;});
+$('#routepicker').addEventListener('close',syncPickerState);
+// Native dialog Escape closes the active modal; close then synchronizes both states.
 $('#undobtn').onclick=undo;
 $('#previewbtn').onclick=async()=>{
   if(BUSY||!routesDirty())return;
@@ -2115,10 +2221,10 @@ $('#resetbtn').onclick=()=>{
   invalidateReview();redraw();msg('Draft discarded. Undo is available.');tick();
 };
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){endDrag();if(PICKER_OPEN)closePicker();}
+  if(e.key==='Escape'){endDrag();}
   if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'&&!e.target.closest('input,textarea,select,[contenteditable]')&&!PICKER_OPEN){e.preventDefault();undo();}
 });
-renderFeed(); tick(); setInterval(tick, 5000);
+renderFeed(); tick(); loadCatalog(); setInterval(tick, 5000);
 </script>
 </body></html>
 """

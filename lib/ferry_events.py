@@ -50,8 +50,91 @@ _EMPTY = {
     "t": "", "call_id": "", "lane": "unknown", "deployment": "", "model": "",
     "provider": "", "api_base": "", "status": 0, "fallbacks": 0, "retries": 0,
     "hop_errors": [], "duration_ms": None, "overhead_ms": None, "cost": None,
-    "resp_bytes": 0, "client_ip": "", "path": "",
+    "resp_bytes": 0, "client_ip": "", "path": "", "schema_warnings": [],
 }
+
+# Request-side tool-schema rules: shapes a provider is KNOWN to reject in a way
+# that never comes back as an error. The record names the PAYLOAD, so a lane
+# that hangs for one client is traceable to that client's tools instead of
+# being booked against the deployment. One rule so far, verified 2026-09-04:
+# Gemini function declarations reject an array property with no `items`, and
+# through OpenRouter the request returned no response headers at all — litellm
+# waited out the deployment timeout on every call and the fallback hop found
+# the client already gone (499 on every flash call from one client, for hours,
+# while curl and every other client sailed through).
+SCHEMA_RULES = {
+    "array_without_items": (
+        "an array property with no `items` schema; Gemini function "
+        "declarations reject it, and through OpenRouter the request hangs "
+        "with no response headers until the deployment timeout"),
+}
+SCHEMA_WARNINGS_LIMIT = 20
+_SCHEMA_DEPTH = 32
+
+
+def tool_schema_warnings(doc, limit=SCHEMA_WARNINGS_LIMIT):
+    """Findings for the tools in one parsed chat body, `[]` when clean.
+
+    Walks every `tools[].function.parameters` schema — the OpenAI shape every
+    client here sends — and returns one dict per hit:
+    `{"tool": <function name>, "path": <property path>, "rule": <SCHEMA_RULES key>}`.
+    Total and best-effort: malformed input yields what was found so far, never
+    an exception, and the list is capped so one pathological request cannot
+    inflate its own record.
+    """
+    out = []
+    try:
+        tools = doc.get("tools") if isinstance(doc, dict) else None
+        if not isinstance(tools, list):
+            return out
+        for tool in tools:
+            if len(out) >= limit:
+                break
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function")
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name")
+            _walk_schema(fn.get("parameters"),
+                         name if isinstance(name, str) else "",
+                         "", out, limit, 0)
+    except Exception:
+        pass
+    return out[:limit]
+
+
+def _walk_schema(schema, tool, path, out, limit, depth):
+    if (not isinstance(schema, dict) or depth > _SCHEMA_DEPTH
+            or len(out) >= limit):
+        return
+    kind = schema.get("type")
+    is_array = kind == "array" or (isinstance(kind, list) and "array" in kind)
+    if is_array and "items" not in schema:
+        out.append({"tool": tool, "path": path or "(root)",
+                    "rule": "array_without_items"})
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for key, sub in props.items():
+            _walk_schema(sub, tool, "%s.%s" % (path, key) if path else str(key),
+                         out, limit, depth + 1)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        _walk_schema(items, tool, path + "[]", out, limit, depth + 1)
+    elif isinstance(items, list):
+        for index, sub in enumerate(items):
+            _walk_schema(sub, tool, "%s[%d]" % (path, index), out, limit,
+                         depth + 1)
+    for key in ("anyOf", "oneOf", "allOf"):
+        alts = schema.get(key)
+        if isinstance(alts, list):
+            for index, sub in enumerate(alts):
+                _walk_schema(sub, tool, "%s<%s %d>" % (path, key, index),
+                             out, limit, depth + 1)
+    extra = schema.get("additionalProperties")
+    if isinstance(extra, dict):
+        _walk_schema(extra, tool, path + ".*" if path else "*", out, limit,
+                     depth + 1)
 
 # `openai/` and friends are litellm API-DIALECT markers, not providers. Any
 # OpenAI-compatible endpoint is addressed as `openai/<model>` with an explicit
@@ -122,6 +205,7 @@ def record_from_headers(headers, client_ip, path, status, now=None):
     """
     rec = dict(_EMPTY)
     rec["hop_errors"] = []
+    rec["schema_warnings"] = []
     try:
         h = {}
         for k, v in headers or ():

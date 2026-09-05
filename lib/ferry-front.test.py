@@ -1056,6 +1056,119 @@ class TestEventTap(unittest.TestCase):
             drive(LaneCatalogueFilter(app, LANES), "/v1/models", scope_type="websocket"))
         self.assertIs(app.seen_send, send)
 
+    # ── request-side: schema warnings ──────────────────────────────────────
+    # The 2026-09-04 outage in miniature: a tool whose array property has no
+    # `items`. Gemini rejects it, OpenRouter answers with no headers, and the
+    # response-side record can only book the hang against the deployment.
+    # The request-side scan is what names the payload.
+    BAD_TOOL = {"type": "function", "function": {
+        "name": "cdp-toolkit_evaluate_script",
+        "parameters": {"type": "object", "properties": {
+            "args": {"type": "array", "description": "Positional JSON arguments."}}}}}
+    GOOD_TOOL = {"type": "function", "function": {
+        "name": "cdp-toolkit_evaluate_script",
+        "parameters": {"type": "object", "properties": {
+            "args": {"type": "array", "items": {}}}}}}
+
+    def _drive_body(self, body, enabled=True, mw=None, reset=True):
+        os.environ["FERRY_EVENTS"] = "on" if enabled else "off"
+        if reset:
+            FF.reset_tap(self.path if enabled else None)
+        app = self._app()
+        mw = mw or LaneCatalogueFilter(app, LANES)
+        sent = []
+
+        async def send(m):
+            sent.append(m)
+
+        reads = []
+
+        async def receive():
+            reads.append(1)
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        scope = {"type": "http", "path": "/v1/chat/completions",
+                 "client": ("192.168.0.9", 5000)}
+        asyncio.run(mw(scope, receive, send))
+        return app, sent, scope, reads
+
+    def _record(self):
+        FF.tap_flush()
+        with open(self.path) as fh:
+            return json.loads(fh.readline())
+
+    def test_a_request_carrying_a_rejected_tool_shape_is_named_in_its_event(self):
+        body = json.dumps({"model": "flash", "messages": [],
+                           "tools": [self.BAD_TOOL]}).encode()
+        self._drive_body(body)
+        rec = self._record()
+        self.assertEqual(rec["schema_warnings"], [{
+            "tool": "cdp-toolkit_evaluate_script", "path": "args",
+            "rule": "array_without_items"}])
+        # The response-side attribution is untouched by the request-side scan.
+        self.assertEqual(rec["lane"], "flash")
+        self.assertEqual(rec["deployment"], "flash-alt-1")
+
+    def test_control_the_same_request_with_items_records_no_warning(self):
+        body = json.dumps({"model": "flash", "messages": [],
+                           "tools": [self.GOOD_TOOL]}).encode()
+        self._drive_body(body)
+        self.assertEqual(self._record()["schema_warnings"], [])
+
+    def test_the_scan_runs_with_no_fleets_configured(self):
+        # LaneCatalogueFilter(app, LANES) has no fleet state, so before this
+        # feature the request body was never read on this path at all. The
+        # tap alone is now reason enough to buffer it.
+        mw = LaneCatalogueFilter(self._app(), LANES)
+        self.assertIsNone(mw.state)
+        body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
+        _, _, scope, reads = self._drive_body(body, mw=mw)
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(scope[FF.SCHEMA_WARNINGS_KEY][0]["path"], "args")
+
+    def test_the_upstream_app_receives_the_body_unmodified(self):
+        # Observability, never a gate: the offending schema goes upstream
+        # exactly as the client sent it. Rewriting it would hide the very
+        # thing the record exists to expose.
+        body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
+        app, _, _, _ = self._drive_body(body)
+        msg = asyncio.run(app.seen_receive())
+        self.assertEqual(msg["body"], body)
+        self.assertFalse(msg.get("more_body"))
+
+    def test_with_the_tap_off_the_body_is_not_read_at_all(self):
+        # The pre-tap contract holds when the tap is off: no fleets, no tap,
+        # no buffering — the app gets the caller's own receive by identity.
+        body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
+        app, _, scope, reads = self._drive_body(body, enabled=False)
+        self.assertEqual(reads, [])
+        self.assertNotIn(FF.SCHEMA_WARNINGS_KEY, scope)
+
+    def test_a_non_json_body_records_an_event_with_no_warnings(self):
+        self._drive_body(b"\x00not json")
+        rec = self._record()
+        self.assertEqual(rec["schema_warnings"], [])
+        self.assertEqual(rec["lane"], "flash")
+
+    def test_a_raising_scan_costs_the_warning_not_the_request(self):
+        body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
+        os.environ["FERRY_EVENTS"] = "on"
+        FF.reset_tap(self.path)
+        FF._tap().tool_schema_warnings = mock.Mock(side_effect=RuntimeError("boom"))
+        app, sent, _, _ = self._drive_body(body, reset=False)
+        start, payload = collect(sent)
+        self.assertEqual(start["status"], 200)
+        self.assertEqual(payload, b"abbccc")
+        self.assertEqual(self._record()["schema_warnings"], [])
+
+    def test_the_byte_stream_is_identical_with_a_scanned_request(self):
+        # The rollout gate, re-run with a body worth scanning: tap on and tap
+        # off must emit message-for-message the same response.
+        body = json.dumps({"model": "flash", "tools": [self.BAD_TOOL]}).encode()
+        _, on, _, _ = self._drive_body(body, enabled=True)
+        _, off, _, _ = self._drive_body(body, enabled=False)
+        self.assertEqual(on, off)
+
 
 class MainWorkersTest(unittest.TestCase):
     """--workers: the uvicorn worker count and the multiproc metrics dir.

@@ -1369,14 +1369,15 @@ class TestFleetGaps(unittest.TestCase):
     """A fleet missing a cloud lane degrades that lane, not the front door."""
 
     def test_names_each_missing_cloud_lane(self):
-        gaps = FF.fleet_gaps({"domestic": {"heavy": "a", "flash": "b", "super-flash": "c"},
+        gaps = FF.fleet_gaps({"domestic": {"heavy": "a", "medium": "m", "flash": "b", "super-flash": "c"},
                               "international": {"heavy": "d"}})
-        self.assertEqual(gaps, ["fleet 'international' has no lane 'flash'",
+        self.assertEqual(gaps, ["fleet 'international' has no lane 'medium'",
+                                "fleet 'international' has no lane 'flash'",
                                 "fleet 'international' has no lane 'super-flash'"])
 
     def test_a_complete_fleet_reports_nothing(self):
         self.assertEqual(FF.fleet_gaps(
-            {"domestic": {"heavy": "a", "flash": "b", "super-flash": "c", "flash-luna": "d"}}), [])
+            {"domestic": {"heavy": "a", "medium": "m", "flash": "b", "super-flash": "c", "flash-luna": "d"}}), [])
 
     def test_no_fleets_reports_nothing(self):
         self.assertEqual(FF.fleet_gaps({}), [])
@@ -1402,9 +1403,11 @@ class TestFleetStatePath(unittest.TestCase):
         self.assertEqual(FF.fleet_state_path(""), "fleets.json")
 
 FLEETS = {"domestic": {"heavy": "chatgpt/responses/gpt-5.6-sol",
+                       "medium": "chatgpt/responses/gpt-5.6-terra",
                        "flash": "openrouter/~google/gemini-flash-latest",
                        "super-flash": "openrouter/~google/gemini-flash-latest"},
           "international": {"heavy": "anthropic/k3",
+                            "medium": "zai/glm-5.3",
                             "flash": "zai/glm-5.3-flash",
                             "super-flash": "zai/glm-5.3-flash"}}
 
@@ -1871,6 +1874,55 @@ class FleetHarness(unittest.TestCase):
 
 
 class TestFleetMiddleware(FleetHarness):
+    def test_medium_uses_each_fleet_selection_on_both_inference_routes(self):
+        for fleet in FLEETS:
+            for path in ("/v1/chat/completions", "/v1/responses"):
+                for selection in ("default", "sticky", "header"):
+                    with self.subTest(fleet=fleet, path=path, selection=selection):
+                        self.write_state({"default": fleet if selection == "default" else "domestic",
+                                          "clients": {"laptop": fleet} if selection == "sticky" else {}})
+                        headers = [(b"x-ferry-client", b"laptop")]
+                        if selection == "header":
+                            headers.append((b"x-ferry-fleet", fleet.encode()))
+                        app = BodyApp()
+                        raw = json.dumps({"model": "medium", "input": "hello"}).encode()
+                        _, sent = self.drive_body(self.mw(app), path, raw, headers=headers)
+                        self.assertEqual(collect(sent)[0]["status"], 200)
+                        self.assertEqual(json.loads(app.body),
+                                         {"model": fleet + ".medium", "input": "hello"})
+
+    def test_explicit_medium_fleet_names_override_selection_unchanged(self):
+        for fleet in FLEETS:
+            with self.subTest(fleet=fleet):
+                app = BodyApp()
+                raw = json.dumps({"model": fleet + ".medium"}).encode()
+                self.drive_body(self.mw(app), "/v1/chat/completions", raw,
+                                headers=[(b"x-ferry-fleet", b"no-such-fleet")])
+                self.assertEqual(app.body, raw)
+
+    def test_old_fleets_keep_existing_lanes_and_report_only_missing_medium(self):
+        old_fleets = {fleet: {lane: model for lane, model in lanes.items() if lane != "medium"}
+                      for fleet, lanes in FLEETS.items()}
+        state = FF.FleetState(self.state_path, old_fleets)
+        gaps = FF.log_fleet_gaps(old_fleets, stream=io.StringIO())
+        self.assertEqual(gaps, ["fleet %r has no lane 'medium'" % fleet for fleet in old_fleets])
+        for fleet in old_fleets:
+            for lane in ("heavy", "medium", "flash", "super-flash"):
+                with self.subTest(fleet=fleet, lane=lane):
+                    app = BodyApp()
+                    mw = LaneCatalogueFilter(app, frozenset(), fleets=old_fleets, state=state)
+                    _, sent = self.drive_body(mw, "/v1/chat/completions",
+                                              json.dumps({"model": lane}).encode(),
+                                              headers=[(b"x-ferry-fleet", fleet.encode())])
+                    start, payload = collect(sent)
+                    if lane == "medium":
+                        self.assertEqual(start["status"], 400)
+                        self.assertEqual(json.loads(payload)["error"]["message"],
+                                         "fleet %r has no lane 'medium'" % fleet)
+                    else:
+                        self.assertEqual(start["status"], 200)
+                        self.assertEqual(json.loads(app.body)["model"], fleet + "." + lane)
+
     def test_state_none_is_byte_identical_passthrough(self):
         # THE compatibility guarantee: with no fleets in the config the
         # middleware behaves exactly as it did before this feature.
@@ -2227,8 +2279,8 @@ class TestFleetWarn(unittest.TestCase):
 
 class TestFleetCatalogue(FleetHarness):
     PUBLIC = frozenset({
-        "domestic.heavy", "domestic.flash", "domestic.super-flash",
-        "international.heavy", "international.flash", "international.super-flash",
+        "domestic.heavy", "domestic.medium", "domestic.flash", "domestic.super-flash",
+        "international.heavy", "international.medium", "international.flash", "international.super-flash",
         "local-orch", "local-sub"})
 
     def _payload(self, *names):
@@ -2248,10 +2300,10 @@ class TestFleetCatalogue(FleetHarness):
                                     for n in names]}).encode()
 
     def _list(self, headers=None, client=("192.168.1.50", 5000), state="use"):
-        payload = self._payload("domestic.heavy", "domestic.flash", "domestic.super-flash",
-                       "international.heavy", "international.flash",
+        payload = self._payload("domestic.heavy", "domestic.medium", "domestic.flash", "domestic.super-flash",
+                       "international.heavy", "international.medium", "international.flash",
                        "international.super-flash", "local-orch", "local-sub",
-                       "domestic.flash-luna")
+                       "domestic.flash-luna", "domestic.medium-terra", "international.medium-glm")
         app = RecordingApp(payload)
         mw = self.mw(app, state=state, public=self.PUBLIC)
         scope = {"type": "http", "path": "/v1/models", "method": "GET",
@@ -2267,10 +2319,25 @@ class TestFleetCatalogue(FleetHarness):
         asyncio.run(mw(scope, receive, send))
         return collect(sent)
 
+    def test_medium_metadata_matches_selected_fleet_and_fallback_hops_stay_hidden(self):
+        for fleet in FLEETS:
+            with self.subTest(fleet=fleet):
+                start, payload = self._list(headers=[(b"x-ferry-fleet", fleet.encode())])
+                self.assertEqual(start["status"], 200)
+                entries = {entry["id"]: entry for entry in json.loads(payload)["data"]}
+                source = entries[fleet + ".medium"]
+                self.assertEqual(entries["medium"], dict(source, id="medium"))
+                self.assertEqual(entries["medium"]["owned_by"], FLEETS[fleet]["medium"])
+                self.assertEqual(ids(payload)[:4], ["heavy", "medium", "flash", "super-flash"])
+                for explicit in ("domestic.medium", "international.medium"):
+                    self.assertIn(explicit, entries)
+                for hidden in ("domestic.medium-terra", "international.medium-glm", "medium-terra", "medium-glm"):
+                    self.assertNotIn(hidden, entries)
+
     def test_the_default_fleet_gets_bare_lanes_prepended(self):
         _, payload = self._list()
         listed = ids(payload)
-        self.assertEqual(listed[:3], ["heavy", "flash", "super-flash"])
+        self.assertEqual(listed[:4], ["heavy", "medium", "flash", "super-flash"])
         self.assertIn("international.flash", listed)
         self.assertNotIn("domestic.flash-luna", listed)   # hops stay hidden
 
@@ -2280,7 +2347,7 @@ class TestFleetCatalogue(FleetHarness):
         # which the entry's own copied fields carry.
         _, dom = self._list(headers=[(b"x-ferry-fleet", b"domestic")])
         _, intl = self._list(headers=[(b"x-ferry-fleet", b"international")])
-        self.assertEqual(ids(dom)[:3], ids(intl)[:3])
+        self.assertEqual(ids(dom)[:4], ids(intl)[:4])
         self.assertNotEqual(dom, intl)
 
     def test_a_sticky_selection_picks_the_fleet(self):
@@ -2288,7 +2355,7 @@ class TestFleetCatalogue(FleetHarness):
         _, sticky = self._list(headers=[(b"x-ferry-client", b"laptop")])
         _, plain = self._list(headers=[(b"x-ferry-client", b"other")])
         self.assertNotEqual(sticky, plain)
-        self.assertEqual(ids(sticky)[:3], ["heavy", "flash", "super-flash"])
+        self.assertEqual(ids(sticky)[:4], ["heavy", "medium", "flash", "super-flash"])
 
     def test_state_none_still_only_filters(self):
         _, payload = self._list(state=None)
@@ -2498,9 +2565,9 @@ class TestFleetGapLog(unittest.TestCase):
         import io
         buf = io.StringIO()
         gaps = FF.log_fleet_gaps(
-            {"domestic": {"heavy": "a", "flash": "b", "super-flash": "c"},
+            {"domestic": {"heavy": "a", "medium": "m", "flash": "b", "super-flash": "c"},
              "international": {"heavy": "a"}}, stream=buf)
-        self.assertEqual(len(gaps), 2)
+        self.assertEqual(len(gaps), 3)
         text = buf.getvalue()
         self.assertIn("international", text)
         self.assertIn("flash", text)
@@ -2511,7 +2578,7 @@ class TestFleetGapLog(unittest.TestCase):
         import io
         buf = io.StringIO()
         gaps = FF.log_fleet_gaps(
-            {"domestic": {"heavy": "a", "flash": "b", "super-flash": "c"}},
+            {"domestic": {"heavy": "a", "medium": "m", "flash": "b", "super-flash": "c"}},
             stream=buf)
         self.assertEqual(gaps, [])
         self.assertEqual(buf.getvalue(), "")

@@ -63,7 +63,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 - 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too, so **Claude Code runs on the ferry backend** (`claude-ferry` wrapper, new in v1.20).
 - 🔑 **Keys stay on the host** — your *provider* keys never leave the host; clients hold one shared master key (v1.22) and never see a provider key.
 - ⚡ **Local GPU + cloud, same endpoint** — Apple MLX inference on the Mac, or a cloud proxy, or **both models on one route config**.
-- 🧠 **Named lanes with explicit fallback chains** — the checked-in domestic template runs `heavy` on GPT-6 Astra with one GPT-5.6 Sol hop; `flash` runs GPT-5.6 Luna → Gemini Flash Latest → GPT-5.6 Terra; `super-flash` runs Gemini Flash Latest → GPT-5.6 Luna. Clients keep their lane names when you change the backends.
+- 🧠 **Named lanes with explicit fallback chains** — the checked-in domestic template runs `heavy` on GPT-6 Astra with one GPT-5.6 Sol hop; `medium` runs GPT-5.6 Terra on the ChatGPT subscription with an OpenRouter Terra fallback; `flash` runs GPT-5.6 Luna → Gemini Flash Latest → GPT-5.6 Terra; `super-flash` runs Gemini Flash Latest → GPT-5.6 Luna. Clients keep their lane names when you change the backends.
 - 🎛️ **Multi-key worker pool** — several API keys pooled with `usage-based-routing-v2` (proactive least-used spread) and automatic 429 cooldown/failover.
 - 🚀 **One-curl client onboarding** — `curl … | zsh` installs the CLI, writes the client profile, and auto-wires the editor (opencode / Continue / Cursor).
 - 🎨 **Signal Studio route editor** — keep your configured model library and browse live public OpenRouter results in one search, then add/reorder/copy configured fallback hops, undo, and review the YAML diff before applying. Desktop, tablet, and phone layouts include tap and keyboard controls. [Tour the workspace →](docs/signal-studio.md)
@@ -107,14 +107,14 @@ Run the command `ferry share` prints — it embeds your host's live mDNS name an
 curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 ```
 
-`ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint (cloud pair as the persistent default), and adds a `host-code` shell shortcut. It also installs three opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
+`ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint with its cloud role defaults, and adds a `host-code` shell shortcut. It also installs three opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
 
-- `opencode-cloud` — the **cloud pair**: `heavy` drives (build/plan), `flash` runs the fan-out (general/explore), `super-flash` handles the background models (title/summary/compaction).
+- `opencode-cloud` — the **cloud role lanes**: `heavy` drives (build/plan), `flash` runs the fan-out (general/explore), `super-flash` handles the background models (title/summary/compaction). `medium` remains selectable for a substantive coding task or review.
 - `opencode-local` — the **GPU pair**: `local-orch` drives, `local-sub` runs the fan-out. Nothing leaves the host.
 - `opencode-super` — the **cheapest cloud profile**, new in v1.21: `heavy` still drives, but `super-flash` runs **both** the fan-out and the background models.
 - bare `opencode` — whichever profile you used **last** (cloud until you pick another; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
-Both need `ferry up` on the host, which serves all five lanes at once.
+Both need `ferry up` on the host, which serves all six domestic-template lanes at once.
 
 **Claude Code works too, as of v1.20.** The ferry endpoint speaks the Anthropic
 `/v1/messages` protocol, so Claude Code can run on the ferry backend with no
@@ -122,7 +122,7 @@ changes to `claude` itself. When `claude` is installed, the bootstrap also
 installs three wrappers into `~/.zshrc` (skip with `--no-claude`):
 
 - `claude-ferry` — the **cloud lanes**: `heavy` drives, `flash` covers background
-  tasks and subagents.
+  tasks and subagents. Select `medium` explicitly for substantive coding or reviews.
 - `claude-ferry-local` — the **GPU lanes**: `local-orch` drives, `local-sub` fans
   out. Nothing leaves the host.
 - `claude-ferry-super` — the **cheapest cloud profile**, new in v1.21: `heavy`
@@ -166,10 +166,13 @@ screenshot, and nothing on the host ever saw an image: the front and LiteLLM's
 Chat→Responses bridge pass `image_url` parts, tool-result images, Anthropic image
 blocks, and `file` PDFs through to GPT-6 Astra and the Gemini worker lanes
 unchanged (all six shapes probed 2026-09-05 with a no-attachment control).
-`ferry opencode` now writes `modalities: {input: [text, image, pdf]}` on the three
-cloud lanes; a client wired before that needs a `ferry update` (which re-runs
-the takeover) or a plain `ferry opencode` re-run to pick it up. The GPU pair
-stays text-only on purpose: the mlx servers behind it reject image input.
+`ferry opencode` writes `modalities: {input: [text, image, pdf]}` on the three
+default cloud role lanes. `medium` intentionally stays text-only in the generated
+config: its domestic Terra route accepts attachments, but the optional international
+GLM-5.3 route does not, and one config can select either fleet per request. A client
+wired before the attachment declaration needs a `ferry update` (which re-runs the
+takeover) or a plain `ferry opencode` re-run to pick it up. The GPU pair stays
+text-only on purpose: the mlx servers behind it reject image input.
 
 #### How much of opencode it takes over
 
@@ -254,7 +257,7 @@ Two details that would otherwise skew it: a `POST /hq` that returned non-200 mea
 ### More host commands
 
 ```bash
-ferry up             # THE STACK: all five lanes on one endpoint (port 8090)
+ferry up             # THE STACK: all six domestic-template lanes on one endpoint (port 8090)
 ferry up --route     # cloud lanes only — no GPU weights resident
 ferry up --local-orch # just the local-orch GPU lane, alone on 8090
 ferry up --local-sub  # just the local-sub GPU lane, alone on 8090
@@ -306,7 +309,7 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 
 ## Contents
 
-- [The stack — five lanes on one endpoint](#the-stack--five-lanes-on-one-endpoint)
+- [The stack — six lanes on one endpoint](#the-stack--six-lanes-on-one-endpoint)
 - [Fleets](#fleets)
 - [The local GPU lanes](#the-local-gpu-lanes)
 - [Dashboards & observability](#dashboards--observability)
@@ -322,20 +325,21 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 - [Development](#development)
 - [License](#license)
 
-## The stack — five lanes on one endpoint
+## The stack — six lanes on one endpoint
 
-`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: five named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus two local MLX servers.
+`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: six named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus two local MLX servers.
 
 | Lane | Where it runs | What it is |
 |---|---|---|
 | **`heavy`** | cloud | The driving model; the domestic template has one fallback on the same ChatGPT subscription |
+| **`medium`** | cloud | Select explicitly for substantive coding or review; it does not replace the default driver, worker, or housekeeping roles |
 | **`flash`** | cloud | High-volume worker; the domestic template runs GPT-5.6 Luna at xhigh, then Gemini Flash Latest, then Terra |
 | **`super-flash`** | cloud | Housekeeping — `title`, `summary`, `compaction`, on their own chain |
 | **`local-orch`** | host GPU | The smart local model (Qwen 3.8-27B nvfp4 + MTP speculative draft) |
 | **`local-sub`** | host GPU | The cheap local fan-out model (Nemotron 3 Nano 30B A3B NVFP4) |
 
 ```bash
-ferry up      # all five, on http://<host>.local:8090/v1
+ferry up      # all six domestic-template lanes, on http://<host>.local:8090/v1
 ```
 
 A lane **name is the contract**. The model behind it is swappable on the host without editing a single client — that is why the lanes are named for their *role* rather than for a model id. Clients just name a lane:
@@ -348,7 +352,7 @@ curl -s http://your-mac.local:8090/v1/chat/completions \
 
 **How it fits together.** LiteLLM on `:8090` is the only door. The two GPU lanes are `mlx_vlm.server` processes on internal loopback ports (`8092`, `8093`) that LiteLLM fronts as ordinary OpenAI-compatible backends — so a local model and a cloud model are indistinguishable to a client apart from the name it asks for.
 
-The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — the `domestic.heavy` driver (its legacy `orch`/`orchestrator` names still resolve to it — see [Fleets](#fleets)) logs in once via device code (written to `~/.config/litellm/chatgpt/auth.json`, no API key needed), and `domestic.flash`/`domestic.super-flash` plus their Terra/Luna hops need `OPENROUTER_API_KEY` exported (in your shell or `~/.config/ferry/secrets.env`) — then re-run.
+The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — the `domestic.heavy` driver (its legacy `orch`/`orchestrator` names still resolve to it — see [Fleets](#fleets)) and `domestic.medium` primary log in through the existing ChatGPT device-code session (written to `~/.config/litellm/chatgpt/auth.json`, no API key needed); `domestic.medium`'s independent Terra fallback and the `domestic.flash`/`domestic.super-flash` routes need `OPENROUTER_API_KEY` exported (in your shell or `~/.config/ferry/secrets.env`) — then re-run.
 
 **Worker pool (load-balanced).** The template ships `domestic.flash` as one primary deployment (GPT-5.6 Luna through OpenRouter, with throughput-based provider routing); any deployments you add **sharing the `domestic.flash` model_name** form a pool: `usage-based-routing-v2` sends each call to the least-used one (proactive even split), and on a `429` it cools the dead deployment out (`cooldown_time`) and rolls traffic to another. If you pool Gemini on a **native** key instead, **widen it with model ids, never with keys.** Google says it plainly — *"Rate limits are applied per project, not per API key"* — so a second key in the same project shares one bucket and buys nothing, and a second *project* to multiply the limit is circumvention under Google APIs ToS §2.d (nine burst-created projects suspended in one night, 2026-08-25, and the account's OAuth APIs restricted). But the limit is per-project-**per-model**: every model id carries its own RPM/TPM/RPD bucket, so pooling `gemini-3.8-flash` with, say, `gemini-3.5-flash` on **one** key is two independent buckets and nothing to circumvent. Pick members that are interchangeable for the lane's *role*, so a caller cannot tell which one answered. The other sanctioned lever is raising the paid tier on that one project (Tier 3 = 20M TPM).
 
@@ -399,7 +403,7 @@ router_settings:
 
 **Add models with Claude Code.** This repo bundles two skills — [`add-fallback-orchestrator`](.claude/skills/add-fallback-orchestrator/SKILL.md) and [`add-worker-model`](.claude/skills/add-worker-model/SKILL.md) — that walk Claude through editing your `litellm.yaml` correctly: the strict-failover-chain vs. load-balanced-pool distinction, the independent-capacity rule for fallbacks, and the per-project-quota gotcha **plus the Google ToS line a worker-key pool must not cross**. Just ask Claude Code to "add a fallback orchestrator" or "add another worker key."
 
-> LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to a driving lane (`heavy` or `local-orch`) and the subagent model to its cheap partner (`flash` or `local-sub`).
+> LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to a driving lane (`heavy` or `local-orch`) and the subagent model to its cheap partner (`flash` or `local-sub`). Select `medium` directly for substantive coding or review work; it does not alter the default roles.
 
 **opencode auto-wiring.** On a client, `ferry opencode` takes opencode's config over so **every** agent routes through the host. Add `--local` to pick the GPU pair instead of the cloud pair:
 
@@ -427,18 +431,25 @@ All seven of opencode's built-in agents get pinned across **three roles**, so no
 | worker | `general`, `explore` | `flash` | `local-sub` |
 | housekeeper | `title`, `summary`, `compaction` | `super-flash` | `local-sub` |
 
+`medium` is a selectable fourth cloud lane, outside those default role pins. Use
+`ferry opencode --model medium` for a substantive coding task or review when the
+standard worker tier is too small. In the domestic template it uses the existing
+ChatGPT subscription at `xhigh`; that usage shares the subscription's limits with
+the other ChatGPT lanes. Its independent OpenRouter fallback can incur paid
+OpenRouter billing. The lane is a role and routing choice, not a benchmark claim.
+
 The housekeeping three matter more than they look. They fire on their own schedule rather than as part of a fan-out, and an unpinned `compaction` sends your *entire transcript* to whatever the default model is. Giving them their own lane also keeps a compaction — the largest single request opencode ever makes — from queueing behind a fan-out that has just saturated the worker pool. `small_model` follows the same lane, since opencode's schema describes it as the model "for tasks like title generation".
 
 On the GPU pair there is no third lane, so the housekeeper shares `local-sub`. Point the housekeeper anywhere with `--housekeeper <lane>`.
 
 **`agent` is replaced wholesale rather than merged**, which is the point — a stale per-agent pin is exactly the drift this ends. Before every write, the previous config is copied to `<name>.<UTC-timestamp>.jsonc` beside it (last 10 kept, `--keep N` to change), so a takeover is always reversible and any custom agent you had is recoverable. The `.jsonc` extension is deliberate: opencode's schema allows comments, and the snapshot is where they survive the rewrite.
 
-Only the **lane pair** is ever declared as a model — never the served catalogue. The host does **not** advertise the fallback hops (`flash-terra`, `super-flash-luna`, …) — only lanes marked `model_info: {public: true}` make it into `/v1/models` — but a hop still routes by name: it's the *router* that reaches it on overflow, not a client picking one out of a menu.
+Only the default role lanes plus selectable `medium` are declared as models — never the served catalogue. The host does **not** advertise the fallback hops (`medium-terra`, `flash-terra`, `super-flash-luna`, …) — only lanes marked `model_info: {public: true}` make it into `/v1/models` — but a hop still routes by name: it's the *router* that reaches it on overflow, not a client picking one out of a menu.
 
 ## Fleets
 
 **Fleets, new in v1.26.0.** A **fleet** is a complete routing set — a primary and a
-fallback CHAIN for every cloud lane (`heavy`, `flash`, `super-flash`) — living in the same
+fallback CHAIN for every cloud lane (`heavy`, `medium`, `flash`, `super-flash`) — living in the same
 `litellm.yaml` as every other fleet, distinguished only by a `<fleet>.<lane>` prefix on its
 deployment names. Clients keep sending bare lane names exactly as before; the front door
 resolves each request to a fleet, in order, from an explicit `X-Ferry-Fleet` header, the
@@ -451,9 +462,19 @@ resolves to the new fleet, in every worker process. The local GPU lanes (`local-
 `local-sub`) have no fleet variant; they stay unprefixed and shared, exactly as before
 fleets existed.
 
-| Template fleet | `heavy` | `flash` | `super-flash` |
-|---|---|---|---|
-| `domestic` | GPT-6 Astra → GPT-5.6 Sol, both on the ChatGPT subscription at `xhigh` | OpenRouter GPT-5.6 Luna (`xhigh`) → Gemini Flash Latest (`xhigh`) → GPT-5.6 Terra (`xhigh`) | OpenRouter Gemini Flash Latest (`minimal`) → GPT-5.6 Luna (reasoning off) |
+| Template fleet | `heavy` | `medium` | `flash` | `super-flash` |
+|---|---|---|---|---|
+| `domestic` | GPT-6 Astra → GPT-5.6 Sol, both on the ChatGPT subscription at `xhigh` | GPT-5.6 Terra on the ChatGPT subscription (`xhigh`) → GPT-5.6 Terra on OpenRouter (`xhigh`) | OpenRouter GPT-5.6 Luna (`xhigh`) → Gemini Flash Latest (`xhigh`) → GPT-5.6 Terra (`xhigh`) | OpenRouter Gemini Flash Latest (`minimal`) → GPT-5.6 Luna (reasoning off) |
+
+The route template provisions `domestic.medium`. An `international.medium` is
+optional: configure Z.ai `glm-5.3` with thinking enabled at `high`, then an
+OpenRouter `z-ai/glm-5.3` fallback with thinking enabled at `high`, using the
+native `GLM_API_KEY` for the Z.ai route. GLM-5.3 is text-only, so the generated
+opencode entry for `medium` does not advertise image or PDF input even when a
+domestic Terra request could accept it. The Z.ai coding subscription and the
+ChatGPT subscription have their own shared limits; OpenRouter fallback usage is
+separately billed. These route descriptions are configuration guidance, not a
+claim that one lane benchmarks above another.
 
 The commands below use `international` as an example of a second fleet you have configured.
 
@@ -777,7 +798,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | Command | Mode | What it does |
 |---|---|---|
 | `install` | host | Install `uv`, `litellm` (+ `mlx-vlm` & default models on macOS), link `ferry` globally |
-| `up [--local-orch\|--local-sub\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | **No args → the full stack**: `heavy` + `flash` (cloud) and `local-orch` + `local-sub` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub` → one GPU lane alone; `-c`/`-m` → a single cloud model; `-i` → interactive catalog |
+| `up [--local-orch\|--local-sub\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | **No args → the full stack**: `heavy` + `medium` + `flash` + `super-flash` (cloud) and `local-orch` + `local-sub` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub` → one GPU lane alone; `-c`/`-m` → a single cloud model; `-i` → interactive catalog |
 | `down` | host | Stop all servers, cloud proxies, and share/proxy servers |
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up. Detects the role from `~/.config/ferry/client.json` and runs that side's reset: a **host** rebuilds the CLI from its own checkout, re-links it, and bounces the proxy; a **client** re-pulls the CLI from its host. `--full` also reloads the GPU lanes (host only) |

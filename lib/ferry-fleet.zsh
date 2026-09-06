@@ -171,7 +171,7 @@ def cmd_ls():
     fleets = doc["fleets"]
     names = list(fleets.keys())
     keys = _keys_column(fleets)
-    header = ["FLEET", "HEAVY", "FLASH", "SUPER-FLASH"]
+    header = ["FLEET", "HEAVY", "MEDIUM", "FLASH", "SUPER-FLASH"]
     if keys is not None:
         header.append("KEYS")
     rows = []
@@ -183,7 +183,7 @@ def cmd_ls():
         if fname == doc.get("fleet"):
             marks.append("you")
         label = fname + ("  " + " ".join(marks) if marks else "")
-        row = [label, _fmt(lanes.get("heavy")), _fmt(lanes.get("flash")), _fmt(lanes.get("super-flash"))]
+        row = [label, _fmt(lanes.get("heavy")), _fmt(lanes.get("medium")), _fmt(lanes.get("flash")), _fmt(lanes.get("super-flash"))]
         if keys is not None:
             row.append(keys.get(fname, "ok"))
         rows.append(row)

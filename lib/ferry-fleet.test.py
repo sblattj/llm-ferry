@@ -40,11 +40,13 @@ DOCUMENT = {
     "fleets": {
         "domestic": {
             "heavy": "chatgpt/responses/gpt-5.6-sol",
+            "medium": "chatgpt/responses/gpt-5.6-terra",
             "flash": "openrouter/~google/gemini-flash-latest",
             "super-flash": "openrouter/~google/gemini-flash-latest",
         },
         "international": {
             "heavy": "anthropic/k3",
+            "medium": "zai/glm-5.3",
             "flash": "zai/glm-5.3-flash",
             "super-flash": "zai/glm-5.3-flash",
         },
@@ -136,6 +138,9 @@ class TestLs(FerryFleetCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("domestic", proc.stdout)
         self.assertIn("international", proc.stdout)
+        self.assertIn("MEDIUM", proc.stdout)
+        self.assertIn("chatgpt/responses/gpt-5.6-terra", proc.stdout)
+        self.assertIn("zai/glm-5.3", proc.stdout)
         domestic_line = next(l for l in proc.stdout.splitlines()
                              if l.startswith("domestic"))
         self.assertIn("*", domestic_line,

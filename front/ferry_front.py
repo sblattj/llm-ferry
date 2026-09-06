@@ -728,7 +728,7 @@ def filter_catalogue(payload: bytes, public: frozenset[str]) -> bytes | None:
 # FAIL-OPEN, same doctrine as the catalogue filter: a config with no dotted
 # names discovers no fleets, and with no fleets the resolver is a no-op that
 # passes every model name through untouched.
-CLOUD_LANES = ("heavy", "flash", "super-flash")
+CLOUD_LANES = ("heavy", "medium", "flash", "super-flash")
 LOCAL_LANES = frozenset({"local-orch", "local-sub"})
 LEGACY_HEAVY = frozenset({"orch", "orchestrator"})
 FLEET_HEADER = b"x-ferry-fleet"
@@ -1030,7 +1030,7 @@ def synthesize_catalogue(payload: bytes, public: frozenset, fleets: dict,
                          fleet: str) -> "bytes | None":
     """filter_catalogue, plus a bare entry per public cloud lane of `fleet`.
 
-    A client on `international` lists heavy/flash/super-flash (its own, bare)
+    A client on `international` lists heavy/medium/flash/super-flash (its own, bare)
     alongside every public fleet lane, so `ferry opencode`'s catalogue check,
     `ferry status` and host-reset's verifier keep matching bare names while a
     curious client can still see and pin a specific fleet lane.
@@ -1516,7 +1516,7 @@ class LaneCatalogueFilter:
         except FleetStateError as err:
             # Symmetric with resolve_model: the file was readable at startup,
             # so this is a mid-run corruption, and degrading to the first
-            # discovered fleet keeps the bare heavy/flash/super-flash entries
+            # discovered fleet keeps the bare heavy/medium/flash/super-flash entries
             # in /v1/models instead of making them vanish in lockstep with the
             # inference path. _fleet_warn rate-limits to one line per distinct
             # error per interval, so the polled catalogue cannot flood.
@@ -1702,7 +1702,7 @@ def log_fleet_gaps(fleets, stream=None) -> list:
 def log_fleet_public_gap(fleets, public, stream=None) -> bool:
     """Say so at startup when fleets exist but no lane is marked public.
 
-    The bare heavy/flash/super-flash entries in /v1/models are SYNTHESISED
+    The bare heavy/medium/flash/super-flash entries in /v1/models are SYNTHESISED
     from `model_info: {public: true}`. Without that flag the catalogue lists
     only dotted fleet lanes, and `ferry opencode`'s catalogue check, `ferry
     status` and host-reset's verifier — all of which match bare names — report
@@ -1717,7 +1717,7 @@ def log_fleet_public_gap(fleets, public, stream=None) -> bool:
         out = stream if stream is not None else sys.stderr
         out.write("ferry_front: fleets %s discovered but no lane carries "
                   "model_info.public: true; /v1/models will list no bare "
-                  "heavy/flash/super-flash\n" % (", ".join(fleets),))
+                  "heavy/medium/flash/super-flash\n" % (", ".join(fleets),))
         flush = getattr(out, "flush", None)
         if flush is not None:
             flush()

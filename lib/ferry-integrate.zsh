@@ -241,6 +241,10 @@ cmd_opencode() {
   #   worker       general / explore                 flash       local-sub
   #   housekeeper  title / summary / compaction      super-flash local-sub
   #
+  # `medium` is an additional cloud lane available in the picker and through
+  # --model. It is intentionally not a default role pin: use it for a
+  # substantive coding turn or review without changing the established split.
+  #
   # The housekeeper is split out because those three agents behave nothing like a
   # fan-out: they fire on their own schedule, and a compaction call carries the
   # ENTIRE transcript. Pointing them at the worker lane makes them queue behind
@@ -361,7 +365,7 @@ DRIVER_AGENTS = ("build", "plan")                        # primary -> driver lan
 WORKER_AGENTS = ("general", "explore")                   # fan-out -> worker lane
 HOUSE_AGENTS  = ("title", "summary", "compaction")       # background -> housekeeper
 
-# --- The three lanes. Never a real model id. ---
+# --- Role lanes plus the selectable medium lane. Never a real model id. ---
 # The local lanes cap KV at 131072 (128k) tokens, so a 100k-token prompt plus
 # opencode's 32k output reservation tips over into a clean 400 (max_tokens is
 # reserved against the KV budget). 8k output keeps prompts up to ~123k
@@ -506,8 +510,20 @@ prev_options = prev_ferry.get("options") if isinstance(prev_ferry.get("options")
 # dict.fromkeys: on the GPU pair the housekeeper IS the worker, and declaring
 # the same lane twice would be a duplicate key.
 models = {}
-for lane in dict.fromkeys((driver, worker, house)):
-    spec = dict(limits)
+# `medium` is a cloud capability tier, not a replacement for any default role.
+# Declare it when the host offers it so it appears in opencode's model picker
+# and can be selected explicitly. Its resolved backend varies by fleet: domestic
+# Terra accepts attachments, while international GLM-5.3 is text-only. A single
+# opencode provider entry cannot vary modalities with X-Ferry-Fleet, so omit the
+# declaration and preserve the safe text-only baseline across every fleet.
+declared_lanes = (driver, worker, house)
+# Do not advertise a lane a pre-medium host does not serve. Explicit use still
+# adds it through driver/worker/house above, allowing a caller to request the
+# new lane deliberately and receive the normal catalogue warning if absent.
+if not prefer_local and "medium" in served:
+    declared_lanes += ("medium",)
+for lane in dict.fromkeys(declared_lanes):
+    spec = {} if lane == "medium" and not prefer_local else dict(limits)
     prev_name = (prev_models.get(lane) or {}).get("name")
     if isinstance(prev_name, str) and prev_name:
         spec["name"] = prev_name
@@ -515,7 +531,7 @@ for lane in dict.fromkeys((driver, worker, house)):
 for lane, spec in prev_models.items():
     if lane not in models and isinstance(spec, dict):
         models[lane] = spec
-extra_lanes = [l for l in models if l not in (driver, worker, house)]
+extra_lanes = [l for l in models if l not in declared_lanes]
 
 # Only baseURL/apiKey/headers are ours; every other options key a user
 # hand-added (or a previous run wrote) survives untouched.

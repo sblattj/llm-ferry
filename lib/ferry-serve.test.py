@@ -192,6 +192,50 @@ class TestShippedLaunchLines(unittest.TestCase):
         self.assertEqual(self.src.count('--num_workers "$FERRY_FRONT_WORKERS"'), 3)
 
 
+class TestRouteTemplateMediumLane(unittest.TestCase):
+    """The shipped route template keeps the substantive worker wired safely."""
+
+    @classmethod
+    def setUpClass(cls):
+        import yaml
+
+        path = os.path.join(REPO, "litellm-route-example.yaml")
+        with open(path) as handle:
+            cls.cfg = yaml.safe_load(handle)
+        cls.deployments = {m["model_name"]: m for m in cls.cfg["model_list"]}
+
+    def test_model_info_ids_are_present_and_unique(self):
+        ids = [m.get("model_info", {}).get("id") for m in self.cfg["model_list"]]
+        self.assertNotIn(None, ids, "every deployment needs a stable model_info.id")
+        self.assertEqual(len(ids), len(set(ids)), "template model_info.id values must be unique")
+
+    def test_medium_primary_and_hop_have_the_expected_visibility_and_routing(self):
+        primary = self.deployments["domestic.medium"]
+        self.assertEqual(
+            primary["litellm_params"],
+            {"model": "chatgpt/responses/gpt-5.6-terra",
+             "api_key": "chatgpt-oauth", "reasoning_effort": "xhigh",
+             "timeout": 600},
+        )
+        self.assertIs(primary["model_info"].get("public"), True)
+
+        hop = self.deployments["domestic.medium-terra"]
+        self.assertNotIn("public", hop["model_info"], "fallback hops must stay private")
+        self.assertEqual(hop["litellm_params"]["model"], "openrouter/openai/gpt-5.6-terra")
+        self.assertEqual(hop["litellm_params"]["timeout"], 600)
+        self.assertEqual(hop["litellm_params"]["stream_timeout"], 60)
+        self.assertEqual(
+            hop["litellm_params"]["extra_body"],
+            {"provider": {"sort": "throughput"}, "reasoning": {"effort": "xhigh"}},
+        )
+
+        fallbacks = {
+            name: hops for entry in self.cfg["router_settings"]["fallbacks"]
+            for name, hops in entry.items()
+        }
+        self.assertEqual(fallbacks["domestic.medium"], ["domestic.medium-terra"])
+
+
 class TestStatusTestCommand(unittest.TestCase):
     """The curl line `ferry status` prints must work when pasted."""
 

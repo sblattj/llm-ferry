@@ -40,16 +40,18 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FERRY = os.path.join(REPO, "ferry")
 
-# A representative host catalogue: the four role lanes plus the router-only
+# A representative host catalogue: the cloud role lanes plus selectable medium
+# and the router-only
 # fallback deployments that sit behind them. Only the roles may reach a config.
 # `super-flash` is deliberately ABSENT — it is a hidden alias, so a real host
 # does not advertise it either, and the housekeeper must wire up anyway.
-CATALOGUE = ["heavy", "orch-fallback-1", "orch-fallback-2", "orch-fallback-3",
+CATALOGUE = ["heavy", "medium", "orch-fallback-1", "orch-fallback-2", "orch-fallback-3",
              "flash", "flash-fallback-1", "flash-fallback-2", "flash-fallback-3",
              "local-orch", "local-sub"]
 
@@ -175,7 +177,7 @@ class TestTakeoverScope(FerryOpencodeCase):
         out = self.run_ferry()
         models = self.read()["provider"]["ferry"]["models"]
         self.assertEqual(set(models),
-                         {"heavy", "flash", "super-flash", "orch",
+                         {"heavy", "medium", "flash", "super-flash", "orch",
                           "local-orch", "local-sub"})
         self.assertIn("Kept in picker", out)
 
@@ -255,10 +257,19 @@ class TestTakeoverScope(FerryOpencodeCase):
 class TestLaneNamesOnly(FerryOpencodeCase):
     """The served catalogue validates the pair; it never populates the config."""
 
-    def test_only_the_three_roles_are_declared(self):
+    def test_role_lanes_and_selectable_medium_are_declared(self):
         self.run_ferry()
         models = self.read()["provider"]["ferry"]["models"]
-        self.assertEqual(set(models), {"heavy", "flash", "super-flash"})
+        self.assertEqual(set(models), {"heavy", "medium", "flash", "super-flash"})
+
+    def test_old_catalogue_does_not_advertise_medium_unless_explicitly_selected(self):
+        old_catalogue = [lane for lane in CATALOGUE if lane != "medium"]
+        with mock.patch(__name__ + ".CATALOGUE", old_catalogue):
+            self.run_ferry()
+            self.assertNotIn("medium", self.read()["provider"]["ferry"]["models"])
+
+            self.run_ferry("--model", "medium")
+            self.assertIn("medium", self.read()["provider"]["ferry"]["models"])
 
     def test_hidden_housekeeper_does_not_warn(self):
         # A hidden model_group_alias resolves on a request but is deliberately
@@ -299,19 +310,24 @@ class TestLaneNamesOnly(FerryOpencodeCase):
         self.assertIn("does not serve", out)
         self.assertIn("no-such-lane", out)
 
-    def test_cloud_lanes_declare_image_and_pdf_input(self):
+    def test_cloud_role_lanes_declare_image_and_pdf_input(self):
         # opencode gates attachments on `modalities.input`: a custom-provider
         # lane without it has capabilities.input.image == false, and opencode
         # then swaps a pasted screenshot for the text `ERROR: Cannot read
         # "x.png" (this model does not support image input). Inform the user.`
-        # before the request ever reaches the front. The cloud lanes read
-        # images and PDFs (probed 2026-09-05), so every one must say so.
+        # before the request ever reaches the front. The cloud role lanes read
+        # images and PDFs (probed 2026-09-05), so each must say so. `medium`
+        # deliberately has no modality declaration: its international GLM-5.3
+        # backend is text-only, and a static client config cannot safely vary
+        # that declaration with a fleet selected per request.
         self.run_ferry()
         models = self.read()["provider"]["ferry"]["models"]
         for lane in ("heavy", "flash", "super-flash"):
             self.assertEqual(models[lane]["modalities"],
                              {"input": ["text", "image", "pdf"],
                               "output": ["text"]}, lane)
+        self.assertNotIn("modalities", models["medium"])
+        self.assertNotIn("limit", models["medium"])
 
     def test_a_rerun_adds_modalities_to_a_config_written_before_them(self):
         # Every client config generated before this declaration existed has

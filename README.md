@@ -109,9 +109,9 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 
 `ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint with its cloud role defaults, and adds a `host-code` shell shortcut. It also installs three opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
 
-- `opencode-cloud` — the **cloud role lanes**: `heavy` drives (build/plan), `flash` runs the fan-out (general/explore), `super-flash` handles the background models (title/summary/compaction). `medium` remains selectable for a substantive coding task or review.
+- `opencode-cloud` — the **cloud role lanes**: `heavy` drives (build/plan), `medium` handles general work and compaction, `flash` handles explore, and `super-flash` handles title/summary.
 - `opencode-local` — the **GPU pair**: `local-orch` drives, `local-sub` runs the fan-out. Nothing leaves the host.
-- `opencode-super` — the **cheapest cloud profile**, new in v1.21: `heavy` still drives, but `super-flash` runs **both** the fan-out and the background models.
+- `opencode-super` — the **cheapest cloud profile**, new in v1.21: `heavy` still drives, while `super-flash` runs every non-driver agent.
 - bare `opencode` — whichever profile you used **last** (cloud until you pick another; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
 Both need `ferry up` on the host, which serves all six domestic-template lanes at once.
@@ -332,9 +332,9 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 | Lane | Where it runs | What it is |
 |---|---|---|
 | **`heavy`** | cloud | The driving model; the domestic template has one fallback on the same ChatGPT subscription |
-| **`medium`** | cloud | Select explicitly for substantive coding or review; it does not replace the default driver, worker, or housekeeping roles |
-| **`flash`** | cloud | High-volume worker; the domestic template runs GPT-5.6 Luna at xhigh, then Gemini Flash Latest, then Terra |
-| **`super-flash`** | cloud | Housekeeping — `title`, `summary`, `compaction`, on their own chain |
+| **`medium`** | cloud | General work and compaction; the domestic template runs GPT-5.6 Terra at xhigh with an OpenRouter Terra fallback |
+| **`flash`** | cloud | Explore worker; the domestic template runs GPT-5.6 Luna at xhigh, then Gemini Flash Latest, then Terra |
+| **`super-flash`** | cloud | Title and summary; Gemini Flash Latest via OpenRouter at minimal reasoning, with a Luna fallback |
 | **`local-orch`** | host GPU | The smart local model (Qwen 3.8-27B nvfp4 + MTP speculative draft) |
 | **`local-sub`** | host GPU | The cheap local fan-out model (Nemotron 3 Nano 30B A3B NVFP4) |
 
@@ -360,7 +360,7 @@ The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.
 
 **The driver lane has one hop, a deliberate override of the older no-chain policy (2026-09-05).** `heavy` (and the legacy `orch`/`orchestrator` names, resolved to `heavy` by the front door since fleets, 2026-09-04 — see [Fleets](#fleets)) runs on the ChatGPT subscription via litellm's native `chatgpt/` provider (`chatgpt/responses/gpt-6-astra`, device-code login at `~/.config/litellm/chatgpt/auth.json` — not an API key) at `reasoning_effort: xhigh`, the top effort value litellm's chat→responses bridge actually forwards (it silently drops `max`). Its single `router_settings.fallbacks` hop is `heavy-sol` (`chatgpt/responses/gpt-5.6-sol`, the previous driver model, same bridge, same `xhigh`): a spill changes the model but not the posture. Because the hop draws on the same subscription bucket, it covers a model-specific outage or a bad rollout of Astra, not an account-level quota `429`. The older rule (a driver that fails should error rather than silently continue on a model the user never chose) still governs everything beyond that one hop. The ChatGPT backend is also **streaming-only** on litellm 1.99.0 — a non-streamed call `500`s — which a streaming client never notices but rules out serving `heavy` to a non-streaming caller at all.
 
-**Each worker lane gets its own strict fallback chain.** `flash` runs GPT-5.6 Luna at `xhigh` (since 2026-09-05; `chatgpt/responses/gpt-5.6-luna` on this host, `openrouter/openai/gpt-5.6-luna` in the example) and falls back to `flash-gemini` (`openrouter/~google/gemini-flash-latest`, currently resolving to Gemini 3.8 Flash, routed to the fastest-throughput OpenRouter provider, `reasoning.effort: xhigh`), then `flash-terra` (GPT-5.6 Terra, `xhigh`); `super-flash` runs the Gemini alias at `reasoning.effort: minimal` and falls back to `super-flash-luna` (GPT-5.6 Luna, reasoning off). Each fallback fires only when its primary errors — a `429`, a `5xx`, or a hard quota `403` — and is never public.
+**Each cloud role lane gets its own strict fallback chain.** `flash` runs GPT-5.6 Luna at `xhigh` (since 2026-09-05; `chatgpt/responses/gpt-5.6-luna` on this host, `openrouter/openai/gpt-5.6-luna` in the example) and falls back to `flash-gemini` (`openrouter/~google/gemini-flash-latest`, currently resolving to Gemini 3.8 Flash, routed to the fastest-throughput OpenRouter provider, `reasoning.effort: xhigh`), then `flash-terra` (GPT-5.6 Terra, `xhigh`); `super-flash` runs Gemini Flash Latest through OpenRouter at `reasoning.effort: minimal` and falls back to `super-flash-luna` (GPT-5.6 Luna, reasoning off). Each fallback fires only when its primary errors — a `429`, a `5xx`, or a hard quota `403` — and is never public.
 
 **OpenRouter hops route to the fastest provider.** One OpenRouter model id is served by many providers — GLM 5.3 Flash by 22 on 2026-09-02, from 111 tok/s at the top to 17 at the bottom — and OpenRouter's default picks among the *cheapest* of them, weighted by inverse-square price. **The OpenRouter deployments in the template**, including the `flash` primary and its Gemini/Terra hops, therefore carry `extra_body: {provider: {sort: throughput}}`, which is [OpenRouter's own provider-routing object](https://openrouter.ai/docs/features/provider-routing) forwarded verbatim by litellm: every request is re-ranked by each provider's p50 tokens/s over a rolling 5-minute window, on OpenRouter's side. Nothing in ferry polls or pins a provider name, so a provider that is rate-limited *this minute* is simply not at the top this minute — pinning `order: ["Baseten"]` (the fastest on the page) returned `429 temporarily rate-limited upstream` while `sort: throughput` on the same model was served by Friendli and Fireworks at once (verified 2026-09-02 through `ferry_front.py`, with an unsorted control lane landing on Z.AI). The trade is price: throughput sort ignores it, so a model with a discounted provider may be served at full rate instead. Drop the block from any deployment you would rather run cheap than fast.
 
@@ -399,16 +399,16 @@ router_settings:
 
 **Never let a real model id become the name clients type.** It is tempting to name a lane after the model currently behind it, and it goes wrong the first time you re-point that lane: clients keep sending a vendor's model name and get someone else's model back, and nothing in `/v1/models` reveals the discrepancy. Name the *role* instead — a role survives the model behind it changing, which is the entire reason clients address lanes. `ferry opencode` enforces the same rule from the client side: it writes only lane names, never a model id.
 
-**Keeping a lane out of the catalogue is a separate control** — the one an alias only appeared to offer. Omit `model_info: {public: true}` and `front/ferry_front.py` leaves the lane out of `/v1/models` while it still routes *and still keeps its chain*. Use it sparingly: an unlisted lane is invisible to everything that reads the catalogue, including ferry's own `host-reset.sh` verifier, which will report it as not served while calls to it keep succeeding. `super-flash` — the **housekeeping** lane `ferry opencode` points `title`/`summary`/`compaction` at — is a real and *advertised* `model_name` for exactly that reason: it carries compaction, and a failed compaction does not retry, it drops the whole transcript.
+**Keeping a lane out of the catalogue is a separate control** — the one an alias only appeared to offer. Omit `model_info: {public: true}` and `front/ferry_front.py` leaves the lane out of `/v1/models` while it still routes *and still keeps its chain*. Use it sparingly: an unlisted lane is invisible to everything that reads the catalogue, including ferry's own `host-reset.sh` verifier, which will report it as not served while calls to it keep succeeding. `super-flash` — the title/summary lane `ferry opencode` points `title` and `summary` at — is a real and *advertised* `model_name`, so clients can select the same inexpensive lane through `small_model`.
 
 **Add models with Claude Code.** This repo bundles two skills — [`add-fallback-orchestrator`](.claude/skills/add-fallback-orchestrator/SKILL.md) and [`add-worker-model`](.claude/skills/add-worker-model/SKILL.md) — that walk Claude through editing your `litellm.yaml` correctly: the strict-failover-chain vs. load-balanced-pool distinction, the independent-capacity rule for fallbacks, and the per-project-quota gotcha **plus the Google ToS line a worker-key pool must not cross**. Just ask Claude Code to "add a fallback orchestrator" or "add another worker key."
 
-> LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). Point it at `http://<host>.local:8090/v1` with the main model set to a driving lane (`heavy` or `local-orch`) and the subagent model to its cheap partner (`flash` or `local-sub`). Select `medium` directly for substantive coding or review work; it does not alter the default roles.
+> LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). The cloud defaults use `heavy` for build/plan, `medium` for general/compaction, `flash` for explore, and `super-flash` for title/summary. The local pair remains `local-orch` for driving and `local-sub` for its other roles.
 
 **opencode auto-wiring.** On a client, `ferry opencode` takes opencode's config over so **every** agent routes through the host. Add `--local` to pick the GPU pair instead of the cloud pair:
 
 ```bash
-ferry opencode            # heavy drives, flash fans out
+ferry opencode            # heavy drives; medium handles general/compaction; flash explores
 ferry opencode --local    # local-orch drives, local-sub fans out
 ```
 
@@ -417,34 +417,39 @@ It is a **surgical takeover, not a merge**. Four keys belong to ferry and are re
 | key | becomes |
 |---|---|
 | `model` | `ferry/<driver>` |
-| `small_model` | `ferry/<housekeeper>` |
+| `small_model` | `ferry/<housekeeper>` (`super-flash` by default in cloud mode) |
 | `permission` | `"allow"` |
 | `agent` | all seven built-ins pinned (below) |
 
 `plugin` is *appended* to, never replaced — [`@prevalentware/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin) is added if it isn't already there.
 
-All seven of opencode's built-in agents get pinned across **three roles**, so nothing silently escapes to a model you aren't paying for on purpose:
+All seven of opencode's built-in agents get pinned to the cloud defaults, so nothing silently escapes to a model you aren't paying for on purpose:
 
 | role | agents | cloud | GPU |
 |---|---|---|---|
 | driver | `build`, `plan` | `heavy` | `local-orch` |
-| worker | `general`, `explore` | `flash` | `local-sub` |
-| housekeeper | `title`, `summary`, `compaction` | `super-flash` | `local-sub` |
+| general / compaction | `general`, `compaction` | `medium` | `local-sub` |
+| explore | `explore` | `flash` | `local-sub` |
+| title / summary | `title`, `summary` | `super-flash` | `local-sub` |
 
-`medium` is a selectable fourth cloud lane, outside those default role pins. Use
-`ferry opencode --model medium` for a substantive coding task or review when the
-standard worker tier is too small. In the domestic template it uses the existing
-ChatGPT subscription at `xhigh`; that usage shares the subscription's limits with
-the other ChatGPT lanes. Its independent OpenRouter fallback can incur paid
-OpenRouter billing. The lane is a role and routing choice, not a benchmark claim.
+When the host advertises `medium`, it is the default for `general` and `compaction`.
+If the catalogue lacks it or cannot be reached, `general` keeps `flash` and
+`compaction` keeps `super-flash`. Explicit overrides still take precedence.
 
-The housekeeping three matter more than they look. They fire on their own schedule rather than as part of a fan-out, and an unpinned `compaction` sends your *entire transcript* to whatever the default model is. Giving them their own lane also keeps a compaction — the largest single request opencode ever makes — from queueing behind a fan-out that has just saturated the worker pool. `small_model` follows the same lane, since opencode's schema describes it as the model "for tasks like title generation".
+`medium` remains selectable as
+`ferry opencode --model medium` for a substantive coding task or review. In the
+domestic template it uses the existing ChatGPT subscription at `xhigh`; that usage
+shares the subscription's limits with the other ChatGPT lanes. Its independent
+OpenRouter fallback can incur paid OpenRouter billing. The lane is a role and
+routing choice, not a benchmark claim.
 
-On the GPU pair there is no third lane, so the housekeeper shares `local-sub`. Point the housekeeper anywhere with `--housekeeper <lane>`.
+`compaction` carries the entire transcript, so it shares the substantive `medium` lane with `general`, whose capacity and fallback posture match that work. `title` and `summary` use `super-flash`; `small_model` follows that inexpensive lane because opencode's schema describes it as the model "for tasks like title generation". Use `--small-model <lane>` to override `general` and `explore`, or `--housekeeper <lane>` to override `title`, `summary`, and `compaction`.
+
+On the GPU pair there is no third lane, so every non-driver role shares `local-sub`.
 
 **`agent` is replaced wholesale rather than merged**, which is the point — a stale per-agent pin is exactly the drift this ends. Before every write, the previous config is copied to `<name>.<UTC-timestamp>.jsonc` beside it (last 10 kept, `--keep N` to change), so a takeover is always reversible and any custom agent you had is recoverable. The `.jsonc` extension is deliberate: opencode's schema allows comments, and the snapshot is where they survive the rewrite.
 
-Only the default role lanes plus selectable `medium` are declared as models — never the served catalogue. The host does **not** advertise the fallback hops (`medium-terra`, `flash-terra`, `super-flash-luna`, …) — only lanes marked `model_info: {public: true}` make it into `/v1/models` — but a hop still routes by name: it's the *router* that reaches it on overflow, not a client picking one out of a menu.
+Only the role lanes and, when available, selectable `medium` are declared as models — never the served catalogue. The host does **not** advertise the fallback hops (`medium-terra`, `flash-terra`, `super-flash-luna`, …) — only lanes marked `model_info: {public: true}` make it into `/v1/models` — but a hop still routes by name: it's the *router* that reaches it on overflow, not a client picking one out of a menu.
 
 ## Fleets
 
@@ -464,17 +469,19 @@ fleets existed.
 
 | Template fleet | `heavy` | `medium` | `flash` | `super-flash` |
 |---|---|---|---|---|
-| `domestic` | GPT-6 Astra → GPT-5.6 Sol, both on the ChatGPT subscription at `xhigh` | GPT-5.6 Terra on the ChatGPT subscription (`xhigh`) → GPT-5.6 Terra on OpenRouter (`xhigh`) | OpenRouter GPT-5.6 Luna (`xhigh`) → Gemini Flash Latest (`xhigh`) → GPT-5.6 Terra (`xhigh`) | OpenRouter Gemini Flash Latest (`minimal`) → GPT-5.6 Luna (reasoning off) |
+| `domestic` | GPT-6 Astra → GPT-5.6 Sol, both on the ChatGPT subscription at `xhigh` | GPT-5.6 Terra on the ChatGPT subscription (`xhigh`) → GPT-5.6 Terra on OpenRouter (`xhigh`); used by general/compaction | OpenRouter GPT-5.6 Luna (`xhigh`) → Gemini Flash Latest (`xhigh`) → GPT-5.6 Terra (`xhigh`); used by explore | OpenRouter Gemini Flash Latest (`minimal`) → GPT-5.6 Luna (reasoning off); used by title/summary |
 
-The route template provisions `domestic.medium`. An `international.medium` is
-optional: configure Z.ai `glm-5.3` with thinking enabled at `high`, then an
-OpenRouter `z-ai/glm-5.3` fallback with thinking enabled at `high`, using the
-native `GLM_API_KEY` for the Z.ai route. GLM-5.3 is text-only, so the generated
-opencode entry for `medium` does not advertise image or PDF input even when a
-domestic Terra request could accept it. The Z.ai coding subscription and the
-ChatGPT subscription have their own shared limits; OpenRouter fallback usage is
-separately billed. These route descriptions are configuration guidance, not a
-claim that one lane benchmarks above another.
+The route template provisions the domestic fleet only. Its commented
+`international.medium` guidance uses Z.ai `glm-5.3` with thinking enabled at
+`high`, then an OpenRouter `z-ai/glm-5.3` fallback at `high`, using the native
+`GLM_API_KEY` for the Z.ai route. If you configure a complete international fleet,
+prefer Gemini Flash Latest through OpenRouter at `minimal` for its `super-flash`
+title/summary role too; this template does not provision those international lanes.
+GLM-5.3 is text-only, so the shared opencode `medium` entry does not advertise
+image or PDF input across either fleet, even when domestic Terra could accept it.
+The Z.ai coding subscription and the ChatGPT subscription have their own shared
+limits; OpenRouter fallback usage is separately billed. These route descriptions
+are configuration guidance, not a claim that one lane benchmarks above another.
 
 The commands below use `international` as an example of a second fleet you have configured.
 
@@ -818,7 +825,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `serve-hf [--port P]` | host | Start the experimental HuggingFace pass-through proxy (default `8096`) |
 | `serve-proxy [--port P]` | host | Start the general HTTP(S) download forward proxy (default `8097`) |
 | `env [--host H] [--proxy-port P] [--hf-port P2] [--write]` | client | Emit shell exports so this laptop routes downloads via the host proxy |
-| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--key KEY] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, `model`, `small_model`, and all seven built-in agents, pinned to lane names. `--key` writes the master key into the configs (v1.22) — without it they carry the keyless `local` placeholder, which a hardened front door rejects. `--super` pins worker AND housekeeper to `super-flash` (heavy keeps driving). Snapshots the original first |
+| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--key KEY] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, global `model` (`heavy`), `small_model` (`super-flash`), and all seven built-in agents pinned to lane names. Defaults: build/plan → `heavy`; general/compaction → `medium`; explore → `flash`; title/summary → `super-flash`. `--small-model` overrides general/explore; `--housekeeper` overrides title/summary/compaction. `--super` keeps `heavy` driving and sends every non-driver agent to `super-flash`. `--key` writes the master key into the configs (v1.22) — without it they carry the keyless `local` placeholder, which a hardened front door rejects. Snapshots the original first |
 | `claude [--host H] [--port P] [--key KEY] [--wrappers]` | dual | Point Claude Code at the ferry endpoint by lane name: installs the `claude-ferry` / `claude-ferry-local` / `claude-ferry-super` wrappers into `~/.zshrc` and writes `~/.config/ferry/claude.json` recording the lane map. `--key` bakes the master key into the wrappers (v1.22); `--wrappers` installs the `~/.zshrc` block only (the host-reset shim) |
 
 Run `ferry --help` for the built-in usage banner.

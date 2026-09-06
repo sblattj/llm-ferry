@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # THE FERRY STACK — several named LANES on one OpenAI-compatible endpoint, so
 # LAN clients (or localhost) get a big driving model, a substantive worker,
-# a fan-out worker, a housekeeper, and the host's own GPU models — all from
+# an exploration worker, a lightweight title/summary lane, and the host's own GPU models — all from
 # one URL, with every credential
 # staying on the host.
 #
@@ -20,17 +20,18 @@
 #                        so a session pinned to the old name mid-run does not
 #                        404 after a rename.
 #   medium             -> SUBSTANTIVE WORKER: GPT-5.6 Terra via the ChatGPT
-#                        subscription at xhigh. It handles bounded, capable
-#                        implementation work between the driver and fan-out.
+#                        subscription at xhigh. It handles general work and
+#                        compaction between the driver and exploration worker.
 #                        Falls back to the same model through OpenRouter.
-#   flash              -> WORKER: high-volume fan-out lane: GPT-5.6 Luna via
+#   flash              -> EXPLORE WORKER: high-volume exploration lane: GPT-5.6 Luna via
 #                        OpenRouter at `reasoning.effort: xhigh`. Falls back to
 #                        `flash-gemini` (`~google/gemini-flash-latest`, currently
 #                        Gemini 3.8 Flash), then `flash-terra`.
-#   super-flash        -> HOUSEKEEPER: title / summary / compaction only. Same
-#                        model as `flash`, its own deployment so compaction
-#                        never queues behind a fan-out — at the LOWEST
-#                        reasoning effort the model will accept. Falls back to
+#   super-flash        -> TITLE/SUMMARY LANE: Gemini Flash Latest via OpenRouter
+#                        at minimal reasoning. It is the primary for this role
+#                        in domestic and the recommended primary for an
+#                        international fleet; the template provisions domestic
+#                        only. Falls back to
 #                        `super-flash-luna` ONLY when it errors.
 #   super-flash-luna   -> `super-flash`'s fallback hop: GPT-5.6 Luna via
 #                        OpenRouter, with reasoning turned OFF.
@@ -38,12 +39,11 @@
 #   local-sub          -> the host GPU's cheap fan-out model, via mlx_vlm.server on :8093
 #
 # FOUR cloud roles allow separate model and fallback choices: driver,
-# substantive worker, high-volume fan-out worker, and housekeeper.
+# substantive worker, exploration worker, and title/summary lane.
 # Subscription deployments still share account-level usage limits. The
-# housekeeper is split out from the workers because it fires on its own schedule
-# and a compaction call carries the ENTIRE transcript. Pointing it at a worker
-# lane makes it queue behind the fan-out on the lane least likely to have
-# headroom. On the GPU pair there is no third lane, so the housekeeper shares
+# title/summary work is lightweight. General work and compaction intentionally
+# share `medium`, so their capacity and fallback posture stay aligned. On the
+# GPU pair there is no third lane, so title, summary, and compaction share
 # local-sub.
 #
 # The driver carries ONE hop, added 2026-09-05 as a deliberate override of the
@@ -273,12 +273,12 @@ model_list:
       # must stay unique across the whole model_list.
       id: or-gemini-flash
 
-  # -- super-flash: the HOUSEKEEPER lane (title / summary / compaction) ------
-  # Same model as `flash`, its own deployment and cooldown, so compaction
-  # never queues behind a worker fan-out — a compaction call carries the
-  # WHOLE transcript. A real model_name (not an alias) so it stays a distinct
-  # id in the metrics; see the model_group_alias warning near the bottom of
-  # this file for why an alias would be the wrong tool here.
+  # -- super-flash: the TITLE/SUMMARY lane -----------------------------------
+  # Gemini Flash Latest via OpenRouter at minimal reasoning is the domestic
+  # primary. It is also the recommended `super-flash` primary if you configure
+  # a complete international fleet, though this template does not provision
+  # international lanes. A real model_name (not an alias) keeps a distinct id
+  # in metrics; see the model_group_alias warning near the bottom of this file.
   #
   # `public: true` is NOT decoration. Omit it and the lane still ROUTES
   # perfectly, but it vanishes from /v1/models, because `ferry up` serves
@@ -290,7 +290,7 @@ model_list:
   # answered a probe correctly on the next line. Mark every LANE; never mark a
   # fallback hop (see `flash-terra` / `super-flash-luna` below).
   #
-  # REASONING FLOOR (verified 2026-09-04): compaction wants NO thinking, but
+  # REASONING FLOOR (verified 2026-09-04): title and summary want NO thinking, but
   # Gemini Flash refuses to switch it off — through OpenRouter, effort
   # `none`, `max_tokens: 0`, and `enabled: false` all 400 with "Reasoning is
   # mandatory for this endpoint and cannot be disabled". `minimal` is the
@@ -345,7 +345,7 @@ model_list:
         provider:
           sort: throughput    # fastest provider this minute, ranked by OpenRouter
         reasoning:
-          effort: none        # the housekeeper's own depth: reasoning OFF
+          effort: none        # the title/summary lane's fallback depth: reasoning OFF
     model_info:
       id: or-luna-sf-fb
 
@@ -495,9 +495,10 @@ router_settings:
   # quota-blocked: the alias returned 500, the real `model_name` returned 200 from
   # the second hop.
   #
-  # This bit hardest on the housekeeping lane. Aliasing `super-flash` looked free
-  # and cost it every fallback it appeared to have — and a failed compaction call
-  # does not just retry, it drops the whole transcript.
+  # This bit hardest when `super-flash` was the housekeeping lane: aliasing it
+  # looked free and cost it every fallback it appeared to have; a failed
+  # compaction call then dropped the whole transcript. It remains a real lane
+  # for today's title/summary role, so the alias warning still applies.
   #
   # So: give a lane a real `model_name` and its own `fallbacks:` entry. To keep it
   # out of the catalogue, just OMIT `model_info: {public: true}` — ferry_front.py

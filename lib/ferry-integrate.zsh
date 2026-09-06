@@ -125,9 +125,9 @@ PYEOF
 # is the host's own choice and ferry does not override it.
 unalias opencode-cloud opencode-local opencode-super 2>/dev/null
 
-# opencode-cloud: heavy drives (build/plan); medium handles general and
-# compaction when advertised; flash handles explore; super-flash handles
-# title/summary. Older or unreachable hosts retain flash/super-flash fallback.
+# opencode-cloud: heavy drives (build/plan); medium handles general when
+# advertised; flash handles explore; super-flash handles compaction and
+# title/summary. Older or unreachable hosts retain flash for general.
 opencode-cloud() {
   OPENCODE_CONFIG="$HOME/.config/ferry/opencode-cloud.json" command opencode "$@"
 }
@@ -147,7 +147,7 @@ opencode-super() {
 EOF
 
   echo ">>> opencode shell wrappers installed in $rc:"
-  echo "    opencode-cloud   -> cloud lanes: heavy drives; medium general/compaction; flash explore"
+  echo "    opencode-cloud   -> cloud lanes: heavy drives; medium general; flash explore; super-flash compaction/title/summary"
   echo "    opencode-super   -> cloud pair: heavy drives, super-flash fans out"
   echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
   echo "    (bare 'opencode' is untouched — run: source $rc)"
@@ -241,16 +241,16 @@ cmd_opencode() {
   #   driver       build / plan                      heavy       local-orch
   #   general      general                           medium*     local-sub
   #   explore      explore                           flash       local-sub
-  #   compaction   compaction                        medium*     local-sub
+  #   compaction   compaction                        super-flash local-sub
   #   housekeeper  title / summary                   super-flash local-sub
   #
   # * `medium` is used only when the host catalogue advertises it. Older or
-  # unreachable hosts retain the established flash/general and super-flash/
-  # compaction fallback rather than receiving a broken new lane reference.
+  # unreachable hosts retain flash for general rather than receiving a broken
+  # new lane reference.
   #
   # Compaction fires on its own schedule and carries the ENTIRE transcript, so
-  # it uses medium when available instead of queuing behind explore. On the GPU
-  # pair there is no third lane, so all non-driver agents share local-sub.
+  # cloud uses the super-flash housekeeping lane. On the GPU pair there is no
+  # third lane, so all non-driver agents share local-sub.
   #
   # A real model id must NEVER reach a client config. The host re-points a lane
   # whenever the economics change; a client that named the model would keep
@@ -389,10 +389,10 @@ HOUSE_AGENTS = ("title", "summary")
 # servers behind local-orch/local-sub take no image input, and declaring one
 # would send bytes they reject instead of the placeholder they now get.
 # --- Query the host catalogue; never populate a config FROM it. ---
-# The catalogue does NOT advertise the fallback deployments (flash-luna,
-# super-flash-luna, ...): they route by name but are not `public`, so they never
-# appear in /v1/models. Those are reached by the ROUTER on overflow, not by a
-# client picking one out of a menu, so they stay out of the config.
+# The catalogue does NOT advertise the fallback deployments: they route by name
+# but are not `public`, so they never appear in /v1/models. Those are reached by
+# the ROUTER on overflow, not by a client picking one out of a menu, so they stay
+# out of the config.
 served = []
 try:
     # An authed front door rejects a bare catalogue request, which would read
@@ -406,10 +406,10 @@ try:
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
 
-# A modern cloud host exposes `medium`, which carries the general and compaction
-# workloads. When that capability is absent (or cannot be checked), retain the
-# old two-lane routing: general/explore use flash and all housekeeping uses
-# super-flash. The GPU pair deliberately stays exactly as it was.
+# A modern cloud host exposes `medium`, which carries general. When that
+# capability is absent (or cannot be checked), general and explore use flash;
+# compaction and housekeeping use super-flash. The GPU pair deliberately stays
+# exactly as it was.
 if prefer_local:
     driver, general, explore, compaction, house = ("local-orch", "local-sub",
                                                      "local-sub", "local-sub",
@@ -417,9 +417,8 @@ if prefer_local:
     limits = {"limit": {"context": 131072, "output": 8192}}
 else:
     driver, explore, house = "heavy", "flash", "super-flash"
-    general = compaction = "medium" if "medium" in served else None
-    general = general or explore
-    compaction = compaction or house
+    general = "medium" if "medium" in served else explore
+    compaction = house
     limits = {"modalities": {"input": ["text", "image", "pdf"],
                              "output": ["text"]}}
 driver = force_model or driver
@@ -517,7 +516,7 @@ prev_options = prev_ferry.get("options") if isinstance(prev_ferry.get("options")
 # two lanes, so declaring one model entry per agent would create duplicates.
 models = {}
 # `medium` is a cloud capability tier. Declare it when the host offers it so it
-# appears in opencode's model picker and can serve general and compaction. Its
+# appears in opencode's model picker and can serve general. Its
 # resolved backend varies by fleet: domestic
 # Terra accepts attachments, while international GLM-5.3 is text-only. A single
 # opencode provider entry cannot vary modalities with X-Ferry-Fleet, so omit the

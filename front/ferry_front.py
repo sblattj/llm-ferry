@@ -311,10 +311,9 @@ def service_reorder(router, chains):
 # that hop now serves the demoted Gemini backend, so the effective order is
 # Luna -> Gemini with zero chain edits. Cross-lane side effect is symmetric
 # and honest: every OTHER chain naming the hop would get the demoted backend
-# in that slot too — under the 2026-09-04 config no lane shares a hop (flash's
-# is flash-luna, super-flash's is super-flash-luna, one apiece), so there is
-# nothing for the effect to touch today, but the mechanism still applies the
-# moment two chains name the same hop — and the dash shows model strings from
+# in that slot too. The current template gives each fallback its own lane
+# name, while super-flash has no fallback. The mechanism still applies when
+# two chains name the same hop — and the dash shows model strings from
 # the file, so after the file echo the new mapping is VISIBLE.
 #
 # litellm resolves the primary per REQUEST (_get_all_deployments reads

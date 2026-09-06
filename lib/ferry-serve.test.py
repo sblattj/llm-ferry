@@ -201,7 +201,8 @@ class TestRouteTemplateMediumLane(unittest.TestCase):
 
         path = os.path.join(REPO, "litellm-route-example.yaml")
         with open(path) as handle:
-            cls.cfg = yaml.safe_load(handle)
+            cls.template_text = handle.read()
+        cls.cfg = yaml.safe_load(cls.template_text)
         cls.deployments = {m["model_name"]: m for m in cls.cfg["model_list"]}
 
     def test_model_info_ids_are_present_and_unique(self):
@@ -234,6 +235,33 @@ class TestRouteTemplateMediumLane(unittest.TestCase):
             for name, hops in entry.items()
         }
         self.assertEqual(fallbacks["domestic.medium"], ["domestic.medium-terra"])
+
+    def test_public_super_flash_is_gemini_only_without_a_model_fallback(self):
+        """Compaction/title/summary stay on Gemini when the lane has an error."""
+        primary = self.deployments["domestic.super-flash"]
+        self.assertEqual(
+            primary["litellm_params"],
+            {
+                "model": "openrouter/~google/gemini-flash-latest",
+                "api_key": "os.environ/OPENROUTER_API_KEY",
+                "timeout": 600,
+                "stream_timeout": 60,
+                "extra_body": {
+                    "provider": {"sort": "throughput"},
+                    "reasoning": {"effort": "minimal"},
+                },
+            },
+        )
+        self.assertIs(primary["model_info"].get("public"), True)
+
+        fallbacks = {
+            name: hops for entry in self.cfg["router_settings"]["fallbacks"]
+            for name, hops in entry.items()
+        }
+        self.assertEqual(fallbacks["domestic.super-flash"], [])
+        self.assertNotIn("domestic.super-flash-luna", self.deployments)
+        self.assertNotIn("domestic.super-flash-luna", self.template_text)
+        self.assertNotIn("international.super-flash", self.deployments)
 
 
 class TestStatusTestCommand(unittest.TestCase):

@@ -6,9 +6,10 @@ description: Use when adding a worker lane or more worker keys to llm-ferry's lo
 # Add a worker model to llm-ferry's route proxy
 
 Workers are the cloud lanes that serve the non-driver roles. The shipped `flash` lane is the
-exploration worker; `super-flash` is the title/summary lane, whose Gemini Flash Latest primary
-runs through OpenRouter at minimal reasoning and carries one Luna fallback hop. `general` and
-`compaction` use `medium`. Each lane is currently a single deployment rather than a pool and is
+exploration worker; `super-flash` serves compaction, title, and summary. It is always
+`openrouter/~google/gemini-flash-latest`, with minimal reasoning and throughput provider
+routing, and deliberately has no fallback. `general` uses `medium` when it is advertised and
+otherwise uses `flash`. Each lane is currently a single deployment rather than a pool and is
 served by `ferry up` (or `ferry up --route` for the cloud lanes alone).
 
 Since fleets (2026-09-04) lane names are `<fleet>.<lane>`; chains never cross a fleet.
@@ -24,7 +25,7 @@ routing.
 
 **Pool vs. fallback — pick the right skill:**
 - **Worker pool (this skill):** multiple **identical** `model_name` deployments. `usage-based-routing-v2` proactively splits calls to the **least-used** key (an even split, not just error-triggered). Order does not matter; no `fallbacks:` entry.
-- **Orchestrator fallback (`add-fallback-orchestrator`):** **separate** `model_name`s wired into `router_settings.fallbacks`, reached **only on error**, in strict order. Use that skill for a lane's failover hop — the worker lanes' single Luna hop, or the driver's chain if you decide to add one.
+- **Orchestrator fallback (`add-fallback-orchestrator`):** **separate** `model_name`s wired into `router_settings.fallbacks`, reached **only on error**, in strict order. Use that skill for a lane's failover hop or the driver's chain. Every cloud lane needs a `fallbacks` entry; `super-flash: []` deliberately declares that it has no hop.
 
 ## Two things you might be doing
 - **A) Grow an existing pool** — add another key to a lane you already serve. Legitimate ONLY when the key represents a genuinely separate account or provider (see the ToS rule below). Append an identical-`model_name` deployment.
@@ -34,7 +35,7 @@ routing.
 1. Mint/obtain the key. Extra headroom must come from a genuinely **separate provider or account** — NEVER from a second Google Cloud project under the same Google account (see the ToS rule below).
 2. Export it under a distinctive env var (shell or `~/.config/ferry/secrets.env`). Never commit real keys.
 3. Edit `~/.config/ferry/litellm.yaml` — append a deployment block (A) or a new `model_name` (B).
-4. **Do NOT** add a worker's OWN pool members (repeated identical `model_name` blocks) into `router_settings.fallbacks` — the pool self-balances via `usage-based-routing-v2`. The shipped config DOES give `flash` and `super-flash` each ONE outbound entry in `fallbacks` (to `flash-luna` / `super-flash-luna`), but that's the lane's failover hop, not pool routing — see `add-fallback-orchestrator` for how that hop is wired and why it's a single hop rather than another pool member.
+4. **Do NOT** add a worker's OWN pool members (repeated identical `model_name` blocks) into `router_settings.fallbacks` — the pool self-balances via `usage-based-routing-v2`. A fallback entry is a lane's error-only route, not pool routing. Keep `super-flash: []`: it is deliberately Gemini-only, with no non-Gemini fallback.
 5. Apply: `ferry reload` (config-only). Use `ferry down && ferry up` for a full restart.
 6. Verify each key independently (below), spread out so you don't trip fresh-key rate limits.
 
@@ -64,8 +65,9 @@ single-deployment worker lane:
 model_list:
   - model_name: flash
     litellm_params:
-      model: openrouter/google/gemini-3.8-flash
+      model: openrouter/openai/gpt-5.6-luna
       api_key: os.environ/OPENROUTER_API_KEY
+      reasoning_effort: xhigh
       extra_body:
         provider:
           sort: throughput
@@ -73,7 +75,7 @@ model_list:
 
   - model_name: super-flash
     litellm_params:
-      model: openrouter/google/gemini-3.8-flash
+      model: openrouter/~google/gemini-flash-latest
       api_key: os.environ/OPENROUTER_API_KEY
       extra_body:
         provider:
@@ -83,8 +85,10 @@ model_list:
       timeout: 600
 ```
 
-Each carries its own one-hop Luna fallback (`flash-luna` / `super-flash-luna`) — wiring
-that hop is `add-fallback-orchestrator`'s job, not this skill's; don't duplicate it here.
+`super-flash` must stay Gemini-only: use `openrouter/~google/gemini-flash-latest` with
+`reasoning.effort: minimal` and `provider.sort: throughput`, and retain its explicit empty
+fallback entry (`{"super-flash": []}`). Do not add a Luna or other non-Gemini hop. Any
+fallback for another lane is wired by `add-fallback-orchestrator`; do not duplicate it here.
 
 ## When a pool IS the right shape (illustration)
 
@@ -128,7 +132,7 @@ one, via `add-fallback-orchestrator`.
 One env var per key, named for its provider: `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, … Use `_N` suffixes only when you hold multiple keys that are **genuinely independent** — separate accounts or providers:
 
 ```bash
-export OPENROUTER_API_KEY="..."      # flash / super-flash and their Luna hops
+export OPENROUTER_API_KEY="..."      # flash, Gemini-only super-flash, and OpenRouter hops
 export GEMINI_API_KEY="..."          # only if you're building the direct-Gemini pool illustration above
 export GEMINI_API_KEY_2="..."        # ONLY if this is a DIFFERENT Google account
 ```

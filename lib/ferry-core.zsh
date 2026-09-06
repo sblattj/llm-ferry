@@ -113,7 +113,8 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 #                   (legacy names `orch`/`orchestrator` still resolve to it)
 #   flash        -> ~google/gemini-flash-latest via OpenRouter (currently
 #                   Gemini 3.8 Flash), xhigh reasoning, Terra fallback
-#   super-flash  -> same alias, minimal reasoning (housekeeping), Luna fallback
+#   super-flash  -> Gemini Flash Latest via OpenRouter, minimal reasoning for
+#                   compaction/title/summary; Gemini-only, no model fallback
 #   local-orch   -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
 #   local-sub    -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
 #

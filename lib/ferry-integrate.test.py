@@ -58,9 +58,9 @@ CATALOGUE = ["heavy", "medium", "orch-fallback-1", "orch-fallback-2", "orch-fall
 BUILTIN_AGENTS = {"build", "plan", "general", "explore",
                   "title", "summary", "compaction"}
 
-# Cloud defaults split general and compaction onto medium when a modern host
-# advertises it. Older/unreachable hosts retain the former flash/super-flash
-# split; local keeps its two GPU lanes.
+# Cloud defaults put general on medium when a modern host advertises it, with
+# compaction and housekeeping on super-flash. Older/unreachable hosts retain
+# flash for general; local keeps its two GPU lanes.
 DRIVER_AGENTS = ("build", "plan")
 GENERAL_AGENTS = ("general",)
 EXPLORE_AGENTS = ("explore",)
@@ -243,11 +243,11 @@ class TestTakeoverScope(FerryOpencodeCase):
         agent = self.read()["agent"]
         for a in DRIVER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/heavy")
-        for a in GENERAL_AGENTS + COMPACTION_AGENTS:
+        for a in GENERAL_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/medium")
         for a in EXPLORE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/flash")
-        for a in HOUSE_AGENTS:
+        for a in COMPACTION_AGENTS + HOUSE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/super-flash")
 
     def test_no_default_leaves_the_takeover_keys_alone(self):
@@ -276,7 +276,7 @@ class TestLaneNamesOnly(FerryOpencodeCase):
             self.run_ferry("--model", "medium")
             self.assertIn("medium", self.read()["provider"]["ferry"]["models"])
 
-    def test_old_catalogue_keeps_the_existing_general_and_compaction_fallbacks(self):
+    def test_old_catalogue_keeps_general_fallback_and_compaction_house_lane(self):
         old_catalogue = [lane for lane in CATALOGUE if lane != "medium"]
         with mock.patch(__name__ + ".CATALOGUE", old_catalogue):
             self.run_ferry()
@@ -460,7 +460,7 @@ class TestSuperProfile(FerryOpencodeCase):
         for a in NON_DRIVER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/super-flash")
 
-    def test_unreachable_catalogue_keeps_the_legacy_general_and_compaction_fallbacks(self):
+    def test_unreachable_catalogue_keeps_general_fallback_and_compaction_house_lane(self):
         out = self.run_ferry(port=self.dead_port)
         self.assertIn("Could not query", out,
                       "the host was supposed to be unreachable")

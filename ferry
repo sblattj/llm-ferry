@@ -3562,13 +3562,29 @@ HOUSE_AGENTS  = ("title", "summary", "compaction")       # background -> houseke
 # opencode's 32k output reservation tips over into a clean 400 (max_tokens is
 # reserved against the KV budget). 8k output keeps prompts up to ~123k
 # admissible; a compaction summary never needs 32k anyway.
+#
+# `modalities` is NOT decoration. opencode gates attachments on it: a custom
+# provider's model has capabilities.input.image == false unless its config
+# entry says `modalities.input` includes "image" (models.dev knows nothing
+# about a ferry lane, so there is no fallback). With the flag false, opencode
+# still runs its Read tool on a pasted screenshot — and then REPLACES the image
+# with the text `ERROR: Cannot read "x.png" (this model does not support image
+# input). Inform the user.` before the request leaves the laptop. The lane
+# behind `heavy` reads images fine; the model was told it could not. Measured
+# 2026-09-05 (opencode 1.18.29) by capturing the bytes on the wire: without the
+# declaration the request carried that ERROR line, with it the request carried
+# an image_url part and GPT-6 Astra described the picture. Same for PDF, which
+# the front passes as an input_file. The GPU pair stays text-only: the mlx
+# servers behind local-orch/local-sub take no image input, and declaring one
+# would send bytes they reject instead of the placeholder they now get.
 if prefer_local:
     # No third GPU lane exists — the housekeeper shares the worker.
     driver, worker, house = "local-orch", "local-sub", "local-sub"
     limits = {"limit": {"context": 131072, "output": 8192}}
 else:
     driver, worker, house = "heavy", "flash", "super-flash"
-    limits = {}
+    limits = {"modalities": {"input": ["text", "image", "pdf"],
+                             "output": ["text"]}}
 driver = force_model or driver
 worker = force_small or worker
 house  = force_house or house

@@ -155,6 +155,22 @@ alone, since a host that exports `OPENCODE_CONFIG` chose that deliberately). The
 land under the same `# >>> ferry opencode profiles >>>` marker the client uses, so
 a hand-wired block from before this change is absorbed rather than duplicated.
 
+**Screenshots and PDFs reach the cloud lanes only because the config says so.**
+opencode gates attachments on the provider entry's `modalities.input`, and a
+custom provider gets no fallback from models.dev, so a lane declared without it
+has `capabilities.input.image == false`. opencode then still reads the pasted
+screenshot with its Read tool — and swaps the image for the text `ERROR: Cannot
+read "x.png" (this model does not support image input). Inform the user.` before
+the request leaves the laptop. The model dutifully reports it cannot see the
+screenshot, and nothing on the host ever saw an image: the front and LiteLLM's
+Chat→Responses bridge pass `image_url` parts, tool-result images, Anthropic image
+blocks, and `file` PDFs through to GPT-6 Astra and the Gemini worker lanes
+unchanged (all six shapes probed 2026-09-05 with a no-attachment control).
+`ferry opencode` now writes `modalities: {input: [text, image, pdf]}` on the three
+cloud lanes; a client wired before that needs a `ferry update` (which re-runs
+the takeover) or a plain `ferry opencode` re-run to pick it up. The GPU pair
+stays text-only on purpose: the mlx servers behind it reject image input.
+
 #### How much of opencode it takes over
 
 The default above assumes the client's opencode is yours to wire. On a laptop that already has its own opencode setup, narrow the scope — the flag goes after `zsh -s --`:

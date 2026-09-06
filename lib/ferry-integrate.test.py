@@ -286,6 +286,9 @@ class TestLaneNamesOnly(FerryOpencodeCase):
         self.assertEqual(set(models), {"local-orch", "local-sub"})
         for lane in models.values():
             self.assertEqual(lane["limit"], {"context": 131072, "output": 8192})
+            # The mlx servers behind the GPU pair take no image input, so the
+            # pair must NOT advertise one: opencode would ship the bytes.
+            self.assertNotIn("modalities", lane)
         self.assertEqual(cfg["model"], "ferry/local-orch")
         self.assertEqual(cfg["small_model"], "ferry/local-sub")
         for a in HOUSE_AGENTS:
@@ -295,6 +298,37 @@ class TestLaneNamesOnly(FerryOpencodeCase):
         out = self.run_ferry("--model", "no-such-lane")
         self.assertIn("does not serve", out)
         self.assertIn("no-such-lane", out)
+
+    def test_cloud_lanes_declare_image_and_pdf_input(self):
+        # opencode gates attachments on `modalities.input`: a custom-provider
+        # lane without it has capabilities.input.image == false, and opencode
+        # then swaps a pasted screenshot for the text `ERROR: Cannot read
+        # "x.png" (this model does not support image input). Inform the user.`
+        # before the request ever reaches the front. The cloud lanes read
+        # images and PDFs (probed 2026-09-05), so every one must say so.
+        self.run_ferry()
+        models = self.read()["provider"]["ferry"]["models"]
+        for lane in ("heavy", "flash", "super-flash"):
+            self.assertEqual(models[lane]["modalities"],
+                             {"input": ["text", "image", "pdf"],
+                              "output": ["text"]}, lane)
+
+    def test_a_rerun_adds_modalities_to_a_config_written_before_them(self):
+        # Every client config generated before this declaration existed has
+        # the lane entries without it. The spec is rebuilt per lane on each
+        # run (only a hand-written `name` survives), so a plain re-run must
+        # upgrade the old shape rather than preserve it.
+        with open(self.cfg, "w") as f:
+            json.dump({"provider": {"ferry": {"models": {
+                "heavy": {"name": "heavy - driver"},
+                "flash": {"name": "flash"},
+                "super-flash": {"name": "super-flash"},
+            }}}}, f)
+        self.run_ferry()
+        models = self.read()["provider"]["ferry"]["models"]
+        self.assertEqual(models["heavy"]["name"], "heavy - driver")
+        self.assertIn("image", models["heavy"]["modalities"]["input"])
+        self.assertIn("image", models["flash"]["modalities"]["input"])
 
 
 class TestMasterKeyAuth(FerryOpencodeCase):

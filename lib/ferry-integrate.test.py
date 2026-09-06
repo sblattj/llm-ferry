@@ -49,8 +49,8 @@ FERRY = os.path.join(REPO, "ferry")
 # A representative host catalogue: the cloud role lanes plus selectable medium
 # and the router-only
 # fallback deployments that sit behind them. Only the roles may reach a config.
-# `super-flash` is deliberately ABSENT — it is a hidden alias, so a real host
-# does not advertise it either, and the housekeeper must wire up anyway.
+# `super-flash` is omitted to exercise hosts whose catalogue does not advertise
+# every usable lane; title/summary must still wire up.
 CATALOGUE = ["heavy", "medium", "orch-fallback-1", "orch-fallback-2", "orch-fallback-3",
              "flash", "flash-fallback-1", "flash-fallback-2", "flash-fallback-3",
              "local-orch", "local-sub"]
@@ -58,12 +58,15 @@ CATALOGUE = ["heavy", "medium", "orch-fallback-1", "orch-fallback-2", "orch-fall
 BUILTIN_AGENTS = {"build", "plan", "general", "explore",
                   "title", "summary", "compaction"}
 
-# Three roles, not two. The housekeeping agents fire on their own schedule and a
-# compaction call carries the whole transcript, so they get their own lane rather
-# than queueing behind a fan-out on the worker.
+# Cloud defaults split general and compaction onto medium when a modern host
+# advertises it. Older/unreachable hosts retain the former flash/super-flash
+# split; local keeps its two GPU lanes.
 DRIVER_AGENTS = ("build", "plan")
-WORKER_AGENTS = ("general", "explore")
-HOUSE_AGENTS = ("title", "summary", "compaction")
+GENERAL_AGENTS = ("general",)
+EXPLORE_AGENTS = ("explore",)
+COMPACTION_AGENTS = ("compaction",)
+HOUSE_AGENTS = ("title", "summary")
+NON_DRIVER_AGENTS = GENERAL_AGENTS + EXPLORE_AGENTS + COMPACTION_AGENTS + HOUSE_AGENTS
 
 SNAP_RE = re.compile(r"^[^/]+\.\d{8}T\d{6}Z(-\d+)?\.jsonc$")
 
@@ -235,12 +238,14 @@ class TestTakeoverScope(FerryOpencodeCase):
         blob = json.dumps(self.read())
         self.assertNotIn("retired-vendor-model", blob)
 
-    def test_three_way_role_split(self):
+    def test_modern_host_uses_the_requested_agent_lane_defaults(self):
         self.run_ferry()
         agent = self.read()["agent"]
         for a in DRIVER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/heavy")
-        for a in WORKER_AGENTS:
+        for a in GENERAL_AGENTS + COMPACTION_AGENTS:
+            self.assertEqual(agent[a]["model"], "ferry/medium")
+        for a in EXPLORE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/flash")
         for a in HOUSE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/super-flash")
@@ -271,11 +276,19 @@ class TestLaneNamesOnly(FerryOpencodeCase):
             self.run_ferry("--model", "medium")
             self.assertIn("medium", self.read()["provider"]["ferry"]["models"])
 
-    def test_hidden_housekeeper_does_not_warn(self):
-        # A hidden model_group_alias resolves on a request but is deliberately
-        # absent from /v1/models (see CATALOGUE above, which omits super-flash
-        # exactly as the live host does). Validating it against the catalogue
-        # would warn on every correct setup.
+    def test_old_catalogue_keeps_the_existing_general_and_compaction_fallbacks(self):
+        old_catalogue = [lane for lane in CATALOGUE if lane != "medium"]
+        with mock.patch(__name__ + ".CATALOGUE", old_catalogue):
+            self.run_ferry()
+        cfg = self.read()
+        self.assertNotIn("medium", cfg["provider"]["ferry"]["models"])
+        self.assertEqual(cfg["agent"]["general"]["model"], "ferry/flash")
+        self.assertEqual(cfg["agent"]["explore"]["model"], "ferry/flash")
+        self.assertEqual(cfg["agent"]["compaction"]["model"], "ferry/super-flash")
+
+    def test_catalogue_omission_of_the_title_summary_lane_does_not_warn(self):
+        # A compatible host can omit the title/summary lane from /v1/models.
+        # It must still generate a valid config without a false warning.
         out = self.run_ferry()
         self.assertNotIn("does not serve", out)
 
@@ -302,7 +315,7 @@ class TestLaneNamesOnly(FerryOpencodeCase):
             self.assertNotIn("modalities", lane)
         self.assertEqual(cfg["model"], "ferry/local-orch")
         self.assertEqual(cfg["small_model"], "ferry/local-sub")
-        for a in HOUSE_AGENTS:
+        for a in NON_DRIVER_AGENTS:
             self.assertEqual(cfg["agent"][a]["model"], "ferry/local-sub")
 
     def test_unserved_lane_warns_instead_of_silently_wiring(self):
@@ -419,11 +432,9 @@ class TestMasterKeyAuth(FerryOpencodeCase):
 class TestSuperProfile(FerryOpencodeCase):
     """`--super` — the cheap cloud profile: heavy drives, super-flash everywhere.
 
-    The worker AND housekeeper roles collapse onto super-flash (general/explore/
+    Every non-driver agent collapses onto super-flash (general/explore/
     title/summary/compaction and small_model), while build/plan and the model
-    stay on heavy. A later explicit flag must still win over the profile, and
-    the hidden-lane catalogue exemption must extend to super-flash in its new
-    worker role.
+    stay on heavy. A later explicit flag must still win over the profile.
     """
 
     @classmethod
@@ -446,15 +457,25 @@ class TestSuperProfile(FerryOpencodeCase):
         agent = cfg["agent"]
         for a in DRIVER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/heavy")
-        for a in WORKER_AGENTS + HOUSE_AGENTS:
+        for a in NON_DRIVER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/super-flash")
+
+    def test_unreachable_catalogue_keeps_the_legacy_general_and_compaction_fallbacks(self):
+        out = self.run_ferry(port=self.dead_port)
+        self.assertIn("Could not query", out,
+                      "the host was supposed to be unreachable")
+        cfg = self.read()
+        self.assertNotIn("medium", cfg["provider"]["ferry"]["models"])
+        self.assertEqual(cfg["agent"]["general"]["model"], "ferry/flash")
+        self.assertEqual(cfg["agent"]["explore"]["model"], "ferry/flash")
+        self.assertEqual(cfg["agent"]["compaction"]["model"], "ferry/super-flash")
 
     def test_a_later_explicit_small_model_flag_wins_over_super(self):
         self.run_ferry("--super", "--small-model", "flash")
         agent = self.read()["agent"]
-        for a in WORKER_AGENTS:
+        for a in GENERAL_AGENTS + EXPLORE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/flash")
-        for a in HOUSE_AGENTS:
+        for a in COMPACTION_AGENTS + HOUSE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/super-flash")
         cfg = self.read()
         self.assertEqual(cfg["model"], "ferry/heavy")
@@ -462,11 +483,18 @@ class TestSuperProfile(FerryOpencodeCase):
         # later flag did not touch.
         self.assertEqual(cfg["small_model"], "ferry/super-flash")
 
-    def test_super_gets_the_same_hidden_housekeeper_exemption(self):
-        # The stub CATALOGUE omits super-flash exactly as the live host does
-        # (see the CATALOGUE note). Under --super it is the WORKER lane too, so
-        # the check must exempt it there as well or every correct --super setup
-        # warns.
+    def test_a_later_explicit_housekeeper_flag_wins_over_super(self):
+        self.run_ferry("--super", "--housekeeper", "flash")
+        cfg = self.read()
+        for a in GENERAL_AGENTS + EXPLORE_AGENTS:
+            self.assertEqual(cfg["agent"][a]["model"], "ferry/super-flash")
+        for a in COMPACTION_AGENTS + HOUSE_AGENTS:
+            self.assertEqual(cfg["agent"][a]["model"], "ferry/flash")
+        self.assertEqual(cfg["small_model"], "ferry/flash")
+
+    def test_super_tolerates_catalogue_omission_of_its_shared_lane(self):
+        # The stub catalogue omits super-flash. Under --super it is shared by
+        # every non-driver agent, so its omission must not cause a false warning.
         out = self.run_ferry("--super")
         self.assertNotIn("does not serve", out)
 

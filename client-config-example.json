@@ -1,5 +1,5 @@
 {
-  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP. The domestic template serves SIX lanes from one endpoint: 'heavy' + 'medium' + 'flash' + 'super-flash' (cloud) and 'local-orch' + 'local-sub' (host GPU). A lane name is the stable contract - the host can swap the model behind it without any client edit. Point the main model at a driving lane ('heavy' or 'local-orch') and the worker/subagent model at its cheap partner ('flash', 'super-flash', or 'local-sub'). Select 'medium' explicitly for substantive coding or review work; it does not change the default driver, worker, or housekeeping roles. Client bootstrap also installs `opencode-cloud`, `opencode-local`, and `opencode-super` profiles. Easiest of all: just run `ferry opencode` on the client to write the opencode block below automatically. Every generated config also carries a fleet-identity `headers` map under `options` — `X-Ferry-Client` (this machine's name) and `X-Ferry-Fleet` (from `$FERRY_FLEET`, for a one-shot pin) — which `ferry opencode` / `ferry claude` write for you; see the `options` block below for the shape. Since fleets (2026-09-04) the host may run several complete routing sets behind these same bare lane names at once; which one you get depends on 'X-Ferry-Fleet', your sticky selection, or the host default — see README.md's Fleets section.",
+  "comment": "Example client configs for laptops on the same LAN. Replace 'your-mac.local' with your host's mDNS name or LAN IP. The domestic template serves SIX lanes from one endpoint: 'heavy' + 'medium' + 'flash' + 'super-flash' (cloud) and 'local-orch' + 'local-sub' (host GPU). A lane name is the stable contract - the host can swap the model behind it without any client edit. The cloud defaults pin build/plan to 'heavy', general/compaction to 'medium', explore to 'flash', and title/summary to 'super-flash'; the global model is 'heavy' and small_model is 'super-flash'. `--small-model` explicitly changes general/explore; `--housekeeper` explicitly changes title/summary/compaction. Client bootstrap also installs `opencode-cloud`, `opencode-local`, and `opencode-super` profiles. Easiest of all: just run `ferry opencode` on the client to write the opencode block below automatically. Every generated config also carries a fleet-identity `headers` map under `options` — `X-Ferry-Client` (this machine's name) and `X-Ferry-Fleet` (from `$FERRY_FLEET`, for a one-shot pin) — which `ferry opencode` / `ferry claude` write for you; see the `options` block below for the shape. Since fleets (2026-09-04) the host may run several complete routing sets behind these same bare lane names at once; which one you get depends on 'X-Ferry-Fleet', your sticky selection, or the host default — see README.md's Fleets section.",
 
   "opencode": {
     "provider": {
@@ -18,15 +18,15 @@
       }
     },
     "model": "ferry/heavy",
-    "small_model": "ferry/flash",
+    "small_model": "ferry/super-flash",
     "agent": {
       "build":   { "model": "ferry/heavy" },
       "plan":    { "model": "ferry/heavy" },
-      "general": { "model": "ferry/flash" },
+      "general": { "model": "ferry/medium" },
       "explore": { "model": "ferry/flash" },
       "title":   { "model": "ferry/super-flash" },
       "summary": { "model": "ferry/super-flash" },
-      "compaction": { "model": "ferry/super-flash" }
+      "compaction": { "model": "ferry/medium" }
     },
     "_tip": "Or just run `ferry opencode` on the client to write this automatically."
   },
@@ -39,7 +39,7 @@
         "model": "heavy",
         "apiBase": "http://your-mac.local:8090/v1",
         "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
-        "_note": "The domestic template serves six lanes at once: heavy + medium + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Choose medium explicitly for substantive coding or reviews; it does not replace the default role lanes."
+        "_note": "The domestic template serves six lanes at once: heavy + medium + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Select medium explicitly for substantive coding or review work."
       }
     ]
   },
@@ -49,11 +49,11 @@
     "override_baseURL": "http://your-mac.local:8090/v1",
     "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
     "model_name_to_add": "heavy",
-    "_note": "The domestic template serves six lanes at once: heavy + medium + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Choose medium explicitly for substantive coding or reviews; it does not replace the default role lanes."
+    "_note": "The domestic template serves six lanes at once: heavy + medium + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Select medium explicitly for substantive coding or review work."
   },
 
   "generic_openai_sdk_python": {
     "code": "from openai import OpenAI\n\nclient = OpenAI(\n    base_url='http://your-mac.local:8090/v1',\n    api_key='local'\n)\n\nresponse = client.chat.completions.create(\n    model='heavy',\n    messages=[{'role': 'user', 'content': 'Tell me a joke.'}]\n)\nprint(response.choices[0].message.content)",
-    "_note": "The domestic template serves six lanes at once: heavy + medium + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Choose medium explicitly for substantive coding or reviews; it does not replace the default role lanes."
+    "_note": "The domestic template serves six lanes at once: heavy + medium + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Select medium explicitly for substantive coding or review work."
   }
 }

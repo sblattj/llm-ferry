@@ -5,11 +5,11 @@ description: Use when adding a worker lane or more worker keys to llm-ferry's lo
 
 # Add a worker model to llm-ferry's route proxy
 
-Workers are the cheap, high-volume lanes that serve the bulk of traffic. The shipped ones
-are **`flash`** and **`super-flash`** — both single OpenRouter Gemini 3.8 Flash deployments,
-routed to whichever upstream provider is fastest right now, each carrying one Luna fallback
-hop. They live in a **load-balanced pool** in `~/.config/ferry/litellm.yaml` and are served
-by `ferry up` (or `ferry up --route` for the cloud lanes alone).
+Workers are the cloud lanes that serve the non-driver roles. The shipped `flash` lane is the
+exploration worker; `super-flash` is the title/summary lane, whose Gemini Flash Latest primary
+runs through OpenRouter at minimal reasoning and carries one Luna fallback hop. `general` and
+`compaction` use `medium`. Each lane is currently a single deployment rather than a pool and is
+served by `ferry up` (or `ferry up --route` for the cloud lanes alone).
 
 Since fleets (2026-09-04) lane names are `<fleet>.<lane>`; chains never cross a fleet.
 
@@ -79,7 +79,7 @@ model_list:
         provider:
           sort: throughput
         reasoning:
-          effort: minimal          # Gemini 3.8 Flash via OpenRouter refuses to disable reasoning entirely — `minimal` is the floor
+          effort: minimal          # Gemini Flash Latest via OpenRouter refuses to disable reasoning entirely — `minimal` is the floor
       timeout: 600
 ```
 

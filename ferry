@@ -3321,8 +3321,9 @@ PYEOF
 # is the host's own choice and ferry does not override it.
 unalias opencode-cloud opencode-local opencode-super 2>/dev/null
 
-# opencode-cloud: the CLOUD pair — heavy drives (build/plan), flash runs the
-# fan-out, super-flash handles title/summary/compaction.
+# opencode-cloud: heavy drives (build/plan); medium handles general and
+# compaction when advertised; flash handles explore; super-flash handles
+# title/summary. Older or unreachable hosts retain flash/super-flash fallback.
 opencode-cloud() {
   OPENCODE_CONFIG="$HOME/.config/ferry/opencode-cloud.json" command opencode "$@"
 }
@@ -3342,7 +3343,7 @@ opencode-super() {
 EOF
 
   echo ">>> opencode shell wrappers installed in $rc:"
-  echo "    opencode-cloud   -> cloud pair: heavy drives, flash fans out"
+  echo "    opencode-cloud   -> cloud lanes: heavy drives; medium general/compaction; flash explore"
   echo "    opencode-super   -> cloud pair: heavy drives, super-flash fans out"
   echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
   echo "    (bare 'opencode' is untouched — run: source $rc)"
@@ -3431,21 +3432,21 @@ cmd_opencode() {
   # [Client] Take this machine's opencode config over so EVERY agent routes
   # through the host's ferry endpoint, addressed by LANE NAME only.
   #
-  # A ferry client knows three ROLES, never a model:
+  # A ferry client knows agent lanes, never a real model:
   #
   #   driver       build / plan                      heavy       local-orch
-  #   worker       general / explore                 flash       local-sub
-  #   housekeeper  title / summary / compaction      super-flash local-sub
+  #   general      general                           medium*     local-sub
+  #   explore      explore                           flash       local-sub
+  #   compaction   compaction                        medium*     local-sub
+  #   housekeeper  title / summary                   super-flash local-sub
   #
-  # `medium` is an additional cloud lane available in the picker and through
-  # --model. It is intentionally not a default role pin: use it for a
-  # substantive coding turn or review without changing the established split.
+  # * `medium` is used only when the host catalogue advertises it. Older or
+  # unreachable hosts retain the established flash/general and super-flash/
+  # compaction fallback rather than receiving a broken new lane reference.
   #
-  # The housekeeper is split out because those three agents behave nothing like a
-  # fan-out: they fire on their own schedule, and a compaction call carries the
-  # ENTIRE transcript. Pointing them at the worker lane makes them queue behind
-  # whatever the fan-out is doing, on the lane least likely to have headroom.
-  # On the GPU pair there is no third lane, so the housekeeper shares local-sub.
+  # Compaction fires on its own schedule and carries the ENTIRE transcript, so
+  # it uses medium when available instead of queuing behind explore. On the GPU
+  # pair there is no third lane, so all non-driver agents share local-sub.
   #
   # A real model id must NEVER reach a client config. The host re-points a lane
   # whenever the economics change; a client that named the model would keep
@@ -3455,7 +3456,7 @@ cmd_opencode() {
   # TAKEOVER, not merge. Four keys are ferry's and get replaced outright:
   #   permission  -> "allow"
   #   model       -> ferry/<driver>
-  #   small_model -> ferry/<worker>
+  #   small_model -> ferry/<housekeeper>
   #   agent       -> all seven built-ins pinned (see the AGENTS lists below)
   # provider.ferry.options.headers is ours too, rewritten every run alongside
   # baseURL/apiKey (see the prov["ferry"] block below) - it carries this
@@ -3489,8 +3490,8 @@ cmd_opencode() {
       --small-model)  force_small="$2"; shift 2 ;;
       --housekeeper)  force_house="$2"; shift 2 ;;
       # --super: the cheapest cloud profile — heavy still drives, super-flash
-      # takes BOTH the worker and housekeeper lanes. Set here at parse time so a
-      # later --small-model / --housekeeper overrides exactly one half.
+      # takes every non-driver agent. Set here at parse time so a later
+      # --small-model / --housekeeper overrides its respective agent group.
       --super)        force_small="super-flash"; force_house="super-flash"; shift ;;
       --keep)         keep_snaps="$2"; shift 2 ;;
       --no-default)   set_default=0; shift ;;
@@ -3557,9 +3558,11 @@ GOAL_PLUGIN_DIR = GOAL_PLUGIN.rsplit("/", 1)[-1]
 # binary contains each of those strings. `scout` is in NEITHER (0 occurrences in
 # the 144MB binary) — ferry pinned it for months and the pin did nothing, because
 # an unknown key just lands in `agent`'s additionalProperties and is never read.
-DRIVER_AGENTS = ("build", "plan")                        # primary -> driver lane
-WORKER_AGENTS = ("general", "explore")                   # fan-out -> worker lane
-HOUSE_AGENTS  = ("title", "summary", "compaction")       # background -> housekeeper
+DRIVER_AGENTS = ("build", "plan")
+GENERAL_AGENTS = ("general",)
+EXPLORE_AGENTS = ("explore",)
+COMPACTION_AGENTS = ("compaction",)
+HOUSE_AGENTS = ("title", "summary")
 
 # --- Role lanes plus the selectable medium lane. Never a real model id. ---
 # The local lanes cap KV at 131072 (128k) tokens, so a 100k-token prompt plus
@@ -3581,19 +3584,7 @@ HOUSE_AGENTS  = ("title", "summary", "compaction")       # background -> houseke
 # the front passes as an input_file. The GPU pair stays text-only: the mlx
 # servers behind local-orch/local-sub take no image input, and declaring one
 # would send bytes they reject instead of the placeholder they now get.
-if prefer_local:
-    # No third GPU lane exists — the housekeeper shares the worker.
-    driver, worker, house = "local-orch", "local-sub", "local-sub"
-    limits = {"limit": {"context": 131072, "output": 8192}}
-else:
-    driver, worker, house = "heavy", "flash", "super-flash"
-    limits = {"modalities": {"input": ["text", "image", "pdf"],
-                             "output": ["text"]}}
-driver = force_model or driver
-worker = force_small or worker
-house  = force_house or house
-
-# --- Validate the pair against the host catalogue; never populate FROM it. ---
+# --- Query the host catalogue; never populate a config FROM it. ---
 # The catalogue does NOT advertise the fallback deployments (flash-luna,
 # super-flash-luna, ...): they route by name but are not `public`, so they never
 # appear in /v1/models. Those are reached by the ROUTER on overflow, not by a
@@ -3610,23 +3601,38 @@ try:
         served = [m.get("id") for m in json.load(r).get("data", []) if m.get("id")]
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
+
+# A modern cloud host exposes `medium`, which carries the general and compaction
+# workloads. When that capability is absent (or cannot be checked), retain the
+# old two-lane routing: general/explore use flash and all housekeeping uses
+# super-flash. The GPU pair deliberately stays exactly as it was.
+if prefer_local:
+    driver, general, explore, compaction, house = ("local-orch", "local-sub",
+                                                     "local-sub", "local-sub",
+                                                     "local-sub")
+    limits = {"limit": {"context": 131072, "output": 8192}}
+else:
+    driver, explore, house = "heavy", "flash", "super-flash"
+    general = compaction = "medium" if "medium" in served else None
+    general = general or explore
+    compaction = compaction or house
+    limits = {"modalities": {"input": ["text", "image", "pdf"],
+                             "output": ["text"]}}
+driver = force_model or driver
+general = force_small or general
+explore = force_small or explore
+compaction = force_house or compaction
+house = force_house or house
+
+# --- Validate the selected lanes against the host catalogue. ---
 if served:
-    # Only the driver and worker are checked, and any lane equal to the
-    # housekeeper value is exempt. A lane hidden from /v1/models cannot be
-    # catalogue-checked: the housekeeper is absent from the catalogue by design,
-    # and under --super the worker IS the housekeeper lane, so the old check
-    # warned on every correct --super setup. (On the GPU pair the housekeeper
-    # shares the worker, so local-sub goes unchecked here too — there is no way
-    # to be precise about hidden-ness from the client without a public-lane
-    # registry, which ferry deliberately does not have.)
-    #
-    # The housekeeper used to be hidden because it was a `model_group_alias` marked
-    # `hidden: true`. It is a real `model_name` as of 2026-08-29 — an alias
-    # silently loses its whole fallback chain (litellm looks fallbacks up by the
-    # raw client string before resolving aliases, router.py:6411), and a failed
-    # compaction drops the entire transcript. It stays out of the catalogue by
-    # omitting `model_info: {public: true}`, which ferry_front.py filters on.
-    missing = [l for l in (driver, worker) if l not in served and l != house]
+    # Public selected lanes are checked. A selected lane that also backs
+    # title/summary is exempt: some compatible hosts omit it from their public
+    # catalogue, and the config must remain usable for their scheduled agents.
+    # The same exemption covers local-sub and --super, where all non-driver
+    # agents deliberately share that lane.
+    missing = [l for l in dict.fromkeys((driver, general, explore, compaction))
+               if l not in served and l != house]
     if missing:
         print(f"    WARNING: host does not serve {', '.join(missing)}.")
         print(f"    Catalogue: {', '.join(served)}")
@@ -3703,18 +3709,18 @@ prev_ferry = prov.get("ferry") if isinstance(prov.get("ferry"), dict) else {}
 prev_models = prev_ferry.get("models") if isinstance(prev_ferry.get("models"), dict) else {}
 prev_options = prev_ferry.get("options") if isinstance(prev_ferry.get("options"), dict) else {}
 
-# dict.fromkeys: on the GPU pair the housekeeper IS the worker, and declaring
-# the same lane twice would be a duplicate key.
+# dict.fromkeys: multiple agents can share one lane, and the GPU pair has only
+# two lanes, so declaring one model entry per agent would create duplicates.
 models = {}
-# `medium` is a cloud capability tier, not a replacement for any default role.
-# Declare it when the host offers it so it appears in opencode's model picker
-# and can be selected explicitly. Its resolved backend varies by fleet: domestic
+# `medium` is a cloud capability tier. Declare it when the host offers it so it
+# appears in opencode's model picker and can serve general and compaction. Its
+# resolved backend varies by fleet: domestic
 # Terra accepts attachments, while international GLM-5.3 is text-only. A single
 # opencode provider entry cannot vary modalities with X-Ferry-Fleet, so omit the
 # declaration and preserve the safe text-only baseline across every fleet.
-declared_lanes = (driver, worker, house)
+declared_lanes = (driver, general, explore, compaction, house)
 # Do not advertise a lane a pre-medium host does not serve. Explicit use still
-# adds it through driver/worker/house above, allowing a caller to request the
+# adds it through the selected agent lanes above, allowing a caller to request the
 # new lane deliberately and receive the normal catalogue warning if absent.
 if not prefer_local and "medium" in served:
     declared_lanes += ("medium",)
@@ -3761,17 +3767,19 @@ if set_default:
     cfg["permission"] = "allow"          # schema: PermissionConfig accepts the
                                          # bare enum "ask" | "allow" | "deny"
     cfg["model"] = f"ferry/{driver}"
-    # small_model follows the HOUSEKEEPER, not the worker. opencode's own schema
+    # small_model follows the title/summary HOUSEKEEPER, not general/explore. opencode's own schema
     # describes it as "small model to use for tasks like title generation", which
-    # is the housekeeping role exactly; leaving it on the worker would send every
-    # small task opencode has not got a named agent for to the fan-out lane.
+    # is the housekeeping role exactly; leaving it on general/explore would send
+    # every small task opencode has not got a named agent for to a fan-out lane.
     cfg["small_model"] = f"ferry/{house}"
 
     # Replaced WHOLESALE, not merged: a stale pin left behind here (a compaction
     # agent still naming a retired model id, say) is exactly the drift this
     # command exists to end. Anything custom is recoverable from the snapshot.
     agent = {a: {"model": f"ferry/{driver}"} for a in DRIVER_AGENTS}
-    agent.update({a: {"model": f"ferry/{worker}"} for a in WORKER_AGENTS})
+    agent.update({a: {"model": f"ferry/{general}"} for a in GENERAL_AGENTS})
+    agent.update({a: {"model": f"ferry/{explore}"} for a in EXPLORE_AGENTS})
+    agent.update({a: {"model": f"ferry/{compaction}"} for a in COMPACTION_AGENTS})
     agent.update({a: {"model": f"ferry/{house}"} for a in HOUSE_AGENTS})
     cfg["agent"] = agent
 
@@ -3814,14 +3822,14 @@ with open(cfg_path, "w") as f:
     f.write("\n")
 
 print(f"    Wired opencode -> {base}")
-print(f"    Provider: ferry   Lanes: {driver} (driver), {worker} (worker), {house} (housekeeper)")
+print(f"    Provider: ferry   Lanes: {driver} (driver), {general} (general), {explore} (explore), {compaction} (compaction), {house} (title/summary)")
 if extra_lanes:
     print(f"    Kept in picker: {', '.join(extra_lanes)} (declared in the config, not pinned by ferry)")
 if set_default:
     print(f"    model={cfg['model']}  small_model={cfg['small_model']}  permission=allow")
     print(f"    Agents pinned:  {'/'.join(DRIVER_AGENTS)} -> ferry/{driver}")
-    print(f"                    {'/'.join(WORKER_AGENTS)} -> ferry/{worker}")
-    print(f"                    {'/'.join(HOUSE_AGENTS)} -> ferry/{house}")
+    print(f"                    {'/'.join(GENERAL_AGENTS)} -> ferry/{general}; {'/'.join(EXPLORE_AGENTS)} -> ferry/{explore}")
+    print(f"                    {'/'.join(COMPACTION_AGENTS)} -> ferry/{compaction}; {'/'.join(HOUSE_AGENTS)} -> ferry/{house}")
     # Report the entry that actually SATISFIES the requirement, not the package
     # we would have added. Printing GOAL_PLUGIN unconditionally claimed an
     # install that never happened whenever a local fork was already present.

@@ -193,6 +193,8 @@ Under `--profiles-only` the lanes are opt-in per invocation — `opencode-cloud`
 
 The local-lane guardrails (`/fan-out` and the `spawning-subagents` skill) live in `~/.config/opencode/`, so they follow the scope: on by default, off in the two narrow modes. They only *add* files, so `--with-guardrails` opts back into them, and `--no-guardrails` out.
 
+The `using-the-goal-plugin` skill isn't gated with the guardrails: it follows the plugin itself, installing in every scope that runs `ferry opencode` — the default **and** `--profiles-only` — and skipped only under `--no-opencode`.
+
 The chosen scope is recorded in `client.json` as `opencode_mode`, which is what keeps the catch-up below from silently re-widening the machine.
 
 #### Catching a client up later
@@ -216,7 +218,7 @@ curl -fsSL http://your-mac.local:8095/client-cleanup.sh | zsh -s -- --dry-run   
 curl -fsSL http://your-mac.local:8095/client-cleanup.sh | zsh                   # apply
 ```
 
-The inverse of the bootstrap, and scope-agnostic: it removes whatever is actually there, so it undoes a default install, a `--profiles-only` one, and a `--no-opencode` one without being told which. Out go the `ferry` CLI, `~/.config/ferry` (profile, lane profiles, snapshots, telemetry), the `~/.zshrc` wrapper block and `host-code` alias, and the guardrail files — under both the `skill/` and `skills/` spellings, since the two installers disagree.
+The inverse of the bootstrap, and scope-agnostic: it removes whatever is actually there, so it undoes a default install, a `--profiles-only` one, and a `--no-opencode` one without being told which. Out go the `ferry` CLI, `~/.config/ferry` (profile, lane profiles, snapshots, telemetry), the `~/.zshrc` wrapper block and `host-code` alias, and the guardrail files and the `using-the-goal-plugin` skill — under both the `skill/` and `skills/` spellings, since the two installers disagree.
 
 It edits `~/.config/opencode/opencode.json` **surgically**: the provider ferry wrote (the `ferry` provider entry), the goal-plugin entry it appended to `plugin`, and the `/goal` command it merged into `command` are removed, the file is snapshotted to `.<UTC>.jsonc` first, and a config with nothing ferry-shaped in it is left byte-identical. Your own providers, MCP servers and commands survive.
 
@@ -437,6 +439,7 @@ Everything around that entry follows from it:
 - **`tui.json`.** The plugin ships two halves, and opencode reads TUI plugins **only** from `~/.config/opencode/tui.json` — never from `opencode.json`'s `plugin` array. The entry written there is **not** the tarball spec but a `file://` URL to a ferry-managed copy of the installed package at `${XDG_DATA_HOME:-~/.local/share}/ferry/opencode-goal-plugin`, refreshed from opencode's cache after the pre-install and marked with a `.ferry-goal-plugin` file (spec, tag, package name). The reason is a third opencode defect: its cache directory *is* the spec string, so the tarball form lives under `packages/opencode-goal-plugin@https:/github.com/…`, and Bun's runtime plugin runner splits any module path at the first `:` into `namespace:path` — the hook opencode uses to hand a TUI plugin its shared `solid-js` never sees the file, and the TUI half dies with `Cannot find package 'solid-js'`. The only trace is in the TUI's own console overlay (`ctrl+p` → "Toggle console"); nothing reaches stderr or `opencode.log`. Every `github:` and `name@https://…` spec has that colon; a plain path does not. The file is created with `"$schema": "https://opencode.ai/tui.json"` if absent, any previous one is snapshotted, every other key is left alone, and a `file://`/path entry without ferry's marker is treated as your own fork and left in place. Use `--tui-config PATH` to point it elsewhere or `--no-tui-config` to skip it. A `--config` outside `~/.config/opencode` (the ferry lane profiles) never gets one.
 - **Cache hygiene.** The spec string *is* opencode's cache key (`~/.cache/opencode/packages/<spec>`), and opencode never invalidates it — no TTL, no version check. Ferry removes the per-spec directory of every entry it just migrated away from, plus the known-dead ones, and removes the canonical directory itself when it holds an *interrupted* install (an empty `node_modules/opencode-goal-plugin` is treated as installed forever). Only directories carrying the package name are ever touched; `--keep-cache` opts out.
 - **Pre-install.** Writing a spec installs nothing, and a failure at opencode's next start is invisible. So after writing, ferry runs `opencode plugin '<spec>' --global` in a throwaway config sandbox (real package cache, 120 s cap), then verifies the cached `package.json` version and both `dist/goal-plugin.js` and `dist/goal-tui.js`, and refreshes the TUI copy under `~/.local/share/ferry` from it. Success prints the installed version and the copy's path; failure prints a warning with the real error and **still exits 0** — the config is correct either way, and an offline laptop shouldn't fail a bootstrap. `--no-install` skips it.
+- **Skill.** Alongside the plugin, `ferry opencode` copies an OpenCode skill, `using-the-goal-plugin`, to `~/.config/opencode/skill/using-the-goal-plugin/SKILL.md` — the same run, the same singular `skill/` path the `spawning-subagents` guardrail already uses. It teaches the model what the plugin's injected turn mechanics never explain: how to size and decompose a plan, work it under the Claim → Evidence → Verdict rule, finish with the exact `[goal:evidence]`/`[goal:complete]` grammar, respect budgets and pauses, and treat a `/goal` control turn as read-only. The copy is refreshed from the repo's `opencode/skills/using-the-goal-plugin/SKILL.md` on every run, so an edit there reaches an already-wired host on the next `ferry opencode`.
 
 Ferry also merges a top-level `command.goal` entry into the config (never overwriting one you wrote) so the plugin's `/goal` slash command actually appears.
 
@@ -455,6 +458,15 @@ And the TUI half, which loads from ferry's copy rather than the cache:
 cat ~/.local/share/ferry/opencode-goal-plugin/.ferry-goal-plugin      # spec, tag, package name
 grep -m1 '"version"' ~/.local/share/ferry/opencode-goal-plugin/package.json
 ```
+
+And the skill, discovered like any other OpenCode skill rather than read off disk:
+
+```bash
+opencode debug skill > /tmp/oc-skills.json   # a pipe truncates at 64 KiB
+python3 -c 'import json;print([s["location"] for s in json.load(open("/tmp/oc-skills.json")) if s["name"]=="using-the-goal-plugin"])'
+```
+
+prints the installed path; before v1.32.0 it prints `[]`.
 
 Then, in a terminal wider than 120 columns, `ctrl+p` → **Plugins** lists an *External* entry for `opencode-goal-plugin` at that path, and `/goal <objective>` puts a **Goal** panel in the sidebar under LSP.
 
@@ -897,7 +909,7 @@ Each Python suite is also runnable on its own. The ChatGPT compatibility and usa
 
 The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.
 
-The client-scope suite goes further: it runs `client-bootstrap.sh`, `client-reset.sh` and `client-cleanup.sh` end-to-end against a throwaway `$HOME` and a stub host that serves `/v1/models` and the repo's own `ferry`. The property it defends is an *absence* — that the narrow scopes never create `~/.config/opencode`, and that cleanup leaves everything that isn't ferry's standing — and an absence is only proved by looking.
+The client-scope suite goes further: it runs `client-bootstrap.sh`, `client-reset.sh` and `client-cleanup.sh` end-to-end against a throwaway `$HOME` and a stub host that serves `/v1/models` and the repo's own `ferry`. The property it defends is an *absence* — that the narrow scopes never create `~/.config/opencode`, and that cleanup leaves everything that isn't ferry's standing — and an absence is only proved by looking. The client-bootstrap and host-reset suites cover the `using-the-goal-plugin` skill the same way they already cover the `spawning-subagents` guardrail.
 
 ## License
 

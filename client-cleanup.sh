@@ -518,8 +518,9 @@ else
 fi
 echo ""
 
-# --- 6. Remove the guardrails bootstrap installed into opencode's global dirs
-echo ">>> Removing the local-lane guardrails (/fan-out + spawning-subagents)..."
+# --- 6. Remove the skill/command files installed into opencode's global dirs
+echo ">>> Removing the bundled opencode skills and commands"
+echo "    (/fan-out + spawning-subagents + using-the-goal-plugin)..."
 # Both spellings: opencode accepts `skill/` and `skills/`, and the two installers
 # disagree — client-bootstrap.sh writes the plural, `ferry opencode`'s host-side
 # guardrail install writes the singular. Removing only one leaves the other
@@ -528,7 +529,9 @@ echo ">>> Removing the local-lane guardrails (/fan-out + spawning-subagents)..."
 for p in \
   "$HOME/.config/opencode/command/fan-out.md" \
   "$HOME/.config/opencode/skills/spawning-subagents/SKILL.md" \
-  "$HOME/.config/opencode/skill/spawning-subagents/SKILL.md"
+  "$HOME/.config/opencode/skill/spawning-subagents/SKILL.md" \
+  "$HOME/.config/opencode/skills/using-the-goal-plugin/SKILL.md" \
+  "$HOME/.config/opencode/skill/using-the-goal-plugin/SKILL.md"
 do
   if [[ -f "$p" ]]; then
     run rm -f "$p"
@@ -541,7 +544,9 @@ done
 # hold user files).
 for d in \
   "$HOME/.config/opencode/skills/spawning-subagents" \
-  "$HOME/.config/opencode/skill/spawning-subagents"
+  "$HOME/.config/opencode/skill/spawning-subagents" \
+  "$HOME/.config/opencode/skills/using-the-goal-plugin" \
+  "$HOME/.config/opencode/skill/using-the-goal-plugin"
 do
   if [[ -d "$d" ]]; then
     run rmdir "$d" 2>/dev/null || true

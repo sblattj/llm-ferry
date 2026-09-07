@@ -764,11 +764,11 @@ GOAL_PLUGIN_REPO = "sblattj/OpenCode-goal-plugin"
 # while the fork's HEAD was 0.9.1. The spec string IS the cache key, so a NEW
 # ref means a NEW directory and a guaranteed fresh install. That is why the ref
 # is pinned here and why cutting a plugin release means bumping GOAL_PLUGIN_REF.
-GOAL_PLUGIN_REF = "v0.10.1"
+GOAL_PLUGIN_REF = "v0.11.0"
 GOAL_PLUGIN_URL = (f"https://github.com/{GOAL_PLUGIN_REPO}"
                    f"/archive/refs/tags/{GOAL_PLUGIN_REF}.tar.gz")
 # Current spec, spelled out for grep:
-# opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.1.tar.gz
+# opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.11.0.tar.gz
 GOAL_PLUGIN = f"{GOAL_PLUGIN_PKG}@{GOAL_PLUGIN_URL}"
 # Kept for MATCHING configs written by older ferries; never written any more.
 GOAL_PLUGIN_BASE = f"github:{GOAL_PLUGIN_REPO}"
@@ -1119,7 +1119,7 @@ def cache_dir_for(spec):
     NORMPATH IS LOAD-BEARING. opencode builds this with node's path.join, which
     COLLAPSES the `//` after `https:`; python's os.path.join does not. So the
     canonical spec lands at
-    `<packages>/opencode-goal-plugin@https:/github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.1.tar.gz`
+    `<packages>/opencode-goal-plugin@https:/github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.11.0.tar.gz`
     with a SINGLE slash after `https:`, and a path built without normpath points
     at a directory that does not exist - which reads as "nothing to purge" and
     as "the plugin is not installed".
@@ -1137,7 +1137,7 @@ def purgeable(spec, path):
 
     (3) is deliberately not "the LEAF is the package name". A spec's slashes
     become directories, so the tarball form's leaf is a TAG
-    (`v0.10.1.tar.gz`) and its first component is `opencode-goal-plugin@https:`,
+    (`v0.11.0.tar.gz`) and its first component is `opencode-goal-plugin@https:`,
     while the pre-v1.30.1 `github:` form's leaf is `OpenCode-goal-plugin#v0.9.1`
     and its first component is `github:sblattj`. A rule anchored to either end
     alone refuses half the directories this exists to clean. `packages/foo`
@@ -1162,7 +1162,7 @@ def purge_cache(specs):
     NOT the whole `opencode-goal-plugin@https:` subtree: every tarball spec of
     this package shares that first component, so wiping it while migrating a
     stale `...v0.10.0.tar.gz` entry would also delete an already-good
-    `...v0.10.1.tar.gz` install and leave an offline laptop with nothing. The
+    `...v0.11.0.tar.gz` install and leave an offline laptop with nothing. The
     exact per-spec directory is the minimal correct unit; empty scaffolding is
     pruned below.
     """

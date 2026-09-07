@@ -738,7 +738,7 @@ class ClientCleanupTest(ClientHarness):
 # so a drift in either direction fails: the canonical spec and the verbatim
 # /goal command (lib/ferry-integrate.zsh's GOAL_PLUGIN / GOAL_COMMAND).
 GOAL_SPEC = ("opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin"
-             "/archive/refs/tags/v0.10.1.tar.gz")
+             "/archive/refs/tags/v0.11.0.tar.gz")
 GOAL_COMMAND = {
     "description": "Set a session-scoped goal and auto-continue until complete.",
     "template": "$ARGUMENTS",
@@ -754,7 +754,7 @@ LOCAL_FORK = "/Users/someone/src/OpenCode-goal-plugin/index.js"
 # delete; its content is "<spec>\n<ref>\n<pkg>\n".
 GOAL_TUI_MARKER = ".ferry-goal-plugin"
 GOAL_PKG = "opencode-goal-plugin"
-GOAL_REF = "v0.10.1"
+GOAL_REF = "v0.11.0"
 
 
 class ClientCleanupGoalPluginTest(ClientHarness):

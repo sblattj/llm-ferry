@@ -3547,7 +3547,8 @@ cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
 SCHEMA = "https://opencode.ai/config.json"
-GOAL_PLUGIN = "@prevalentware/opencode-goal-plugin"
+GOAL_PLUGIN = "opencode-goal-plugin"
+LEGACY_GOAL_PLUGIN = "@prevalentware/opencode-goal-plugin"
 # The package's own directory name, used to recognise a LOCAL PATH pointing at
 # the same plugin. opencode accepts a filesystem path as a plugin entry, and Bun
 # cannot resolve a PRIVATE repo over `github:` - so a hard fork of this plugin
@@ -3797,7 +3798,22 @@ if set_default:
         if not isinstance(entry, str):
             return None
         # Strip a trailing @version without eating the leading scope @.
-        return entry.rsplit("@", 1)[0] if entry.count("@") > 1 else entry
+        if entry.startswith("@"):
+            return entry.rsplit("@", 1)[0] if entry.count("@") > 1 else entry
+        return entry.rsplit("@", 1)[0] if "@" in entry else entry
+
+    # Upgrade / replace legacy goal plugin if present
+    migrated = []
+    for p in plugins:
+        p_name = pkg_name(p)
+        if p_name == LEGACY_GOAL_PLUGIN:
+            if isinstance(p, list) and len(p) > 1:
+                migrated.append([GOAL_PLUGIN, p[1]])
+            else:
+                migrated.append(GOAL_PLUGIN)
+        else:
+            migrated.append(p)
+    plugins = migrated
 
     def is_goal_plugin(entry):
         name = pkg_name(entry)
@@ -3809,9 +3825,11 @@ if set_default:
         # without a file extension, so ".../opencode-goal-plugin/dist/server.js"
         # and ".../opencode-goal-plugin.js" both count as present while a
         # neighbouring ".../opencode-goal-plugin-extras/..." does not.
-        segs = [s for s in name.split("/") if s]
-        return GOAL_PLUGIN_DIR in segs or GOAL_PLUGIN_DIR in (
-            os.path.splitext(s)[0] for s in segs)
+        if name.startswith("/") or name.startswith(".") or name.startswith("~"):
+            segs = [s for s in name.split("/") if s]
+            return GOAL_PLUGIN_DIR in segs or GOAL_PLUGIN_DIR in (
+                os.path.splitext(s)[0] for s in segs)
+        return False
 
     goal_entry = next((e for e in plugins if is_goal_plugin(e)), None)
     if goal_entry is None:

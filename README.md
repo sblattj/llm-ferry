@@ -421,7 +421,7 @@ It is a **surgical takeover, not a merge**. Four keys belong to ferry and are re
 | `permission` | `"allow"` |
 | `agent` | all seven built-ins pinned (below) |
 
-`plugin` is *appended* to, never replaced — [`@prevalentware/opencode-goal-plugin`](https://github.com/prevalentWare/opencode-goal-plugin) is added if it isn't already there.
+`plugin` is *appended* to, never replaced — [`opencode-goal-plugin`](https://github.com/willytop8/OpenCode-goal-plugin) is added if it isn't already there (and legacy `@prevalentware/opencode-goal-plugin` entries are upgraded).
 
 All seven of opencode's built-in agents get pinned to the cloud defaults, so nothing silently escapes to a model you aren't paying for on purpose:
 

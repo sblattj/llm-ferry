@@ -32,6 +32,49 @@ _ferry_install_opencode_guardrails() {
   echo "    $dst_skill/SKILL.md"
   echo "    (the recipe must ride in the USER message — that is what /fan-out does;"
   echo "     putting it in system instructions measured WORSE.)"
+  # The goal-plugin skill rides along: `ferry install` reaches THIS function and
+  # never runs cmd_opencode (they are sibling top-level dispatch entries), so
+  # without this call a freshly installed host has the fan-out guardrails and no
+  # goal doctrine until someone happens to run `ferry opencode`.
+  _ferry_install_goal_skill
+}
+
+# _ferry_install_goal_skill — put the goal-plugin USAGE skill where opencode will
+# actually read it, next to the guardrails above.
+#
+# The plugin ships the loop MECHANICS and nothing else: it injects the
+# <goal_continuation> block, exposes the goal_* tools and draws the sidebar. It
+# never teaches how big a plan step should be, what counts as evidence for one,
+# or what the [goal:evidence] / [goal:complete] / [goal:blocked] markers and the
+# budget actually mean. A model handed the tools without that doctrine writes a
+# forty-step plan, marks a step done because the code "looks right", and never
+# emits [goal:blocked] at all. So the skill rides WITH the plugin: every host
+# whose config ferry wires /goal into gets the doctrine in the same run.
+#
+# Source of truth is opencode/skills/using-the-goal-plugin/SKILL.md in this
+# checkout — edit it there, not at the destination, which is overwritten on
+# every run. A client has no checkout, so this says so and no-ops;
+# client-bootstrap.sh ships the client's copy from its own heredoc.
+#
+# The destination is a GLOBAL opencode path, independent of $OPENCODE_CONFIG,
+# and singular `skill/` like the guardrails installer — so it lands where
+# opencode looks even on a host whose config lives in a dotfiles directory.
+typeset -g _FERRY_GOAL_SKILL_DONE=0
+_ferry_install_goal_skill() {
+  # Both entry points can fire in one process (`ferry install` reaches the
+  # guardrails installer, which calls this). A second copy is harmless; a second
+  # report line is noise, so the first call wins.
+  (( _FERRY_GOAL_SKILL_DONE )) && return 0
+  _FERRY_GOAL_SKILL_DONE=1
+  local src="$APP_DIR/opencode/skills/using-the-goal-plugin/SKILL.md"
+  if [[ ! -f "$src" ]]; then
+    echo "    Skill:   using-the-goal-plugin not installed here (no checkout); client-bootstrap.sh ships it"
+    return 0
+  fi
+  local dst="$HOME/.config/opencode/skill/using-the-goal-plugin"
+  mkdir -p "$dst"
+  cp "$src" "$dst/SKILL.md"
+  echo "    Skill:   ~/.config/opencode/skill/using-the-goal-plugin/SKILL.md"
 }
 
 # _ferry_install_host_wrappers — put the `opencode-cloud` / `opencode-local` /
@@ -1552,6 +1595,15 @@ PYEOF
     goal_tui_bad="$(sed -n 7p "$oc_specfile")"
   fi
   rm -f "$oc_specfile"
+
+  # The doctrine for the plugin this run just wired. Gated on $goal_spec for the
+  # same reason the pre-install below is: a non-empty spec means "this run wrote
+  # a real config AND ferry's own goal entry is the one in play" — --no-default
+  # and a pre-existing local fork both leave it empty, and neither should get a
+  # skill describing wiring ferry did not do. Deliberately NOT gated on
+  # (( do_install )): copying one file out of the checkout is local work, while
+  # --no-install is about skipping the network fetch of the plugin package.
+  [[ -n "$goal_spec" ]] && _ferry_install_goal_skill
 
   if (( do_install )) && [[ -n "$goal_spec" ]]; then
     if command -v opencode >/dev/null 2>&1; then

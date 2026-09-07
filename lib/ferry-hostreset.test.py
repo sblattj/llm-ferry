@@ -695,6 +695,26 @@ class ScriptShapeCase(unittest.TestCase):
                         self.text.index("Re-applying the opencode takeover"),
                         "guardrails must be installed before the takeover reports success")
 
+    def test_installs_the_goal_plugin_usage_skill(self):
+        # The goal plugin injects the loop MECHANICS - the continuation block,
+        # the goal_* tools, the sidebar - and teaches none of the doctrine:
+        # plan sizing, what counts as evidence, what the [goal:*] markers and
+        # the budget mean. `ferry opencode` (called further down this script)
+        # installs the skill too, but only when ferry's OWN goal entry is the
+        # one in the config, so a host running a local fork of the plugin would
+        # get the wiring and never the doctrine. This copy is unconditional.
+        self.assertIn("opencode/skills/using-the-goal-plugin/SKILL.md", self.text)
+        self.assertLess(self.text.index("using-the-goal-plugin"),
+                        self.text.index("Re-applying the opencode takeover"),
+                        "the skill must be installed before the takeover runs")
+
+    def test_the_goal_plugin_skill_goes_to_the_global_opencode_path(self):
+        # Same reason as the guardrails below: skill/ is a GLOBAL location,
+        # independent of $OPENCODE_CONFIG. Deriving it from the config's
+        # directory would put it where opencode never looks on exactly the
+        # hosts whose config lives in a dotfiles directory.
+        self.assertIn('$HOME/.config/opencode/skill/using-the-goal-plugin', self.text)
+
     def test_the_guardrails_go_to_the_global_opencode_paths(self):
         # command/ and skill/ are GLOBAL locations, independent of
         # $OPENCODE_CONFIG. Deriving them from the config's directory would put

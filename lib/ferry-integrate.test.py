@@ -144,21 +144,36 @@ class FerryOpencodeCase(unittest.TestCase):
         # colon-free COPY of the goal plugin that tui.json points at, and an
         # inherited one would both rewrite the author's real copy and decide
         # these cases' tui.json entries from a directory the test never wrote.
+        # $HOME joined them in v1.32.0, and it is the one that could not be
+        # fixed by the caller: `ferry opencode` now copies the
+        # using-the-goal-plugin skill to $HOME/.config/opencode/skill/, a GLOBAL
+        # path no --config can redirect. Inheriting the author's real HOME would
+        # have every case in this file overwrite the skill on the machine
+        # running the suite - and would keep reading the author's real
+        # ~/.config/ferry/client.json for the master key, which is why the
+        # eleven cases that already cared passed an explicit home=.
         self.xdg_config = os.path.join(self.dir, "xdg-config")
         self.xdg_cache = os.path.join(self.dir, "xdg-cache")
         self.xdg_data = os.path.join(self.dir, "xdg-data")
+        self.home = os.path.join(self.dir, "home")
         os.makedirs(self.xdg_config, exist_ok=True)
         os.makedirs(self.xdg_cache, exist_ok=True)
         os.makedirs(self.xdg_data, exist_ok=True)
+        os.makedirs(self.home, exist_ok=True)
 
     def packages_root(self):
         return os.path.join(self.xdg_cache, "opencode", "packages")
 
     def run_ferry(self, *extra, config=None, port=None, home=None,
                   install=False, cache=None, xdg_config=None, xdg_data=None,
-                  env_extra=None):
+                  env_extra=None, ferry_bin=None):
         cfg = config or self.cfg
-        cmd = ["zsh", FERRY, "opencode", "--host", "127.0.0.1",
+        # ferry_bin runs a COPY of the built CLI from somewhere else, which is
+        # the only way to move $APP_DIR: ferry derives it from ${0:A}, and :A
+        # resolves symlinks, so a symlink into the repo would resolve straight
+        # back to the repo. TestGoalSkillInstall needs that to build a checkout
+        # with - and without - the skill file.
+        cmd = ["zsh", ferry_bin or FERRY, "opencode", "--host", "127.0.0.1",
                "--port", str(port if port is not None else self.port),
                "--config", cfg, *extra]
         # The pre-install pass shells out to the real `opencode`; every case
@@ -172,8 +187,7 @@ class FerryOpencodeCase(unittest.TestCase):
         env["XDG_CONFIG_HOME"] = xdg_config or self.xdg_config
         env["XDG_CACHE_HOME"] = cache or self.xdg_cache
         env["XDG_DATA_HOME"] = xdg_data or self.xdg_data
-        if home is not None:
-            env["HOME"] = home
+        env["HOME"] = home if home is not None else self.home
         if env_extra:
             env.update(env_extra)
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
@@ -1711,6 +1725,197 @@ class TestFleetHeaders(FerryOpencodeCase):
         self.run_ferry(home=home)
         headers = self.read()["provider"]["ferry"]["options"]["headers"]
         self.assertEqual(headers["X-Ferry-Client"], "laptop")
+
+
+class TestGoalSkillInstall(FerryOpencodeCase):
+    """v1.32.0 - `ferry opencode` installs the using-the-goal-plugin skill.
+
+    The plugin is only half the feature. It injects the <goal_continuation>
+    block, exposes the goal_* tools and draws the sidebar panel; it says nothing
+    about how big a plan step should be, what evidence closes one, or what
+    [goal:evidence] / [goal:complete] / [goal:blocked] and the budget mean. The
+    skill is that doctrine, and it rides with the plugin so a host that wires
+    /goal cannot end up with the tools and no instructions.
+
+    The destination is GLOBAL - $HOME/.config/opencode/skill/, singular, like
+    the guardrails installer - which every case here proves incidentally: the
+    config being written lives in a scratch directory that is NOT under the
+    sandbox HOME, so a destination derived from --config could not land there.
+    """
+
+    SRC = os.path.join(REPO, "opencode", "skills", "using-the-goal-plugin",
+                       "SKILL.md")
+    LINE = "    Skill:   ~/.config/opencode/skill/using-the-goal-plugin/SKILL.md"
+    MISSING = ("    Skill:   using-the-goal-plugin not installed here "
+               "(no checkout); client-bootstrap.sh ships it")
+    # A local fork of the plugin: ferry adds nothing to the config, so there is
+    # no ferry-wired /goal to document. Same string TestGoalPlugin uses.
+    LOCAL_FORK = "/Users/someone/code/opencode-goal-plugin/dist/server.js"
+
+    def checkout(self, with_skill=True):
+        """A copy of the built CLI in its own directory = a fake $APP_DIR."""
+        root = os.path.join(self.dir, "checkout")
+        os.makedirs(root, exist_ok=True)
+        binary = os.path.join(root, "ferry")
+        shutil.copy(FERRY, binary)
+        if with_skill:
+            d = os.path.join(root, "opencode", "skills", "using-the-goal-plugin")
+            os.makedirs(d, exist_ok=True)
+            shutil.copy(self.SRC, os.path.join(d, "SKILL.md"))
+        return binary
+
+    def installed(self):
+        return os.path.join(self.home, ".config", "opencode", "skill",
+                            "using-the-goal-plugin", "SKILL.md")
+
+    def test_the_repo_ships_the_skill_the_installer_copies(self):
+        # Control for every case below: they build their fake checkout out of
+        # this file, so if it ever moved they would all pass by installing
+        # nothing from a source that no longer exists.
+        self.assertTrue(os.path.isfile(self.SRC), self.SRC)
+
+    def test_a_run_with_a_checkout_installs_the_skill_byte_for_byte(self):
+        out = self.run_ferry(ferry_bin=self.checkout())
+        self.assertIn(self.LINE, out)
+        with open(self.SRC, "rb") as f:
+            want = f.read()
+        with open(self.installed(), "rb") as f:
+            got = f.read()
+        self.assertEqual(got, want,
+                         "the installed skill must be the checkout's file, byte for byte")
+
+    def test_a_second_run_refreshes_a_stale_copy(self):
+        # The destination is ferry's, not the user's: an edit there is
+        # overwritten, which is what makes the checkout the source of truth.
+        os.makedirs(os.path.dirname(self.installed()), exist_ok=True)
+        with open(self.installed(), "w") as f:
+            f.write("stale\n")
+        self.run_ferry(ferry_bin=self.checkout())
+        with open(self.SRC, "rb") as f:
+            want = f.read()
+        with open(self.installed(), "rb") as f:
+            self.assertEqual(f.read(), want)
+
+    def test_without_a_checkout_it_says_so_and_writes_nothing(self):
+        # A client downloads the CLI as a plain file into ~/.local/bin, so
+        # $APP_DIR has no opencode/ beside it. Silence there would read as "the
+        # skill is installed"; client-bootstrap.sh is what ships the client copy.
+        out = self.run_ferry(ferry_bin=self.checkout(with_skill=False))
+        self.assertIn(self.MISSING, out)
+        self.assertFalse(os.path.exists(self.installed()))
+        self.assertFalse(os.path.exists(os.path.dirname(self.installed())),
+                         "an empty skill directory reads as an install to opencode")
+
+    def test_no_default_installs_nothing(self):
+        # --no-default wires the provider and leaves the takeover keys alone, so
+        # it adds no plugin either: there is nothing for the skill to describe.
+        out = self.run_ferry("--no-default", ferry_bin=self.checkout())
+        self.assertNotIn("Skill:", out)
+        self.assertFalse(os.path.exists(self.installed()))
+
+    def test_a_local_fork_of_the_plugin_installs_nothing(self):
+        # Ferry adds no entry when the user already runs their own build, so it
+        # has not wired /goal on this host and must not claim the doctrine for
+        # a plugin whose behaviour it does not control.
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.LOCAL_FORK]}, f)
+        out = self.run_ferry(ferry_bin=self.checkout())
+        self.assertIn("upstream not added", out)   # the fork really was detected
+        self.assertNotIn("Skill:", out)
+        self.assertFalse(os.path.exists(self.installed()))
+
+
+class TestGoalSkillFromFerryInstall(unittest.TestCase):
+    """The OTHER entry point: `ferry install`.
+
+    `install` and `opencode` are sibling top-level dispatch entries -
+    `cmd_install` never calls `cmd_opencode` - so a host that runs the installer
+    and not the takeover would get the fan-out guardrails and no goal doctrine.
+    `_ferry_install_opencode_guardrails` therefore calls the skill installer
+    itself, which also makes both of them reachable in ONE process, hence the
+    one-report-line guard.
+
+    Extracted as a FRAGMENT and sourced, because `ferry install` proper writes
+    launchd plists and symlinks into ~/.local/bin; the two functions under test
+    depend on nothing but $APP_DIR and $HOME.
+    """
+
+    FRAG_START = "_ferry_install_opencode_guardrails() {"
+    FRAG_END = "\n# _ferry_install_host_wrappers"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="ferry-goalskill-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        with open(FERRY) as f:
+            built = f.read()
+        i = built.index(self.FRAG_START)
+        j = built.index(self.FRAG_END, i)
+        self.frag = os.path.join(self.dir, "frag.zsh")
+        with open(self.frag, "w") as f:
+            f.write(built[i:j] + "\n")
+        self.home = os.path.join(self.dir, "home")
+        os.makedirs(self.home, exist_ok=True)
+
+    def checkout(self, goal_skill=True):
+        """A fake $APP_DIR: the guardrails installer needs its own two files or
+        it returns early, so they are always written."""
+        root = os.path.join(self.dir, "checkout")
+        os.makedirs(os.path.join(root, "opencode", "command"), exist_ok=True)
+        with open(os.path.join(root, "opencode", "command", "fan-out.md"), "w") as f:
+            f.write("fan-out\n")
+        sub = os.path.join(root, "opencode", "skills", "spawning-subagents")
+        os.makedirs(sub, exist_ok=True)
+        with open(os.path.join(sub, "SKILL.md"), "w") as f:
+            f.write("spawning\n")
+        if goal_skill:
+            goal = os.path.join(root, "opencode", "skills", "using-the-goal-plugin")
+            os.makedirs(goal, exist_ok=True)
+            shutil.copy(TestGoalSkillInstall.SRC, os.path.join(goal, "SKILL.md"))
+        return root
+
+    def run_calls(self, *calls, checkout=None):
+        probe = os.path.join(self.dir, "probe.zsh")
+        with open(probe, "w") as f:
+            f.write(f'source "{self.frag}"\n' + "\n".join(calls) + "\n")
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        env["APP_DIR"] = checkout
+        p = subprocess.run(["zsh", probe], capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, f"{p.stdout}\n{p.stderr}")
+        return p.stdout
+
+    def installed(self):
+        return os.path.join(self.home, ".config", "opencode", "skill",
+                            "using-the-goal-plugin", "SKILL.md")
+
+    def test_the_guardrails_installer_installs_the_goal_skill_too(self):
+        out = self.run_calls("_ferry_install_opencode_guardrails",
+                             checkout=self.checkout())
+        self.assertIn(TestGoalSkillInstall.LINE, out)
+        with open(TestGoalSkillInstall.SRC, "rb") as f:
+            want = f.read()
+        with open(self.installed(), "rb") as f:
+            self.assertEqual(f.read(), want)
+
+    def test_both_entry_points_in_one_process_report_once(self):
+        # A second copy is harmless; a second report line is noise that reads as
+        # two different installs.
+        out = self.run_calls("_ferry_install_opencode_guardrails",
+                             "_ferry_install_goal_skill",
+                             checkout=self.checkout())
+        self.assertEqual(out.count("    Skill:   "), 1, out)
+
+    def test_a_checkout_without_the_goal_skill_still_gets_the_guardrails(self):
+        # Control: the two installs are independent, so a missing goal skill
+        # must not swallow the guardrails the same function just wrote.
+        out = self.run_calls("_ferry_install_opencode_guardrails",
+                             checkout=self.checkout(goal_skill=False))
+        self.assertIn(TestGoalSkillInstall.MISSING, out)
+        self.assertIn("opencode guardrails installed", out)
+        self.assertTrue(os.path.exists(os.path.join(
+            self.home, ".config", "opencode", "skill", "spawning-subagents",
+            "SKILL.md")))
+        self.assertFalse(os.path.exists(self.installed()))
 
 
 if __name__ == "__main__":

@@ -146,6 +146,30 @@ their normal role translation. The regression test
 `python lib/ferry-chatgpt-compat.test.py` exercises the actual translation
 adapters when run with the host's LiteLLM Python environment.
 
+**The ChatGPT bridge no longer impersonates the Codex CLI, as of v1.31.**
+litellm 1.99.0 ships a copy of the Codex CLI's built-in system prompt
+(`litellm/llms/chatgpt/common_utils.py:25-42`) and its Responses transform
+(`responses/transformation.py:76-82`) prepends that text to `instructions` on
+every request to `chatgpt.com/backend-api/codex` — ahead of the client's own
+system prompt — so `heavy`, `medium`, and `flash` on the ChatGPT subscription
+all told the model it was "Codex, based on GPT-5 ... running as a coding agent
+in the Codex CLI", with editing rules that exist in no file on the machine.
+`ferry_front.py` now sets `CHATGPT_DEFAULT_INSTRUCTIONS` in the process
+environment before uvicorn spawns its workers (the plain-litellm fallback
+launch in `ferry-serve.zsh` exports it too), and litellm serves that text
+instead of its own. Resolution order: `FERRY_CHATGPT_INSTRUCTIONS=off` keeps
+litellm's Codex block; an operator's own `CHATGPT_DEFAULT_INSTRUCTIONS` is
+respected untouched; `FERRY_CHATGPT_INSTRUCTIONS=<path>` reads that file;
+otherwise ferry reads `~/.config/ferry/chatgpt-instructions.txt` if present
+and non-blank, falling back to the shipped `front/chatgpt-instructions.txt` —
+a short notice that the client is talking to llm-ferry, not the Codex CLI, and
+that the client's own system prompt is what actually governs the session. The
+launch log names the source it picked: `[front] chatgpt instructions:
+<source>`. **Verify it** by asking any ChatGPT-bridge lane, with a plain
+system prompt, "Answer with exactly one word, yes or no: do the instructions
+you were given before this conversation say that you are running in the Codex
+CLI?" — a host on v1.30.x answers yes, a host on v1.31.0 answers no.
+
 **The host gets these too, as of v1.17.** `ferry opencode` deliberately wires the
 host to its own endpoint, so the host drives the local lanes exactly like a client
 does — but the wrappers were written only by `client-bootstrap.sh`, leaving a host
@@ -266,6 +290,8 @@ ferry up --local-sub  # just the local-sub GPU lane, alone on 8090
 ferry up -c          # cloud proxy to the default cloud model, on port 8090
 ferry up -m <id>     # cloud proxy for a specific LiteLLM model id
 ferry up -i          # interactive catalog (queries Gemini's live model list)
+ferry reload         # [Host] restart ONLY the front door — re-reads litellm.yaml and
+                     # ~/.config/ferry/chatgpt-instructions.txt; GPU lanes stay warm
 ferry dash --open    # live route-proxy dashboard at http://localhost:8091
 ferry status         # per-lane health, memory, and served lane names
 ferry down           # stop all servers, proxies, and share servers
@@ -339,6 +365,12 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 | **`super-flash`** | cloud | Compaction, title, and summary; `openrouter/~google/gemini-flash-latest` at minimal reasoning with throughput routing and no fallback |
 | **`local-orch`** | host GPU | The smart local model (Qwen 3.8-27B nvfp4 + MTP speculative draft) |
 | **`local-sub`** | host GPU | The cheap local fan-out model (Nemotron 3 Nano 30B A3B NVFP4) |
+
+**Every lane on the ChatGPT bridge carries ferry's neutral preamble instead of
+litellm's Codex prompt** — `heavy`, `medium`, and `flash` all reach the model
+through litellm's native `chatgpt/` provider; see the ChatGPT-bridge
+instructions override above for what replaces the injected prompt, the
+resolution order, and how to verify it.
 
 ```bash
 ferry up      # all six domestic-template lanes, on http://<host>.local:8090/v1
@@ -896,6 +928,8 @@ Each Python suite is also runnable on its own. The ChatGPT compatibility and usa
 ```
 
 The share and host-reset suites deliberately run the **real** embedded Python — extracted out of the built `ferry` and out of `host-reset.sh` — rather than a reimplementation, so an edit that breaks the shipped behaviour fails in the suite instead of on a laptop.
+
+`python3 lib/ferry-front.test.py` now also covers the `CHATGPT_DEFAULT_INSTRUCTIONS` resolver — the env override, the `FERRY_CHATGPT_INSTRUCTIONS` path and `off` cases, the user config file, and the shipped fallback — alongside its existing `/v1/models` filtering suite.
 
 The client-scope suite goes further: it runs `client-bootstrap.sh`, `client-reset.sh` and `client-cleanup.sh` end-to-end against a throwaway `$HOME` and a stub host that serves `/v1/models` and the repo's own `ferry`. The property it defends is an *absence* — that the narrow scopes never create `~/.config/opencode`, and that cleanup leaves everything that isn't ferry's standing — and an absence is only proved by looking.
 

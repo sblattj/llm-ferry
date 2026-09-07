@@ -125,9 +125,10 @@ PYEOF
 # is the host's own choice and ferry does not override it.
 unalias opencode-cloud opencode-local opencode-super 2>/dev/null
 
-# opencode-cloud: heavy drives (build/plan); medium handles general when
-# advertised; flash handles explore; super-flash handles compaction and
-# title/summary. Older or unreachable hosts retain flash for general.
+# opencode-cloud: heavy drives (build/plan); flash handles `light` (tasks rated
+# 0-50) and explore; medium handles `standard` (51-100) when advertised;
+# super-flash handles compaction and title/summary. The built-in `general`
+# subagent is DISABLED. Older or unreachable hosts put standard on flash too.
 opencode-cloud() {
   OPENCODE_CONFIG="$HOME/.config/ferry/opencode-cloud.json" command opencode "$@"
 }
@@ -147,7 +148,7 @@ opencode-super() {
 EOF
 
   echo ">>> opencode shell wrappers installed in $rc:"
-  echo "    opencode-cloud   -> cloud lanes: heavy drives; medium general; flash explore; super-flash compaction/title/summary"
+  echo "    opencode-cloud   -> cloud lanes: heavy drives; flash light+explore; medium standard; super-flash compaction/title/summary; general disabled"
   echo "    opencode-super   -> cloud pair: heavy drives, super-flash fans out"
   echo "    opencode-local   -> GPU pair:   local-orch drives, local-sub fans out"
   echo "    (bare 'opencode' is untouched — run: source $rc)"
@@ -239,13 +240,19 @@ cmd_opencode() {
   # A ferry client knows agent lanes, never a real model:
   #
   #   driver       build / plan                      heavy       local-orch
-  #   general      general                           medium*     local-sub
+  #   light        light   (complexity 0-50)         flash       local-sub
+  #   standard     standard (complexity 51-100)      medium*     local-sub
   #   explore      explore                           flash       local-sub
   #   compaction   compaction                        super-flash local-sub
   #   housekeeper  title / summary                   super-flash local-sub
   #
+  # opencode's built-in `general` subagent is DISABLED — the fan-out worker is
+  # split into two custom subagents banded by complexity, because opencode's
+  # task tool has no model parameter: the driver picks an AGENT NAME, and each
+  # agent is pinned to exactly one lane here.
+  #
   # * `medium` is used only when the host catalogue advertises it. Older or
-  # unreachable hosts retain flash for general rather than receiving a broken
+  # unreachable hosts retain flash for standard rather than receiving a broken
   # new lane reference.
   #
   # Compaction fires on its own schedule and carries the ENTIRE transcript, so
@@ -261,7 +268,9 @@ cmd_opencode() {
   #   permission  -> "allow"
   #   model       -> ferry/<driver>
   #   small_model -> ferry/<housekeeper>
-  #   agent       -> all seven built-ins pinned (see the AGENTS lists below)
+  #   agent       -> six built-ins pinned, `general` disabled, and the two
+  #                  custom `light`/`standard` subagents declared (see the
+  #                  AGENTS lists below)
   # provider.ferry.options.headers is ours too, rewritten every run alongside
   # baseURL/apiKey (see the prov["ferry"] block below) - it carries this
   # machine's identity and a one-shot fleet override, never a real model id.
@@ -400,10 +409,29 @@ GOAL_COMMAND = {
 # the 144MB binary) — ferry pinned it for months and the pin did nothing, because
 # an unknown key just lands in `agent`'s additionalProperties and is never read.
 DRIVER_AGENTS = ("build", "plan")
-GENERAL_AGENTS = ("general",)
 EXPLORE_AGENTS = ("explore",)
 COMPACTION_AGENTS = ("compaction",)
 HOUSE_AGENTS = ("title", "summary")
+
+# --- The fan-out worker, split in two and banded by complexity. ---
+# opencode's task tool takes NO model parameter: the driver dispatches by AGENT
+# NAME, and each agent is pinned to exactly one lane in this config. The only
+# thing the driver sees at dispatch time is the task tool's own description,
+# which lists every non-primary agent as "- <name>: <description>" — so the
+# complexity band has to live IN the description or the driver has nothing to
+# route on. Hence one cheap worker (light) and one capable worker (standard),
+# each carrying its band in prose.
+#
+# `general` is DISABLED rather than deleted. Dropping the key does not remove
+# the agent: opencode ships `general` as a built-in, and an unpinned built-in
+# reappears inheriting the primary model — i.e. every fan-out task would land
+# on the expensive driver lane. `{"disable": true}` is the only way to take it
+# off the task tool's menu.
+LIGHT_AGENTS = ("light",)
+STANDARD_AGENTS = ("standard",)
+DISABLED_AGENTS = ("general",)
+LIGHT_DESC = "Worker for tasks rated 0-50 of 100 complexity: exploration follow-ups, small fixes, easy implementation, mechanical edits with clear instructions. Full tool access. Default worker; use standard only when the task clearly needs deeper judgment."
+STANDARD_DESC = "Worker for tasks rated 51-100 of 100 complexity: multi-file implementation, ambiguous debugging, design judgment. Full tool access. Use light for anything rated 50 or below."
 
 # --- Role lanes plus the selectable medium lane. Never a real model id. ---
 # The local lanes cap KV at 131072 (128k) tokens, so a 100k-token prompt plus
@@ -443,23 +471,28 @@ try:
 except Exception as e:
     print(f"    (Could not query {base}/models: {e}; wiring the lane pair unchecked)")
 
-# A modern cloud host exposes `medium`, which carries general. When that
-# capability is absent (or cannot be checked), general and explore use flash;
-# compaction and housekeeping use super-flash. The GPU pair deliberately stays
-# exactly as it was.
+# A modern cloud host exposes `medium`, which carries the `standard` worker.
+# When that capability is absent (or cannot be checked), standard joins light
+# and explore on flash; compaction and housekeeping use super-flash. The GPU
+# pair deliberately stays exactly as it was — it has only two lanes, so light,
+# standard and explore all share local-sub.
 if prefer_local:
-    driver, general, explore, compaction, house = ("local-orch", "local-sub",
-                                                     "local-sub", "local-sub",
-                                                     "local-sub")
+    driver, light, standard, explore, compaction, house = (
+        "local-orch", "local-sub", "local-sub", "local-sub", "local-sub",
+        "local-sub")
     limits = {"limit": {"context": 131072, "output": 8192}}
 else:
-    driver, explore, house = "heavy", "flash", "super-flash"
-    general = "medium" if "medium" in served else explore
+    driver, light, explore, house = "heavy", "flash", "flash", "super-flash"
+    standard = "medium" if "medium" in served else "flash"
     compaction = house
     limits = {"modalities": {"input": ["text", "image", "pdf"],
                              "output": ["text"]}}
 driver = force_model or driver
-general = force_small or general
+# --small-model (and therefore --super) moves the whole fan-out together: the
+# band split is about which worker the driver PICKS, not about keeping two
+# different lanes alive when the operator asked for one.
+light = force_small or light
+standard = force_small or standard
 explore = force_small or explore
 compaction = force_house or compaction
 house = force_house or house
@@ -471,7 +504,8 @@ if served:
     # catalogue, and the config must remain usable for their scheduled agents.
     # The same exemption covers local-sub and --super, where all non-driver
     # agents deliberately share that lane.
-    missing = [l for l in dict.fromkeys((driver, general, explore, compaction))
+    missing = [l for l in dict.fromkeys((driver, light, standard, explore,
+                                         compaction))
                if l not in served and l != house]
     if missing:
         print(f"    WARNING: host does not serve {', '.join(missing)}.")
@@ -553,12 +587,12 @@ prev_options = prev_ferry.get("options") if isinstance(prev_ferry.get("options")
 # two lanes, so declaring one model entry per agent would create duplicates.
 models = {}
 # `medium` is a cloud capability tier. Declare it when the host offers it so it
-# appears in opencode's model picker and can serve general. Its
+# appears in opencode's model picker and can serve the `standard` worker. Its
 # resolved backend varies by fleet: domestic
 # Terra accepts attachments, while international GLM-5.3 is text-only. A single
 # opencode provider entry cannot vary modalities with X-Ferry-Fleet, so omit the
 # declaration and preserve the safe text-only baseline across every fleet.
-declared_lanes = (driver, general, explore, compaction, house)
+declared_lanes = (driver, light, standard, explore, compaction, house)
 # Do not advertise a lane a pre-medium host does not serve. Explicit use still
 # adds it through the selected agent lanes above, allowing a caller to request the
 # new lane deliberately and receive the normal catalogue warning if absent.
@@ -607,9 +641,9 @@ if set_default:
     cfg["permission"] = "allow"          # schema: PermissionConfig accepts the
                                          # bare enum "ask" | "allow" | "deny"
     cfg["model"] = f"ferry/{driver}"
-    # small_model follows the title/summary HOUSEKEEPER, not general/explore. opencode's own schema
+    # small_model follows the title/summary HOUSEKEEPER, not the fan-out workers. opencode's own schema
     # describes it as "small model to use for tasks like title generation", which
-    # is the housekeeping role exactly; leaving it on general/explore would send
+    # is the housekeeping role exactly; leaving it on light/standard/explore would send
     # every small task opencode has not got a named agent for to a fan-out lane.
     cfg["small_model"] = f"ferry/{house}"
 
@@ -617,7 +651,13 @@ if set_default:
     # agent still naming a retired model id, say) is exactly the drift this
     # command exists to end. Anything custom is recoverable from the snapshot.
     agent = {a: {"model": f"ferry/{driver}"} for a in DRIVER_AGENTS}
-    agent.update({a: {"model": f"ferry/{general}"} for a in GENERAL_AGENTS})
+    # Disabled, not deleted: a deleted key lets opencode's built-in `general`
+    # come back on the primary (driver) model.
+    agent.update({a: {"disable": True} for a in DISABLED_AGENTS})
+    agent.update({a: {"description": LIGHT_DESC, "mode": "subagent",
+                      "model": f"ferry/{light}"} for a in LIGHT_AGENTS})
+    agent.update({a: {"description": STANDARD_DESC, "mode": "subagent",
+                      "model": f"ferry/{standard}"} for a in STANDARD_AGENTS})
     agent.update({a: {"model": f"ferry/{explore}"} for a in EXPLORE_AGENTS})
     agent.update({a: {"model": f"ferry/{compaction}"} for a in COMPACTION_AGENTS})
     agent.update({a: {"model": f"ferry/{house}"} for a in HOUSE_AGENTS})
@@ -717,13 +757,14 @@ with open(cfg_path, "w") as f:
     f.write("\n")
 
 print(f"    Wired opencode -> {base}")
-print(f"    Provider: ferry   Lanes: {driver} (driver), {general} (general), {explore} (explore), {compaction} (compaction), {house} (title/summary)")
+print(f"    Provider: ferry   Lanes: {driver} (driver), {light} (light), {standard} (standard), {explore} (explore), {compaction} (compaction), {house} (title/summary)")
 if extra_lanes:
     print(f"    Kept in picker: {', '.join(extra_lanes)} (declared in the config, not pinned by ferry)")
 if set_default:
     print(f"    model={cfg['model']}  small_model={cfg['small_model']}  permission=allow")
     print(f"    Agents pinned:  {'/'.join(DRIVER_AGENTS)} -> ferry/{driver}")
-    print(f"                    {'/'.join(GENERAL_AGENTS)} -> ferry/{general}; {'/'.join(EXPLORE_AGENTS)} -> ferry/{explore}")
+    print(f"                    {'/'.join(LIGHT_AGENTS)} -> ferry/{light}; {'/'.join(STANDARD_AGENTS)} -> ferry/{standard}")
+    print(f"                    {'/'.join(EXPLORE_AGENTS)} -> ferry/{explore}; {'/'.join(DISABLED_AGENTS)} -> disabled")
     print(f"                    {'/'.join(COMPACTION_AGENTS)} -> ferry/{compaction}; {'/'.join(HOUSE_AGENTS)} -> ferry/{house}")
     # Report the entry that actually SATISFIES the requirement, not the package
     # we would have added. Printing GOAL_PLUGIN unconditionally claimed an

@@ -10,10 +10,16 @@ they degrade to ferry_up 0 exactly as a down proxy would.
 """
 import importlib.machinery
 import importlib.util
+import io
+import json
 import os
 import socket
 import tempfile
+import threading
 import unittest
+import unittest.mock
+import urllib.error
+import urllib.request
 import warnings
 
 # The reused ferry-dash.load_topology reads litellm.yaml without closing the fd
@@ -549,6 +555,97 @@ class EventMetricsTest(unittest.TestCase):
         for name, _labels, value in samples:
             f = float(value)
             self.assertEqual(f, f, "NaN in %s" % name)
+
+
+class ExporterServerAndCliTests(unittest.TestCase):
+    def test_help_flag(self):
+        with io.StringIO() as buf, unittest.mock.patch("sys.stdout", buf):
+            with self.assertRaises(SystemExit) as ctx:
+                EXP.main(["--help"])
+            self.assertEqual(ctx.exception.code, 0)
+
+    def test_bind_failure(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        port = sock.getsockname()[1]
+        try:
+            with io.StringIO() as buf, unittest.mock.patch("sys.stdout", buf):
+                with self.assertRaises(SystemExit) as ctx:
+                    EXP.main(["--port", str(port)], serve=False)
+                self.assertIn("cannot bind", str(ctx.exception))
+        finally:
+            sock.close()
+
+    def test_http_server_endpoints(self):
+        with io.StringIO() as buf, unittest.mock.patch("sys.stdout", buf):
+            srv, col = EXP.main([
+                "--port", "0",
+                "--ferry", "http://127.0.0.1:%d" % closed_port(),
+            ], serve=False)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            # 1. /metrics
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                body = r.read().decode()
+                self.assertIn("ferry_up 0", body)
+
+            # 2. /healthz
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=5) as r:
+                self.assertEqual(r.status, 200)
+                body = json.loads(r.read().decode())
+                self.assertEqual(body, {"ok": True})
+
+            # 3. 404
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/other")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    status = r.status
+            except urllib.error.HTTPError as e:
+                status = e.code
+            self.assertEqual(status, 404)
+
+            # 4. render exception fallback
+            with unittest.mock.patch.object(col, "render", side_effect=RuntimeError("boom")):
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as r:
+                    self.assertEqual(r.status, 200)
+                    body = r.read().decode()
+                    self.assertIn("ferry_exporter_up 1", body)
+                    self.assertIn("ferry_exporter_build_info", body)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_format_number_edge_cases(self):
+        self.assertEqual(EXP.fmt_value(True), "1")
+        self.assertEqual(EXP.fmt_value(False), "0")
+        self.assertEqual(EXP.fmt_value(42), "42")
+        self.assertEqual(EXP.fmt_value(42.0), "42")
+        self.assertEqual(EXP.fmt_value(42.5), "42.5")
+        self.assertIsNone(EXP.fmt_value(float("nan")))
+        self.assertIsNone(EXP.fmt_value(float("inf")))
+        self.assertIsNone(EXP.fmt_value("not-a-number"))
+
+    def test_fallback_classifier_without_live_mod(self):
+        orig_live = EXP.live_mod
+        try:
+            EXP.live_mod = None
+            self.assertEqual(EXP.classify_backend_event({}, "RateLimitError: 429"), "rate_limited")
+            self.assertEqual(EXP.classify_backend_event({}, "insufficient_quota 403"), "quota_exhausted")
+            self.assertIsNone(EXP.classify_backend_event({}, "normal 200 OK"))
+        finally:
+            EXP.live_mod = orig_live
+
+    def test_fold_event_edge_cases(self):
+        col = EXP.Collector("http://127.0.0.1:8090", "key", "/none", None)
+        # Non-dict record ignored
+        col._fold_event("not-a-dict", {})
+        # Invalid status non-fatal
+        col._fold_event({"lane": "test", "status": "bad-status"}, {})
+        self.assertEqual(col._events.get(("test", "unknown", "unknown", "error")), 1)
 
 
 if __name__ == "__main__":

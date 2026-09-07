@@ -3018,6 +3018,31 @@ class TestChatGptInstructions(unittest.TestCase):
         self.assertEqual(label, "ferry default (front/chatgpt-instructions.txt)")
         self.assertTrue(text)
 
+    def test_the_shipped_path_is_module_relative_not_cwd_relative(self):
+        # ferry launches the front from wherever the operator's shell happens
+        # to be (and uvicorn workers inherit that cwd), so a relative
+        # "front/chatgpt-instructions.txt" would resolve to nothing and the
+        # Codex prompt would come straight back. The whole-suite run from the
+        # repo root cannot see that: only an absolute, module-anchored path can.
+        self.assertTrue(os.path.isabs(FF.SHIPPED_CHATGPT_INSTRUCTIONS),
+                        FF.SHIPPED_CHATGPT_INSTRUCTIONS)
+        self.assertEqual(
+            FF.SHIPPED_CHATGPT_INSTRUCTIONS,
+            os.path.join(os.path.dirname(os.path.abspath(FF.__file__)),
+                         "chatgpt-instructions.txt"))
+
+    def test_the_shipped_default_resolves_from_any_cwd(self):
+        # The behavioural half of the assertion above: chdir somewhere with no
+        # front/ directory and the last resort must still be readable.
+        cwd = os.getcwd()
+        os.chdir(self.home)
+        try:
+            text, label = self._resolve({})
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(label, "ferry default (front/chatgpt-instructions.txt)")
+        self.assertIn("You are not running in the Codex CLI", text)
+
     def test_the_shipped_file_denies_the_codex_cli_runtime(self):
         with open(FF.SHIPPED_CHATGPT_INSTRUCTIONS, "rb") as fh:
             raw = fh.read()
@@ -3115,7 +3140,11 @@ class TestChatGptInstructions(unittest.TestCase):
         fake.run = lambda *a, **kw: seen.update(
             env=os.environ.get(FF.CHATGPT_INSTRUCTIONS_ENV))
         out = io.StringIO()
-        with mock.patch.dict(os.environ, {}, clear=False):
+        # main() takes the production path (home=None -> expanduser("~")), so
+        # HOME must point at the tempdir: an operator who used this feature's
+        # OWN documented override (~/.config/ferry/chatgpt-instructions.txt)
+        # would otherwise turn the shipped suite red on their machine.
+        with mock.patch.dict(os.environ, {"HOME": self.home}, clear=False):
             os.environ.pop(FF.FERRY_CHATGPT_INSTRUCTIONS_ENV, None)
             os.environ.pop(FF.CHATGPT_INSTRUCTIONS_ENV, None)
             sys.modules["uvicorn"] = fake
@@ -3127,6 +3156,31 @@ class TestChatGptInstructions(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("[front] chatgpt instructions: ", out.getvalue())
         self.assertIn("You are not running in the Codex CLI", seen["env"])
+
+    def test_main_prefers_the_operators_own_user_file(self):
+        # The other half of the HOME redirect above: with a file in the fake
+        # ~/.config/ferry, main() must export THAT and say so — proving the
+        # redirect actually reaches the resolver rather than being inert.
+        import types
+        seen = {}
+        fake = types.ModuleType("uvicorn")
+        fake.run = lambda *a, **kw: seen.update(
+            env=os.environ.get(FF.CHATGPT_INSTRUCTIONS_ENV))
+        path = self._user_file("Operator's own preamble.\n")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": self.home}, clear=False):
+            os.environ.pop(FF.FERRY_CHATGPT_INSTRUCTIONS_ENV, None)
+            os.environ.pop(FF.CHATGPT_INSTRUCTIONS_ENV, None)
+            sys.modules["uvicorn"] = fake
+            try:
+                with mock.patch("sys.stdout", out):
+                    rc = FF.main(["--config", "x.yaml", "--port", "8090"])
+            finally:
+                sys.modules.pop("uvicorn", None)
+        self.assertEqual(rc, 0)
+        self.assertIn("[front] chatgpt instructions: file %s" % path,
+                      out.getvalue())
+        self.assertEqual(seen["env"], "Operator's own preamble.")
 
     def test_main_reports_the_opt_out_without_exporting(self):
         import types

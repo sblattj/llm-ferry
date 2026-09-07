@@ -199,7 +199,12 @@ class TestShippedLaunchLines(unittest.TestCase):
     # fallback path quietly serves the Codex prompt again.
 
     def _litellm_launch_blocks(self):
-        """(line no, lines since the enclosing block opened) per litellm launch."""
+        """(line no, executable lines since the enclosing block opened) per launch.
+
+        Comment lines are dropped: a substring scan that keeps them accepts a
+        commented-out `# _ferry_export_chatgpt_instructions` as a real call,
+        which is exactly how this guard would be disarmed by accident.
+        """
         lines = self.src.splitlines()
         blocks = []
         for i, line in enumerate(lines):
@@ -212,7 +217,8 @@ class TestShippedLaunchLines(unittest.TestCase):
                         or stripped.endswith("() {"):
                     break
                 j -= 1
-            blocks.append((i + 1, lines[j + 1:i]))
+            body = [l for l in lines[j + 1:i] if not l.strip().startswith("#")]
+            blocks.append((i + 1, body))
         return blocks
 
     def test_every_litellm_launch_exports_the_chatgpt_instructions(self):
@@ -246,6 +252,30 @@ class TestShippedLaunchLines(unittest.TestCase):
         body = re.search(r"_ferry_launch_front\(\) \{(.*?)\n\}", self.src, re.S)
         self.assertIsNotNone(body, "_ferry_launch_front is missing from ferry")
         self.assertNotIn("_ferry_export_chatgpt_instructions", body.group(1))
+
+    def test_the_zsh_mirror_behaves_like_the_python_resolver(self):
+        """Run the mirror, don't just read it.
+
+        Every assertion above is a substring scan over the generated `ferry`,
+        and text cannot see behaviour: dropping the `export` keyword, or
+        swapping the user file and the shipped file in the candidate list, keeps
+        this whole class green while the `nohup litellm` children stop
+        inheriting the override and litellm serves its Codex prompt again.
+        lib/ferry-chatgpt-instructions.test.zsh sources the function out of the
+        BUILT ferry and asserts what a CHILD PROCESS sees on every branch.
+        """
+        script = os.path.join(REPO, "lib", "ferry-chatgpt-instructions.test.zsh")
+        self.assertTrue(os.path.isfile(script), "missing harness: %s" % script)
+        proc = subprocess.run(["zsh", script], capture_output=True, text=True)
+        self.assertEqual(
+            proc.returncode, 0,
+            "the zsh mirror harness failed:\n%s\n%s" % (proc.stdout, proc.stderr))
+        self.assertNotIn("FAIL", proc.stdout)
+        self.assertIn("ZSH CHATGPT-INSTRUCTIONS MIRROR: all checks passed",
+                      proc.stdout)
+        # A harness that quietly stopped asserting would also exit 0, so pin the
+        # branch count: a/a2 x3+1, b/b2/b3, c/c2/c3, d/d2/d3, e/e2, f.
+        self.assertGreaterEqual(proc.stdout.count("PASS "), 16, proc.stdout)
 
 
 class TestRouteTemplateMediumLane(unittest.TestCase):

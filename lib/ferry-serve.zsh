@@ -273,13 +273,21 @@ _ferry_launch_front() {
 # _ferry_launch_front: the front reports where its prompt came from, and a
 # pre-export here would make every launch log say "operator env".
 _ferry_export_chatgpt_instructions() {
-  local f text sentinel override
-  # Whitespace-stripped, lower-cased: the opt-out keeps litellm's own prompt.
-  sentinel="${(L)${${FERRY_CHATGPT_INSTRUCTIONS:-}//[[:space:]]/}}"
+  # `#` as a repetition operator (the ends-only trims below) is an extended_glob
+  # feature and SILENTLY no-ops without it; local_options restores on return.
+  setopt local_options extended_glob
+  local f text sentinel override operator
+  # Trimmed at the ENDS only, exactly like the Python resolver's str.strip():
+  # interior whitespace belongs to a path, and "o f f" is not the opt-out.
+  override="${${${FERRY_CHATGPT_INSTRUCTIONS:-}##[[:space:]]#}%%[[:space:]]#}"
+  sentinel="${(L)override}"
   [[ "$sentinel" == "off" ]] && return 0
-  [[ -n "${CHATGPT_DEFAULT_INSTRUCTIONS:-}" ]] && return 0
+  # litellm reads `getenv(...) or DEFAULT`, so an all-whitespace value is NOT
+  # the operator having decided anything — same .strip() test as the resolver,
+  # or the model would get three spaces as its entire preamble.
+  operator="${CHATGPT_DEFAULT_INSTRUCTIONS:-}"
+  [[ -n "${operator//[[:space:]]/}" ]] && return 0
   local -a candidates=()
-  override="${FERRY_CHATGPT_INSTRUCTIONS:-}"
   # A leading ~ in a VALUE is not expanded by the shell (and `${~var}` only
   # arms globbing), so do the one case expanduser() does on the Python side.
   [[ "$override" == "~" ]] && override="$HOME"
@@ -288,7 +296,10 @@ _ferry_export_chatgpt_instructions() {
   candidates+=("$HOME/.config/ferry/chatgpt-instructions.txt")
   candidates+=("$APP_DIR/front/chatgpt-instructions.txt")
   for f in "${candidates[@]}"; do
-    [[ -r "$f" ]] || continue
+    # -r alone is TRUE for a directory, and `$(<dir)` then spills
+    # "error when reading ...: is a directory" onto ferry's stderr; the Python
+    # side swallows the same case (IsADirectoryError is an OSError).
+    [[ -f "$f" && -r "$f" ]] || continue
     text="$(<"$f")"
     # A blank file must never become an empty override: litellm treats "" as
     # unset and falls straight back to the Codex prompt.

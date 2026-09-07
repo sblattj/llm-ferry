@@ -54,7 +54,11 @@ _ferry_install_opencode_guardrails() {
 # Source of truth is opencode/skills/using-the-goal-plugin/SKILL.md in this
 # checkout — edit it there, not at the destination, which is overwritten on
 # every run. A client has no checkout, so this says so and no-ops;
-# client-bootstrap.sh ships the client's copy from its own heredoc.
+# client-bootstrap.sh ships the client's copy from its own heredoc — in its
+# DEFAULT scope only, which is why the no-checkout line names that scope
+# instead of promising the file outright: under --profiles-only the bootstrap
+# deliberately ships no skill, and a promise here would be contradicted by the
+# bootstrap's own report five lines later.
 #
 # The destination is a GLOBAL opencode path, independent of $OPENCODE_CONFIG,
 # and singular `skill/` like the guardrails installer — so it lands where
@@ -66,15 +70,24 @@ _ferry_install_goal_skill() {
   # report line is noise, so the first call wins.
   (( _FERRY_GOAL_SKILL_DONE )) && return 0
   _FERRY_GOAL_SKILL_DONE=1
+  # ...but the guard is per-PROCESS, and the scripts that drive the takeover
+  # (host-reset.sh, client-bootstrap.sh, client-reset.sh) run `ferry opencode`
+  # once per config target — three or four fresh processes that would each
+  # print this line while reporting the same single install. Those scripts
+  # report the skill themselves, so they set FERRY_GOAL_SKILL_QUIET=1 to say
+  # "I already told the operator". It silences the REPORT LINE ONLY: the copy
+  # below still happens, on every target, exactly as it would otherwise.
+  local quiet="${FERRY_GOAL_SKILL_QUIET:-}"
   local src="$APP_DIR/opencode/skills/using-the-goal-plugin/SKILL.md"
   if [[ ! -f "$src" ]]; then
-    echo "    Skill:   using-the-goal-plugin not installed here (no checkout); client-bootstrap.sh ships it"
+    [[ -n "$quiet" ]] || \
+      echo "    Skill:   using-the-goal-plugin not installed here (no checkout); the client copy ships in client-bootstrap.sh's default scope"
     return 0
   fi
   local dst="$HOME/.config/opencode/skill/using-the-goal-plugin"
   mkdir -p "$dst"
   cp "$src" "$dst/SKILL.md"
-  echo "    Skill:   ~/.config/opencode/skill/using-the-goal-plugin/SKILL.md"
+  [[ -n "$quiet" ]] || echo "    Skill:   ~/.config/opencode/skill/using-the-goal-plugin/SKILL.md"
 }
 
 # _ferry_install_host_wrappers — put the `opencode-cloud` / `opencode-local` /

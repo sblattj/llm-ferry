@@ -1746,8 +1746,13 @@ class TestGoalSkillInstall(FerryOpencodeCase):
     SRC = os.path.join(REPO, "opencode", "skills", "using-the-goal-plugin",
                        "SKILL.md")
     LINE = "    Skill:   ~/.config/opencode/skill/using-the-goal-plugin/SKILL.md"
+    # The no-checkout line names client-bootstrap.sh's DEFAULT SCOPE, not the
+    # script outright: --profiles-only ships no skill at all and says so, so an
+    # unqualified promise here would be contradicted by the bootstrap's own
+    # report a few lines later in the same run.
     MISSING = ("    Skill:   using-the-goal-plugin not installed here "
-               "(no checkout); client-bootstrap.sh ships it")
+               "(no checkout); the client copy ships in client-bootstrap.sh's "
+               "default scope")
     # A local fork of the plugin: ferry adds nothing to the config, so there is
     # no ferry-wired /goal to document. Same string TestGoalPlugin uses.
     LOCAL_FORK = "/Users/someone/code/opencode-goal-plugin/dist/server.js"
@@ -1805,6 +1810,34 @@ class TestGoalSkillInstall(FerryOpencodeCase):
         self.assertFalse(os.path.exists(self.installed()))
         self.assertFalse(os.path.exists(os.path.dirname(self.installed())),
                          "an empty skill directory reads as an install to opencode")
+
+    def test_a_quiet_caller_gets_the_install_without_the_report_line(self):
+        # host-reset.sh, client-bootstrap.sh and client-reset.sh each run this
+        # command once per config target - three to five fresh processes, which
+        # the in-process guard cannot see across - and each reports the skill
+        # itself, once. FERRY_GOAL_SKILL_QUIET is how they say so. It must
+        # silence the LINE and nothing else: the file still lands, on every
+        # target, or a reset would stop refreshing a stale copy.
+        # Control: test_a_run_with_a_checkout_installs_the_skill_byte_for_byte
+        # is the same run without the variable, and it asserts the line.
+        out = self.run_ferry(ferry_bin=self.checkout(),
+                             env_extra={"FERRY_GOAL_SKILL_QUIET": "1"})
+        self.assertNotIn("Skill:", out)
+        with open(self.SRC, "rb") as f:
+            want = f.read()
+        with open(self.installed(), "rb") as f:
+            self.assertEqual(f.read(), want,
+                             "quiet must suppress the report, not the install")
+
+    def test_a_quiet_caller_silences_the_no_checkout_line_too(self):
+        # The client side of the same problem, and the one that was actually
+        # wrong out loud: on a client this line is what repeated once per
+        # target. Control: test_without_a_checkout_it_says_so_and_writes_nothing
+        # is the same run without the variable, and it asserts the line.
+        out = self.run_ferry(ferry_bin=self.checkout(with_skill=False),
+                             env_extra={"FERRY_GOAL_SKILL_QUIET": "1"})
+        self.assertNotIn("Skill:", out)
+        self.assertFalse(os.path.exists(self.installed()))
 
     def test_no_default_installs_nothing(self):
         # --no-default wires the provider and leaves the takeover keys alone, so

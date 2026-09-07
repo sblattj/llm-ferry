@@ -708,6 +708,22 @@ class ScriptShapeCase(unittest.TestCase):
                         self.text.index("Re-applying the opencode takeover"),
                         "the skill must be installed before the takeover runs")
 
+    def test_the_takeover_runs_do_not_repeat_the_skill_report(self):
+        # This script reports the skill once (the ok/warn above) and then runs
+        # `ferry opencode` four times - the default target plus the three-target
+        # loop. Each is a fresh process, so ferry's own one-report-line guard
+        # cannot see the other three and one reset announced the same single
+        # install five times. Both invocation sites carry the marker; the
+        # --wrappers call below installs no skill, so it needs none.
+        self.assertEqual(self.text.count("FERRY_GOAL_SKILL_QUIET=1"), 2,
+                         "both `ferry opencode` invocations must be quiet")
+        loop = self.text[self.text.index("for oc_target in"):]
+        self.assertIn("FERRY_GOAL_SKILL_QUIET=1", loop,
+                      "the three-target loop is where the repeats came from")
+        self.assertLess(self.text.index("using-the-goal-plugin skill installed"),
+                        self.text.index("FERRY_GOAL_SKILL_QUIET=1"),
+                        "silence is only honest AFTER this script has reported it")
+
     def test_the_goal_plugin_skill_goes_to_the_global_opencode_path(self):
         # Same reason as the guardrails below: skill/ is a GLOBAL location,
         # independent of $OPENCODE_CONFIG. Deriving it from the config's

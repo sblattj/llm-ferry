@@ -478,7 +478,11 @@ if [[ -n "${OPENCODE_CONFIG:-}" ]]; then
   echo "    (default target from \$OPENCODE_CONFIG - this host does not use the stock path)"
 fi
 echo "    -> $oc_default"
-"$FERRY_BIN" opencode --host 127.0.0.1 --port "$PORT" --config "$oc_default" || RESET_FAILED=1
+# FERRY_GOAL_SKILL_QUIET: the skill was reported once above, and each `ferry
+# opencode` below is a fresh process whose own one-report-line guard cannot see
+# the other three. Without this, one reset announces the same single install
+# five times. The copy still happens in every one of them.
+FERRY_GOAL_SKILL_QUIET=1 "$FERRY_BIN" opencode --host 127.0.0.1 --port "$PORT" --config "$oc_default" || RESET_FAILED=1
 
 for oc_target in \
   "$HOME/.config/ferry/opencode-cloud.json|" \
@@ -489,7 +493,7 @@ do
   oc_flag="${oc_target#*|}"
   [[ "$oc_path" == "$oc_default" ]] && continue   # already written above
   echo "    -> $oc_path"
-  if ! env -u OPENCODE_CONFIG "$FERRY_BIN" opencode \
+  if ! FERRY_GOAL_SKILL_QUIET=1 env -u OPENCODE_CONFIG "$FERRY_BIN" opencode \
         --host 127.0.0.1 --port "$PORT" --config "$oc_path" $oc_flag; then
     RESET_FAILED=1
   fi

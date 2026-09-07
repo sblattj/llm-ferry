@@ -311,6 +311,49 @@ class ClientScopeTest(ClientHarness):
         self.assertFalse(os.path.exists(self.path(
             ".config", "opencode", "skills", "using-the-goal-plugin", "SKILL.md")))
 
+    def test_the_skill_is_reported_once_per_run_and_never_falsely(self):
+        """A client has no llm-ferry checkout, so `ferry opencode` reports the
+        skill as not installed — and this script runs it once per config
+        target, in a fresh process each time, where ferry's own one-line guard
+        cannot see the others. That printed the same line four times in full
+        scope and three under --profiles-only, and in THAT scope its trailing
+        promise was false: it said client-bootstrap.sh ships the file while
+        this script says, a few lines later, that it did not.
+
+        So the takeover runs are passed FERRY_GOAL_SKILL_QUIET=1 and this
+        script states the outcome itself, once, for the scope it actually ran.
+        The control that the variable is what silences it (and that it silences
+        the report, not the install) is in lib/ferry-integrate.test.py:
+        TestGoalSkillInstall runs the same command without it and asserts both
+        lines."""
+        # Counted inside the takeover section only: the closing banner names
+        # the skill again on purpose, as part of "here is what you now have".
+        def takeover(out):
+            start = out.index(">>> Auto-configuring")
+            return out[start:out.index(">>> UNIFIED FERRY CLI INSTALLED", start)]
+
+        p = self.run_script(BOOTSTRAP)
+        self.assertNotIn("no checkout", p.stdout)
+        self.assertEqual(takeover(p.stdout).count("using-the-goal-plugin"), 1,
+                         takeover(p.stdout))
+
+        q = self.run_script(BOOTSTRAP, "--profiles-only")
+        self.assertNotIn("no checkout", q.stdout)
+        self.assertEqual(takeover(q.stdout).count("using-the-goal-plugin"), 1,
+                         takeover(q.stdout))
+        self.assertIn("skill was NOT installed", takeover(q.stdout))
+
+    def test_reset_says_once_that_it_cannot_ship_the_skill(self):
+        """A reset re-writes configs and never skill files — the client copy
+        rides in this bootstrap's heredoc and there is no checkout to copy from
+        — so the one thing an operator needs is that fact, once, not ferry's
+        per-target line three or four times."""
+        self.run_script(BOOTSTRAP)
+        out = self.run_script(RESET).stdout
+        self.assertNotIn("no checkout", out)
+        self.assertEqual(out.count("using-the-goal-plugin is bootstrap-only"), 1, out)
+        self.assertIn("Re-run client-bootstrap.sh", out)
+
     # --- the default is unchanged ------------------------------------------
     def test_full_scope_is_still_the_default(self):
         self.run_script(BOOTSTRAP)

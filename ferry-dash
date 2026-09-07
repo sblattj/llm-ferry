@@ -2254,7 +2254,7 @@ def lan_ip():
         return "127.0.0.1"
 
 
-def main():
+def main(argv=None, serve=True):
     ap = argparse.ArgumentParser(description="Live local dashboard for the ferry route proxy.")
     ap.add_argument("--port", type=int, default=8091, help="dashboard port (default 8091)")
     ap.add_argument("--ferry", default="http://127.0.0.1:8090", help="ferry/litellm base URL")
@@ -2269,7 +2269,7 @@ def main():
     ap.add_argument("--rules", default=os.path.expanduser(
         "~/.config/ferry/event-rules.json"),
         help="exhaustion classifier table (see event-rules.example.json)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     ferry_port = args.ferry.rsplit(":", 1)[-1].split("/")[0]
     logpath = args.log or find_log(ferry_port)
@@ -2295,7 +2295,7 @@ def main():
         srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     except OSError as e:
         raise SystemExit("ferry-dash: cannot bind 127.0.0.1:%d (%s). Try --port." % (args.port, e))
-    url = "http://localhost:%d" % args.port
+    url = "http://localhost:%d" % srv.server_address[1]
     print("ferry-dash → %s   (ferry %s, log %s)" % (url, CFG["ferry"], logpath or "not found"))
     print("Ctrl-C to stop.")
     if args.open:
@@ -2304,10 +2304,15 @@ def main():
             webbrowser.open(url)
         except Exception:
             pass
+    if not serve:
+        return srv
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nferry-dash stopped.")
+    finally:
+        srv.server_close()
+    return 0
 
 
 if __name__ == "__main__":

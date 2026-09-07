@@ -577,6 +577,213 @@ class ClientCleanupTest(ClientHarness):
         self.assertIn("Not installed", p.stdout)
 
 
+# The three things `ferry opencode` writes for the goal plugin, spelled out here
+# so a drift in either direction fails: the canonical spec and the verbatim
+# /goal command (lib/ferry-integrate.zsh's GOAL_PLUGIN / GOAL_COMMAND).
+GOAL_SPEC = ("opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin"
+             "/archive/refs/tags/v0.10.1.tar.gz")
+GOAL_COMMAND = {
+    "description": "Set a session-scoped goal and auto-continue until complete.",
+    "template": "$ARGUMENTS",
+    "agent": "build",
+}
+LOCAL_FORK = "/Users/someone/src/OpenCode-goal-plugin/index.js"
+
+
+class ClientCleanupGoalPluginTest(ClientHarness):
+    """v1.30.2: cleanup takes the goal plugin back out of BOTH config files.
+
+    v1.30.1 started mirroring the plugin into tui.json, and cleanup only ever
+    stripped provider.ferry — so a cleaned client kept ferry's plugin entry in
+    opencode.json and tui.json plus its /goal command, and the next bare
+    `opencode` still loaded them. The line these tests defend is the one between
+    what ferry WROTE (ours to remove) and what the user owns: a local-path fork
+    of the plugin, and a /goal command they edited.
+    """
+
+    # --- helpers ------------------------------------------------------------
+    def write_oc(self, cfg, name="opencode.json"):
+        d = self.path(".config", "opencode")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            json.dump(cfg, f, indent=2)
+        return p
+
+    def oc_files(self):
+        return sorted(os.listdir(self.path(".config", "opencode")))
+
+    def raw(self, *parts):
+        with open(self.path(*parts), "rb") as f:
+            return f.read()
+
+    # --- end to end ---------------------------------------------------------
+    def test_a_full_bootstrap_then_cleanup_leaves_no_goal_plugin_behind(self):
+        """The real thing: bootstrap writes all three, cleanup removes all three."""
+        self.run_script(BOOTSTRAP)
+        before = self.read_json(".config", "opencode", "opencode.json")
+        # Guard the premise — if the bootstrap stopped writing these, this test
+        # would pass vacuously.
+        self.assertEqual(before["plugin"], [GOAL_SPEC])
+        self.assertEqual(before["command"]["goal"], GOAL_COMMAND)
+        self.assertEqual(self.read_json(".config", "opencode", "tui.json")["plugin"],
+                         [GOAL_SPEC])
+
+        self.run_script(CLEANUP)
+
+        after = self.read_json(".config", "opencode", "opencode.json")
+        self.assertNotIn("plugin", after)
+        self.assertNotIn("command", after)
+        self.assertNotIn("ferry", after.get("provider", {}))
+        self.assertFalse(os.path.exists(self.path(".config", "opencode", "tui.json")))
+
+    # --- opencode.json: plugin ---------------------------------------------
+    def test_the_canonical_spec_goes_and_a_local_fork_stays(self):
+        self.write_oc({"plugin": [GOAL_SPEC, LOCAL_FORK, "unrelated-plugin"]})
+
+        out = self.run_script(CLEANUP).stdout
+
+        after = self.read_json(".config", "opencode", "opencode.json")
+        self.assertEqual(after["plugin"], [LOCAL_FORK, "unrelated-plugin"])
+        self.assertIn("Removed goal plugin entry", out)
+
+    def test_every_older_spelling_goes_including_the_tuple_form(self):
+        """ensure_goal_plugin() rewrote all of these onto machines over time."""
+        self.write_oc({"plugin": [
+            "opencode-goal-plugin",
+            "@prevalentware/opencode-goal-plugin",
+            "github:sblattj/OpenCode-goal-plugin#v0.9.1",
+            "git+https://github.com/sblattj/OpenCode-goal-plugin.git",
+            ["opencode-goal-plugin@https://github.com/willytop8/OpenCode-goal-plugin"
+             "/archive/refs/tags/v0.8.0.tar.gz", {"enabled": True}],
+            "keep-me",
+        ]})
+
+        self.run_script(CLEANUP)
+
+        self.assertEqual(self.read_json(".config", "opencode", "opencode.json")["plugin"],
+                         ["keep-me"])
+
+    def test_a_local_fork_on_its_own_leaves_the_file_byte_identical(self):
+        """A path is the ONLY way to name a private fork, so it is never ours."""
+        p = self.write_oc({"plugin": [LOCAL_FORK], "model": "someprovider/m"})
+        before = self.raw(".config", "opencode", "opencode.json")
+
+        dry = self.run_script(CLEANUP, "--dry-run").stdout
+        self.assertIn("would be left alone", dry)
+        self.run_script(CLEANUP)
+
+        self.assertEqual(before, self.raw(".config", "opencode", "opencode.json"))
+        self.assertEqual(self.oc_files(), ["opencode.json"], "a snapshot was taken")
+
+    # --- opencode.json: command.goal ---------------------------------------
+    def test_a_verbatim_goal_command_goes_and_the_others_stay(self):
+        self.write_oc({"plugin": [GOAL_SPEC],
+                       "command": {"goal": dict(GOAL_COMMAND),
+                                   "mine": {"template": "hello"}}})
+
+        self.run_script(CLEANUP)
+
+        after = self.read_json(".config", "opencode", "opencode.json")
+        self.assertEqual(after["command"], {"mine": {"template": "hello"}})
+
+    def test_an_edited_goal_command_survives(self):
+        mine = dict(GOAL_COMMAND, template="$ARGUMENTS — and do it my way")
+        self.write_oc({"plugin": [GOAL_SPEC], "command": {"goal": mine}})
+
+        self.run_script(CLEANUP)
+
+        after = self.read_json(".config", "opencode", "opencode.json")
+        self.assertEqual(after["command"]["goal"], mine)
+        # ...while the plugin entry beside it still went.
+        self.assertNotIn("plugin", after)
+
+    def test_the_emptied_plugin_and_command_keys_are_dropped_entirely(self):
+        """An empty list/dict left behind is ferry's litter, not a user setting."""
+        self.write_oc({"plugin": [GOAL_SPEC], "command": {"goal": dict(GOAL_COMMAND)},
+                       "theme": "opencode"})
+
+        out = self.run_script(CLEANUP).stdout
+
+        after = self.read_json(".config", "opencode", "opencode.json")
+        self.assertEqual(after, {"theme": "opencode"})
+        self.assertIn("Removed the now-empty 'plugin' list", out)
+        self.assertIn("Removed the now-empty 'command' block", out)
+
+    # --- tui.json -----------------------------------------------------------
+    def test_tui_json_is_deleted_when_it_held_nothing_but_our_entry(self):
+        self.write_oc({"$schema": "https://opencode.ai/tui.json", "plugin": [GOAL_SPEC]},
+                      name="tui.json")
+
+        out = self.run_script(CLEANUP).stdout
+
+        self.assertFalse(os.path.exists(self.path(".config", "opencode", "tui.json")))
+        self.assertIn("it held nothing but ferry's plugin entry", out)
+        # Deleted, not snapshotted: a snapshot would be the same trace by
+        # another name.
+        self.assertEqual(self.oc_files(), [])
+
+    def test_tui_json_is_rewritten_with_a_snapshot_when_it_holds_more(self):
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": [GOAL_SPEC, LOCAL_FORK],
+                       "theme": {"name": "mine"}}, name="tui.json")
+
+        self.run_script(CLEANUP)
+
+        after = self.read_json(".config", "opencode", "tui.json")
+        self.assertEqual(after["plugin"], [LOCAL_FORK])
+        self.assertEqual(after["theme"], {"name": "mine"})
+        snaps = [f for f in self.oc_files()
+                 if f.startswith("tui.") and f.endswith(".jsonc")]
+        self.assertEqual(len(snaps), 1, self.oc_files())
+
+    def test_a_tui_json_that_is_none_of_ours_is_left_byte_identical(self):
+        self.write_oc({"theme": {"name": "mine"}, "plugin": ["someone-elses-plugin"]},
+                      name="tui.json")
+        before = self.raw(".config", "opencode", "tui.json")
+
+        self.run_script(CLEANUP)
+
+        self.assertEqual(before, self.raw(".config", "opencode", "tui.json"))
+        self.assertEqual(self.oc_files(), ["tui.json"])
+
+    def test_a_missing_tui_json_is_reported_not_an_error(self):
+        self.write_oc({"model": "someprovider/m"})
+        out = self.run_script(CLEANUP).stdout
+        self.assertIn("tui.json ...", out)
+        self.assertIn("Not present — skipping.", out)
+
+    # --- dry run and idempotence -------------------------------------------
+    def test_dry_run_reports_both_files_and_changes_neither(self):
+        self.write_oc({"plugin": [GOAL_SPEC], "command": {"goal": dict(GOAL_COMMAND)}})
+        self.write_oc({"$schema": "https://opencode.ai/tui.json", "plugin": [GOAL_SPEC]},
+                      name="tui.json")
+        before = (self.raw(".config", "opencode", "opencode.json"),
+                  self.raw(".config", "opencode", "tui.json"))
+
+        out = self.run_script(CLEANUP, "--dry-run").stdout
+
+        self.assertIn("would remove the goal plugin entry from", out)
+        self.assertIn("would remove the /goal command from", out)
+        self.assertIn("would delete", out)
+        self.assertEqual(before, (self.raw(".config", "opencode", "opencode.json"),
+                                  self.raw(".config", "opencode", "tui.json")))
+        self.assertEqual(self.oc_files(), ["opencode.json", "tui.json"])
+
+    def test_a_second_cleanup_is_a_no_op(self):
+        """Cleanup gets run twice all the time — the second must not re-snapshot."""
+        self.run_script(BOOTSTRAP)
+        self.run_script(CLEANUP)
+        before = self.raw(".config", "opencode", "opencode.json")
+        listing = self.oc_files()
+
+        out = self.run_script(CLEANUP).stdout
+
+        self.assertEqual(before, self.raw(".config", "opencode", "opencode.json"))
+        self.assertEqual(listing, self.oc_files())
+        self.assertIn("Nothing ferry-shaped found — file left unchanged.", out)
+
+
 class ScriptContractTest(unittest.TestCase):
     """Cheap static checks for the two ways these scripts drift apart."""
 
@@ -596,6 +803,25 @@ class ScriptContractTest(unittest.TestCase):
             text = self.read(path)
             self.assertIn("HOST_MDNS_PLACEHOLDER", text, path)
             self.assertIn("SHARE_PORT_PLACEHOLDER", text, path)
+
+    def test_cleanup_knows_every_goal_spelling_ferry_can_write(self):
+        """client-cleanup.sh re-implements is_goal_spec()/GOAL_COMMAND (it is
+        piped into zsh, so it cannot import lib/). Both copies must list the
+        same spellings, or a cleanup silently leaves one behind."""
+        integrate = self.read(os.path.join(REPO, "lib", "ferry-integrate.zsh"))
+        cleanup = self.read(CLEANUP)
+        for spelling in ("opencode-goal-plugin",
+                         "@prevalentware/opencode-goal-plugin",
+                         "willytop8/opencode-goal-plugin",
+                         "github:willytop8/opencode-goal-plugin",
+                         "sblattj/opencode-goal-plugin"):
+            self.assertIn(f'"{spelling}"', integrate, spelling)
+            self.assertIn(f'"{spelling}"', cleanup, spelling)
+        for part in ("Set a session-scoped goal and auto-continue until complete.",
+                     '"template": "$ARGUMENTS"',
+                     '"agent": "build"'):
+            self.assertIn(part, integrate, part)
+            self.assertIn(part, cleanup, part)
 
     def test_reset_threads_a_stored_master_key_through_to_the_cli(self):
         """v1.22.0: a reset re-applies the key the bootstrap stored — as --key,

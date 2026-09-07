@@ -218,7 +218,9 @@ curl -fsSL http://your-mac.local:8095/client-cleanup.sh | zsh                   
 
 The inverse of the bootstrap, and scope-agnostic: it removes whatever is actually there, so it undoes a default install, a `--profiles-only` one, and a `--no-opencode` one without being told which. Out go the `ferry` CLI, `~/.config/ferry` (profile, lane profiles, snapshots, telemetry), the `~/.zshrc` wrapper block and `host-code` alias, and the guardrail files — under both the `skill/` and `skills/` spellings, since the two installers disagree.
 
-It edits `~/.config/opencode/opencode.json` **surgically**: only the provider ferry wrote (the `ferry` provider entry) is removed, the file is snapshotted to `.<UTC>.jsonc` first, and a config with no ferry provider in it is left byte-identical. Your own providers, MCP servers and commands survive.
+It edits `~/.config/opencode/opencode.json` **surgically**: the provider ferry wrote (the `ferry` provider entry), the goal-plugin entry it appended to `plugin`, and the `/goal` command it merged into `command` are removed, the file is snapshotted to `.<UTC>.jsonc` first, and a config with nothing ferry-shaped in it is left byte-identical. Your own providers, MCP servers and commands survive.
+
+The same goal-plugin entry is taken out of `~/.config/opencode/tui.json` — the TUI half `ferry opencode` has mirrored there since v1.30.1 — and that file is deleted outright when the entry was all it held. Two things are ferry's to remove and two are not: a **local filesystem path** to your own fork of the plugin is never touched (a path is the only way to name a private fork), and a `/goal` command you edited stays exactly as you wrote it — only the verbatim one ferry wrote goes.
 
 Two things it deliberately keeps: the `opencode` binary (not ferry's to uninstall) and `~/.local/share/opencode`, your session history — `--full --yes` is the only way to delete that, and `--full` without `--yes` is refused outright so a piped fat-finger can't wipe it.
 

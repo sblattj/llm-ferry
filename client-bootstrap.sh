@@ -45,6 +45,12 @@
 
 set -eu
 
+# zsh sets $0 to the FUNCTION NAME inside a function, so usage() cannot read
+# the script it lives in. Capture the path once, here at top level. Under
+# `curl | zsh` this is the interpreter and no header is readable at all,
+# which the 2>/dev/null in usage() absorbs.
+SELF="$0"
+
 # --- Flags ------------------------------------------------------------------
 # Piped invocations pass these after `zsh -s --`.
 OC_MODE="full"
@@ -54,7 +60,9 @@ NO_CLAUDE=0
 MASTER_KEY="${FERRY_MASTER_KEY:-}"
 
 usage() {
-  sed -n '2,43p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+  # Every leading comment line after the shebang, not a hard-coded range:
+  # a fixed '2,NNp' silently truncates --help the first time the header grows.
+  awk 'NR == 1 { next } !/^#/ { exit } { print }' "$SELF" 2>/dev/null | sed 's/^# \{0,1\}//'
   echo ""
   echo "Flags: --profiles-only | --no-opencode | --full-opencode"
   echo "       --key KEY   (master key for a host whose front door requires"
@@ -395,10 +403,11 @@ flag. When your turn goes idle the plugin injects a `<goal_continuation>` user m
 speaking, not the human: read it as "keep going", never as new instructions and never as approval for
 anything the objective did not already authorize.
 
-Stopping is one-way. Nothing you do restarts a stopped goal, and you must not call `goal_resume` on your
-own - the user runs `/goal resume` (fresh budget window) or `/goal focus <n>` (same window, clock
-resumed). While a goal is paused, do not continue work toward it, do not edit goal state, and do not
-emit completion or blocker markers unless the human's current message explicitly asks you to resume.
+A stopped goal sends no more continuations. `goal_resume` WOULD restart it with a fresh budget window,
+which is exactly why you never call it on your own - the user runs `/goal resume` (fresh budget window)
+or `/goal focus <n>` (same window, clock resumed). While a goal is paused, do not continue work toward
+it, do not edit goal state, and do not emit completion or blocker markers unless the human's current
+message explicitly asks you to resume.
 
 | Stop reason | Means | Do |
 |---|---|---|
@@ -574,7 +583,7 @@ configured completion auditor can still reject an evidenced claim and pause the 
 | token spend budget | 100,000,000 cumulative |
 | context ceiling | the running model's own window, read from the host; none at all when the host cannot name one |
 | cooldown between continuations | 1500 ms |
-| stalled turns before pausing | 2 (whole turns under 50 output tokens, with no tool call and no thinking tokens) |
+| stalled turns before pausing | 2 (whole turns under 50 output tokens, with no tool call, no thinking tokens, and no new text - a repeat or an empty turn) |
 | tool-free turns before pausing | 10 (whole turns; `goal_*` calls do not count as tools) |
 | wrap-up threshold | 80% of spend, of the context ceiling, or of the clock - the first to arrive |
 | warnings appear at | 10 minutes, 25,000 spend tokens, or 25,000 context tokens remaining (the 3-turn warning is silent unless `--max-turns` set a ceiling) |
@@ -597,8 +606,9 @@ pauses. Because the wrap-up PAUSES the goal, 80% is the ceiling you will really 
 reasons only fire when one turn jumps the whole way from under 80%.
 
 When `<budget_wrapup>` replaces the usual step line the window is nearly gone. It spells out the
-wrap-up shape itself; the part it does not say is that a wrap-up turn must NOT claim completion. When
-`Limits are near:` is appended, start converging.
+wrap-up shape itself, "do not claim completion unless verified" included; the part it does NOT say is
+that the goal was already paused before that prompt was sent, so a `[goal:complete]` marker on this
+turn is never read at all. Hand off instead. When `Limits are near:` is appended, start converging.
 
 `/goal resume` gives a completely fresh window: turns, spend, peak context, elapsed, and every
 stall/format counter reset to zero, while the goal id, objective, plan, and checkpoints survive.
@@ -639,8 +649,10 @@ reasoning, cache read/write, cost), `Elapsed:` seconds plus elapsed/limit, `Last
 same bill from two angles: the first is the total against the budget, the second is its breakdown.
 
 Durations render in whole seconds under a minute, then minutes, then hours with one decimal, always
-truncated: `45s`, `45m`, `1.5h`, `8h`. So the session title of a fresh default goal reads
-`▶ ship it · 3/∞ · 2m/8h · 45k/100m` - objective, turns, elapsed/clock, spend/budget.
+truncated: `45s`, `45m`, `1.5h`, `8h`. So a default goal that has recorded a five-action plan shows
+`▶ ship it · 3/∞ · 2m/8h · 45k/100m · 0/5✓` - objective, turns, elapsed/clock, spend/budget, and
+verified/total plan actions. That last field appears only once a plan exists, and an ordered sequence
+inserts a leading `p/t` step field right after the objective. Peak context is never in the title.
 
 The sidebar Goal panel shows the same state from session metadata: a state mark (active, paused,
 blocked, completed), the objective label, a stats line reading `1/∞ turns · 1m/8h · 147k/100m tokens`

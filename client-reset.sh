@@ -57,7 +57,9 @@ for arg in "$@"; do
     --profiles-only) OC_MODE_OVERRIDE="profiles" ;;
     --full-opencode) OC_MODE_OVERRIDE="full" ;;
     -h|--help)
-      sed -n '2,40p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
+      # Every leading comment line after the shebang, not a hard-coded
+      # range: a fixed '2,NNp' truncates --help when the header grows.
+      awk 'NR == 1 { next } !/^#/ { exit } { print }' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'
       echo ""
       echo "Flags: --profiles-only | --no-opencode | --full-opencode | --help"
       exit 0 ;;

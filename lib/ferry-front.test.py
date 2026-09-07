@@ -1234,7 +1234,10 @@ class MainWorkersTest(unittest.TestCase):
         fake.run = lambda *a, **kw: captured.update(kw)
         sys.modules["uvicorn"] = fake
         try:
-            rc = FF.main(argv)
+            # main() also logs which ChatGPT instruction override it exported;
+            # swallow it here so this class's subject stays the worker count.
+            with mock.patch("sys.stdout", io.StringIO()):
+                rc = FF.main(argv)
         finally:
             sys.modules.pop("uvicorn", None)
         return rc, captured
@@ -1242,10 +1245,13 @@ class MainWorkersTest(unittest.TestCase):
     def setUp(self):
         os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
         os.environ.pop("CONFIG_FILE_PATH", None)
+        os.environ.pop(FF.CHATGPT_INSTRUCTIONS_ENV, None)
 
     def tearDown(self):
         os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
         os.environ.pop("CONFIG_FILE_PATH", None)
+        # main() exports this into the REAL environment; never leak it.
+        os.environ.pop(FF.CHATGPT_INSTRUCTIONS_ENV, None)
 
     def test_single_worker_sets_no_multiproc_dir(self):
         rc, captured = self._run_main(["--config", "x.yaml", "--port", "8090"])
@@ -2873,6 +2879,275 @@ class TestRequestMetrics(unittest.TestCase):
             _, delivered, _ = self.run_request({}, messages)
         self.assertEqual(delivered, messages)
         self.assertIs(self.records[0]["response_complete"], True)
+
+
+class TestChatGptInstructions(unittest.TestCase):
+    """The Codex prompt litellm injects ahead of every client system prompt.
+
+    litellm's ChatGPT provider prepends CHATGPT_DEFAULT_INSTRUCTIONS ("You are
+    Codex ... running as a coding agent in the Codex CLI ... if you notice
+    unexpected changes you didn't make, STOP IMMEDIATELY") to the request's
+    instructions, so the client's own prompt arrives SECOND and argues with it.
+    On this host that clause makes a lane abandon a task the moment another
+    agent touches a file in the repo.
+
+    The override is read per request via `os.getenv(...) or DEFAULT`, so an
+    empty string is not an override — every branch below is asserted against
+    that trap, because a blank file silently restoring the Codex prompt is the
+    failure this whole path exists to prevent.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.home = self.dir.name
+
+    def tearDown(self):
+        # main() writes the REAL environment; never leak it into the rest of
+        # the suite (or into anything that later imports litellm).
+        os.environ.pop(FF.CHATGPT_INSTRUCTIONS_ENV, None)
+        os.environ.pop("CONFIG_FILE_PATH", None)
+
+    def _user_file(self, text):
+        path = FF.user_chatgpt_instructions_path(self.home)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def _loose_file(self, name, text):
+        path = os.path.join(self.home, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return path
+
+    def _resolve(self, env):
+        return FF.resolve_chatgpt_instructions(env, self.home)
+
+    # ---- (a) the opt-out -------------------------------------------------
+    def test_off_keeps_litellms_own_prompt(self):
+        self._user_file("Would have won.\n")
+        for spelling in ("off", "OFF", "  Off  "):
+            with self.subTest(spelling=spelling):
+                text, label = self._resolve({FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: spelling})
+                self.assertIsNone(text)
+                self.assertEqual(label, "off: litellm's built-in Codex prompt")
+
+    def test_off_outranks_an_operator_env(self):
+        text, label = self._resolve({
+            FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: "off",
+            FF.CHATGPT_INSTRUCTIONS_ENV: "operator text",
+        })
+        self.assertIsNone(text)
+        self.assertEqual(label, "off: litellm's built-in Codex prompt")
+
+    # ---- (b) the operator's own export wins outright ---------------------
+    def test_an_operator_env_is_never_overwritten(self):
+        self._user_file("ferry would have used this.\n")
+        text, label = self._resolve({FF.CHATGPT_INSTRUCTIONS_ENV: "operator text"})
+        self.assertIsNone(text)
+        self.assertEqual(label, "operator env CHATGPT_DEFAULT_INSTRUCTIONS")
+
+    def test_a_blank_operator_env_is_not_an_override(self):
+        # litellm's `os.getenv(...) or DEFAULT` treats "" as unset, so a blank
+        # value must NOT be mistaken for the operator having decided anything.
+        self._user_file("From the user file.\n")
+        text, label = self._resolve({FF.CHATGPT_INSTRUCTIONS_ENV: "   \n"})
+        self.assertEqual(text, "From the user file.")
+        self.assertTrue(label.startswith("file "), label)
+
+    # ---- (c) an explicit path --------------------------------------------
+    def test_an_explicit_path_beats_the_user_file(self):
+        self._user_file("user file\n")
+        path = self._loose_file("explicit.txt", "Explicit prompt.\n")
+        text, label = self._resolve({FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: path})
+        self.assertEqual(text, "Explicit prompt.")
+        self.assertEqual(label, "file %s" % path)
+
+    def test_an_explicit_path_expands_a_tilde(self):
+        path = self._loose_file("tilde.txt", "Tilde prompt.\n")
+        with mock.patch.dict(os.environ, {"HOME": self.home}):
+            text, label = self._resolve(
+                {FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: "~/tilde.txt"})
+        self.assertEqual(text, "Tilde prompt.")
+        self.assertEqual(label, "file %s" % path)
+
+    def test_a_missing_explicit_path_warns_and_falls_back(self):
+        self._user_file("Fallback prompt.\n")
+        missing = os.path.join(self.home, "gone.txt")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            text, label = self._resolve({FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: missing})
+        self.assertEqual(text, "Fallback prompt.")
+        self.assertEqual(label, "file %s" % FF.user_chatgpt_instructions_path(self.home))
+        self.assertIn(missing, err.getvalue())          # the warning names the path
+        self.assertEqual(err.getvalue().count("\n"), 1)  # one line, not a traceback
+
+    def test_a_blank_explicit_path_falls_back_rather_than_blanking(self):
+        self._user_file("Fallback prompt.\n")
+        blank = self._loose_file("blank.txt", "  \n\n\t\n")
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            text, label = self._resolve({FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: blank})
+        self.assertEqual(text, "Fallback prompt.")
+        self.assertIn(blank, err.getvalue())
+
+    # ---- (d) the user file ------------------------------------------------
+    def test_the_user_file_beats_the_shipped_default(self):
+        path = self._user_file("Mine, not ferry's.\n")
+        text, label = self._resolve({})
+        self.assertEqual(text, "Mine, not ferry's.")
+        self.assertEqual(label, "file %s" % path)
+
+    def test_the_user_path_is_under_config_ferry(self):
+        self.assertEqual(
+            FF.user_chatgpt_instructions_path(self.home),
+            os.path.join(self.home, ".config", "ferry", "chatgpt-instructions.txt"))
+        self.assertTrue(
+            FF.user_chatgpt_instructions_path().startswith(os.path.expanduser("~")))
+
+    def test_a_blank_user_file_falls_through_to_the_shipped_default(self):
+        self._user_file("\n   \n")
+        text, label = self._resolve({})
+        self.assertEqual(label, "ferry default (front/chatgpt-instructions.txt)")
+        self.assertIn("You are not running in the Codex CLI", text)
+
+    # ---- (e) the shipped default -----------------------------------------
+    def test_the_shipped_default_is_the_last_resort(self):
+        text, label = self._resolve({})
+        self.assertEqual(label, "ferry default (front/chatgpt-instructions.txt)")
+        self.assertTrue(text)
+
+    def test_the_shipped_file_denies_the_codex_cli_runtime(self):
+        with open(FF.SHIPPED_CHATGPT_INSTRUCTIONS, "rb") as fh:
+            raw = fh.read()
+        self.assertTrue(raw.strip(), "the shipped prompt must not be blank")
+        raw.decode("ascii")                       # ASCII: it rides an env var
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertFalse(raw.endswith(b"\n\n"))   # exactly one trailing newline
+        text = raw.decode("ascii")
+        # The claim under test is about the model's RUNTIME, not the substring:
+        # it must say ferry, and must contradict rather than echo litellm's
+        # "you are running as a coding agent in the Codex CLI".
+        self.assertIn("You are not running in the Codex CLI", text)
+        self.assertIn("llm-ferry", text)
+        self.assertNotIn("You are Codex", text)
+        self.assertNotIn("running as a coding agent in the Codex CLI", text)
+
+    # ---- (f) nothing readable at all --------------------------------------
+    def test_nothing_readable_leaves_litellms_prompt_and_warns(self):
+        missing = os.path.join(self.home, "not-shipped.txt")
+        err = io.StringIO()
+        with mock.patch.object(FF, "SHIPPED_CHATGPT_INSTRUCTIONS", missing):
+            with mock.patch("sys.stderr", err):
+                text, label = self._resolve({})
+        self.assertIsNone(text)
+        self.assertEqual(label, "unavailable: litellm's built-in Codex prompt")
+        self.assertIn(missing, err.getvalue())
+
+    # ---- reading rules ----------------------------------------------------
+    def test_trailing_whitespace_goes_but_the_text_never_empties(self):
+        path = self._loose_file("padded.txt", "Line one.\nLine two.  \n\n\n")
+        text, _ = self._resolve({FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: path})
+        self.assertEqual(text, "Line one.\nLine two.")
+
+    def test_undecodable_bytes_do_not_raise(self):
+        path = os.path.join(self.home, "latin.txt")
+        with open(path, "wb") as fh:
+            fh.write(b"Caf\xe9 prompt.\n")
+        text, _ = self._resolve({FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: path})
+        self.assertTrue(text.startswith("Caf"))
+
+    def test_a_directory_in_place_of_the_file_is_survivable(self):
+        with mock.patch("sys.stderr", io.StringIO()):
+            text, label = self._resolve({FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: self.home})
+        self.assertEqual(label, "ferry default (front/chatgpt-instructions.txt)")
+        self.assertTrue(text)
+
+    # ---- apply ------------------------------------------------------------
+    def test_apply_exports_the_resolved_text(self):
+        self._user_file("Applied prompt.\n")
+        env = {}
+        label = FF.apply_chatgpt_instructions(env, self.home)
+        self.assertEqual(env[FF.CHATGPT_INSTRUCTIONS_ENV], "Applied prompt.")
+        self.assertEqual(label, "file %s" % FF.user_chatgpt_instructions_path(self.home))
+
+    def test_apply_sets_nothing_when_there_is_no_text(self):
+        env = {FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: "off"}
+        label = FF.apply_chatgpt_instructions(env, self.home)
+        self.assertNotIn(FF.CHATGPT_INSTRUCTIONS_ENV, env)
+        self.assertEqual(label, "off: litellm's built-in Codex prompt")
+
+    def test_apply_is_idempotent(self):
+        # build_app() calls this again inside every uvicorn worker, on an
+        # environment main() already exported into. The second pass must not
+        # double-write, blank, or otherwise disturb the value.
+        self._user_file("Applied prompt.\n")
+        env = {}
+        FF.apply_chatgpt_instructions(env, self.home)
+        second = FF.apply_chatgpt_instructions(env, self.home)
+        self.assertEqual(env, {FF.CHATGPT_INSTRUCTIONS_ENV: "Applied prompt."})
+        self.assertEqual(second, "operator env CHATGPT_DEFAULT_INSTRUCTIONS")
+
+    # ---- build_app() ------------------------------------------------------
+    def test_build_app_applies_before_it_imports_litellm(self):
+        # uvicorn's `--factory` launch enters build_app in EVERY worker; a
+        # factory-only start (or a worker respawn) never runs main(). Blocking
+        # the litellm import proves the export already happened by then, with
+        # no litellm installed and no proxy app ever constructed.
+        calls = []
+        blocked = {"litellm": None, "litellm.proxy": None,
+                   "litellm.proxy.proxy_server": None}
+        with mock.patch.object(FF, "apply_chatgpt_instructions",
+                               side_effect=lambda *a, **k: calls.append(a) or "test"):
+            with mock.patch.dict(sys.modules, blocked):
+                with self.assertRaises(ImportError):
+                    FF.build_app()
+        self.assertEqual(len(calls), 1, "build_app must apply the override once")
+
+    # ---- main() -----------------------------------------------------------
+    def test_main_exports_and_logs_before_uvicorn_runs(self):
+        import types
+        seen = {}
+        fake = types.ModuleType("uvicorn")
+        # Reading the env from inside run() proves the export happened BEFORE
+        # uvicorn (and so before it spawns workers, which snapshot os.environ).
+        fake.run = lambda *a, **kw: seen.update(
+            env=os.environ.get(FF.CHATGPT_INSTRUCTIONS_ENV))
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(FF.FERRY_CHATGPT_INSTRUCTIONS_ENV, None)
+            os.environ.pop(FF.CHATGPT_INSTRUCTIONS_ENV, None)
+            sys.modules["uvicorn"] = fake
+            try:
+                with mock.patch("sys.stdout", out):
+                    rc = FF.main(["--config", "x.yaml", "--port", "8090"])
+            finally:
+                sys.modules.pop("uvicorn", None)
+        self.assertEqual(rc, 0)
+        self.assertIn("[front] chatgpt instructions: ", out.getvalue())
+        self.assertIn("You are not running in the Codex CLI", seen["env"])
+
+    def test_main_reports_the_opt_out_without_exporting(self):
+        import types
+        seen = {}
+        fake = types.ModuleType("uvicorn")
+        fake.run = lambda *a, **kw: seen.update(
+            env=os.environ.get(FF.CHATGPT_INSTRUCTIONS_ENV, "<unset>"))
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {FF.FERRY_CHATGPT_INSTRUCTIONS_ENV: "off"}):
+            os.environ.pop(FF.CHATGPT_INSTRUCTIONS_ENV, None)
+            sys.modules["uvicorn"] = fake
+            try:
+                with mock.patch("sys.stdout", out):
+                    rc = FF.main(["--config", "x.yaml", "--port", "8090"])
+            finally:
+                sys.modules.pop("uvicorn", None)
+        self.assertEqual(rc, 0)
+        self.assertIn(
+            "[front] chatgpt instructions: off: litellm's built-in Codex prompt",
+            out.getvalue())
+        self.assertEqual(seen["env"], "<unset>")
 
 
 if __name__ == "__main__":

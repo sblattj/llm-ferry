@@ -100,6 +100,17 @@ class ClientHarness(unittest.TestCase):
         e["SHARE_PORT"] = str(port if port is not None else self.port)
         # A client is not expected to carry the host's own config pointer.
         e.pop("OPENCODE_CONFIG", None)
+        e.pop("OPENCODE_TUI_CONFIG", None)
+        # ...nor the author's XDG roots. Since v1.30.1 `ferry opencode` reads
+        # both: XDG_CONFIG_HOME decides whether the config it writes IS the
+        # global takeover target (and so whether tui.json is mirrored), and
+        # XDG_CACHE_HOME is where orphaned plugin package directories are
+        # purged from. Left inherited, this suite would write into the author's
+        # ~/.config/opencode and delete out of their ~/.cache/opencode while
+        # $HOME says otherwise — and the narrow-scope ABSENCE assertions below
+        # would be checking the wrong directory entirely.
+        e.pop("XDG_CONFIG_HOME", None)
+        e.pop("XDG_CACHE_HOME", None)
         # ...nor a stray master key from the operator's shell.
         e.pop("FERRY_MASTER_KEY", None)
         if master_key is not None:
@@ -240,6 +251,12 @@ class ClientScopeTest(ClientHarness):
         self.assertIn('"$lane" == "super"', rc)
         self.assertIn("alias host-code='opencode'", rc)
         self.assertTrue(os.path.exists(self.path(".config", "opencode", "command", "fan-out.md")))
+        # v1.30.1: the goal plugin's TUI half is loaded from tui.json and
+        # nowhere else, so the full takeover has to write one beside the config
+        # it just took over (packages/opencode/src/config/tui.ts:157-210).
+        tui = self.read_json(".config", "opencode", "tui.json")
+        self.assertTrue(any("opencode-goal-plugin@" in str(p) for p in tui["plugin"]),
+                        tui)
 
     def test_full_scope_bare_opencode_follows_the_super_last_lane(self):
         """Behavioral last-lane routing: `super` written to last-lane, bare

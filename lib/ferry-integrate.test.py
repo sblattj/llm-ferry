@@ -133,19 +133,42 @@ class FerryOpencodeCase(unittest.TestCase):
         self.dir = tempfile.mkdtemp(prefix="ferry-oc-")
         self.addCleanup(shutil.rmtree, self.dir, True)
         self.cfg = os.path.join(self.dir, "opencode.json")
+        # HERMETIC BY DEFAULT. Since v1.30.1 `ferry opencode` reads
+        # XDG_CONFIG_HOME (to decide whether the config it is writing IS the
+        # global takeover target, and so whether to mirror the entry into
+        # tui.json) and XDG_CACHE_HOME (to purge orphaned per-spec package
+        # directories). Inheriting the author's real ones would let the suite
+        # write into ~/.config/opencode and delete out of ~/.cache/opencode.
+        self.xdg_config = os.path.join(self.dir, "xdg-config")
+        self.xdg_cache = os.path.join(self.dir, "xdg-cache")
+        os.makedirs(self.xdg_config, exist_ok=True)
+        os.makedirs(self.xdg_cache, exist_ok=True)
 
-    def run_ferry(self, *extra, config=None, port=None, home=None):
+    def packages_root(self):
+        return os.path.join(self.xdg_cache, "opencode", "packages")
+
+    def run_ferry(self, *extra, config=None, port=None, home=None,
+                  install=False, cache=None, xdg_config=None, env_extra=None):
         cfg = config or self.cfg
         cmd = ["zsh", FERRY, "opencode", "--host", "127.0.0.1",
                "--port", str(port if port is not None else self.port),
                "--config", cfg, *extra]
+        # The pre-install pass shells out to the real `opencode`; every case
+        # that is not ABOUT it opts out, or the suite would hit the network.
+        if not install and "--no-install" not in extra:
+            cmd.append("--no-install")
         # env -u OPENCODE_CONFIG equivalent: the command honours it as the
         # default target, and an inherited one would silently redirect the write.
-        env = {k: v for k, v in os.environ.items() if k != "OPENCODE_CONFIG"}
+        skip = {"OPENCODE_CONFIG", "OPENCODE_TUI_CONFIG"}
+        env = {k: v for k, v in os.environ.items() if k not in skip}
+        env["XDG_CONFIG_HOME"] = xdg_config or self.xdg_config
+        env["XDG_CACHE_HOME"] = cache or self.xdg_cache
         if home is not None:
             env["HOME"] = home
+        if env_extra:
+            env.update(env_extra)
         proc = subprocess.run(cmd, capture_output=True, text=True, env=env,
-                              cwd=REPO, timeout=60)
+                              cwd=REPO, timeout=180)
         self.assertEqual(proc.returncode, 0,
                          f"ferry opencode failed:\n{proc.stdout}\n{proc.stderr}")
         return proc.stdout
@@ -573,12 +596,20 @@ class TestSuperProfile(FerryOpencodeCase):
 
 
 class TestGoalPlugin(FerryOpencodeCase):
-    # The entry ferry writes is PINNED to a git ref: opencode caches a git
-    # plugin under ~/.cache/opencode/packages/<spec> and never refreshes it
-    # once node_modules exists, so the spec string has to change for a new
-    # plugin version to install. Bump alongside GOAL_PLUGIN_REF.
+    # The entry ferry writes is the NAME-PREFIXED TARBALL form, and nothing
+    # else. On opencode 1.18.29 a bare `github:`/URL spec has no npm name, so
+    # `npa(pkg).name ?? pkg` yields the raw spec and Npm.add throws AFTER a
+    # successful reify (packages/core/src/npm.ts:117-134) — the package is on
+    # disk and the plugin never loads, with nothing logged. Any GIT spec whose
+    # package.json declares build/prepack additionally dies in pacote's prepare
+    # step inside the bun binary. The ref is still pinned because the spec
+    # string IS opencode's cache key. Bump alongside GOAL_PLUGIN_REF.
+    REF = "v0.10.1"
+    PKG = "opencode-goal-plugin"
     BASE = "github:sblattj/OpenCode-goal-plugin"
-    PLUGIN = "github:sblattj/OpenCode-goal-plugin#v0.9.1"
+    TARBALL = (f"https://github.com/sblattj/OpenCode-goal-plugin"
+               f"/archive/refs/tags/{REF}.tar.gz")
+    PLUGIN = f"{PKG}@{TARBALL}"
     GOAL_COMMAND = {
         "description": "Set a session-scoped goal and auto-continue until complete.",
         "template": "$ARGUMENTS",
@@ -756,6 +787,448 @@ class TestGoalPlugin(FerryOpencodeCase):
         out = self.run_ferry()
         self.assertIn(self.PLUGIN, out)
         self.assertNotIn("upstream not added", out)
+
+    # ── v1.30.1: every spelling ferry ever wrote is an UNLOADABLE spec ─────
+    # Each of these installed to disk on opencode 1.18.29 and was then silently
+    # discarded, so a machine carrying one has never once run the plugin.
+    def test_the_v1294_bare_github_pin_is_migrated(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [f"{self.BASE}#v0.9.1"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_a_name_prefixed_git_spec_is_migrated(self):
+        """Name-prefixed fixes the npa defect but NOT the pacote prepare defect:
+        the plugin has declared build+prepack since v0.9.1, so a git spec still
+        dies with `git dep preparation failed`. Only the tarball is immune."""
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [f"{self.PKG}@{self.BASE}#v0.9.0"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_an_older_tarball_url_is_migrated(self):
+        old = ("https://github.com/sblattj/OpenCode-goal-plugin"
+               "/archive/refs/tags/v0.9.1.tar.gz")
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [old]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_an_older_named_tarball_is_migrated(self):
+        old = f"{self.PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [old]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_a_git_plus_https_url_is_migrated(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [
+                "git+https://github.com/sblattj/OpenCode-goal-plugin.git#v0.9.0"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_a_willytop8_tarball_is_migrated(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [
+                "https://github.com/willytop8/opencode-goal-plugin/archive/refs/tags/v0.8.2.tar.gz"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_a_bare_github_tuple_is_migrated_and_keeps_its_options(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [[f"{self.BASE}#v0.9.1", {"enabled": True}]]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [[self.PLUGIN, {"enabled": True}]])
+
+    def test_a_tarball_tuple_is_migrated_and_keeps_its_options(self):
+        old = f"{self.PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [[old, {"enabled": False}]]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [[self.PLUGIN, {"enabled": False}]])
+
+    def test_every_dead_spelling_at_once_collapses_to_one_entry(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [
+                "some-other-plugin",
+                f"{self.BASE}#v0.9.1",
+                f"{self.PKG}@{self.BASE}#v0.9.0",
+                "https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.9.1.tar.gz",
+                "@prevalentware/opencode-goal-plugin",
+            ]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], ["some-other-plugin", self.PLUGIN])
+
+    def test_an_unrelated_plugin_naming_another_owner_is_untouched(self):
+        """Control for the repo-substring rule: it must key on OUR repo, not on
+        the words `opencode` and `plugin` appearing near each other."""
+        other = "github:someoneelse/opencode-tidy-plugin#v1.0.0"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [other]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [other, self.PLUGIN])
+
+    def test_a_local_path_naming_our_repo_is_still_left_alone(self):
+        """A fork checked out under a `sblattj/OpenCode-goal-plugin` directory
+        matches the repo substring, and must STILL not be rewritten - a path is
+        the only way to name a private fork."""
+        fork = "/Users/someone/code/sblattj/OpenCode-goal-plugin/dist/server.js"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [fork]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [fork])
+
+
+class TestGoalPluginTuiConfig(FerryOpencodeCase):
+    """The TUI half of the plugin is read from tui.json and NOWHERE else.
+
+    opencode.json's `plugin` array feeds the SERVER plugin loader. A module
+    loaded with kind:"tui" - the goal plugin's sidebar panel - comes from
+    tui.json/tui.jsonc in the global config dir, $OPENCODE_TUI_CONFIG, a project
+    tui file or a .opencode dir (packages/opencode/src/config/tui.ts:157-210).
+    Listing the spec only in opencode.json loads the server half and, silently,
+    nothing else.
+    """
+
+    PLUGIN = TestGoalPlugin.PLUGIN
+    BASE = TestGoalPlugin.BASE
+
+    def setUp(self):
+        super().setUp()
+        # The full-takeover target: ${XDG_CONFIG_HOME}/opencode/opencode.json.
+        # Deliberately NOT created here: several cases below assert that this
+        # directory never comes into existence, and a setUp that made it would
+        # turn those into assertions about setUp.
+        self.oc_dir = os.path.join(self.xdg_config, "opencode")
+        self.global_cfg = os.path.join(self.oc_dir, "opencode.json")
+        self.tui = os.path.join(self.oc_dir, "tui.json")
+
+    def read_tui(self, path=None):
+        with open(path or self.tui) as f:
+            return json.load(f)
+
+    def test_created_beside_the_global_config(self):
+        out = self.run_ferry(config=self.global_cfg)
+        self.assertEqual(self.read_tui(), {
+            "$schema": "https://opencode.ai/tui.json",
+            "plugin": [self.PLUGIN],
+        })
+        self.assertIn("tui.json: written", out)
+
+    def test_merged_into_an_existing_tui_config_without_touching_other_keys(self):
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.tui, "w") as f:
+            json.dump({"theme": "gruvbox", "plugin": ["their-tui-plugin"]}, f)
+        self.run_ferry(config=self.global_cfg)
+        data = self.read_tui()
+        self.assertEqual(data["theme"], "gruvbox")
+        self.assertEqual(data["plugin"], ["their-tui-plugin", self.PLUGIN])
+
+    def test_a_dead_spec_in_tui_json_is_migrated_too(self):
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.tui, "w") as f:
+            json.dump({"plugin": [f"{self.BASE}#v0.9.1"]}, f)
+        self.run_ferry(config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [self.PLUGIN])
+
+    def test_the_previous_tui_config_is_snapshotted(self):
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.tui, "w") as f:
+            f.write('{\n  // a comment json.dump could never round-trip\n  "theme": "gruvbox"\n}\n')
+        original = open(self.tui).read()
+        self.run_ferry(config=self.global_cfg)
+        snaps = [f for f in os.listdir(self.oc_dir)
+                 if re.match(r"^tui\.\d{8}T\d{6}Z(-\d+)?\.jsonc$", f)]
+        self.assertEqual(len(snaps), 1, os.listdir(self.oc_dir))
+        with open(os.path.join(self.oc_dir, snaps[0])) as f:
+            self.assertEqual(f.read(), original)
+
+    def test_not_created_when_the_config_lives_elsewhere(self):
+        """The ferry lane profiles (~/.config/ferry/opencode-*.json) and the
+        --profiles-only / --no-opencode client scopes must never bring
+        ~/.config/opencode into existence; that ABSENCE is what they mean."""
+        elsewhere = os.path.join(self.dir, "ferry", "opencode-cloud.json")
+        os.makedirs(os.path.dirname(elsewhere), exist_ok=True)
+        out = self.run_ferry(config=elsewhere)
+        self.assertFalse(os.path.exists(os.path.join(self.xdg_config, "opencode")),
+                         "writing a profile created the global opencode dir")
+        self.assertIn("tui.json: skipped", out)
+
+    def test_no_tui_config_suppresses_it_on_the_global_target(self):
+        out = self.run_ferry("--no-tui-config", config=self.global_cfg)
+        self.assertFalse(os.path.exists(self.tui))
+        self.assertIn("tui.json: skipped", out)
+
+    def test_an_explicit_tui_config_is_honoured_from_anywhere(self):
+        elsewhere = os.path.join(self.dir, "ferry", "opencode-cloud.json")
+        os.makedirs(os.path.dirname(elsewhere), exist_ok=True)
+        target = os.path.join(self.dir, "custom-tui.json")
+        self.run_ferry("--tui-config", target, config=elsewhere)
+        self.assertEqual(self.read_tui(target)["plugin"], [self.PLUGIN])
+        self.assertFalse(os.path.exists(os.path.join(self.xdg_config, "opencode")))
+
+    def test_no_default_never_writes_a_tui_config(self):
+        out = self.run_ferry("--no-default", config=self.global_cfg)
+        self.assertFalse(os.path.exists(self.tui))
+        self.assertNotIn("tui.json", out)
+
+
+class TestGoalPluginCacheHygiene(FerryOpencodeCase):
+    """opencode NEVER invalidates ~/.cache/opencode/packages, so ferry must.
+
+    The per-spec directory is path.join(cache, "packages", <raw spec>) with
+    sanitize() a no-op off Windows, so the spec's slashes are PATH SEPARATORS
+    (packages/core/src/npm.ts:43-47,79). With a name-prefixed spec the install
+    short-circuits on the mere EXISTENCE of <dir>/node_modules/<name>
+    (npm.ts:125-127), so an interrupted install is stuck forever.
+    """
+
+    PLUGIN = TestGoalPlugin.PLUGIN
+    PKG = TestGoalPlugin.PKG
+    BASE = TestGoalPlugin.BASE
+
+    # The exact directory opencode 1.18.29 creates for the canonical spec.
+    # Node's path.join COLLAPSES the "//" after "https:"; python's os.path.join
+    # does not, which is why the implementation runs it through normpath. This
+    # literal is the observable: it was read off a real
+    # `opencode plugin '<spec>' --global` run.
+    CANONICAL_REL = os.path.join(
+        "opencode-goal-plugin@https:", "github.com", "sblattj",
+        "OpenCode-goal-plugin", "archive", "refs", "tags",
+        f"{TestGoalPlugin.REF}.tar.gz")
+
+    def pkgdir(self, *parts):
+        return os.path.join(self.packages_root(), *parts)
+
+    def seed(self, rel, populated=False):
+        d = self.pkgdir(rel) if isinstance(rel, str) else self.pkgdir(*rel)
+        target = os.path.join(d, "node_modules", self.PKG)
+        os.makedirs(os.path.join(target, "dist"), exist_ok=True)
+        if populated:
+            with open(os.path.join(target, "package.json"), "w") as f:
+                json.dump({"name": self.PKG, "version": "0.10.1"}, f)
+        return d
+
+    def test_the_canonical_cache_path_is_the_node_normalised_one(self):
+        """Guards the normpath: a populated canonical dir at THIS exact path is
+        recognised as a real install and kept."""
+        d = self.seed(self.CANONICAL_REL, populated=True)
+        self.run_ferry()
+        self.assertTrue(os.path.exists(os.path.join(d, "node_modules", self.PKG,
+                                                    "package.json")),
+                        "a good install was purged")
+
+    def test_an_interrupted_canonical_install_is_removed(self):
+        """Control for the case above, varying exactly one factor: the same
+        directory WITHOUT package.json is the interrupted state that opencode's
+        existence-only short-circuit treats as installed forever."""
+        d = self.seed(self.CANONICAL_REL, populated=False)
+        out = self.run_ferry()
+        self.assertFalse(os.path.exists(d), "the empty install was kept")
+        self.assertIn("Cache purged", out)
+
+    def test_the_known_dead_directories_are_removed(self):
+        dead = [
+            os.path.join("github:sblattj", "OpenCode-goal-plugin#v0.9.1"),
+            os.path.join("github:sblattj", "OpenCode-goal-plugin"),
+            "opencode-goal-plugin@latest",
+        ]
+        made = [self.seed(d, populated=True) for d in dead]
+        self.run_ferry()
+        for d in made:
+            self.assertFalse(os.path.exists(d), f"{d} survived")
+
+    def test_an_unrelated_package_directory_is_untouched(self):
+        """The safety rule: only paths carrying our package name may be deleted."""
+        keep = self.seed("foo", populated=True)
+        self.seed("opencode-goal-plugin@latest", populated=True)
+        self.run_ferry()
+        self.assertTrue(os.path.exists(keep), "an unrelated cache dir was deleted")
+
+    def test_a_migrated_away_spec_loses_its_cache_directory(self):
+        old_spec = f"{self.PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
+        d = self.seed(os.path.join(
+            "opencode-goal-plugin@https:", "github.com", "sblattj",
+            "OpenCode-goal-plugin", "archive", "refs", "tags",
+            "v0.10.0.tar.gz"), populated=True)
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [old_spec]}, f)
+        self.run_ferry()
+        self.assertFalse(os.path.exists(d))
+
+    def test_migrating_an_old_tarball_keeps_a_good_canonical_install(self):
+        """Purging must delete the PER-SPEC directory, never the whole
+        `opencode-goal-plugin@https:` subtree they share - that would destroy a
+        working install while cleaning up a stale config entry, and an offline
+        laptop would be left with nothing."""
+        good = self.seed(self.CANONICAL_REL, populated=True)
+        stale = self.seed(os.path.join(
+            "opencode-goal-plugin@https:", "github.com", "sblattj",
+            "OpenCode-goal-plugin", "archive", "refs", "tags",
+            "v0.10.0.tar.gz"), populated=True)
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [
+                f"{self.PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"]}, f)
+        self.run_ferry()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(os.path.join(good, "node_modules",
+                                                    self.PKG, "package.json")))
+
+    def test_keep_cache_leaves_everything_alone(self):
+        d = self.seed("opencode-goal-plugin@latest", populated=True)
+        out = self.run_ferry("--keep-cache")
+        self.assertTrue(os.path.exists(d))
+        self.assertNotIn("Cache purged", out)
+
+    def test_no_default_never_purges(self):
+        d = self.seed("opencode-goal-plugin@latest", populated=True)
+        self.run_ferry("--no-default")
+        self.assertTrue(os.path.exists(d))
+
+
+# A stand-in for the real `opencode` binary. Records the argv and the
+# environment it was handed, then either emulates a successful install into the
+# package cache or fails the way opencode 1.18.29 fails on a git spec.
+STUB_OPENCODE = '''#!/usr/bin/env python3
+import json, os, sys
+
+spec = sys.argv[2] if len(sys.argv) > 2 else ""
+with open(os.environ["FERRY_TEST_RECORD"], "w") as f:
+    json.dump({
+        "argv": sys.argv[1:],
+        "opencode_config": os.environ.get("OPENCODE_CONFIG"),
+        "xdg_cache_home": os.environ.get("XDG_CACHE_HOME"),
+        "xdg_config_home": os.environ.get("XDG_CONFIG_HOME"),
+        "xdg_data_home": os.environ.get("XDG_DATA_HOME"),
+        "xdg_state_home": os.environ.get("XDG_STATE_HOME"),
+        "cwd": os.getcwd(),
+    }, f)
+
+if os.environ.get("FERRY_TEST_STUB_FAIL") == "1":
+    print("Install failed")
+    print('Could not install "%s"' % spec)
+    print("git dep preparation failed")
+    sys.exit(1)
+
+root = os.path.join(
+    os.path.normpath(os.path.join(os.environ["XDG_CACHE_HOME"], "opencode",
+                                  "packages", spec)),
+    "node_modules", "opencode-goal-plugin")
+os.makedirs(os.path.join(root, "dist"), exist_ok=True)
+with open(os.path.join(root, "package.json"), "w") as f:
+    json.dump({"name": "opencode-goal-plugin",
+               "version": os.environ.get("FERRY_TEST_STUB_VERSION", "0.10.1")}, f)
+for half in ("goal-plugin.js", "goal-tui.js"):
+    open(os.path.join(root, "dist", half), "w").close()
+print("Plugin package ready")
+print("Installed %s" % spec)
+'''
+
+
+class TestGoalPluginPreInstall(FerryOpencodeCase):
+    """Writing a spec installs nothing. This is what makes the failure visible.
+
+    A plugin that fails to install during a normal opencode start is published
+    as a Session event and never logged (plugin/index.ts:198-201 -> :139-141,
+    no-op reporters at :191-192), the entry is dropped (loader.ts:234) and npm
+    plugins are never retried (loader.ts:178) - which is exactly how v1.29.4
+    shipped a spec that had never once loaded. `opencode plugin <spec> --global`
+    is the only production entry point that PRINTS the real error.
+    """
+
+    PLUGIN = TestGoalPlugin.PLUGIN
+
+    def setUp(self):
+        super().setUp()
+        self.bin = os.path.join(self.dir, "stubbin")
+        os.makedirs(self.bin, exist_ok=True)
+        self.stub = os.path.join(self.bin, "opencode")
+        with open(self.stub, "w") as f:
+            f.write(STUB_OPENCODE)
+        os.chmod(self.stub, 0o755)
+        self.record = os.path.join(self.dir, "stub-record.json")
+
+    def run_install(self, *extra, fail=False, version=None, **kw):
+        env = {
+            "PATH": self.bin + os.pathsep + os.environ.get("PATH", ""),
+            "FERRY_TEST_RECORD": self.record,
+            # Deliberately SET, so "the pre-install unsets it" is a real claim
+            # instead of a value that was never there. `opencode plugin`
+            # patches whatever config this points at.
+            "OPENCODE_CONFIG": os.path.join(self.dir, "must-not-be-patched.json"),
+        }
+        if fail:
+            env["FERRY_TEST_STUB_FAIL"] = "1"
+        if version:
+            env["FERRY_TEST_STUB_VERSION"] = version
+        return self.run_ferry(*extra, install=True, env_extra=env, **kw)
+
+    def recorded(self):
+        with open(self.record) as f:
+            return json.load(f)
+
+    def test_it_runs_opencode_plugin_with_the_spec_and_global(self):
+        self.run_install()
+        argv = self.recorded()["argv"]
+        self.assertEqual(argv[0], "plugin")
+        self.assertIn(self.PLUGIN, argv)
+        self.assertIn("--global", argv)
+
+    def test_opencode_config_is_unset_for_the_child(self):
+        """Otherwise `opencode plugin` patches the operator's live config with a
+        second copy of the entry ferry has just written."""
+        self.run_install()
+        self.assertIsNone(self.recorded()["opencode_config"])
+
+    def test_the_child_gets_a_throwaway_config_data_and_state_home(self):
+        self.run_install()
+        rec = self.recorded()
+        for key in ("xdg_config_home", "xdg_data_home", "xdg_state_home"):
+            self.assertIsNotNone(rec[key], key)
+            self.assertNotEqual(rec[key], self.xdg_config, key)
+            self.assertNotIn(rec[key], (self.dir, self.xdg_cache), key)
+
+    def test_the_child_keeps_the_real_package_cache(self):
+        """The sandbox is for the config patch, NOT for the package cache:
+        populating the real cache is the entire point of installing early."""
+        self.run_install()
+        self.assertEqual(self.recorded()["xdg_cache_home"], self.xdg_cache)
+
+    def test_a_successful_install_is_reported_with_the_cached_version(self):
+        out = self.run_install()
+        self.assertIn("installed opencode-goal-plugin 0.10.1", out)
+        self.assertIn("ready for next opencode start", out)
+        self.assertNotIn("WARNING", out)
+
+    def test_a_wrong_version_in_the_cache_is_reported_not_hidden(self):
+        """Control for the line above: it must read the manifest, not echo the
+        ref it was asked for."""
+        out = self.run_install(version="0.9.0")
+        self.assertIn("WARNING", out)
+        self.assertIn("0.9.0", out)
+
+    def test_a_failing_install_warns_and_still_exits_zero(self):
+        # run_ferry already asserts rc == 0; the config was written correctly
+        # and an offline laptop must not turn a good bootstrap into a red one.
+        out = self.run_install(fail=True)
+        self.assertIn("WARNING", out)
+        self.assertIn("git dep preparation failed", out)
+        self.assertIn("opencode will retry on next start", out)
+
+    def test_no_install_skips_it_entirely(self):
+        self.run_ferry("--no-install", env_extra={
+            "PATH": self.bin + os.pathsep + os.environ.get("PATH", ""),
+            "FERRY_TEST_RECORD": self.record,
+        })
+        self.assertFalse(os.path.exists(self.record))
+
+    def test_a_local_fork_does_not_trigger_an_upstream_install(self):
+        fork = "/Users/someone/code/opencode-goal-plugin/dist/server.js"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [fork]}, f)
+        self.run_install()
+        self.assertFalse(os.path.exists(self.record))
 
 
 class TestSnapshots(FerryOpencodeCase):

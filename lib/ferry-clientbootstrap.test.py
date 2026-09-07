@@ -17,6 +17,7 @@ end-to-end against a throwaway $HOME and a stub host server that serves
 a regression that re-widens the scope fails here rather than on the laptop it
 was supposed to leave alone.
 """
+import difflib
 import json
 import os
 import pathlib
@@ -32,6 +33,12 @@ BOOTSTRAP = os.path.join(REPO, "client-bootstrap.sh")
 RESET = os.path.join(REPO, "client-reset.sh")
 CLEANUP = os.path.join(REPO, "client-cleanup.sh")
 FERRY = os.path.join(REPO, "ferry")
+# The two skills the client scripts ship as heredocs. The repo copies are the
+# source of truth (`ferry install` / host-reset.sh copy them straight out of
+# the checkout); the client scripts are piped into zsh with no checkout to
+# read from, so they carry a transcription that has to be kept identical.
+GOAL_SKILL_SRC = os.path.join(REPO, "opencode", "skills", "using-the-goal-plugin", "SKILL.md")
+FANOUT_SKILL_SRC = os.path.join(REPO, "opencode", "skills", "spawning-subagents", "SKILL.md")
 
 # The lane names the takeover checks against the catalogue. Serving them keeps
 # the run free of "host does not serve ..." warnings that would mask a real one.
@@ -140,6 +147,30 @@ class ClientHarness(unittest.TestCase):
         with open(self.path(*parts)) as f:
             return json.load(f)
 
+    def assert_skill_matches_repo(self, source, *parts):
+        """The heredoc a client script writes IS the repo file, byte for byte.
+
+        Only this assertion enforces it. The skills exist twice on purpose — the
+        host installer copies them out of the checkout, the client scripts carry
+        a heredoc because they are curl|zsh'd onto a machine with no checkout —
+        so an edit to one and not the other drifts in silence, and the client
+        keeps loading last month's wording forever."""
+        installed = self.path(".config", "opencode", *parts)
+        self.assertTrue(os.path.exists(installed), f"{installed} was not written")
+        with open(source, "rb") as f:
+            want = f.read()
+        with open(installed, "rb") as f:
+            got = f.read()
+        if want == got:
+            return
+        rel = os.path.relpath(source, REPO)
+        diff = "".join(difflib.unified_diff(
+            want.decode("utf-8", "replace").splitlines(keepends=True),
+            got.decode("utf-8", "replace").splitlines(keepends=True),
+            fromfile=rel, tofile="heredoc in client-bootstrap.sh"))
+        self.fail(f"the client-bootstrap.sh heredoc has drifted from {rel}. "
+                  f"Regenerate it from the repo file rather than hand-editing:\n{diff}")
+
     def zshrc(self):
         with open(self.path(".zshrc")) as f:
             return f.read()
@@ -240,6 +271,45 @@ class ClientScopeTest(ClientHarness):
             self.path(".config", "opencode", "skills", "spawning-subagents", "SKILL.md")))
         # Still no takeover of opencode's own config.
         self.assertFalse(os.path.exists(self.path(".config", "opencode", "opencode.json")))
+
+    # --- the bundled skills -------------------------------------------------
+    def test_full_scope_ships_the_goal_plugin_skill(self):
+        """The reference for /goal and the goal_* tools rides with the plugin
+        that the same run just wired into opencode.json."""
+        self.run_script(BOOTSTRAP)
+        self.assert_skill_matches_repo(
+            GOAL_SKILL_SRC, "skills", "using-the-goal-plugin", "SKILL.md")
+
+    def test_full_scope_ships_the_spawning_subagents_skill(self):
+        """The same sync guard for the older heredoc, which never had one.
+        In sync as of this commit; the guard is what keeps it that way."""
+        self.run_script(BOOTSTRAP)
+        self.assert_skill_matches_repo(
+            FANOUT_SKILL_SRC, "skills", "spawning-subagents", "SKILL.md")
+
+    def test_no_opencode_does_not_ship_the_goal_plugin_skill(self):
+        """--no-opencode wires no plugin, so it installs no skill either — and
+        says so, rather than leaving the operator to notice the absence."""
+        p = self.run_script(BOOTSTRAP, "--no-opencode")
+        self.assert_opencode_dir_absent()
+        self.assertIn("using-the-goal-plugin skill was not installed", p.stdout)
+
+    def test_profiles_only_does_not_ship_the_goal_plugin_skill(self):
+        """--profiles-only DOES wire the goal plugin, into ferry's own profiles.
+        The skill still cannot follow: opencode scans only its own global config
+        dir plus project/home .opencode dirs for skills — the directory holding
+        an $OPENCODE_CONFIG profile is not one of them (opencode 1.18.29,
+        packages/opencode/src/config/paths.ts:23-41 and
+        packages/opencode/src/skill/index.ts:204-207). ~/.config/opencode is
+        exactly what this mode exists to leave alone, so the skill is skipped —
+        and --with-guardrails must not smuggle it in through the side door."""
+        p = self.run_script(BOOTSTRAP, "--profiles-only")
+        self.assert_opencode_dir_absent()
+        self.assertIn("using-the-goal-plugin skill was NOT installed", p.stdout)
+
+        self.run_script(BOOTSTRAP, "--profiles-only", "--with-guardrails")
+        self.assertFalse(os.path.exists(self.path(
+            ".config", "opencode", "skills", "using-the-goal-plugin", "SKILL.md")))
 
     # --- the default is unchanged ------------------------------------------
     def test_full_scope_is_still_the_default(self):
@@ -450,6 +520,43 @@ class ClientCleanupTest(ClientHarness):
         self.run_script(CLEANUP)
 
         self.assertFalse(os.path.exists(os.path.join(singular, "SKILL.md")))
+
+    def test_it_removes_the_goal_plugin_skill_under_both_spellings(self):
+        """client-bootstrap.sh writes skills/, a host-side `ferry opencode`
+        writes skill/. A machine that has been both must come out clean."""
+        self.run_script(BOOTSTRAP)
+        plural = self.path(".config", "opencode", "skills", "using-the-goal-plugin")
+        singular = self.path(".config", "opencode", "skill", "using-the-goal-plugin")
+        self.assertTrue(os.path.exists(os.path.join(plural, "SKILL.md")))
+        os.makedirs(singular)
+        with open(os.path.join(singular, "SKILL.md"), "w") as f:
+            f.write("---\nname: using-the-goal-plugin\n---\n")
+
+        self.run_script(CLEANUP)
+
+        for d in (plural, singular):
+            self.assertFalse(os.path.exists(os.path.join(d, "SKILL.md")), d)
+            self.assertFalse(os.path.isdir(d), f"{d} should have been rmdir'd")
+
+    def test_it_leaves_a_still_occupied_skill_dir_and_a_stranger_alone(self):
+        """rmdir, never rm -rf: a directory the removal did not just empty stays
+        standing, and a skill of the user's own is none of ferry's business."""
+        self.run_script(BOOTSTRAP)
+        ours = self.path(".config", "opencode", "skills", "using-the-goal-plugin")
+        with open(os.path.join(ours, "NOTES.md"), "w") as f:
+            f.write("my own notes\n")
+        stranger = self.path(".config", "opencode", "skills", "my-own-skill")
+        os.makedirs(stranger)
+        with open(os.path.join(stranger, "SKILL.md"), "w") as f:
+            f.write("---\nname: my-own-skill\n---\n")
+
+        self.run_script(CLEANUP)
+
+        self.assertFalse(os.path.exists(os.path.join(ours, "SKILL.md")))
+        self.assertTrue(os.path.exists(os.path.join(ours, "NOTES.md")),
+                        "rmdir emptied a directory that still held a user file")
+        self.assertTrue(os.path.exists(os.path.join(stranger, "SKILL.md")),
+                        "cleanup ate a skill ferry never installed")
 
     def test_it_strips_ferrys_provider_and_leaves_the_rest_of_the_config(self):
         self.run_script(BOOTSTRAP)
@@ -1036,6 +1143,17 @@ class ScriptContractTest(unittest.TestCase):
         for literal in ('".ferry-goal-plugin"', '"ferry", "opencode-goal-plugin"'):
             self.assertIn(literal, integrate, literal)
             self.assertIn(literal, cleanup, literal)
+
+    def test_both_client_scripts_name_the_goal_plugin_skill(self):
+        """The bootstrap installs it and the cleanup removes it, under both
+        spellings opencode accepts. A rename in one that misses the other leaves
+        the file loading on every session forever."""
+        boot, cleanup = self.read(BOOTSTRAP), self.read(CLEANUP)
+        self.assertIn("using-the-goal-plugin", boot)
+        self.assertIn("skills/using-the-goal-plugin/SKILL.md", boot)
+        for spelling in ("skills/using-the-goal-plugin/SKILL.md",
+                         "skill/using-the-goal-plugin/SKILL.md"):
+            self.assertIn(spelling, cleanup, spelling)
 
     def test_reset_threads_a_stored_master_key_through_to_the_cli(self):
         """v1.22.0: a reset re-applies the key the bootstrap stored — as --key,

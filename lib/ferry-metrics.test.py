@@ -170,6 +170,54 @@ class MetricsTests(unittest.TestCase):
         self.assertIsNone(r['first_text_ms'])
         self.assertIsNone(CURRENT_METRICS.get())
 
+    def test_edge_cases_and_error_branches(self):
+        m, _ = self.observer()
+        m.finish()
+        m.start_response([(b'content-type', b'text/event-stream')], 200)
+
+        m2 = RequestMetrics(clock=Clock())
+        m2.start_response([123], 200)
+
+        m.observe_openai_usage({'prompt_tokens': 10})
+
+        class NonDictUsage:
+            def model_dump(self, **kwargs):
+                return "not a dict"
+        m2.observe_openai_usage(NonDictUsage())
+
+        m2._document("not-a-dict")
+        m2._document(None)
+
+        m3, c3 = self.observer()
+        c3.value = 10.4
+        self.event(m3, {'type': 'content_block_start', 'content_block': {'type': 'text', 'text': 'block text'}})
+        self.assertAlmostEqual(m3.finish()['first_text_ms'], 400)
+
+        m4, _ = self.observer()
+        self.event(m4, {'choices': [None, 42, 'string', {'delta': {'content': 'choice text'}}]})
+        m5, _ = self.observer()
+        m5.MAX_SSE_FRAME = 10
+        m5._frame_size = 10
+        m5._data.append(b"old")
+        m5._line(b"extra")
+        self.assertTrue(m5._discard)
+        self.assertEqual(m5._data, [])
+
+        m6, _ = self.observer(sse=False)
+        m6.MAX_JSON_BODY = 10
+        m6.feed(b'x' * 20)
+        self.assertTrue(m6._discard)
+        m6.feed(b'y' * 5)
+
+        class BadBytes:
+            def __len__(self):
+                return 10
+            def find(self, *args):
+                raise TypeError("mock error")
+        m7, _ = self.observer()
+        m7.feed(BadBytes())
+
 
 if __name__ == '__main__':
     unittest.main()
+

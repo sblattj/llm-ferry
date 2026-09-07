@@ -8,7 +8,9 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
 
 
 def _load():
@@ -159,6 +161,12 @@ class TestRecord(unittest.TestCase):
         r = E.record_from_headers([], "", "/v1/chat/completions", 200)
         self.assertRegex(r["t"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
+    def test_non_bytes_header_and_bad_status(self):
+        rec1 = E.record_from_headers([(123, b"foo")], "127.0.0.1", "/v1/chat", 200)
+        self.assertEqual(rec1["lane"], "unknown")
+        rec2 = E.record_from_headers([], "127.0.0.1", "/v1/chat", status="bad-status")
+        self.assertEqual(rec2["status"], 0)
+
 
 class TestEventLog(unittest.TestCase):
     def _log(self, **kw):
@@ -257,6 +265,60 @@ class TestEventLog(unittest.TestCase):
         # find_log() discovers cloud-proxy-<port>.log; a .log suffix here would
         # risk the shipper tailing the event stream back into itself.
         self.assertFalse(p.endswith(".log"))
+
+    def test_edge_cases_and_unhealthy_state(self):
+        # Line 356: not healthy
+        log = self._log()
+        log.healthy = False
+        self.assertFalse(log.offer({"lane": "test"}))
+        log.close()
+
+        # Lines 364-365: put_nowait generic exception
+        log2 = self._log()
+        with patch.object(log2._q, "put_nowait", side_effect=RuntimeError("queue broken")):
+            self.assertFalse(log2.offer({"lane": "test"}))
+        log2.close()
+
+        # Lines 398-399: _shut fh.close() raises exception
+        log3 = self._log()
+        class BadFh:
+            def close(self):
+                raise OSError("close error")
+        log3._fh = BadFh()
+        log3._shut()
+        self.assertIsNone(log3._fh)
+        log3.close()
+
+        # Lines 407-408: _rotate_if_needed os.replace raises exception
+        log4 = self._log(max_bytes=10)
+        log4._open()
+        log4._fh.write("x" * 20)
+        with patch.object(E.os, "replace", side_effect=OSError("disk err")):
+            log4._rotate_if_needed()
+        log4.close()
+
+        # Line 413: paused wait loop; Lines 416-419: empty queue timeout
+        log5 = E.EventLog.__new__(E.EventLog)
+        log5._stop = E.threading.Event()
+        log5._paused = E.threading.Event()
+        log5._paused.set()
+        orig_wait = log5._stop.wait
+        def wait_and_stop(timeout=None):
+            orig_wait(timeout)
+            log5._stop.set()
+        log5._stop.wait = wait_and_stop
+        log5._q = E.queue.Queue()
+        log5._idle = E.threading.Event()
+        log5._run()
+
+        # Lines 442-443: write/flush exception in _run
+        log6 = self._log()
+        class BadRec:
+            pass
+        log6.offer(BadRec())
+        log6.flush()
+        self.assertIsNone(log6._fh)
+        log6.close()
 
 
 def tool(name, properties):
@@ -513,6 +575,44 @@ class TestComplyToolSchemas(unittest.TestCase):
         line = json.loads(json.dumps(rec))
         self.assertEqual(line["schema_warnings"][0]["fixed"], True)
         self.assertEqual(set(line), set(E._EMPTY))
+
+    def test_broken_tools_and_schema_edges(self):
+        # Lines 149-150: tools iteration exception
+        class BadList(list):
+            def __iter__(self):
+                raise RuntimeError("iter error")
+        self.assertEqual(E.comply_tool_schemas({"tools": BadList()}), [])
+
+        # Lines 171-172: tuple schema items (items is a list)
+        tuple_doc = {"tools": [{"type": "function", "function": {
+            "name": "tuple_tool",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tuple_prop": {
+                        "type": "array",
+                        "items": [
+                            {"type": "string"},
+                            {"type": "array"}  # missing items in tuple element
+                        ]
+                    }
+                }
+            }
+        }}]}
+        found = E.comply_tool_schemas(tuple_doc)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["path"], "tuple_prop[1]")
+        self.assertEqual(found[0]["rule"], "array_without_items")
+
+        # Lines 200-201: repair raises exception in _hit
+        class BrokenDict(dict):
+            def __setitem__(self, k, v):
+                raise RuntimeError("cannot set")
+        broken = BrokenDict({"type": "array"})
+        out = []
+        E._hit(broken, "array_without_items", "tool", "path", out, fix=True)
+        self.assertEqual(len(out), 1)
+        self.assertNotIn("fixed", out[0])
 
 
 if __name__ == "__main__":

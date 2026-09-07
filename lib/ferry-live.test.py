@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -563,6 +564,75 @@ class LogLineTapTests(unittest.TestCase):
     def test_kinds_are_classifier_states(self):
         for kind in L.TAP_KINDS:
             self.assertIn(kind, L.STATES)
+
+
+class TestLiveEdgeCases(unittest.TestCase):
+    def test_bytes_per_sec_exception(self):
+        class BadRec:
+            def get(self, k):
+                raise RuntimeError("boom")
+        self.assertIsNone(L.bps_of(BadRec()))
+
+    def test_load_rules_non_dict(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write("[1, 2, 3]\n")
+            f_path = f.name
+        try:
+            loaded = L.load_rules(f_path)
+            self.assertEqual(loaded, {"version": 0, "rules": [], "ttl": {}})
+        finally:
+            os.unlink(f_path)
+
+    def test_exhaustion_tracker_edge_inputs(self):
+        tracker = L.ExhaustionState({"rules": []})
+        tracker.observe("not-a-dict")
+        tracker.observe(None)
+        tracker.observe({"hop_errors": [None, "bad-hop", 123]}, chain=["dep-1"])
+        tracker.observe({"deployment": ""})
+        tracker.observe({"deployment": None})
+
+    def test_event_tail_truncation_errors_and_filtering(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write('{"line": 1}\n{"line": 2}\n')
+            tail_path = f.name
+        try:
+            tail = L.EventTail(tail_path)
+            self.assertEqual(tail.read_new(), [])
+            with open(tail_path, "a") as f:
+                f.write('{"line": 3}\n')
+            self.assertEqual(len(tail.read_new()), 1)
+            # Truncate file in place
+            with open(tail_path, "w") as f:
+                f.write('{"line": 4}\n')
+            records = tail.read_new()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["line"], 4)
+
+            # Open failure OSError
+            with open(tail_path, "a") as f:
+                f.write('{"line": 5}\n')
+            L.EventTail.read_new.__globals__["open"] = lambda *a, **kw: (_ for _ in ()).throw(OSError("denied"))
+            try:
+                self.assertEqual(tail.read_new(), [])
+            finally:
+                L.EventTail.read_new.__globals__.pop("open", None)
+
+            # MAX_PARTIAL exceeded
+            with open(tail_path, "w") as f:
+                f.write('{"line": 6, "partial": "very long partial line without newline"')
+            tail._offset = 0
+            tail.MAX_PARTIAL = 10
+            self.assertEqual(tail.read_new(), [])
+            self.assertEqual(tail._partial, "")
+
+            # Blank lines filtered
+            with open(tail_path, "a") as f:
+                f.write('\n\n   \n{"line": 7}\n\n')
+            records = tail.read_new()
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["line"], 7)
+        finally:
+            os.unlink(tail_path)
 
 
 if __name__ == "__main__":

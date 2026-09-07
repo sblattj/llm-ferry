@@ -455,6 +455,20 @@ else
   warn "no opencode/ in the checkout - guardrails not installed."
 fi
 
+# The goal-plugin usage skill, on the same catch-up footing. `ferry opencode`
+# below installs it too, but only when ferry's OWN goal entry is the one in the
+# config - a host carrying a local fork of the plugin gets the wiring and would
+# otherwise never get the doctrine. Copying it here is unconditional, so a host
+# provisioned before the skill existed picks it up on the next reset either way.
+if [[ -f "$APP_DIR/opencode/skills/using-the-goal-plugin/SKILL.md" ]]; then
+  mkdir -p "$HOME/.config/opencode/skill/using-the-goal-plugin"
+  cp "$APP_DIR/opencode/skills/using-the-goal-plugin/SKILL.md" \
+     "$HOME/.config/opencode/skill/using-the-goal-plugin/SKILL.md"
+  ok "using-the-goal-plugin skill installed"
+else
+  warn "no opencode/skills/using-the-goal-plugin in the checkout - skill not installed."
+fi
+
 echo ""
 say ">>> Re-applying the opencode takeover (host -> its own endpoint)..."
 RESET_FAILED=0

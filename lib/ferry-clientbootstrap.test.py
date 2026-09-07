@@ -19,6 +19,7 @@ was supposed to leave alone.
 """
 import json
 import os
+import pathlib
 import shutil
 import subprocess
 import tempfile
@@ -111,6 +112,12 @@ class ClientHarness(unittest.TestCase):
         # would be checking the wrong directory entirely.
         e.pop("XDG_CONFIG_HOME", None)
         e.pop("XDG_CACHE_HOME", None)
+        # ...and since v1.30.3, XDG_DATA_HOME: it is where ferry installs its own
+        # copy of the goal plugin and where cleanup deletes that copy from. Left
+        # inherited, a cleanup run under this suite would rm -rf the author's
+        # real ~/.local/share/ferry/opencode-goal-plugin. The relocation test
+        # below sets it back, deliberately, to a path inside the throwaway $HOME.
+        e.pop("XDG_DATA_HOME", None)
         # ...nor a stray master key from the operator's shell.
         e.pop("FERRY_MASTER_KEY", None)
         if master_key is not None:
@@ -589,6 +596,16 @@ GOAL_COMMAND = {
 }
 LOCAL_FORK = "/Users/someone/src/OpenCode-goal-plugin/index.js"
 
+# v1.30.3: opencode cannot load the TUI half out of its own package cache — that
+# directory's name carries the spec verbatim, and Bun's plugin runner splits a
+# module path at the first colon, so the bundle's bare `solid-js` import is
+# never rewritten. ferry therefore keeps a colon-free COPY it owns and points
+# tui.json at THAT. The marker file inside is what makes the copy ferry's to
+# delete; its content is "<spec>\n<ref>\n<pkg>\n".
+GOAL_TUI_MARKER = ".ferry-goal-plugin"
+GOAL_PKG = "opencode-goal-plugin"
+GOAL_REF = "v0.10.1"
+
 
 class ClientCleanupGoalPluginTest(ClientHarness):
     """v1.30.2: cleanup takes the goal plugin back out of BOTH config files.
@@ -599,6 +616,12 @@ class ClientCleanupGoalPluginTest(ClientHarness):
     `opencode` still loaded them. The line these tests defend is the one between
     what ferry WROTE (ours to remove) and what the user owns: a local-path fork
     of the plugin, and a /goal command they edited.
+
+    v1.30.3 moves that line: ferry now installs its OWN colon-free copy of the
+    package (opencode cannot load the TUI half out of its package cache) and
+    points tui.json at it with a file:// URL. So one local path IS ferry's, and
+    a third thing has to come back out — the directory itself, and only when it
+    carries ferry's marker.
     """
 
     # --- helpers ------------------------------------------------------------
@@ -616,6 +639,42 @@ class ClientCleanupGoalPluginTest(ClientHarness):
     def raw(self, *parts):
         with open(self.path(*parts), "rb") as f:
             return f.read()
+
+    def managed_dir(self, data_home=None):
+        """Ferry's own copy of the plugin — the shell's
+        ${XDG_DATA_HOME:-$HOME/.local/share}/ferry/opencode-goal-plugin."""
+        base = data_home if data_home is not None else self.path(".local", "share")
+        return os.path.join(base, "ferry", GOAL_PKG)
+
+    def install_managed(self, data_home=None, marker=True):
+        """Plant that copy, with or without the marker that makes it ferry's."""
+        d = self.managed_dir(data_home)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "package.json"), "w") as f:
+            json.dump({"name": GOAL_PKG, "version": GOAL_REF.lstrip("v")}, f)
+        if marker:
+            with open(os.path.join(d, GOAL_TUI_MARKER), "w") as f:
+                f.write(f"{GOAL_SPEC}\n{GOAL_REF}\n{GOAL_PKG}\n")
+        return d
+
+    def managed_entry(self, data_home=None):
+        """Exactly what ferry writes into tui.json: pathlib's file:// URL."""
+        return pathlib.Path(self.managed_dir(data_home)).as_uri()
+
+    def section(self, out, needle):
+        """One '>>> ...' section of cleanup's output. Several sections print
+        'Not present — skipping.', so a bare assertIn proves nothing about
+        which one did."""
+        lines = out.splitlines()
+        for i, ln in enumerate(lines):
+            if ln.startswith(">>>") and needle in ln:
+                body = [ln]
+                for nxt in lines[i + 1:]:
+                    if nxt.startswith(">>>"):
+                        break
+                    body.append(nxt)
+                return "\n".join(body)
+        self.fail(f"no section matching {needle!r} in:\n{out}")
 
     # --- end to end ---------------------------------------------------------
     def test_a_full_bootstrap_then_cleanup_leaves_no_goal_plugin_behind(self):
@@ -753,6 +812,153 @@ class ClientCleanupGoalPluginTest(ClientHarness):
         self.assertIn("tui.json ...", out)
         self.assertIn("Not present — skipping.", out)
 
+    # --- ferry's own copy of the package (section 4c) -----------------------
+    def test_the_managed_copy_and_its_tui_entry_both_go(self):
+        """The v1.30.3 shape end to end: a file:// entry and the dir it names."""
+        d = self.install_managed()
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": [self.managed_entry()]}, name="tui.json")
+        self.assertTrue(os.path.isdir(d), "premise: the copy was planted")
+
+        out = self.run_script(CLEANUP).stdout
+
+        self.assertFalse(os.path.exists(d), out)
+        self.assertIn("(ferry's TUI copy of the goal plugin)", out)
+        self.assertFalse(os.path.exists(self.path(".local", "share", "ferry")),
+                         "the emptied parent should have gone with it")
+        self.assertFalse(os.path.exists(self.path(".config", "opencode", "tui.json")),
+                         out)
+        # The control: ~/.local/share belongs to the user, not to ferry.
+        self.assertTrue(os.path.isdir(self.path(".local", "share")),
+                        "cleanup climbed one directory too far")
+
+    def test_a_sibling_under_the_ferry_data_dir_keeps_the_parent(self):
+        """rmdir only ever removes a parent this script just emptied."""
+        d = self.install_managed()
+        sibling = self.path(".local", "share", "ferry", "other")
+        with open(sibling, "w") as f:
+            f.write("not ours\n")
+
+        self.run_script(CLEANUP)
+
+        self.assertFalse(os.path.exists(d))
+        self.assertTrue(os.path.exists(sibling),
+                        "a non-empty ferry data dir was removed")
+
+    def test_a_managed_dir_without_the_marker_is_left_alone(self):
+        """The path is a convention; the MARKER is the proof of ownership."""
+        d = self.install_managed(marker=False)
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": [self.managed_entry()]}, name="tui.json")
+
+        out = self.run_script(CLEANUP).stdout
+
+        self.assertIn("carries no ferry marker — left alone.", out)
+        self.assertTrue(os.path.isfile(os.path.join(d, "package.json")),
+                        "an unmarked directory was deleted anyway")
+        # ...while the entry still goes: tui.json is ferry's file either way.
+        self.assertFalse(os.path.exists(self.path(".config", "opencode", "tui.json")),
+                         out)
+
+    def test_the_managed_entry_goes_and_the_rest_of_tui_json_survives(self):
+        self.install_managed()
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": [self.managed_entry()],
+                       "theme": {"name": "mine"}}, name="tui.json")
+
+        self.run_script(CLEANUP)
+
+        after = self.read_json(".config", "opencode", "tui.json")
+        self.assertNotIn("plugin", after)
+        self.assertEqual(after["theme"], {"name": "mine"})
+        snaps = [f for f in self.oc_files()
+                 if f.startswith("tui.") and f.endswith(".jsonc")]
+        self.assertEqual(len(snaps), 1, self.oc_files())
+
+    def test_a_users_paths_survive_in_both_files_but_the_managed_one_does_not(self):
+        """Exactly ONE local path is ferry's. Every other one is a fork."""
+        fork_url = "file:///Users/someone/src/my-fork"
+        fork_abs = "/opt/forks/opencode-goal-plugin"
+        entries = [self.managed_entry(), fork_url, fork_abs]
+        self.install_managed()
+        self.write_oc({"plugin": list(entries), "theme": "opencode"})
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": list(entries)}, name="tui.json")
+
+        self.run_script(CLEANUP)
+
+        oc = self.read_json(".config", "opencode", "opencode.json")
+        tui = self.read_json(".config", "opencode", "tui.json")
+        self.assertEqual(oc["plugin"], [fork_url, fork_abs])
+        self.assertEqual(tui["plugin"], [fork_url, fork_abs])
+        self.assertEqual(oc["theme"], "opencode")
+
+    def test_the_tuple_form_of_the_managed_entry_is_removed(self):
+        d = self.install_managed()
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": [[self.managed_entry(), {"enabled": True}]]},
+                      name="tui.json")
+
+        out = self.run_script(CLEANUP).stdout
+
+        self.assertIn("Removed goal plugin entry", out)
+        self.assertFalse(os.path.exists(self.path(".config", "opencode", "tui.json")),
+                         out)
+        self.assertFalse(os.path.exists(d), out)
+
+    def test_dry_run_reports_the_managed_copy_and_changes_nothing(self):
+        d = self.install_managed()
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": [self.managed_entry()]}, name="tui.json")
+        before = self.raw(".config", "opencode", "tui.json")
+
+        out = self.run_script(CLEANUP, "--dry-run").stdout
+
+        self.assertIn("would remove the goal plugin entry from", out)
+        self.assertIn(f"[dry-run] rm -rf {d}", out)
+        self.assertTrue(os.path.isfile(os.path.join(d, GOAL_TUI_MARKER)), out)
+        self.assertTrue(os.path.isfile(os.path.join(d, "package.json")), out)
+        self.assertEqual(before, self.raw(".config", "opencode", "tui.json"))
+        self.assertEqual(self.oc_files(), ["tui.json"])
+
+    def test_a_second_run_finds_no_managed_copy_left(self):
+        """Section 4c has to be as re-runnable as the two file sections."""
+        self.install_managed()
+        self.write_oc({"theme": "opencode", "plugin": [GOAL_SPEC]})
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": [self.managed_entry()]}, name="tui.json")
+        first = self.run_script(CLEANUP).stdout
+        self.assertIn("(ferry's TUI copy of the goal plugin)", first)
+
+        out = self.run_script(CLEANUP).stdout
+
+        self.assertIn("Not present — skipping.",
+                      self.section(out, "ferry's own copy of the goal plugin"))
+        self.assertIn("Nothing ferry-shaped found — file left unchanged.",
+                      self.section(out, "opencode.json ..."))
+        self.assertIn("Not present — skipping.", self.section(out, "tui.json ..."))
+
+    def test_xdg_data_home_relocates_both_the_entry_and_the_directory(self):
+        """The copy is INSTALLED against XDG_DATA_HOME, so cleanup must read it."""
+        relocated = self.path("relocated-data")
+        d = self.install_managed(data_home=relocated)
+        decoy = self.install_managed()      # the default path, marker and all
+        self.write_oc({"$schema": "https://opencode.ai/tui.json",
+                       "plugin": [self.managed_entry(data_home=relocated)]},
+                      name="tui.json")
+        e = self.env()
+        e["XDG_DATA_HOME"] = relocated
+
+        out = self.run_script(CLEANUP, env=e).stdout
+
+        self.assertFalse(os.path.exists(d), out)
+        self.assertFalse(os.path.exists(self.path(".config", "opencode", "tui.json")),
+                         out)
+        # The control: with XDG_DATA_HOME pointing elsewhere, the default path is
+        # not ferry's copy on this machine — removing it would be matching by
+        # name instead of by location.
+        self.assertTrue(os.path.isdir(decoy), "the un-relocated path was deleted")
+
     # --- dry run and idempotence -------------------------------------------
     def test_dry_run_reports_both_files_and_changes_neither(self):
         self.write_oc({"plugin": [GOAL_SPEC], "command": {"goal": dict(GOAL_COMMAND)}})
@@ -822,6 +1028,14 @@ class ScriptContractTest(unittest.TestCase):
                      '"agent": "build"'):
             self.assertIn(part, integrate, part)
             self.assertIn(part, cleanup, part)
+        # v1.30.3: the same duplication, one layer down. ferry writes tui.json a
+        # file:// URL to a copy of the package that it owns, and cleanup is the
+        # only thing that removes that copy — so the two halves have to agree on
+        # WHERE it lives and on the marker file that proves it is ours. Disagree,
+        # and cleanup either orphans the copy or deletes a stranger's directory.
+        for literal in ('".ferry-goal-plugin"', '"ferry", "opencode-goal-plugin"'):
+            self.assertIn(literal, integrate, literal)
+            self.assertIn(literal, cleanup, literal)
 
     def test_reset_threads_a_stored_master_key_through_to_the_cli(self):
         """v1.22.0: a reset re-applies the key the bootstrap stored — as --key,

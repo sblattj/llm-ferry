@@ -3204,5 +3204,724 @@ class TestChatGptInstructions(unittest.TestCase):
         self.assertEqual(seen["env"], "<unset>")
 
 
+class TestBuildApp(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.config = os.path.join(self.dir.name, "litellm.yaml")
+        with open(self.config, "w") as f:
+            f.write("""
+model_list:
+  - model_name: f1.orch
+    litellm_params:
+      model: openrouter/google/gemini-2.5-flash
+    model_info:
+      public: true
+""")
+
+    def test_build_app_with_injected_app(self):
+        mock_app = mock.AsyncMock()
+        with mock.patch.dict(os.environ, {"CONFIG_FILE_PATH": self.config, "FERRY_EVENTS": "1"}):
+            app = FF.build_app(litellm_app=mock_app)
+            self.assertIsInstance(app, FF.LaneCatalogueFilter)
+            self.assertIs(app.app, mock_app)
+            self.assertIn("f1.orch", app.public)
+
+    def test_build_app_no_wrap(self):
+        mock_app = mock.AsyncMock()
+        with mock.patch.dict(os.environ, {"CONFIG_FILE_PATH": self.config}):
+            with mock.patch("ferry_front.should_wrap", return_value=False):
+                app = FF.build_app(litellm_app=mock_app)
+                self.assertIs(app, mock_app)
+
+    def test_build_app_empty_public_logs_gap(self):
+        mock_app = mock.AsyncMock()
+        cfg = os.path.join(self.dir.name, "empty.yaml")
+        with open(cfg, "w") as f:
+            f.write("""
+model_list:
+  - model_name: f1.orch
+    litellm_params:
+      model: openrouter/google/gemini-2.5-flash
+""")
+        with mock.patch.dict(os.environ, {"CONFIG_FILE_PATH": cfg}):
+            app = FF.build_app(litellm_app=mock_app)
+            self.assertIsInstance(app, FF.LaneCatalogueFilter)
+
+
+class TestSystemCompatHook(unittest.TestCase):
+    def test_transform_responses_api_request(self):
+        class MockConfig:
+            def transform_responses_api_request(self, *args, **kwargs):
+                return {"input": [
+                    {"role": "system", "type": "message", "content": "system 1"},
+                    {"role": "user", "content": "user 1"},
+                    {"role": "system", "type": "function", "content": "not message"}
+                ]}
+
+        FF.install_chatgpt_system_compat(config_class=MockConfig)
+        inst = MockConfig()
+        res = inst.transform_responses_api_request()
+        roles = [item["role"] for item in res["input"]]
+        self.assertEqual(roles, ["developer", "user", "system"])
+
+        # Idempotence (line 1758)
+        FF.install_chatgpt_system_compat(config_class=MockConfig)
+        self.assertTrue(getattr(MockConfig.transform_responses_api_request, "_ferry_system_compat", False))
+
+    def test_install_chatgpt_system_compat_default_config_class(self):
+        import types
+        class MockConfig:
+            def transform_responses_api_request(self, *args, **kwargs):
+                return {"input": []}
+
+        fake_mod = types.SimpleNamespace(ChatGPTResponsesAPIConfig=MockConfig)
+        with mock.patch.dict(sys.modules, {
+            "litellm.llms.chatgpt.responses.transformation": fake_mod
+        }):
+            FF.install_chatgpt_system_compat(config_class=None)
+            self.assertTrue(getattr(MockConfig.transform_responses_api_request, "_ferry_system_compat", False))
+
+
+class TestReasoningUsageHook(unittest.TestCase):
+    def test_install_reasoning_usage_hook_default_adapter(self):
+        import types
+        class MockAdapter:
+            @classmethod
+            def _translate_openai_usage_to_anthropic_usage_delta(cls, usage):
+                return usage
+
+        fake_mod = types.SimpleNamespace(LiteLLMAnthropicMessagesAdapter=MockAdapter)
+        with mock.patch.dict(sys.modules, {
+            "litellm.llms.anthropic.experimental_pass_through.adapters.transformation": fake_mod
+        }):
+            ok = FF.install_reasoning_usage_hook(adapter=None)
+            self.assertTrue(ok)
+
+    def test_install_and_translate_reasoning(self):
+        class MockAdapter:
+            @classmethod
+            def _translate_openai_usage_to_anthropic_usage_delta(cls, usage):
+                return {"original": usage}
+
+        collector = mock.Mock()
+        metrics = FF._metrics_module()
+        token = metrics.CURRENT_METRICS.set(collector)
+        try:
+            ok = FF.install_reasoning_usage_hook(adapter=MockAdapter)
+            self.assertTrue(ok)
+
+            # Second call is idempotent
+            self.assertTrue(FF.install_reasoning_usage_hook(adapter=MockAdapter))
+
+            # Call translate with reasoning tokens
+            usage = {"completion_tokens_details": {"reasoning_tokens": 100}}
+            res = MockAdapter._translate_openai_usage_to_anthropic_usage_delta(usage)
+            self.assertEqual(res, {"original": usage})
+            collector.observe_openai_usage.assert_called_once_with(usage)
+
+            # Call translate with invalid / non-numeric reasoning tokens
+            collector.reset_mock()
+            MockAdapter._translate_openai_usage_to_anthropic_usage_delta({"completion_tokens_details": {"reasoning_tokens": True}})
+            collector.observe_openai_usage.assert_not_called()
+
+            # Call translate when collector raises (lines 587-588)
+            collector.observe_openai_usage.side_effect = RuntimeError("collector fail")
+            MockAdapter._translate_openai_usage_to_anthropic_usage_delta({"completion_tokens_details": {"reasoning_tokens": 50}})
+        finally:
+            metrics.CURRENT_METRICS.reset(token)
+
+    def test_install_failure_returns_false(self):
+        class BadAdapter:
+            pass
+
+        with mock.patch("sys.stderr", io.StringIO()):
+            ok = FF.install_reasoning_usage_hook(adapter=BadAdapter)
+            self.assertFalse(ok)
+
+
+class TestEdgeCasesAndBranches(unittest.TestCase):
+    def test_live_router(self):
+        import types
+        mock_ps = types.SimpleNamespace(llm_router="live_router")
+        fake_proxy = types.SimpleNamespace(proxy_server=mock_ps)
+        fake_litellm = types.SimpleNamespace(proxy=fake_proxy)
+        with mock.patch.dict(sys.modules, {
+            "litellm": fake_litellm,
+            "litellm.proxy": fake_proxy,
+            "litellm.proxy.proxy_server": mock_ps,
+        }):
+            self.assertEqual(FF._live_router(), "live_router")
+        with mock.patch.dict(sys.modules, {"litellm.proxy.proxy_server": None}):
+            self.assertIsNone(FF._live_router())
+
+    def test_parse_reorder_body_validation_edges(self):
+        # line 202: doc not a dict
+        c, err = FF.parse_reorder_body(b"[]")
+        self.assertEqual(err, "body must be a JSON object")
+
+        # line 207: order seq not a list
+        c, err = FF.parse_reorder_body(b'{"order": {"l1": "bad"}}')
+        self.assertEqual(err, "order['l1'] must be a list")
+
+        # line 209: order seq empty
+        c, err = FF.parse_reorder_body(b'{"order": {"l1": []}}')
+        self.assertEqual(err, "order['l1'] may not be empty")
+
+        # line 220: chains seq not a list
+        c, err = FF.parse_reorder_body(b'{"chains": {"l1": "bad"}}')
+        self.assertEqual(err, "chains['l1'] must be a list of model names")
+
+        # line 222: chains seq item not a str
+        c, err = FF.parse_reorder_body(b'{"chains": {"l1": [123]}}')
+        self.assertEqual(err, "chains['l1'] must be a list of model names")
+
+    def test_apply_reorder_fallbacks(self):
+        import types
+        # router where get_model_groups raises, and model_list has entries
+        router = types.SimpleNamespace(
+            model_group_alias={},
+            get_model_groups=mock.Mock(side_effect=RuntimeError("no groups")),
+            model_list=[{"model_name": "orch"}, {"model_name": "flash"}],
+            fallbacks=[],
+        )
+        ok, errs = FF.service_reorder(router, {"orch": ["flash"]})
+        self.assertTrue(ok)
+        self.assertEqual(errs, [])
+
+        # router where get_model_groups raises and model_list access/iter raises
+        class BadRouter:
+            model_group_alias = {}
+            def get_model_groups(self):
+                raise RuntimeError("err")
+            @property
+            def model_list(self):
+                raise RuntimeError("bad list")
+            fallbacks = []
+
+        ok, errs = FF.service_reorder(BadRouter(), {"orch": ["flash"]})
+        self.assertFalse(ok)
+        self.assertIn("lane 'orch' is not served by the running proxy", errs)
+
+    def test_deployment_dict_exceptions(self):
+        router = mock.Mock()
+        router.get_deployment_by_model_group_name.side_effect = RuntimeError("fail")
+        self.assertIsNone(FF._deployment_dict(router, "orch"))
+
+        router.get_deployment_by_model_group_name.side_effect = None
+        dep = mock.Mock()
+        dep.to_json.side_effect = RuntimeError("json fail")
+        router.get_deployment_by_model_group_name.return_value = dep
+        self.assertIsNone(FF._deployment_dict(router, "orch"))
+
+    def test_parse_promote_body_edges(self):
+        self.assertEqual(FF.parse_promote_body(b"not json")[3], "body is not JSON")
+        self.assertEqual(FF.parse_promote_body(b"[]")[3], "body must be a JSON object")
+
+    def test_live_ids_exception(self):
+        class BadRouter:
+            @property
+            def model_list(self):
+                raise RuntimeError("fail")
+        self.assertEqual(FF._live_ids(BadRouter()), set())
+
+    def test_validate_promote_same_id(self):
+        import types
+        dep = {"model_info": {"id": "same_id"}, "litellm_params": {}}
+        router = types.SimpleNamespace(
+            get_deployment_by_model_group_name=lambda name: dep,
+            fallbacks=[{"lane1": ["hop1"]}],
+            model_list=[],
+        )
+        errs = FF.validate_promote(router, "lane1", "hop1")
+        self.assertIn("lane 'lane1' and hop 'hop1' share one deployment — nothing to swap", errs)
+
+    def test_service_promote_edges(self):
+        import types
+        dep_no_id1 = {"model_info": {"id": "lane_id"}, "litellm_params": {}}
+        dep_no_id2 = {"model_info": {"id": ""}, "litellm_params": {}}
+        router = types.SimpleNamespace(
+            get_deployment_by_model_group_name=lambda name: dep_no_id1 if name == "lane" else dep_no_id2,
+            fallbacks=[{"lane": ["hop"]}],
+            model_list=[],
+        )
+        ok, errs, ids = FF.service_promote(router, "lane", "hop")
+        self.assertFalse(ok)
+        self.assertEqual(errs, ["both deployments need a model_info.id to evict"])
+
+        dep1 = {"model_info": {"id": "id1"}, "litellm_params": {}}
+        dep2 = {"model_info": {"id": "id2"}, "litellm_params": {}}
+        router2 = types.SimpleNamespace(
+            get_deployment_by_model_group_name=lambda name: dep1 if name == "lane" else dep2,
+            fallbacks=[{"lane": ["hop"]}],
+            model_list=[],
+        )
+        ok, errs, ids = FF.service_promote(router2, "lane", "hop", ids={"lane_id": "same", "hop_id": "same"})
+        self.assertFalse(ok)
+        self.assertEqual(errs, ["lane_id and hop_id must differ"])
+
+        class MockDeployment:
+            def __init__(self, model_name, litellm_params, model_info):
+                self.model_name = model_name
+                self.litellm_params = litellm_params
+                self.model_info = model_info
+
+        fake_router_module = types.SimpleNamespace(Deployment=MockDeployment)
+        router_good = types.SimpleNamespace(
+            get_deployment_by_model_group_name=lambda name: dep1 if name == "lane" else dep2,
+            fallbacks=[{"lane": ["hop"]}],
+            model_list=[],
+            upsert_deployment=mock.Mock(),
+            delete_deployment=mock.Mock(),
+        )
+        with mock.patch.dict(sys.modules, {"litellm.types.router": fake_router_module}):
+            ok, errs, ids = FF.service_promote(router_good, "lane", "hop")
+            self.assertTrue(ok)
+            self.assertEqual(router_good.upsert_deployment.call_count, 2)
+
+        router_fail = types.SimpleNamespace(
+            get_deployment_by_model_group_name=lambda name: dep1 if name == "lane" else dep2,
+            fallbacks=[{"lane": ["hop"]}],
+            model_list=[],
+            upsert_deployment=mock.Mock(side_effect=RuntimeError("upsert broke")),
+            delete_deployment=mock.Mock(),
+        )
+        ok, errs, ids = FF.service_promote(router_fail, "lane", "hop")
+        self.assertFalse(ok)
+        self.assertIn("primary swap failed: RuntimeError: upsert broke", errs[0])
+
+    def test_metrics_module_exec_failure(self):
+        sys.modules.pop("ferry_metrics", None)
+        with mock.patch("importlib.util.spec_from_file_location") as m_spec:
+            spec = mock.Mock()
+            spec.loader.exec_module.side_effect = RuntimeError("loader failed")
+            m_spec.return_value = spec
+            with self.assertRaises(RuntimeError):
+                FF._metrics_module()
+
+    def test_reset_tap_close_error(self):
+        tap_mock = mock.Mock()
+        tap_mock.close.side_effect = RuntimeError("cannot close")
+        FF._TAP = tap_mock
+        FF.reset_tap()
+        self.assertIsNone(FF._TAP)
+
+    def test_tap_and_comply_events_module_error(self):
+        FF._TAP = None
+        FF._COMPLY = None
+        with mock.patch("ferry_front._events_module", side_effect=RuntimeError("no events")):
+            self.assertIsNone(FF._tap())
+            self.assertIsNone(FF._comply_fn())
+
+    def test_public_lane_names_and_discover_fleets_edges(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write("""
+model_list:
+  - "not-a-dict"
+  - model_name: ".emptyfleet"
+    litellm_params: {model: "x"}
+  - model_name: "emptylane."
+    litellm_params: {model: "y"}
+  - model_name: "valid.flash"
+    model_info: {public: true}
+    litellm_params: {model: "z"}
+""")
+            path = f.name
+        try:
+            pub = FF._public_lane_names(path)
+            self.assertEqual(pub, frozenset({"valid.flash"}))
+            fleets = FF.discover_fleets(path)
+            self.assertIn("valid", fleets)
+            self.assertNotIn("", fleets)
+        finally:
+            os.unlink(path)
+
+    def test_fleet_state_oserror_and_write_failure(self):
+        fs = FF.FleetState("/tmp/nonexistent-fleet-state.json", {})
+        with mock.patch("os.stat", side_effect=PermissionError("denied")):
+            with self.assertRaises(FF.FleetStateError):
+                fs.load()
+
+        with tempfile.TemporaryDirectory() as td:
+            state_file = os.path.join(td, "fleets.json")
+            fs = FF.FleetState(state_file, {})
+            with mock.patch("os.replace", side_effect=OSError("disk error")):
+                with self.assertRaises(OSError):
+                    fs._write({"clients": {}})
+            with mock.patch("os.replace", side_effect=OSError("disk error")):
+                with mock.patch("os.unlink", side_effect=OSError("unlink error")):
+                    with self.assertRaises(OSError):
+                        fs._write({"clients": {}})
+
+    def test_header_text_decode_error(self):
+        class BadBytes(bytes):
+            def decode(self, *args, **kwargs):
+                raise UnicodeError("cannot decode")
+        self.assertEqual(FF._header_text({b"h": BadBytes(b"val")}, b"h"), "")
+
+    def test_fleet_warn_exception(self):
+        FF._FLEET_WARNED.clear()
+        stream = mock.Mock()
+        stream.write.side_effect = RuntimeError("stream broke")
+        self.assertFalse(FF._fleet_warn(RuntimeError("test"), stream=stream))
+
+    def test_header_map_exception(self):
+        class BadHeaders:
+            def __iter__(self):
+                raise RuntimeError("err")
+        self.assertEqual(FF._header_map({"headers": BadHeaders()}), {})
+
+    def test_set_content_length_exception(self):
+        class BadScope(dict):
+            def __setitem__(self, key, value):
+                raise RuntimeError("readonly")
+        scope = BadScope({"headers": []})
+        FF._set_content_length(scope, 10)
+
+    def test_warn_chatgpt_instructions_exception(self):
+        with mock.patch("sys.stderr.write", side_effect=RuntimeError("stderr fail")):
+            FF._warn_chatgpt_instructions("warning message")
+
+
+class TestControlPlaneAndInferenceCoverage(FleetHarness):
+    def drive_request(self, mw, path, method="POST", raw=b"", headers=None, client=("127.0.0.1", 5000)):
+        scope = {"type": "http", "path": path, "method": method,
+                 "client": client,
+                 "headers": list(headers or [])}
+        msgs = [{"type": "http.request", "body": raw, "more_body": False}]
+        sent = []
+
+        async def receive():
+            if not msgs:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            m = msgs.pop(0)
+            if isinstance(m, Exception):
+                raise m
+            return m
+
+        async def send(m):
+            sent.append(m)
+
+        asyncio.run(mw(scope, receive, send))
+        return scope, sent
+
+    def test_fleet_control_plane_document_error(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        with mock.patch.object(self.state, "document", side_effect=RuntimeError("db err")):
+            _, sent = self.drive_request(mw, "/v1/ferry/fleet", method="GET")
+            start, payload = collect(sent)
+            self.assertEqual(start["status"], 503)
+
+    def test_fleet_control_plane_read_body_none(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        scope = {"type": "http", "path": "/v1/ferry/fleet", "method": "POST",
+                 "client": ("127.0.0.1", 5000), "headers": []}
+        async def failing_receive():
+            raise RuntimeError("disconnected")
+        sent = []
+        async def send(m):
+            sent.append(m)
+        asyncio.run(mw(scope, failing_receive, send))
+        start, payload = collect(sent)
+        self.assertEqual(start["status"], 400)
+
+    def test_fleet_control_plane_invalid_fleet_type(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        _, sent = self.drive_request(mw, "/v1/ferry/fleet", method="POST", raw=b'{"fleet": 123}')
+        start, _ = collect(sent)
+        self.assertEqual(start["status"], 400)
+
+    def test_fleet_control_plane_set_selection_error(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        with mock.patch.object(self.state, "set_selection", side_effect=RuntimeError("write fail")):
+            _, sent = self.drive_request(mw, "/v1/ferry/fleet", method="POST", raw=b'{"fleet": "domestic"}')
+            start, _ = collect(sent)
+            self.assertEqual(start["status"], 503)
+
+    def test_chains_control_plane_post_method(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        _, sent = self.drive_request(mw, "/v1/ferry/chains", method="POST")
+        start, _ = collect(sent)
+        self.assertEqual(start["status"], 405)
+
+    def test_promote_preview_methods_and_errors(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        # GET on preview -> 405
+        _, sent = self.drive_request(mw, "/v1/ferry/promote/preview", method="GET")
+        self.assertEqual(collect(sent)[0]["status"], 405)
+
+        # body receive failure -> 400
+        scope = {"type": "http", "path": "/v1/ferry/promote/preview", "method": "POST",
+                 "client": ("127.0.0.1", 5000), "headers": []}
+        async def failing_receive():
+            raise RuntimeError("disconnected")
+        sent = []
+        async def send(m):
+            sent.append(m)
+        asyncio.run(mw(scope, failing_receive, send))
+        self.assertEqual(collect(sent)[0]["status"], 400)
+
+        # invalid JSON -> 400
+        _, sent = self.drive_request(mw, "/v1/ferry/promote/preview", method="POST", raw=b"bad")
+        self.assertEqual(collect(sent)[0]["status"], 400)
+
+        # router None -> 503
+        with mock.patch("ferry_front._live_router", return_value=None):
+            _, sent = self.drive_request(mw, "/v1/ferry/promote/preview", method="POST", raw=b'{"lane": "a", "hop": "b"}')
+            self.assertEqual(collect(sent)[0]["status"], 503)
+
+        # validate_promote errs -> 409
+        mock_router = mock.Mock()
+        with mock.patch("ferry_front._live_router", return_value=mock_router):
+            with mock.patch("ferry_front.validate_promote", return_value=["err1"]):
+                _, sent = self.drive_request(mw, "/v1/ferry/promote/preview", method="POST", raw=b'{"lane": "a", "hop": "b"}')
+                self.assertEqual(collect(sent)[0]["status"], 409)
+
+    def test_promote_methods_and_errors(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        # GET on promote -> 405
+        _, sent = self.drive_request(mw, "/v1/ferry/promote", method="GET")
+        self.assertEqual(collect(sent)[0]["status"], 405)
+
+        # body receive failure -> 400
+        scope = {"type": "http", "path": "/v1/ferry/promote", "method": "POST",
+                 "client": ("127.0.0.1", 5000), "headers": []}
+        async def failing_receive():
+            raise RuntimeError("disconnected")
+        sent = []
+        async def send(m):
+            sent.append(m)
+        asyncio.run(mw(scope, failing_receive, send))
+        self.assertEqual(collect(sent)[0]["status"], 400)
+
+        # invalid JSON -> 400
+        _, sent = self.drive_request(mw, "/v1/ferry/promote", method="POST", raw=b"bad")
+        self.assertEqual(collect(sent)[0]["status"], 400)
+
+        # router None -> 503
+        with mock.patch("ferry_front._live_router", return_value=None):
+            _, sent = self.drive_request(mw, "/v1/ferry/promote", method="POST", raw=b'{"lane": "a", "hop": "b"}')
+            self.assertEqual(collect(sent)[0]["status"], 503)
+
+        # service_promote ok=False -> 409
+        mock_router = mock.Mock()
+        with mock.patch("ferry_front._live_router", return_value=mock_router):
+            with mock.patch("ferry_front.service_promote", return_value=(False, ["err1"], None)):
+                _, sent = self.drive_request(mw, "/v1/ferry/promote", method="POST", raw=b'{"lane": "a", "hop": "b"}')
+                self.assertEqual(collect(sent)[0]["status"], 409)
+
+    def test_reorder_methods_and_errors(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        # GET on reorder -> 405
+        _, sent = self.drive_request(mw, "/v1/ferry/reorder", method="GET")
+        self.assertEqual(collect(sent)[0]["status"], 405)
+
+        # body receive failure -> 400
+        scope = {"type": "http", "path": "/v1/ferry/reorder", "method": "POST",
+                 "client": ("127.0.0.1", 5000), "headers": []}
+        async def failing_receive():
+            raise RuntimeError("disconnected")
+        sent = []
+        async def send(m):
+            sent.append(m)
+        asyncio.run(mw(scope, failing_receive, send))
+        self.assertEqual(collect(sent)[0]["status"], 400)
+
+        # invalid JSON -> 400
+        _, sent = self.drive_request(mw, "/v1/ferry/reorder", method="POST", raw=b"bad")
+        self.assertEqual(collect(sent)[0]["status"], 400)
+
+        # router None -> 503
+        with mock.patch("ferry_front._live_router", return_value=None):
+            _, sent = self.drive_request(mw, "/v1/ferry/reorder", method="POST", raw=b'{"order": {"a": ["a", "b"]}}')
+            self.assertEqual(collect(sent)[0]["status"], 503)
+
+    def test_catalogue_forwards_unknown_asgi_message(self):
+        async def custom_app(scope, receive, send):
+            await send({"type": "http.response.custom", "val": 123})
+            await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": b'{"object":"list","data":[]}', "more_body": False})
+
+        mw = LaneCatalogueFilter(custom_app, frozenset({"orch"}))
+        _, sent = self.drive_request(mw, "/v1/models", method="GET")
+        types = [m["type"] for m in sent]
+        self.assertIn("http.response.custom", types)
+
+    def test_read_body_receive_failure_in_inference(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST",
+                 "client": ("127.0.0.1", 5000), "headers": []}
+        async def failing_receive():
+            raise RuntimeError("disconnected")
+        sent = []
+        async def send(m):
+            sent.append(m)
+        asyncio.run(mw(scope, failing_receive, send))
+        start, payload = collect(sent)
+        self.assertEqual(start["status"], 400)
+
+    def test_inference_metrics_module_failure(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        with mock.patch.dict(os.environ, {"FERRY_EVENTS": "1"}):
+            with mock.patch("ferry_front._metrics_module", side_effect=RuntimeError("no metrics")):
+                _, sent = self.drive_request(mw, "/v1/chat/completions", method="POST", raw=b'{"model": "domestic.flash"}')
+                self.assertEqual(collect(sent)[0]["status"], 200)
+
+    def test_fleet_rewrite_comply_and_reparse_failure(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        comply_mock = mock.Mock(side_effect=RuntimeError("comply broke"))
+        orig_loads = json.loads
+        calls = [0]
+        def custom_loads(b):
+            calls[0] += 1
+            if calls[0] == 2:
+                raise RuntimeError("second load broke")
+            return orig_loads(b)
+
+        with mock.patch("ferry_front._comply_fn", return_value=comply_mock):
+            with mock.patch("json.loads", side_effect=custom_loads):
+                _, sent = self.drive_request(mw, "/v1/chat/completions", method="POST", raw=b'{"tools": []}')
+                self.assertEqual(collect(sent)[0]["status"], 200)
+
+    def test_fleet_rewrite_scope_warnings_set_failure(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        with mock.patch.dict(os.environ, {"FERRY_EVENTS": "1"}):
+            with mock.patch("ferry_front._tap", return_value=mock.Mock()):
+                class BadScope(dict):
+                    def __setitem__(self, k, v):
+                        if k == FF.SCHEMA_WARNINGS_KEY:
+                            raise RuntimeError("cannot set warnings")
+                        super().__setitem__(k, v)
+                scope = BadScope({"type": "http", "path": "/v1/chat/completions", "method": "POST",
+                                 "client": ("127.0.0.1", 5000), "headers": []})
+                msgs = [{"type": "http.request", "body": b'{"model": "domestic.flash"}', "more_body": False}]
+                sent = []
+                async def receive():
+                    return msgs.pop(0) if msgs else {"type": "http.request", "body": b"", "more_body": False}
+                async def send(m):
+                    sent.append(m)
+                asyncio.run(mw(scope, receive, send))
+                self.assertEqual(collect(sent)[0]["status"], 200)
+
+    def test_fleet_rewrite_resolve_model_generic_exception(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        with mock.patch("ferry_front.resolve_model", side_effect=Exception("wild error")):
+            with mock.patch("ferry_front._fleet_warn") as m_warn:
+                _, sent = self.drive_request(mw, "/v1/chat/completions", method="POST", raw=b'{"model": "flash"}')
+                self.assertEqual(collect(sent)[0]["status"], 200)
+                m_warn.assert_called_once()
+
+    def test_fleet_rewrite_json_dumps_failure(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        with mock.patch("json.dumps", side_effect=RuntimeError("dumps broke")):
+            _, sent = self.drive_request(mw, "/v1/chat/completions", method="POST", raw=b'{"model": "flash"}')
+            self.assertEqual(collect(sent)[0]["status"], 200)
+
+    def test_fleet_rewrite_replay_second_call(self):
+        scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST",
+                 "client": ("127.0.0.1", 5000), "headers": []}
+        msgs = [{"type": "http.request", "body": b'{"model": "flash"}', "more_body": False},
+                {"type": "http.request", "body": b"second", "more_body": False}]
+        async def receive():
+            return msgs.pop(0)
+        async def test_app(sc, rec, send):
+            msg1 = await rec()
+            msg2 = await rec()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": msg2["body"], "more_body": False})
+        mw_test = LaneCatalogueFilter(test_app, frozenset(), fleets=FLEETS, state=self.state)
+        sent = []
+        async def send(m):
+            sent.append(m)
+        asyncio.run(mw_test(scope, receive, send))
+        self.assertEqual(collect(sent)[1], b"second")
+
+    def test_catalogue_fleet_generic_exception(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        with mock.patch.object(self.state, "selection_for", side_effect=Exception("weird fail")):
+            with mock.patch("ferry_front._fleet_warn") as m_warn:
+                fleet = mw._catalogue_fleet({"headers": []})
+                self.assertIsNone(fleet)
+                m_warn.assert_called_once()
+
+    def test_stripping_and_tapped_strip_headers_failure(self):
+        app = BodyApp()
+        mw = self.mw(app)
+        with mock.patch("ferry_front._strip_headers", side_effect=RuntimeError("strip fail")):
+            with mock.patch("ferry_front.strip_headers_enabled", return_value=True):
+                # _stripping error branch
+                _, sent = self.drive_request(mw, "/v1/chat/completions", method="POST",
+                                             raw=b'{"model": "domestic.flash"}', client=("192.168.1.100", 5000))
+                self.assertEqual(collect(sent)[0]["status"], 200)
+
+                # _tapped error branch (with FERRY_EVENTS=1)
+                with mock.patch.dict(os.environ, {"FERRY_EVENTS": "1"}):
+                    _, sent = self.drive_request(mw, "/v1/chat/completions", method="POST",
+                                                 raw=b'{"model": "domestic.flash"}', client=("192.168.1.100", 5000))
+                    self.assertEqual(collect(sent)[0]["status"], 200)
+
+
+class TestMainWorkersAndRunpy(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.home = self.dir.name
+
+    def test_main_multi_workers_prepares_multiproc(self):
+        import types
+        seen = {}
+        fake = types.ModuleType("uvicorn")
+        fake.run = lambda *a, **kw: seen.update(prom=os.environ.get("PROMETHEUS_MULTIPROC_DIR"))
+        out = io.StringIO()
+        os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+        with mock.patch.dict(os.environ, {"HOME": self.home}, clear=False):
+            sys.modules["uvicorn"] = fake
+            try:
+                with mock.patch("sys.stdout", out):
+                    rc = FF.main(["--config", "x.yaml", "--port", "8095", "--workers", "2"])
+            finally:
+                sys.modules.pop("uvicorn", None)
+        self.assertEqual(rc, 0)
+        prom_dir = seen.get("prom") or ""
+        self.assertTrue(os.path.exists(prom_dir))
+        self.assertIn("ferry-prom-multiproc-8095", prom_dir)
+        import shutil
+        shutil.rmtree(prom_dir, ignore_errors=True)
+        os.environ.pop("PROMETHEUS_MULTIPROC_DIR", None)
+
+    def test_runpy_main_module(self):
+        import runpy
+        import types
+        front_path = os.path.join(REPO, "front", "ferry_front.py")
+        fake_uvicorn = types.ModuleType("uvicorn")
+        fake_uvicorn.run = lambda *a, **kw: None
+        with tempfile.TemporaryDirectory() as td:
+            cfg = os.path.join(td, "cfg.yaml")
+            with open(cfg, "w") as f:
+                f.write("model_list: []\n")
+            with mock.patch.dict(os.environ, {"HOME": td}, clear=False):
+                with mock.patch.dict(sys.modules, {"uvicorn": fake_uvicorn}):
+                    with mock.patch("sys.argv", ["ferry_front.py", "--config", cfg, "--port", "8099"]):
+                        with mock.patch("sys.stdout", io.StringIO()):
+                            with self.assertRaises(SystemExit) as cm:
+                                runpy.run_path(front_path, run_name="__main__")
+                            self.assertEqual(cm.exception.code, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -421,7 +421,7 @@ It is a **surgical takeover, not a merge**. Four keys belong to ferry and are re
 | `permission` | `"allow"` |
 | `agent` | all seven built-ins pinned (below) |
 
-`plugin` is *appended* to, never replaced — [`github:sblattj/OpenCode-goal-plugin`](https://github.com/sblattj/OpenCode-goal-plugin) (pre-bundled standalone distribution) is added if it isn't already there (and legacy `opencode-goal-plugin` / `@prevalentware/opencode-goal-plugin` entries are upgraded).
+`plugin` is *appended* to, never replaced — [`github:sblattj/OpenCode-goal-plugin#v0.9.1`](https://github.com/sblattj/OpenCode-goal-plugin) (pre-bundled standalone distribution) is added if it isn't already there (and legacy `opencode-goal-plugin` / `@prevalentware/opencode-goal-plugin` entries are upgraded). The entry is **pinned to a git ref, and ferry bumps that ref each release**: opencode caches a git plugin under `~/.cache/opencode/packages/<spec>` and never refreshes it once installed, so only a new spec string forces a new version in — which is why an unpinned or stale-ref entry is rewritten to the current pin on every run. A local filesystem path to your own fork still counts as present and is left alone. Ferry also merges a top-level `command.goal` entry into the config (never overwriting one you wrote) so the plugin's `/goal` slash command actually appears.
 
 All seven of opencode's built-in agents get pinned to the cloud defaults, so nothing silently escapes to a model you aren't paying for on purpose:
 

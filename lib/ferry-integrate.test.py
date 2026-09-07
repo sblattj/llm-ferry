@@ -500,7 +500,7 @@ class TestSuperProfile(FerryOpencodeCase):
 
 
 class TestGoalPlugin(FerryOpencodeCase):
-    PLUGIN = "opencode-goal-plugin"
+    PLUGIN = "github:sblattj/OpenCode-goal-plugin"
 
     def test_appended_when_absent(self):
         self.run_ferry()
@@ -519,9 +519,9 @@ class TestGoalPlugin(FerryOpencodeCase):
 
     def test_a_version_pinned_entry_counts_as_present(self):
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [f"{self.PLUGIN}@0.9.0"]}, f)
+            json.dump({"plugin": [f"{self.PLUGIN}#v0.9.1"]}, f)
         self.run_ferry()
-        self.assertEqual(self.read()["plugin"], [f"{self.PLUGIN}@0.9.0"])
+        self.assertEqual(self.read()["plugin"], [f"{self.PLUGIN}#v0.9.1"])
 
     def test_the_pkg_plus_options_tuple_form_counts_as_present(self):
         with open(self.cfg, "w") as f:
@@ -532,6 +532,18 @@ class TestGoalPlugin(FerryOpencodeCase):
     def test_legacy_prevalentware_plugin_is_migrated_to_new_plugin(self):
         with open(self.cfg, "w") as f:
             json.dump({"plugin": ["@prevalentware/opencode-goal-plugin"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_legacy_bare_opencode_goal_plugin_is_migrated(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": ["opencode-goal-plugin"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_legacy_willytop8_plugin_is_migrated(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": ["github:willytop8/OpenCode-goal-plugin"]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [self.PLUGIN])
 
@@ -546,6 +558,12 @@ class TestGoalPlugin(FerryOpencodeCase):
             json.dump({"plugin": [["@prevalentware/opencode-goal-plugin", {"enabled": True}]]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [[self.PLUGIN, {"enabled": True}]])
+
+    def test_deduplicates_legacy_and_new_entries(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": ["opencode-goal-plugin", self.PLUGIN]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
 
     # ── a LOCAL fork of the same plugin ───────────────────────────────────
     LOCAL_FORK = "/Users/someone/code/opencode-goal-plugin/dist/server.js"

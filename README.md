@@ -460,7 +460,7 @@ It is a **surgical takeover, not a merge**. Four keys belong to ferry and are re
 `plugin` is *appended* to, never replaced — the [OpenCode goal plugin](https://github.com/sblattj/OpenCode-goal-plugin) is added if it isn't already there, in exactly this form:
 
 ```
-opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.1.tar.gz
+opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.11.0.tar.gz
 ```
 
 **The spelling is the whole feature.** On opencode 1.18.29 a bare `github:owner/repo#tag` spec (which is what ferry ≤ v1.29.4 wrote) *installs to disk and then never loads*: npm-package-arg returns no name for it, so `Npm.add` throws after a perfectly successful reify, the entry is dropped, and **nothing is logged anywhere** — the package cache fills up and the plugin has never once run. Prefixing the package name fixes that. On top of it, any *git* spec whose `package.json` declares a `build`/`prepack` script dies inside opencode's bundled installer (`git dep preparation failed`), so the pinned form is a **remote tarball**, which is fetched by a code path that never runs that step at all.
@@ -482,7 +482,7 @@ find "${XDG_CACHE_HOME:-$HOME/.cache}/opencode/packages" \
   -path '*/node_modules/opencode-goal-plugin/package.json' -exec grep -m1 '"version"' {} +
 ```
 
-`find`, not a glob: a spec's slashes become directories, so the tarball form lands eight levels down at `packages/opencode-goal-plugin@https:/github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.1.tar.gz/` — a single-level `packages/*opencode-goal-plugin*/…` pattern matches only the older `github:`-shaped directories and reports a healthy install as missing.
+`find`, not a glob: a spec's slashes become directories, so the tarball form lands eight levels down at `packages/opencode-goal-plugin@https:/github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.11.0.tar.gz/` — a single-level `packages/*opencode-goal-plugin*/…` pattern matches only the older `github:`-shaped directories and reports a healthy install as missing.
 
 And the TUI half, which loads from ferry's copy rather than the cache:
 

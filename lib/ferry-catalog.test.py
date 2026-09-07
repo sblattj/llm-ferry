@@ -116,6 +116,48 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(result['total'], 0)
         self.assertIsNone(result['fetched_at'])
 
+    def test_catalog_edge_branches(self):
+        # Line 30: invalid url
+        with self.assertRaises(self.catalog.CatalogError) as cm:
+            self.catalog._safe_url('')
+        self.assertIn('Invalid catalog pagination URL', str(cm.exception))
+        with self.assertRaises(self.catalog.CatalogError):
+            self.catalog._safe_url(None)
+
+        # Lines 38-39: urlsplit/port ValueError
+        with self.assertRaises(self.catalog.CatalogError) as cm:
+            self.catalog._safe_url('https://openrouter.ai:99999/api/v1/models')
+        self.assertIn('Unsafe catalog pagination URL', str(cm.exception))
+
+        # Line 103: time budget exceeded
+        self.now += 31
+        calls = [0]
+        def fake_mono():
+            calls[0] += 1
+            return 1000.0 if calls[0] >= 3 else 0.0
+
+        with patch('time.monotonic', side_effect=fake_mono):
+            res = self.catalog.get_catalog(refresh=True)
+            self.assertIn('time budget', res['error'])
+
+        # Line 121: invalid total count (boolean or negative)
+        self.now += 31
+        with patch.object(self.catalog._opener, 'open', return_value=self.response([{'id': 'a'}], total_count=True)):
+            res = self.catalog.get_catalog(refresh=True)
+            self.assertIn('invalid total count', res['error'])
+        self.now += 31
+        with patch.object(self.catalog._opener, 'open', return_value=self.response([{'id': 'a'}], total_count=-1)):
+            res = self.catalog.get_catalog(refresh=True)
+            self.assertIn('invalid total count', res['error'])
+
+        # Line 123: total count changed during pagination
+        self.now += 31
+        resp1 = self.response([{'id': 'a'}], links={'next': '?page=2'}, total_count=2)
+        resp2 = self.response([{'id': 'b'}], total_count=3)
+        with patch.object(self.catalog._opener, 'open', side_effect=[resp1, resp2]):
+            res = self.catalog.get_catalog(refresh=True)
+            self.assertIn('retry required', res['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

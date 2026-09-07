@@ -57,16 +57,38 @@ CATALOGUE = ["heavy", "medium", "orch-fallback-1", "orch-fallback-2", "orch-fall
 
 BUILTIN_AGENTS = {"build", "plan", "general", "explore",
                   "title", "summary", "compaction"}
+# Not opencode built-ins: ferry declares these two itself, as subagents, to
+# replace the disabled `general` worker.
+CUSTOM_AGENTS = {"light", "standard"}
 
-# Cloud defaults put general on medium when a modern host advertises it, with
-# compaction and housekeeping on super-flash. Older/unreachable hosts retain
-# flash for general; local keeps its two GPU lanes.
+# Cloud defaults put `standard` on medium when a modern host advertises it,
+# `light` and explore on flash, and compaction/housekeeping on super-flash.
+# Older/unreachable hosts drop standard back to flash; local keeps its two GPU
+# lanes and shares local-sub across every worker.
 DRIVER_AGENTS = ("build", "plan")
-GENERAL_AGENTS = ("general",)
+LIGHT_AGENTS = ("light",)
+STANDARD_AGENTS = ("standard",)
+DISABLED_AGENTS = ("general",)
 EXPLORE_AGENTS = ("explore",)
 COMPACTION_AGENTS = ("compaction",)
 HOUSE_AGENTS = ("title", "summary")
-NON_DRIVER_AGENTS = GENERAL_AGENTS + EXPLORE_AGENTS + COMPACTION_AGENTS + HOUSE_AGENTS
+# The agents that carry a model and are NOT the driver. `general` is absent on
+# purpose: it is disabled, so it has no model key at all.
+WORKER_AGENTS = LIGHT_AGENTS + STANDARD_AGENTS + EXPLORE_AGENTS
+NON_DRIVER_AGENTS = WORKER_AGENTS + COMPACTION_AGENTS + HOUSE_AGENTS
+
+# opencode's task tool advertises each non-primary agent to the driver as
+# "- <name>: <description>", so the complexity band has to live in the
+# description text. These strings are the routing contract; assert them
+# verbatim, because a paraphrase that loses the numeric band silently stops the
+# driver from routing.
+LIGHT_DESC = ("Worker for tasks rated 0-50 of 100 complexity: exploration "
+              "follow-ups, small fixes, easy implementation, mechanical edits "
+              "with clear instructions. Full tool access. Default worker; use "
+              "standard only when the task clearly needs deeper judgment.")
+STANDARD_DESC = ("Worker for tasks rated 51-100 of 100 complexity: multi-file "
+                 "implementation, ambiguous debugging, design judgment. Full "
+                 "tool access. Use light for anything rated 50 or below.")
 
 SNAP_RE = re.compile(r"^[^/]+\.\d{8}T\d{6}Z(-\d+)?\.jsonc$")
 
@@ -226,7 +248,7 @@ class TestTakeoverScope(FerryOpencodeCase):
     def test_agent_section_is_replaced_wholesale(self):
         self.run_ferry()
         agent = self.read()["agent"]
-        self.assertEqual(set(agent), BUILTIN_AGENTS)
+        self.assertEqual(set(agent), BUILTIN_AGENTS | CUSTOM_AGENTS)
         self.assertNotIn("my-custom-agent", agent, "agent must be replaced, not merged")
         self.assertNotIn("scout", agent, "scout is not an opencode agent")
 
@@ -243,12 +265,37 @@ class TestTakeoverScope(FerryOpencodeCase):
         agent = self.read()["agent"]
         for a in DRIVER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/heavy")
-        for a in GENERAL_AGENTS:
+        for a in LIGHT_AGENTS:
+            self.assertEqual(agent[a]["model"], "ferry/flash")
+        for a in STANDARD_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/medium")
         for a in EXPLORE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/flash")
         for a in COMPACTION_AGENTS + HOUSE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/super-flash")
+
+    def test_the_builtin_general_worker_is_disabled_not_deleted(self):
+        # Deleting the key does NOT remove the agent: opencode ships `general`
+        # as a built-in, and an unpinned built-in reappears inheriting the
+        # primary model — i.e. the expensive driver lane would run the fan-out.
+        self.run_ferry()
+        agent = self.read()["agent"]
+        for a in DISABLED_AGENTS:
+            self.assertEqual(agent[a], {"disable": True},
+                             "general must be disabled, with no model key")
+
+    def test_the_two_workers_are_subagents_carrying_the_band_descriptions(self):
+        # The description is the ONLY thing the driver sees at dispatch time
+        # (opencode's task tool has no model parameter), so the band rule has
+        # to be in it verbatim.
+        self.run_ferry()
+        agent = self.read()["agent"]
+        self.assertEqual(agent["light"], {"description": LIGHT_DESC,
+                                          "mode": "subagent",
+                                          "model": "ferry/flash"})
+        self.assertEqual(agent["standard"], {"description": STANDARD_DESC,
+                                             "mode": "subagent",
+                                             "model": "ferry/medium"})
 
     def test_no_default_leaves_the_takeover_keys_alone(self):
         self.run_ferry("--no-default")
@@ -276,15 +323,19 @@ class TestLaneNamesOnly(FerryOpencodeCase):
             self.run_ferry("--model", "medium")
             self.assertIn("medium", self.read()["provider"]["ferry"]["models"])
 
-    def test_old_catalogue_keeps_general_fallback_and_compaction_house_lane(self):
+    def test_old_catalogue_keeps_standard_fallback_and_compaction_house_lane(self):
         old_catalogue = [lane for lane in CATALOGUE if lane != "medium"]
         with mock.patch(__name__ + ".CATALOGUE", old_catalogue):
             self.run_ferry()
         cfg = self.read()
         self.assertNotIn("medium", cfg["provider"]["ferry"]["models"])
-        self.assertEqual(cfg["agent"]["general"]["model"], "ferry/flash")
+        # No medium on the wire => standard falls back onto flash rather than
+        # naming a lane this host cannot resolve.
+        self.assertEqual(cfg["agent"]["standard"]["model"], "ferry/flash")
+        self.assertEqual(cfg["agent"]["light"]["model"], "ferry/flash")
         self.assertEqual(cfg["agent"]["explore"]["model"], "ferry/flash")
         self.assertEqual(cfg["agent"]["compaction"]["model"], "ferry/super-flash")
+        self.assertEqual(cfg["agent"]["general"], {"disable": True})
 
     def test_catalogue_omission_of_the_title_summary_lane_does_not_warn(self):
         # A compatible host can omit the title/summary lane from /v1/models.
@@ -317,6 +368,25 @@ class TestLaneNamesOnly(FerryOpencodeCase):
         self.assertEqual(cfg["small_model"], "ferry/local-sub")
         for a in NON_DRIVER_AGENTS:
             self.assertEqual(cfg["agent"][a]["model"], "ferry/local-sub")
+        # Two lanes only, so light and standard collapse onto the same one —
+        # they stay two AGENTS (the band split is about which one the driver
+        # picks), and general is disabled here exactly as it is on cloud.
+        self.assertEqual(cfg["agent"]["light"]["mode"], "subagent")
+        self.assertEqual(cfg["agent"]["standard"]["mode"], "subagent")
+        self.assertEqual(cfg["agent"]["general"], {"disable": True})
+
+    def test_an_explicit_small_model_overrides_every_worker_lane(self):
+        # --small-model is one knob for the whole fan-out: the band split says
+        # which worker the driver picks, not which lanes stay alive when the
+        # operator has named one.
+        self.run_ferry("--small-model", "medium")
+        cfg = self.read()
+        for a in WORKER_AGENTS:
+            self.assertEqual(cfg["agent"][a]["model"], "ferry/medium")
+        # The driver and the housekeeping lanes are untouched by it.
+        self.assertEqual(cfg["model"], "ferry/heavy")
+        for a in COMPACTION_AGENTS + HOUSE_AGENTS:
+            self.assertEqual(cfg["agent"][a]["model"], "ferry/super-flash")
 
     def test_unserved_lane_warns_instead_of_silently_wiring(self):
         out = self.run_ferry("--model", "no-such-lane")
@@ -432,7 +502,7 @@ class TestMasterKeyAuth(FerryOpencodeCase):
 class TestSuperProfile(FerryOpencodeCase):
     """`--super` — the cheap cloud profile: heavy drives, super-flash everywhere.
 
-    Every non-driver agent collapses onto super-flash (general/explore/
+    Every non-driver agent collapses onto super-flash (light/standard/explore/
     title/summary/compaction and small_model), while build/plan and the model
     stay on heavy. A later explicit flag must still win over the profile.
     """
@@ -459,21 +529,24 @@ class TestSuperProfile(FerryOpencodeCase):
             self.assertEqual(agent[a]["model"], "ferry/heavy")
         for a in NON_DRIVER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/super-flash")
+        self.assertEqual(agent["general"], {"disable": True})
 
-    def test_unreachable_catalogue_keeps_general_fallback_and_compaction_house_lane(self):
+    def test_unreachable_catalogue_keeps_standard_fallback_and_compaction_house_lane(self):
         out = self.run_ferry(port=self.dead_port)
         self.assertIn("Could not query", out,
                       "the host was supposed to be unreachable")
         cfg = self.read()
         self.assertNotIn("medium", cfg["provider"]["ferry"]["models"])
-        self.assertEqual(cfg["agent"]["general"]["model"], "ferry/flash")
+        self.assertEqual(cfg["agent"]["standard"]["model"], "ferry/flash")
+        self.assertEqual(cfg["agent"]["light"]["model"], "ferry/flash")
         self.assertEqual(cfg["agent"]["explore"]["model"], "ferry/flash")
         self.assertEqual(cfg["agent"]["compaction"]["model"], "ferry/super-flash")
+        self.assertEqual(cfg["agent"]["general"], {"disable": True})
 
     def test_a_later_explicit_small_model_flag_wins_over_super(self):
         self.run_ferry("--super", "--small-model", "flash")
         agent = self.read()["agent"]
-        for a in GENERAL_AGENTS + EXPLORE_AGENTS:
+        for a in WORKER_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/flash")
         for a in COMPACTION_AGENTS + HOUSE_AGENTS:
             self.assertEqual(agent[a]["model"], "ferry/super-flash")
@@ -486,7 +559,7 @@ class TestSuperProfile(FerryOpencodeCase):
     def test_a_later_explicit_housekeeper_flag_wins_over_super(self):
         self.run_ferry("--super", "--housekeeper", "flash")
         cfg = self.read()
-        for a in GENERAL_AGENTS + EXPLORE_AGENTS:
+        for a in WORKER_AGENTS:
             self.assertEqual(cfg["agent"][a]["model"], "ferry/super-flash")
         for a in COMPACTION_AGENTS + HOUSE_AGENTS:
             self.assertEqual(cfg["agent"][a]["model"], "ferry/flash")
@@ -754,6 +827,13 @@ class TestPhantomScoutPin(unittest.TestCase):
     summary/compaction under `agent`, and the shipped binary contains no
     "scout" string at all. Ferry pinned `agent.scout` in two places; the pin
     landed in additionalProperties and was never read.
+
+    `light`/`standard` are a DIFFERENT thing and must not be caught by this
+    guard: they are custom subagents ferry declares deliberately, and a custom
+    agent is legitimately absent from the built-in list. What distinguishes
+    them from a phantom pin is that they carry `mode: "subagent"` and a
+    description — the fields opencode reads for a user-declared agent — so this
+    class checks the two populations separately.
     """
 
     def _sources(self):
@@ -782,6 +862,40 @@ class TestPhantomScoutPin(unittest.TestCase):
             text = f.read()
         self.assertNotIn("opencode-cloud.json\": {", text)
         self.assertIn("ferry\" opencode", text)
+
+
+class TestAgentKeysAreRealOrDeclared(FerryOpencodeCase):
+    """Every key ferry writes under `agent` is either an opencode built-in or a
+    properly DECLARED custom subagent. This is the generalisation of the scout
+    bug: an unknown key lands in additionalProperties and is never read, so a
+    typo'd or invented name costs nothing and does nothing.
+    """
+
+    def test_no_agent_key_is_an_undeclared_invention(self):
+        self.run_ferry()
+        agent = self.read()["agent"]
+        for name, spec in agent.items():
+            if name in BUILTIN_AGENTS:
+                continue
+            self.assertIn(name, CUSTOM_AGENTS,
+                          f"{name} is neither an opencode built-in nor a "
+                          f"custom agent ferry declares")
+            # A custom agent opencode will actually surface: mode + description.
+            self.assertEqual(spec.get("mode"), "subagent", name)
+            self.assertTrue(spec.get("description"), name)
+
+    def test_ferry_pins_exactly_the_builtins_it_means_to(self):
+        # Six pinned to a lane, plus `general` disabled. If opencode renames a
+        # built-in, this is the assertion that notices.
+        self.run_ferry()
+        agent = self.read()["agent"]
+        pinned_builtins = {n for n in agent if n in BUILTIN_AGENTS}
+        self.assertEqual(pinned_builtins, BUILTIN_AGENTS)
+        for name in BUILTIN_AGENTS - set(DISABLED_AGENTS):
+            self.assertTrue(agent[name]["model"].startswith("ferry/"), name)
+        for name in DISABLED_AGENTS:
+            self.assertNotIn("model", agent[name],
+                             "a disabled agent must not also carry a lane pin")
 
 
 class TestFleetHeaders(FerryOpencodeCase):

@@ -1751,8 +1751,11 @@ def install_chatgpt_system_compat(config_class=None):
     Copy changed items: requests may be reused by a retry or another provider.
     """
     if config_class is None:
-        from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
-        config_class = ChatGPTResponsesAPIConfig
+        try:
+            from litellm.llms.chatgpt.responses.transformation import ChatGPTResponsesAPIConfig
+            config_class = ChatGPTResponsesAPIConfig
+        except Exception:
+            return
     original = config_class.transform_responses_api_request
     if getattr(original, "_ferry_system_compat", False):
         return
@@ -1902,7 +1905,7 @@ def apply_chatgpt_instructions(env=None, home=None) -> str:
     return label
 
 
-def build_app():
+def build_app(litellm_app=None):
     """Import litellm's proxy app and wrap it. Used as the uvicorn app factory.
 
     litellm resolves its own config from CONFIG_FILE_PATH, so importing its app
@@ -1914,7 +1917,8 @@ def build_app():
     # never runs main(), and a worker without it serves the Codex prompt.
     apply_chatgpt_instructions()
 
-    from litellm.proxy.proxy_server import app as litellm_app
+    if litellm_app is None:
+        from litellm.proxy.proxy_server import app as litellm_app
 
     install_chatgpt_system_compat()
     if tap_enabled():

@@ -280,6 +280,26 @@ class ClientScopeTest(ClientHarness):
         self.assert_skill_matches_repo(
             GOAL_SKILL_SRC, "skills", "using-the-goal-plugin", "SKILL.md")
 
+    def test_no_guardrails_still_ships_the_goal_plugin_skill(self):
+        """The skill follows the PLUGIN, not the guardrails switch.
+
+        README.md and the v1.32.0 release note both promise that a
+        `--no-guardrails` client still gets it, and only this test holds the
+        gate at client-bootstrap.sh's $OC_MODE check instead of its $GUARDRAILS
+        one: folding the skill write into the guardrails branch would leave the
+        rest of this suite green while contradicting both documents."""
+        self.run_script(BOOTSTRAP, "--no-guardrails")
+        self.assert_skill_matches_repo(
+            GOAL_SKILL_SRC, "skills", "using-the-goal-plugin", "SKILL.md")
+        # Control: the flag really took effect. Without it the test would still
+        # pass if --no-guardrails were parsed and then ignored.
+        for parts in (("skills", "spawning-subagents", "SKILL.md"),
+                      ("skill", "spawning-subagents", "SKILL.md"),
+                      ("command", "fan-out.md")):
+            self.assertFalse(
+                os.path.exists(self.path(".config", "opencode", *parts)),
+                f"--no-guardrails still wrote {os.path.join(*parts)}")
+
     def test_full_scope_ships_the_spawning_subagents_skill(self):
         """The same sync guard for the older heredoc, which never had one.
         In sync as of this commit; the guard is what keeps it that way."""

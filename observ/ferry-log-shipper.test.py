@@ -12,10 +12,13 @@ VictoriaLogs is simulated, never contacted.
 """
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import tempfile
 import unittest
+import unittest.mock
+import urllib.error
 
 
 def _load_shipper():
@@ -557,6 +560,79 @@ class TestCli(unittest.TestCase):
     def test_flags_parse(self):
         a = S.parse_args(["--vlogs", "http://h:1", "--log", "/x.log", "--from-start"])
         self.assertEqual((a.vlogs, a.log, a.from_start), ("http://h:1", "/x.log", True))
+
+    def test_help_flag(self):
+        with io.StringIO() as buf, unittest.mock.patch("sys.stdout", buf):
+            with self.assertRaises(SystemExit) as ctx:
+                S.main(["--help"])
+            self.assertEqual(ctx.exception.code, 0)
+
+    def test_main_once_dry_run(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".log") as f:
+            f.write(ACCESS_OK + "\n")
+            f.flush()
+            with io.StringIO() as buf, unittest.mock.patch("sys.stdout", buf):
+                rc = S.main(["--once", "--dry-run", "--log", f.name, "--from-start"])
+                self.assertEqual(rc, 0)
+                out = buf.getvalue()
+                self.assertIn("ferry-log-shipper ->", out)
+                self.assertIn("single pass", out)
+
+
+class TestShipperNetworkAndDrain(unittest.TestCase):
+    def test_post_success(self):
+        shipper = S.Shipper("http://127.0.0.1:9428")
+        mock_resp = unittest.mock.MagicMock()
+        mock_resp.status = 204
+        mock_resp.__enter__.return_value = mock_resp
+        mock_resp.read.return_value = b""
+        with unittest.mock.patch("urllib.request.urlopen", return_value=mock_resp):
+            ok, err = shipper.post([{"test": "record"}])
+            self.assertTrue(ok)
+            self.assertIsNone(err)
+
+    def test_post_http_error(self):
+        shipper = S.Shipper("http://127.0.0.1:9428")
+        err = urllib.error.HTTPError("http://127.0.0.1:9428", 500, "Internal Server Error", {}, io.BytesIO(b"boom"))
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=err):
+            ok, msg = shipper.post([{"test": "record"}])
+            self.assertFalse(ok)
+            self.assertIn("HTTP 500", msg)
+
+    def test_post_network_exception(self):
+        shipper = S.Shipper("http://127.0.0.1:9428")
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=OSError("connection refused")):
+            ok, msg = shipper.post([{"test": "record"}])
+            self.assertFalse(ok)
+            self.assertIn("connection refused", msg)
+
+    def test_drain_and_due(self):
+        shipper = S.Shipper("http://127.0.0.1:9428", batch_size=2, flush_interval=100.0)
+        self.assertFalse(shipper.due())
+        shipper.add({"a": 1})
+        self.assertFalse(shipper.due())
+        shipper.add({"b": 2})
+        self.assertTrue(shipper.due())
+        with unittest.mock.patch.object(shipper, "post", return_value=(True, None)):
+            shipper.drain(deadline_seconds=0.1)
+            self.assertEqual(len(shipper.pending), 0)
+
+
+class TestHelpersAndEdgeCases(unittest.TestCase):
+    def test_clean_value_empty(self):
+        self.assertEqual(S._clean_id(None), "")
+        self.assertEqual(S._clean_id(""), "")
+        self.assertEqual(S._clean_id("a"), "")
+
+    def test_level_for_invalid_status(self):
+        self.assertEqual(S.level_for("line", status="invalid"), "info")
+        self.assertEqual(S.level_for("line", status="503"), "error")
+        self.assertEqual(S.level_for("line", status="404"), "warn")
+        self.assertEqual(S.level_for("line", status="200"), "info")
+
+    def test_tailer_pinned_without_path(self):
+        t = S.Tailer(None, pinned=True)
+        self.assertEqual(t.poll(), [])
 
 
 if __name__ == "__main__":

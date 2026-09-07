@@ -673,7 +673,7 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
-def main(argv=None):
+def main(argv=None, serve=True):
     args = parse_args(argv)
     collector, logpath = build_collector(args)
     try:
@@ -686,10 +686,15 @@ def main(argv=None):
           % (args.port, collector.ferry, args.config, logpath or "not found",
              args.events if collector._tail else "off"))
     print("Ctrl-C to stop.")
+    if not serve:
+        return srv, collector
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nferry-metrics-exporter stopped.")
+    finally:
+        srv.server_close()
+    return 0
 
 
 if __name__ == "__main__":

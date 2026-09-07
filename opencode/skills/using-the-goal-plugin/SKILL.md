@@ -27,10 +27,10 @@ emit completion or blocker markers unless the human's current message explicitly
 | `paused` | user ran `/goal pause` | nothing until they resume |
 | `user intervention` | a human message arrived mid-loop; latest instruction wins | answer the human; do not resume the loop |
 | `blocked` | your `[goal:blocked]` was accepted | wait for the input you named |
-| `no progress` / `no tool calls` | consecutive tiny or talk-only turns | say plainly what stalled you and what step you would run next |
+| `no progress` / `no tool calls` | 2 consecutive stalled turns, or 10 consecutive turns that called no tool | say plainly what stalled you and what step you would run next |
 | `format validation failures` | rejected completions/blockers hit the cap | re-read section 5 before the next attempt |
-| `budget wrap-up requested` | 80% of the token budget spent | hand off: done, remaining, next action |
-| `max turns reached (n)`, `max duration reached (Ns)`, `max context tokens reached (N)` | hard limit hit | summarize state; the user must resume for a fresh window |
+| `budget wrap-up requested` | 80% of token spend, of peak context, or of the clock - whichever arrives first | hand off: done, remaining, next action |
+| `max turns reached (n)`, `max duration reached (8h)`, `max tokens reached (N)`, `context window reached (N)` | hard limit hit | summarize state; the user must resume for a fresh window |
 | `audit rejected` | a configured verifier rejected your evidence | strengthen the evidence, do not re-claim |
 | `plan agent active` / `<name> agent active` | a planning-only agent holds the goal | keep planning; tell the user to switch agents then `/goal resume` |
 | `backgrounded` / `queued` | another goal has focus, or this one is later in an ordered sequence | work the focused goal only; queued goals auto-promote |
@@ -45,20 +45,22 @@ Flags go on the FIRST LINE ONLY. Both `--flag value` and `--flag=value` parse; a
 be quoted. An unrecognized `--word` is not an error - it is swallowed into the objective, so a typo like
 `--max-turn 20` silently does nothing. A KNOWN flag with a bad value is the opposite: it aborts the
 whole command and NO goal is created - a `--mode` that is not `normal`/`ordered`, a numeric flag that
-is not a strict positive integer, a flag whose value is missing, or an unparseable `--budget`. The
-reply lists the offending flags instead of a goal; fix the line and re-send it.
+is not a strict positive integer, a `--max-turns` that is neither a positive integer nor an unlimited
+spelling, a flag whose value is missing, or an unparseable `--budget`/`--context-window`. The reply
+lists the offending flags instead of a goal; fix the line and re-send it.
 
 | Flag | Alias | Value | Effect |
 |---|---|---|---|
-| `--max-turns` | | positive int | auto-continue cap |
+| `--max-turns` | | positive int, or `0`/`unlimited`/`none`/`inf`/`infinite`/`infinity`/`∞` | auto-continue cap; the unlimited spellings are case-insensitive and are the default |
 | `--max-duration-ms` | | positive int | wall-clock cap in ms |
 | `--max-minutes` | | positive int | wall-clock cap in minutes |
-| `--max-tokens` | | positive int | context-token cap |
-| `--budget` | | `<n>`, `<n>k`, `<n>m` | same cap, friendlier units |
+| `--max-tokens` | | positive int | cumulative token SPEND cap |
+| `--budget` | | `<n>`, `<n>k`, `<n>m` | the same spend cap, friendlier units |
+| `--context-window` | | `<n>`, `<n>k`, `<n>m` | peak-context ceiling; overrides the model window the plugin reads from the host |
 | `--cooldown-ms` | | positive int | min delay between continuations |
 | `--no-progress-threshold` | | positive int | output tokens under which a turn looks stalled |
 | `--no-progress-turns` | | positive int | stalled turns before pausing |
-| `--no-tool-turns` | | positive int | talk-only turns before pausing |
+| `--no-tool-turns` | | positive int | tool-free turns before pausing; `0` is rejected here (only the plugin option may disable the brake) |
 | `--success` | `--success-criteria` | text | success criteria block |
 | `--constraints` | `--non-goals` | text | constraints / non-goals block |
 | `--mode` | | `normal` \| `ordered` | ordered adds "finish each step before the next" |
@@ -112,7 +114,11 @@ Re-plan when the world proves the plan wrong; `goal_plan_get` re-reads the curre
 
 1. `goal_action_update(id: "a2", status: "in_progress")` before you start it.
 2. Do the work with real tools. EVERY continuation turn must call at least one tool - a turn that
-   only talks burns a strike toward the talk-only pause, and two in a row stop the goal.
+   only talks burns a strike toward the tool-free pause, and ten in a row stop the goal. The
+   whole turn counts, not your last message: one tool call anywhere in it clears the strike, so a
+   turn that ran tools and then closed with a prose summary is fine. `goal_*` calls are the
+   exception - bookkeeping against the goal is not work, so a turn whose only tool call was
+   `goal_status` or `goal_plan_set` still counts as tool-free.
 3. Finish it with `goal_action_update(id: "a2", status: "done", claim: ..., evidence: ...,
    verdict: "pass")`. All three are required; `done` without them is refused, and a `done` action
    lacking `verdict: "pass"` blocks goal completion later.
@@ -151,6 +157,10 @@ silently voids the whole claim. Indentation and uppercase are fine, and the unbr
 `goal:evidence <proof>` / `goal:complete` also work. A `[goal:complete]` with no adjacent evidence line
 is rejected, recorded, and re-prompted with an `<evidence_required>` block next turn.
 
+The markers are read from the LAST thing in the turn that produced text. A tool call made after them
+does not void the claim; any further prose does, and only the final block of text is scanned, so a
+marker written earlier in the turn stays ignored.
+
 To stop for the human, put the concrete blocker on the line IMMEDIATELY BEFORE the marker:
 
 ```
@@ -181,28 +191,40 @@ configured completion auditor can still reject an evidenced claim and pause the 
 
 | Limit | Default |
 |---|---|
-| auto-continue turns | 10 |
-| wall clock | 15 minutes |
-| context tokens | 200,000 |
+| auto-continue turns | unlimited, rendered `∞` |
+| wall clock | 8 hours |
+| token spend budget | 100,000,000 cumulative |
+| context ceiling | the running model's own window, read from the host; none at all when the host cannot name one |
 | cooldown between continuations | 1500 ms |
-| stalled turns before pausing | 2 (turns under 50 output tokens) |
-| talk-only turns before pausing | 2 |
-| wrap-up threshold | 80% of the token budget |
-| warnings appear at | 3 turns, 60 s, or 25,000 tokens remaining |
+| stalled turns before pausing | 2 (whole turns under 50 output tokens, with no tool call and no thinking tokens) |
+| tool-free turns before pausing | 10 (whole turns; `goal_*` calls do not count as tools) |
+| wrap-up threshold | 80% of spend, of the context ceiling, or of the clock - the first to arrive |
+| warnings appear at | 10 minutes, 25,000 spend tokens, or 25,000 context tokens remaining (the 3-turn warning is silent unless `--max-turns` set a ceiling) |
 | rejected-format pauses at | 3 failures (a clean turn decrements the counter by one, it does not clear it) |
 
-`<progress_budget>` counts the CURRENT window down for you; what it does not say is that its
-"context tokens" is a running maximum of the largest single-message total seen, not a running
-bill: it tracks how big the live context has grown, plateaus across cheap turns, and drops to 0 after a
-compaction. Cumulative spend is the separate `API usage:` line in `/goal status`.
+Two different token numbers, and they are not interchangeable. SPEND is the running bill - input,
+output, reasoning and cache read/write summed over every message the goal produced, including the
+tokens a subagent you delegated to burned. It only grows, a compaction does not reduce it, and it is
+what `tokens_remaining` in `<progress_budget>`, `Token spend:` in `/goal status`, and the token stat
+in the title and sidebar all count against the 100,000,000 budget. PEAK CONTEXT is the largest single
+message the goal has seen: it tracks how big the live context has grown, plateaus across cheap turns,
+and drops to 0 after a compaction. It is what `context_remaining` and `Peak context:` report, and it
+is measured against the model's own window rather than the budget. When the host cannot name a window
+both of those read `unlimited` / `∞` and no context brake exists - the clock and the spend budget are
+then the only hard limits.
+
+Turns are unlimited by default, so do not pace yourself against a turn count: the brakes that actually
+stop a healthy run are the 8-hour clock, the spend budget, the context ceiling, and the two stall
+pauses. Because the wrap-up PAUSES the goal, 80% is the ceiling you will really hit; the 100% stop
+reasons only fire when one turn jumps the whole way from under 80%.
 
 When `<budget_wrapup>` replaces the usual step line the window is nearly gone. It spells out the
 wrap-up shape itself; the part it does not say is that a wrap-up turn must NOT claim completion. When
 `Limits are near:` is appended, start converging.
 
-`/goal resume` gives a completely fresh window: turns, tokens, elapsed, and every stall/format counter
-reset to zero, while the goal id, objective, plan, and checkpoints survive. `/goal focus` resets
-nothing; it just un-pauses the clock.
+`/goal resume` gives a completely fresh window: turns, spend, peak context, elapsed, and every
+stall/format counter reset to zero, while the goal id, objective, plan, and checkpoints survive.
+`/goal focus` resets nothing; it just un-pauses the clock.
 
 ## 7. Interaction rules
 
@@ -231,17 +253,25 @@ nothing; it just un-pauses the clock.
 
 Answer from `/goal status` or `goal_status` data, never from memory of what you did. `/goal status`
 prints, in order: `Active goal:`, `State:`, `Completion audit:`, the objective size when a long handoff
-is retained, success criteria, constraints, mode, `Auto-continues sent:` used/max, `Context tokens:`
-used/max, the `API usage:` line (input, output, reasoning, cache read/write, cost), `Elapsed:` seconds
-used/max, `Last progress:`, `No-progress turns:`, `Recent checkpoint:`, `Last status:`, the plan render,
-and - when stopped - `Stopped:`, `Blocked reason:`, and a suggested action.
+is retained, success criteria, constraints, mode, `Auto-continues sent:` used/`∞`, `Token spend:`
+used/max, `Peak context:` used/max (`∞` when no ceiling is known), the `API usage:` line (input, output,
+reasoning, cache read/write, cost), `Elapsed:` seconds plus elapsed/limit, `Last progress:`,
+`No-progress turns:`, `Recent checkpoint:`, `Last status:`, the plan render, and - when stopped -
+`Stopped:`, `Blocked reason:`, and a suggested action. `Token spend:` and the `API usage:` line are the
+same bill from two angles: the first is the total against the budget, the second is its breakdown.
+
+Durations render in whole seconds under a minute, then minutes, then hours with one decimal, always
+truncated: `45s`, `45m`, `1.5h`, `8h`. So the session title of a fresh default goal reads
+`▶ ship it · 3/∞ · 2m/8h · 45k/100m` - objective, turns, elapsed/clock, spend/budget.
 
 The sidebar Goal panel shows the same state from session metadata: a state mark (active, paused,
-blocked, completed), the objective label, a stats line of turns, minutes and tokens each as used/max, a
-`step p/t` line in an ordered sequence, `<verified>/<total> actions verified` plus any blocked count, up
-to 12 action lines with status mark and verdict, and notes for blocked, stopped, success criteria and
-constraints. An action shown as done WITHOUT a passing verdict is not verified - the usual reason a goal
-looks finished but will not complete.
+blocked, completed), the objective label, a stats line reading `1/∞ turns · 1m/8h · 147k/100m tokens`
+and gaining a fourth `147k/1m ctx` stat ONLY when a context ceiling is known, a `step p/t` line in an
+ordered sequence, `<verified>/<total> actions verified` plus any blocked count, up to 12 action lines
+with status mark and verdict, and notes for blocked, stopped, success criteria and constraints. Three
+stats instead of four means the goal is running with no context ceiling, not that the panel broke. An
+action shown as done WITHOUT a passing verdict is not verified - the usual reason a goal looks finished
+but will not complete.
 
 ## 9. State, restarts, and other processes
 

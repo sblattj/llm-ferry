@@ -347,15 +347,21 @@ cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
 SCHEMA = "https://opencode.ai/config.json"
-GOAL_PLUGIN = "opencode-goal-plugin"
-LEGACY_GOAL_PLUGIN = "@prevalentware/opencode-goal-plugin"
+GOAL_PLUGIN = "github:sblattj/OpenCode-goal-plugin"
+LEGACY_GOAL_PLUGINS = {
+    "@prevalentware/opencode-goal-plugin",
+    "opencode-goal-plugin",
+    "willytop8/opencode-goal-plugin",
+    "github:willytop8/opencode-goal-plugin",
+    "sblattj/opencode-goal-plugin",
+}
 # The package's own directory name, used to recognise a LOCAL PATH pointing at
 # the same plugin. opencode accepts a filesystem path as a plugin entry, and Bun
 # cannot resolve a PRIVATE repo over `github:` - so a hard fork of this plugin
 # can only be named by path. A path never equals the npm name, so a presence
 # check on the name alone re-appended upstream on EVERY run, leaving opencode
 # loading both the fork and the very package the fork exists to replace.
-GOAL_PLUGIN_DIR = GOAL_PLUGIN.rsplit("/", 1)[-1]
+GOAL_PLUGIN_DIR = GOAL_PLUGIN.rsplit("/", 1)[-1].lower()
 
 # opencode 1.18.23 ships SEVEN built-in agents. Verified two ways so a future
 # rename gets caught: the published schema's $defs.Config.properties.agent names
@@ -597,16 +603,22 @@ if set_default:
             entry = entry[0]
         if not isinstance(entry, str):
             return None
-        # Strip a trailing @version without eating the leading scope @.
+        # Strip trailing #ref
+        if "#" in entry:
+            entry = entry.rsplit("#", 1)[0]
+        # Strip trailing @version without eating a leading scope @
         if entry.startswith("@"):
             return entry.rsplit("@", 1)[0] if entry.count("@") > 1 else entry
-        return entry.rsplit("@", 1)[0] if "@" in entry else entry
+        if "@" in entry:
+            return entry.rsplit("@", 1)[0]
+        return entry
 
-    # Upgrade / replace legacy goal plugin if present
+    # Upgrade / replace legacy goal plugins if present
+    legacy_lower = {x.lower() for x in LEGACY_GOAL_PLUGINS}
     migrated = []
     for p in plugins:
         p_name = pkg_name(p)
-        if p_name == LEGACY_GOAL_PLUGIN:
+        if p_name and p_name.lower() in legacy_lower:
             if isinstance(p, list) and len(p) > 1:
                 migrated.append([GOAL_PLUGIN, p[1]])
             else:
@@ -615,20 +627,33 @@ if set_default:
             migrated.append(p)
     plugins = migrated
 
+    # Deduplicate while preserving order
+    seen_names = set()
+    deduped = []
+    for p in plugins:
+        p_name = pkg_name(p)
+        name_key = p_name.lower() if p_name else None
+        if name_key and name_key in seen_names:
+            continue
+        if name_key:
+            seen_names.add(name_key)
+        deduped.append(p)
+    plugins = deduped
+
     def is_goal_plugin(entry):
         name = pkg_name(entry)
         if not isinstance(name, str):
             return False
-        if name == GOAL_PLUGIN:
+        if name.lower() == GOAL_PLUGIN.lower():
             return True
         # Match the package's directory name as a whole PATH SEGMENT, with or
         # without a file extension, so ".../opencode-goal-plugin/dist/server.js"
         # and ".../opencode-goal-plugin.js" both count as present while a
         # neighbouring ".../opencode-goal-plugin-extras/..." does not.
         if name.startswith("/") or name.startswith(".") or name.startswith("~"):
-            segs = [s for s in name.split("/") if s]
+            segs = [s.lower() for s in name.split("/") if s]
             return GOAL_PLUGIN_DIR in segs or GOAL_PLUGIN_DIR in (
-                os.path.splitext(s)[0] for s in segs)
+                os.path.splitext(s)[0].lower() for s in segs)
         return False
 
     goal_entry = next((e for e in plugins if is_goal_plugin(e)), None)

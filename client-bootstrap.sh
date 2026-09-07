@@ -525,8 +525,10 @@ opencode() {
 }
 
 # opencode-cloud: the CLOUD pair — orch drives (build/plan), flash runs the
-# fan-out and the housekeeping models (general/explore/title/summary/compaction).
-# Nothing touches the host GPU. Sets the bare-`opencode` default.
+# fan-out worker (light) and explore; medium handles the standard worker when
+# advertised (otherwise flash); super-flash runs the housekeeping models
+# (title/summary/compaction). Nothing touches the host GPU. Sets the
+# bare-`opencode` default.
 opencode-cloud() {
   mkdir -p "$HOME/.config/ferry" && printf 'cloud\n' > "$HOME/.config/ferry/last-lane"
   OPENCODE_CONFIG="$HOME/.config/ferry/opencode-cloud.json" command opencode "$@"
@@ -588,8 +590,9 @@ Delegation rules, follow EXACTLY:
 - Call the task tool once per brief. You may launch them in parallel.
 - Each task call MUST have exactly these three fields and nothing else:
   - description: a short 3-5 word label
-  - subagent_type: the string "general"
+  - subagent_type: the string "light"
   - prompt: the complete brief
+- `light` is the default worker (local lanes route it to `local-sub`). A `standard` subagent also exists for work rated above 50 of 100 complexity; the built-in `general` agent is disabled.
 - Do NOT pass task_id or any other field. Do NOT nest delegation: a brief must never mention subagents, delegating, or orchestrating — it describes concrete work and what to return.
 - If a tool call errors, read the error, fix the named field, and retry that call ONCE. Never resend an identical failing call.
 
@@ -618,8 +621,9 @@ Follow these rules EVERY time you call the `task` tool:
 
 1. The call MUST have exactly these three fields - nothing else:
    - `description`: a short 3-5 word label for the subtask
-   - `subagent_type`: the string "general"
+   - `subagent_type`: the string "light"
    - `prompt`: the complete, self-contained brief
+   - `light` is the default worker (local lanes route it to `local-sub`); a `standard` subagent also exists for tasks rated above 50 of 100 complexity, and the built-in `general` agent is disabled.
 2. NEVER pass `task_id`, `command`, `model`, or any other field. `task_id` is
    reserved for resuming an existing session and must start with "ses" - if
    you invent one, the call fails.

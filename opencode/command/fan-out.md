@@ -10,8 +10,9 @@ Delegation rules, follow EXACTLY:
 - Call the task tool once per brief. You may launch them in parallel.
 - Each task call MUST have exactly these three fields and nothing else:
   - description: a short 3-5 word label
-  - subagent_type: the string "general"
+  - subagent_type: the string "light"
   - prompt: the complete brief
+- `light` is the default worker (local lanes route it to `local-sub`). A `standard` subagent also exists for work rated above 50 of 100 complexity; the built-in `general` agent is disabled.
 - Do NOT pass task_id or any other field. Do NOT nest delegation: a brief must never mention subagents, delegating, or orchestrating — it describes concrete work and what to return.
 - If a tool call errors, read the error, fix the named field, and retry that call ONCE. Never resend an identical failing call.
 

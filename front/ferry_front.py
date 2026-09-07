@@ -1777,6 +1777,131 @@ def install_chatgpt_system_compat(config_class=None):
     config_class.transform_responses_api_request = transform
 
 
+# litellm's ChatGPT (subscription) provider does not send the client's system
+# prompt first. It PREPENDS its own, and that prompt tells the model it is Codex
+# running inside the Codex CLI:
+#
+#   litellm/llms/chatgpt/common_utils.py:25-42   CHATGPT_DEFAULT_INSTRUCTIONS
+#   litellm/llms/chatgpt/common_utils.py:249     get_chatgpt_default_instructions()
+#   litellm/llms/chatgpt/responses/transformation.py:76-82  prepends it
+#
+# The chat-completions bridge folds the caller's system message into the same
+# `instructions` field, so an OpenCode or Claude Code prompt lands AFTER that
+# block, arguing with it. One of its clauses is actively harmful on a shared
+# host: "you might notice unexpected changes that you didn't make. If this
+# happens, STOP IMMEDIATELY" — which is what a second agent editing a file in
+# the same repo looks like, so the lane abandons the task mid-run.
+#
+# litellm reads the override PER REQUEST via os.getenv, so setting the env var
+# once before the workers spawn is enough; an EMPTY string is not an override
+# (`or` falls back to the Codex block), hence the non-blank checks below.
+CHATGPT_INSTRUCTIONS_ENV = "CHATGPT_DEFAULT_INSTRUCTIONS"
+FERRY_CHATGPT_INSTRUCTIONS_ENV = "FERRY_CHATGPT_INSTRUCTIONS"
+SHIPPED_CHATGPT_INSTRUCTIONS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "chatgpt-instructions.txt")
+
+
+def user_chatgpt_instructions_path(home=None) -> str:
+    """Where an operator drops their own replacement prompt.
+
+    `home` exists so the tests can point the lookup at a tempdir instead of the
+    real ~; production always resolves it through expanduser.
+    """
+    base = os.path.expanduser("~") if home is None else home
+    return os.path.join(base, ".config", "ferry", "chatgpt-instructions.txt")
+
+
+def _warn_chatgpt_instructions(message: str) -> None:
+    """One line to stderr, never fatal — a prompt override is not worth an outage."""
+    try:
+        sys.stderr.write(message if message.endswith("\n") else message + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _read_chatgpt_instructions(path: str):
+    """The file's text, or None when it is missing, unreadable or blank.
+
+    Trailing whitespace (which includes the file's final newline) is stripped:
+    the value goes into an env var that is concatenated ahead of the client's
+    own prompt, and a blank file must never become an empty override — that
+    would silently restore litellm's Codex block.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if not text.strip():
+        return None
+    return text.rstrip()
+
+
+def resolve_chatgpt_instructions(env=None, home=None):
+    """(text, label) for the ChatGPT instruction override. Pure: sets nothing.
+
+    Precedence, first match wins:
+      a. FERRY_CHATGPT_INSTRUCTIONS=off       -> keep litellm's Codex prompt
+      b. CHATGPT_DEFAULT_INSTRUCTIONS already set -> the operator wins outright
+      c. FERRY_CHATGPT_INSTRUCTIONS=<path>    -> that file
+      d. ~/.config/ferry/chatgpt-instructions.txt
+      e. front/chatgpt-instructions.txt       -> ferry's shipped default
+      f. nothing readable                     -> keep litellm's Codex prompt
+
+    (b) before (c) on purpose: an operator who exported the real litellm
+    variable has already said exactly what they want, and ferry overwriting it
+    would be the same silent hijack this whole function exists to undo.
+    """
+    env = os.environ if env is None else env
+
+    override = (env.get(FERRY_CHATGPT_INSTRUCTIONS_ENV) or "").strip()
+    if override.lower() == "off":
+        return (None, "off: litellm's built-in Codex prompt")
+
+    if (env.get(CHATGPT_INSTRUCTIONS_ENV) or "").strip():
+        return (None, "operator env %s" % CHATGPT_INSTRUCTIONS_ENV)
+
+    if override:
+        path = os.path.expanduser(override)
+        text = _read_chatgpt_instructions(path)
+        if text is not None:
+            return (text, "file %s" % path)
+        _warn_chatgpt_instructions(
+            "ferry_front: %s=%s is unreadable or blank; falling back"
+            % (FERRY_CHATGPT_INSTRUCTIONS_ENV, path))
+
+    user = user_chatgpt_instructions_path(home)
+    text = _read_chatgpt_instructions(user)
+    if text is not None:
+        return (text, "file %s" % user)
+
+    text = _read_chatgpt_instructions(SHIPPED_CHATGPT_INSTRUCTIONS)
+    if text is not None:
+        return (text, "ferry default (front/chatgpt-instructions.txt)")
+
+    _warn_chatgpt_instructions(
+        "ferry_front: no ChatGPT instruction override readable (%s); litellm's "
+        "built-in Codex prompt stays in front of every client prompt"
+        % SHIPPED_CHATGPT_INSTRUCTIONS)
+    return (None, "unavailable: litellm's built-in Codex prompt")
+
+
+def apply_chatgpt_instructions(env=None, home=None) -> str:
+    """Export the resolved override and return the label describing its source.
+
+    Idempotent: a second call sees the value this one exported, takes branch (b)
+    of the resolver, and leaves the environment exactly as it is. That is why
+    main() prints the label and build_app() does not — the worker's repeat call
+    would only report "operator env", which is ferry's own export.
+    """
+    env = os.environ if env is None else env
+    text, label = resolve_chatgpt_instructions(env, home)
+    if text is not None:
+        env[CHATGPT_INSTRUCTIONS_ENV] = text
+    return label
+
+
 def build_app():
     """Import litellm's proxy app and wrap it. Used as the uvicorn app factory.
 
@@ -1784,6 +1909,11 @@ def build_app():
     here is the same startup the `litellm` CLI performs — this module adds the
     wrapper and the ChatGPT system-role compatibility hook.
     """
+    # Idempotent, and silent here: main() already exported and logged this, but
+    # a factory-only launch (uvicorn pointed straight at ferry_front:build_app)
+    # never runs main(), and a worker without it serves the Codex prompt.
+    apply_chatgpt_instructions()
+
     from litellm.proxy.proxy_server import app as litellm_app
 
     install_chatgpt_system_compat()
@@ -1853,6 +1983,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     os.environ["CONFIG_FILE_PATH"] = args.config
+    # Before uvicorn: spawned workers snapshot os.environ at spawn time, and
+    # litellm's ChatGPT provider reads CHATGPT_DEFAULT_INSTRUCTIONS per request
+    # inside those workers. Logged so the launch log says which prompt is live.
+    print("[front] chatgpt instructions: %s" % apply_chatgpt_instructions())
     if args.workers > 1:
         _prepare_multiproc_metrics(args.port)
 

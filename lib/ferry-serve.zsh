@@ -262,6 +262,54 @@ _ferry_launch_front() {
   return 0
 }
 
+# litellm's ChatGPT provider PREPENDS its own "you are Codex in the Codex CLI"
+# prompt to every request's instructions, ahead of the client's system prompt.
+# CHATGPT_DEFAULT_INSTRUCTIONS replaces it (read per request).
+#
+# ferry_front.py resolves and exports this itself — see
+# front/ferry_front.py resolve_chatgpt_instructions() for the full rationale and
+# precedence. This mirror exists ONLY for the plain `litellm` CLI launches
+# below, which never load that module. Deliberately NOT called before
+# _ferry_launch_front: the front reports where its prompt came from, and a
+# pre-export here would make every launch log say "operator env".
+_ferry_export_chatgpt_instructions() {
+  # `#` as a repetition operator (the ends-only trims below) is an extended_glob
+  # feature and SILENTLY no-ops without it; local_options restores on return.
+  setopt local_options extended_glob
+  local f text sentinel override operator
+  # Trimmed at the ENDS only, exactly like the Python resolver's str.strip():
+  # interior whitespace belongs to a path, and "o f f" is not the opt-out.
+  override="${${${FERRY_CHATGPT_INSTRUCTIONS:-}##[[:space:]]#}%%[[:space:]]#}"
+  sentinel="${(L)override}"
+  [[ "$sentinel" == "off" ]] && return 0
+  # litellm reads `getenv(...) or DEFAULT`, so an all-whitespace value is NOT
+  # the operator having decided anything — same .strip() test as the resolver,
+  # or the model would get three spaces as its entire preamble.
+  operator="${CHATGPT_DEFAULT_INSTRUCTIONS:-}"
+  [[ -n "${operator//[[:space:]]/}" ]] && return 0
+  local -a candidates=()
+  # A leading ~ in a VALUE is not expanded by the shell (and `${~var}` only
+  # arms globbing), so do the one case expanduser() does on the Python side.
+  [[ "$override" == "~" ]] && override="$HOME"
+  [[ "$override" == "~/"* ]] && override="$HOME/${override#\~/}"
+  [[ -n "$override" ]] && candidates+=("$override")
+  candidates+=("$HOME/.config/ferry/chatgpt-instructions.txt")
+  candidates+=("$APP_DIR/front/chatgpt-instructions.txt")
+  for f in "${candidates[@]}"; do
+    # -r alone is TRUE for a directory, and `$(<dir)` then spills
+    # "error when reading ...: is a directory" onto ferry's stderr; the Python
+    # side swallows the same case (IsADirectoryError is an OSError).
+    [[ -f "$f" && -r "$f" ]] || continue
+    text="$(<"$f")"
+    # A blank file must never become an empty override: litellm treats "" as
+    # unset and falls straight back to the Codex prompt.
+    [[ -n "${text//[[:space:]]/}" ]] || continue
+    export CHATGPT_DEFAULT_INSTRUCTIONS="$text"
+    return 0
+  done
+  return 0
+}
+
 _ferry_stop_litellm() {
   local port="${1:-}" waited=0 pat label
   if [[ -n "$port" ]]; then
@@ -599,6 +647,7 @@ cmd_up() {
     if ! _ferry_launch_front "$FERRY_ROUTE_CONFIG" "$target_port" "$cloud_log"; then
       echo "        note: catalogue filter unavailable — serving litellm directly"
       echo "              (/v1/models will advertise the fallback hops too)"
+      _ferry_export_chatgpt_instructions
       nohup litellm \
         --config "$FERRY_ROUTE_CONFIG" \
         --port "$target_port" \
@@ -671,6 +720,7 @@ cmd_up() {
     
     # Launch LiteLLM proxy
     _ferry_reset_log "$cloud_log"
+    _ferry_export_chatgpt_instructions
     nohup litellm \
       --model "$CLOUD_MODEL" \
       --port "$target_port" \
@@ -697,6 +747,7 @@ cmd_up() {
     if ! _ferry_launch_front "$FERRY_ROUTE_CONFIG" "$target_port" "$cloud_log"; then
       echo "    note: catalogue filter unavailable — serving litellm directly"
       echo "          (/v1/models will advertise the fallback hops too)"
+      _ferry_export_chatgpt_instructions
       nohup litellm \
         --config "$FERRY_ROUTE_CONFIG" \
         --port "$target_port" \
@@ -794,6 +845,7 @@ cmd_reload() {
   echo "        log    $cloud_log"
   if ! _ferry_launch_front "$FERRY_ROUTE_CONFIG" "$target_port" "$cloud_log"; then
     echo "        note: catalogue filter unavailable — serving litellm directly"
+    _ferry_export_chatgpt_instructions
     nohup litellm \
       --config "$FERRY_ROUTE_CONFIG" \
       --port "$target_port" \

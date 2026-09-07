@@ -353,6 +353,140 @@ PYEOF
   return 0
 }
 
+# _ferry_sync_goal_tui_copy — refresh ferry's colon-free COPY of the installed
+# goal plugin and point tui.json at it.
+#
+# The TUI half of a plugin cannot be loaded out of opencode's package cache: the
+# canonical spec's cache directory contains the component
+# `opencode-goal-plugin@https:`, Bun's runtime plugin runner splits a module
+# path at the FIRST colon into `namespace:path`, and a file under a colon path
+# therefore never reaches opentui's host-module shim
+# (packages/opencode/src/plugin/tui/runtime.ts:47) that supplies solid-js. The
+# server half loads from that same spec without complaint, which is what made
+# the breakage invisible. Full trace, and the one-factor-varied path table, in
+# the GOAL_TUI_MARKER comment block in the python above.
+#
+# So: copy <cache>/node_modules/<pkg> to $XDG_DATA_HOME/ferry/<pkg> (no colon,
+# no '#'), stamp it with a marker file that proves the copy is ferry's, and
+# rewrite the tui.json entry from the spec to a file:// URL for the copy.
+#
+# Runs AFTER the pre-install, and re-verifies the cache itself rather than
+# trusting it - the pre-install may have warned and still left a usable tree,
+# or left nothing at all. NEVER fails the caller (ferry runs under `set -eu`,
+# lib/ferry-core.zsh:25): a laptop that cannot copy still has a correct config
+# and a working /goal command.
+_ferry_sync_goal_tui_copy() {
+  local spec="$1" ref="$2" pkg="$3" tui_file="$4" tui_dir="$5" cache_root="$6"
+  python3 - "$spec" "$ref" "$pkg" "$tui_file" "$tui_dir" "$cache_root" <<'PYEOF' || true
+import json, os, pathlib, shutil, sys
+
+spec, ref, pkg, tui_file, tui_dir, cache_root = sys.argv[1:7]
+want = ref[1:] if ref.startswith("v") else ref
+MARKER = ".ferry-goal-plugin"
+
+
+def bail(reason):
+    print(f"    TUI plugin: not copied ({reason}); tui.json keeps the spec")
+    sys.exit(0)
+
+
+# 1. The SOURCE has to be a complete install of the version we pinned. A
+#    half-written cache copied into place is a broken plugin with ferry's name
+#    on it.
+manifest = os.path.join(cache_root, "package.json")
+if not os.path.exists(manifest):
+    bail(f"missing {manifest}")
+try:
+    version = json.load(open(manifest)).get("version")
+except Exception as e:
+    bail(f"{manifest} is unreadable ({e})")
+if version != want:
+    bail(f"the cache holds version {version}, expected {want}")
+if not os.path.exists(os.path.join(cache_root, "dist", "goal-tui.js")):
+    bail(f"missing dist/goal-tui.js under {cache_root}")
+
+# 2. Refuse the two paths that would reproduce the very bug this dodges, and
+#    refuse to touch a directory ferry did not create. cmd_opencode already
+#    skips the call in the ':'/'#' case (it reported it when it wrote the
+#    config); the guard stands so the function is safe called on its own.
+if ":" in tui_dir or "#" in tui_dir:
+    bail(f"{tui_dir} contains ':' or '#'")
+marker = os.path.join(tui_dir, MARKER)
+if os.path.exists(tui_dir) and not os.path.isfile(marker):
+    print(f"    WARNING: {tui_dir} exists but carries no {MARKER};")
+    print("             it is not ferry's, so it is left alone and tui.json keeps the")
+    print("             spec. Move it aside to let ferry manage the TUI copy.")
+    sys.exit(0)
+
+# 3. Replace wholesale — a merge over an older version leaves stale files.
+try:
+    if os.path.exists(tui_dir):
+        shutil.rmtree(tui_dir)
+    os.makedirs(os.path.dirname(tui_dir) or ".", exist_ok=True)
+    shutil.copytree(cache_root, tui_dir, symlinks=False)
+    with open(marker, "w") as f:
+        f.write(f"{spec}\n{ref}\n{pkg}\n")
+except Exception as e:
+    print(f"    WARNING: could not copy the goal plugin to {tui_dir} ({e});")
+    print("             tui.json keeps the spec and the sidebar half will not load.")
+    sys.exit(0)
+
+# Verify the COPY, not the source: rmtree+copytree onto a full disk is exactly
+# the failure that would otherwise be reported as a success.
+try:
+    copied = json.load(open(os.path.join(tui_dir, "package.json"))).get("version")
+except Exception as e:
+    copied = None
+if copied != want or not os.path.exists(os.path.join(tui_dir, "dist", "goal-tui.js")):
+    print(f"    WARNING: the copy at {tui_dir} is incomplete (version {copied});")
+    print("             tui.json keeps the spec.")
+    sys.exit(0)
+
+uri = pathlib.Path(tui_dir).as_uri()
+
+# 4. Point tui.json at the copy. No snapshot: the main block snapshotted this
+#    exact file moments ago in this same run, and it wrote it as plain JSON.
+rewritten = False
+if tui_file and os.path.exists(tui_file):
+    try:
+        with open(tui_file) as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"    WARNING: {tui_file} is unreadable ({e}); left as it was.")
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("plugin"), list):
+        out = []
+        for p in data["plugin"]:
+            if isinstance(p, list) and p and p[0] == spec:
+                out.append([uri] + list(p[1:]))      # options survive
+            elif p == spec:
+                out.append(uri)
+            else:
+                out.append(p)
+        seen, deduped = set(), []
+        for p in out:
+            key = json.dumps(p, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(p)
+        data["plugin"] = deduped
+        try:
+            with open(tui_file, "w") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+            rewritten = True
+        except OSError as e:
+            print(f"    WARNING: could not write {tui_file} ({e}).")
+
+if rewritten:
+    print(f"    TUI plugin: {tui_dir} ({copied}) -> {tui_file}")
+else:
+    print(f"    TUI plugin: {tui_dir} ({copied})")
+PYEOF
+  return 0
+}
+
 cmd_opencode() {
   # [Client] Take this machine's opencode config over so EVERY agent routes
   # through the host's ferry endpoint, addressed by LANE NAME only.
@@ -404,10 +538,16 @@ cmd_opencode() {
   # GOAL_PLUGIN comment block for the file:line trace. Every earlier spelling
   # ferry ever wrote is rewritten to it on every run, and the ref is pinned
   # because the spec string IS opencode's cache key.
-  # The same entry is MIRRORED into ~/.config/opencode/tui.json, which is the
-  # only place opencode reads TUI-half plugins from - opencode.json's `plugin`
-  # array feeds the server loader alone, so the plugin's sidebar panel never
-  # appears without it. Only the full-takeover target gets a tui.json:
+  # The plugin is ALSO listed in ~/.config/opencode/tui.json, the only place
+  # opencode reads TUI-half plugins from - opencode.json's `plugin` array feeds
+  # the server loader alone, so the plugin's sidebar panel never appears without
+  # it. tui.json does NOT get the spec, though: the TUI loader cannot load a
+  # module out of the package cache, whose directory name contains
+  # `opencode-goal-plugin@https:`, because Bun splits a module path at the first
+  # colon (see the GOAL_TUI_MARKER block). It gets a file:// URL for a
+  # colon-free COPY ferry keeps in $XDG_DATA_HOME/ferry/opencode-goal-plugin and
+  # refreshes from the cache after the pre-install. Only the full-takeover
+  # target gets a tui.json:
   # --config paths outside ~/.config/opencode (the ferry lane profiles) never do.
   # `command.goal` is MERGED in (never taken over) so the plugin's /goal slash
   # command exists; a user's own `goal` and every other command are left alone.
@@ -498,8 +638,8 @@ cmd_opencode() {
   # from the string that was actually written into the config.
   local oc_specfile; oc_specfile="$(mktemp -t ferry-goal-spec)"
 
-  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" "$oc_key" "$CLIENT_NAME" "$keep_cache" "$tui_mode" "$tui_path" "$oc_specfile" <<'PYEOF'
-import datetime, json, os, re, sys, shutil, urllib.request
+  python3 - "$oc_host" "$oc_port" "$oc_config" "$force_model" "$force_small" "$set_default" "$prefer_local" "$force_write" "$keep_snaps" "$force_house" "$oc_key" "$CLIENT_NAME" "$keep_cache" "$tui_mode" "$tui_path" "$oc_specfile" "$do_install" <<'PYEOF'
+import datetime, json, os, pathlib, re, sys, shutil, urllib.parse, urllib.request
 
 host, port, cfg_path, force_model, force_small = sys.argv[1:6]
 set_default  = sys.argv[6] == "1"
@@ -513,6 +653,8 @@ keep_cache   = sys.argv[13] == "1"
 tui_mode     = sys.argv[14]         # auto | explicit | off
 tui_path     = sys.argv[15]
 spec_out     = sys.argv[16]
+# Only so the stale-copy note can say whether this run will refresh the copy.
+do_install   = sys.argv[17] == "1"
 cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
@@ -595,6 +737,108 @@ GOAL_REPO_MARKERS = ("sblattj/opencode-goal-plugin", "willytop8/opencode-goal-pl
 # loading both the fork and the very package the fork exists to replace.
 GOAL_PLUGIN_DIR = GOAL_PLUGIN_REPO.rsplit("/", 1)[-1].lower()
 
+# --- Why tui.json CANNOT carry the spec, and points at a copy instead. ---
+#
+# opencode installs a package at
+# `~/.cache/opencode/packages/<the spec, verbatim>/node_modules/<pkg>`
+# (packages/core/src/npm.ts:43-47,79; sanitize() is a no-op off Windows), so the
+# canonical tarball spec's directory literally contains the path component
+# `opencode-goal-plugin@https:`. Bun's runtime plugin runner splits any module
+# path at the FIRST colon into `namespace:path`, so a module living under a
+# colon-bearing directory never reaches opentui's host-module shim
+# (`ensureRuntimePluginSupport`, packages/opencode/src/plugin/tui/runtime.ts:47)
+# - the `file`-namespace onLoad hook that shares the host's solid-js/@opentui
+# with plugins by rewriting the bundle's bare `import ... from "solid-js"` into
+# `opentui:runtime-module:solid-js`. Without that rewrite Bun's native resolver
+# takes over and fails: the TUI console prints
+# `[tui.plugin] failed to load tui plugin ... Cannot find package 'solid-js'
+# from '<cache path>/dist/goal-tui.js'` and the sidebar silently never appears.
+# The SERVER half loads from the very same spec without complaint, which is why
+# v1.30.1's mirror looked correct and shipped a half-dead plugin.
+#
+# One factor varied — the SAME bundle, copied byte for byte, listed in tui.json
+# as a `file://` URL (bun 1.3.14):
+#     /tmp/x/opencode-goal-plugin               loads
+#     /tmp/x/pkg@v1/x/opencode-goal-plugin      loads
+#     /tmp/x/node_modules/opencode-goal-plugin  loads
+#     /tmp/x/https:/x/opencode-goal-plugin      FAILS
+#     /tmp/x/a:b/opencode-goal-plugin           FAILS
+# A `#` is fatal for the same reason (the shim slices a path at the first `?`
+# or `#`), so the pre-v1.30.1 `github:...#ref` cache directories were doubly
+# broken. Only a registry spec (`name@1.2.3`) gets a colon-free cache dir.
+#
+# Hence the split: opencode.json keeps the tarball SPEC (the server half is
+# resolved out of the cache, next to the `zod` sibling installed with it), and
+# tui.json gets a `file://` URL pointing at a colon-free COPY that ferry owns
+# under $XDG_DATA_HOME/ferry/ and refreshes from the cache after the
+# pre-install (_ferry_sync_goal_tui_copy).
+GOAL_TUI_MARKER = ".ferry-goal-plugin"     # ownership marker inside the copy
+
+
+def goal_tui_dir():
+    """Where ferry keeps its colon-free copy of the installed plugin."""
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+    return os.path.abspath(os.path.join(base, "ferry", "opencode-goal-plugin"))
+
+
+def goal_tui_spec():
+    """The tui.json entry for that copy: file:///Users/.../opencode-goal-plugin."""
+    return pathlib.Path(goal_tui_dir()).as_uri()
+
+
+def tui_dir_unusable():
+    """A ':' or '#' in OUR path would hit the very Bun bug we are dodging."""
+    d = goal_tui_dir()
+    return (":" in d) or ("#" in d)
+
+
+def local_path_of(raw):
+    """`raw` as an absolute filesystem path, or None when it names no path."""
+    if not isinstance(raw, str):
+        return None
+    low = raw.lower()
+    if low.startswith("file://"):
+        p = raw[len("file://"):]
+    elif low.startswith("file:"):
+        p = raw[len("file:"):]
+    elif raw.startswith(("/", ".", "~")):
+        p = raw
+    else:
+        return None
+    return os.path.normpath(os.path.expanduser(urllib.parse.unquote(p)))
+
+
+def is_managed_tui_entry(entry):
+    """Does this entry name FERRY'S managed copy (file:// URL or plain path)?"""
+    raw = entry[0] if isinstance(entry, list) and entry else entry
+    p = local_path_of(raw)
+    return p is not None and p == goal_tui_dir()
+
+
+def tui_copy_state():
+    """None when there is no managed copy; else what the one on disk holds.
+
+    The marker file is BOTH the ownership proof (ferry never deletes a
+    directory it did not write) and the record of which spec/ref produced it.
+    """
+    d = goal_tui_dir()
+    marker = os.path.join(d, GOAL_TUI_MARKER)
+    if not os.path.isfile(marker):
+        return None
+    try:
+        lines = open(marker).read().splitlines()
+    except OSError:
+        lines = []
+    try:
+        version = json.load(open(os.path.join(d, "package.json"))).get("version")
+    except Exception:
+        version = None
+    return {"version": version,
+            "spec": lines[0] if lines else "",
+            "ok": os.path.exists(os.path.join(d, "dist", "goal-tui.js"))}
+
+
 # opencode's own `command` config key (top-level), NOT the
 # ~/.config/opencode/command/*.md files ferry installs for /fan-out. The goal
 # plugin's README requires this entry or its /goal slash command never appears.
@@ -648,10 +892,16 @@ def is_goal_spec(entry):
     deliberately excluded - opencode accepts a filesystem path, Bun cannot
     resolve a private repo over `github:`, and a hard fork can only be named
     that way, so a path keeps its counts-as-present behaviour untouched.
+
+    The ONE path that is ours anyway is ferry's managed copy (goal_tui_dir()),
+    checked BEFORE that exclusion: ferry wrote it, so ferry rewrites it. Every
+    other path entry is still somebody's fork and is left alone.
     """
     raw = entry[0] if isinstance(entry, list) and entry else entry
     if not isinstance(raw, str):
         return False
+    if is_managed_tui_entry(raw):
+        return True
     if is_path_entry(raw):
         return False
     name = pkg_name(raw)
@@ -663,6 +913,8 @@ def is_goal_spec(entry):
 
 def is_goal_plugin(entry):
     """Does this entry already SATISFY the requirement (upstream or a fork)?"""
+    if is_managed_tui_entry(entry):        # ferry's own colon-free copy
+        return True
     name = pkg_name(entry)
     if not isinstance(name, str):
         return False
@@ -681,17 +933,27 @@ def is_goal_plugin(entry):
     return False
 
 
-def ensure_goal_plugin(plugins):
-    """Migrate every earlier spelling to GOAL_PLUGIN, dedupe, guarantee one entry.
+def ensure_goal_plugin(plugins, want=None):
+    """Migrate every earlier spelling to `want`, dedupe, guarantee one entry.
 
     Ferry OWNS this entry: any other remote spelling is drift, and rewriting it
     is the only way a working spec (or a new plugin version) ever reaches a
     machine that already has one. Options on a ["pkg", {opts}] tuple survive.
 
+    `want` is the canonical entry FOR THIS FILE, and the two files differ:
+    opencode.json always gets GOAL_PLUGIN (the server half resolves out of the
+    package cache, beside the `zod` installed with it, and a managed entry found
+    there is migrated back to the spec), while tui.json gets the colon-free
+    managed copy - see the GOAL_TUI_MARKER block for why.
+
     Returns (plugins, goal_entry, migrated_from); migrated_from lists the raw
     spec strings this run replaced - i.e. the cache directories nothing
-    references any more.
+    references any more. GOAL_PLUGIN is never listed even when tui.json moves
+    off it (opencode.json still points at that cache directory), and neither is
+    the managed copy, which is not a cache directory at all.
     """
+    if want is None:
+        want = GOAL_PLUGIN
     if not isinstance(plugins, list):
         plugins = []
     migrated_from, out = [], []
@@ -701,10 +963,10 @@ def ensure_goal_plugin(plugins):
             continue
         old = p[0] if isinstance(p, list) and p else p
         if isinstance(p, list) and len(p) > 1:
-            out.append([GOAL_PLUGIN, p[1]])
+            out.append([want, p[1]])
         else:
-            out.append(GOAL_PLUGIN)
-        if old != GOAL_PLUGIN:              # an exact match is a no-op
+            out.append(want)
+        if old not in (want, GOAL_PLUGIN) and not is_managed_tui_entry(old):
             migrated_from.append(old)
 
     # Deduplicate by package name while preserving order.
@@ -720,8 +982,8 @@ def ensure_goal_plugin(plugins):
 
     goal_entry = next((e for e in deduped if is_goal_plugin(e)), None)
     if goal_entry is None:
-        deduped.append(GOAL_PLUGIN)
-        goal_entry = GOAL_PLUGIN
+        deduped.append(want)
+        goal_entry = want
     return deduped, goal_entry, migrated_from
 
 
@@ -1164,7 +1426,23 @@ with open(cfg_path, "w") as f:
 
 # --- Mirror the plugin entry into tui.json (the sidebar half). ---
 # Same migration, same dedupe, same snapshot policy as opencode.json; every
-# other key in the file is left exactly as it was.
+# other key in the file is left exactly as it was. The ENTRY differs, though:
+# the TUI loader cannot load a module out of the colon-bearing package cache
+# (see the GOAL_TUI_MARKER block), so tui.json names ferry's colon-free copy.
+tui_state = tui_copy_state()
+tui_copy_ready = bool(tui_state and tui_state["ok"]) and not tui_dir_unusable()
+raw_goal = goal_entry[0] if isinstance(goal_entry, list) and goal_entry else goal_entry
+if isinstance(raw_goal, str) and is_path_entry(raw_goal) and not is_managed_tui_entry(raw_goal):
+    # A user's own fork: whatever satisfies the server half satisfies the TUI
+    # half, and ferry has no copy of a fork to point at.
+    tui_want = raw_goal
+elif tui_copy_ready:
+    tui_want = goal_tui_spec()
+else:
+    # BOOTSTRAP form: nothing is installed yet, so there is nothing to copy.
+    # _ferry_sync_goal_tui_copy replaces this with the file:// URL later in
+    # this same run, right after the pre-install populates the cache.
+    tui_want = GOAL_PLUGIN
 if set_default:
     tui_file = tui_target(cfg_path, tui_mode, tui_path)
 if tui_file:
@@ -1172,7 +1450,7 @@ if tui_file:
     if not isinstance(tui_cfg, dict):
         tui_cfg = {}
     tui_snap = snapshot(tui_file, keep_snaps)
-    tui_plugins, _tui_entry, tui_migrated = ensure_goal_plugin(tui_cfg.get("plugin"))
+    tui_plugins, _tui_entry, tui_migrated = ensure_goal_plugin(tui_cfg.get("plugin"), tui_want)
     migrated_from.extend(tui_migrated)
     tui_cfg.setdefault("$schema", TUI_SCHEMA)
     tui_cfg["plugin"] = tui_plugins
@@ -1197,9 +1475,16 @@ if set_default and not keep_cache:
 
 # Hand the canonical spec to the pre-install pass, but only when ferry's own
 # entry is the one in play: a local fork must not trigger an upstream install.
+# Lines 4-7 are for _ferry_sync_goal_tui_copy, which runs after the install and
+# needs to know which tui.json was written (empty when none was), where the
+# managed copy lives, which cache directory to copy FROM, and whether that
+# managed path is usable at all.
 if set_default and goal_entry == GOAL_PLUGIN and spec_out:
+    goal_cache_root = os.path.join(cache_dir_for(GOAL_PLUGIN), "node_modules", GOAL_PLUGIN_PKG)
     with open(spec_out, "w") as f:
-        f.write(f"{GOAL_PLUGIN}\n{GOAL_PLUGIN_REF}\n{GOAL_PLUGIN_PKG}\n")
+        f.write(f"{GOAL_PLUGIN}\n{GOAL_PLUGIN_REF}\n{GOAL_PLUGIN_PKG}\n"
+                f"{tui_file or ''}\n{goal_tui_dir()}\n{goal_cache_root}\n"
+                f"{'1' if tui_dir_unusable() else '0'}\n")
 
 print(f"    Wired opencode -> {base}")
 print(f"    Provider: ferry   Lanes: {driver} (driver), {light} (light), {standard} (standard), {explore} (explore), {compaction} (compaction), {house} (title/summary)")
@@ -1215,9 +1500,28 @@ if set_default:
     # we would have added. Printing GOAL_PLUGIN unconditionally claimed an
     # install that never happened whenever a local fork was already present.
     label = goal_entry[0] if isinstance(goal_entry, list) and goal_entry else goal_entry
-    print(f"    Plugin: {label}  (/goal command wired; tui.json: {'written' if tui_file else 'skipped'})")
+    # What tui.json now names, spelled out: the file:// copy is the only form
+    # whose TUI half actually loads, so "written" is not enough to tell a good
+    # run from one that only wired the server half.
+    if not tui_file:
+        tui_note = "skipped"
+    elif tui_want == GOAL_PLUGIN:
+        tui_note = "spec, TUI copy pending install"
+    else:
+        tui_note = tui_want
+    print(f"    Plugin: {label}  (/goal command wired; tui.json: {tui_note})")
     if label != GOAL_PLUGIN:
         print(f"                    (counts as {GOAL_PLUGIN}; upstream not added)")
+    if tui_file and tui_dir_unusable():
+        print(f"    WARNING: {goal_tui_dir()} contains ':' or '#'. Bun splits a module")
+        print("             path at the first colon, so opencode's TUI loader cannot load a")
+        print("             plugin from there; tui.json keeps the spec and the sidebar half")
+        print("             will not appear. Set XDG_DATA_HOME to a path without ':' or '#'.")
+    elif tui_file and tui_state and (tui_state["spec"] != GOAL_PLUGIN
+                                     or tui_state["version"] != GOAL_PLUGIN_REF.lstrip("v")):
+        stale = f"    TUI plugin: copy holds {tui_state['version']}, expected {GOAL_PLUGIN_REF.lstrip('v')}"
+        print(stale + ("; refreshed after the install below" if do_install
+                       else "; rerun without --no-install"))
     for d in purged:
         print(f"    Cache purged:   {d}")
 else:
@@ -1237,16 +1541,31 @@ PYEOF
   # _ferry_preinstall_goal_plugin). Doing it here is what turns "the config
   # looks right" into "the plugin is on disk and loadable".
   local goal_spec="" goal_ref="" goal_pkg=""
+  local goal_tui_file="" goal_tui_dir="" goal_cache_root="" goal_tui_bad="0"
   if [[ -s "$oc_specfile" ]]; then
     goal_spec="$(sed -n 1p "$oc_specfile")"
     goal_ref="$(sed -n 2p "$oc_specfile")"
     goal_pkg="$(sed -n 3p "$oc_specfile")"
+    goal_tui_file="$(sed -n 4p "$oc_specfile")"
+    goal_tui_dir="$(sed -n 5p "$oc_specfile")"
+    goal_cache_root="$(sed -n 6p "$oc_specfile")"
+    goal_tui_bad="$(sed -n 7p "$oc_specfile")"
   fi
   rm -f "$oc_specfile"
 
   if (( do_install )) && [[ -n "$goal_spec" ]]; then
     if command -v opencode >/dev/null 2>&1; then
       _ferry_preinstall_goal_plugin "$goal_spec" "$goal_ref" "$goal_pkg"
+      # Runs after the pre-install whether or not it warned: the sync re-checks
+      # the cache for itself, and the TUI half is worthless until the copy
+      # exists. It is what turns the bootstrap spec in tui.json into a file://
+      # entry the TUI loader can actually load. Skipped only when the managed
+      # path is itself unloadable (a ':' or '#' in $XDG_DATA_HOME) — the python
+      # block above has already reported that, and the copy would be useless.
+      if [[ "$goal_tui_bad" != "1" ]]; then
+        _ferry_sync_goal_tui_copy "$goal_spec" "$goal_ref" "$goal_pkg" \
+          "$goal_tui_file" "$goal_tui_dir" "$goal_cache_root"
+      fi
     else
       echo "    Plugin:  opencode is not on PATH; skipping the pre-install."
       echo "             It will be fetched the first time opencode starts."

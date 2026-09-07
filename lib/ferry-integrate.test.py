@@ -40,6 +40,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -139,16 +140,23 @@ class FerryOpencodeCase(unittest.TestCase):
         # tui.json) and XDG_CACHE_HOME (to purge orphaned per-spec package
         # directories). Inheriting the author's real ones would let the suite
         # write into ~/.config/opencode and delete out of ~/.cache/opencode.
+        # XDG_DATA_HOME joined them in v1.30.3: it is where ferry keeps the
+        # colon-free COPY of the goal plugin that tui.json points at, and an
+        # inherited one would both rewrite the author's real copy and decide
+        # these cases' tui.json entries from a directory the test never wrote.
         self.xdg_config = os.path.join(self.dir, "xdg-config")
         self.xdg_cache = os.path.join(self.dir, "xdg-cache")
+        self.xdg_data = os.path.join(self.dir, "xdg-data")
         os.makedirs(self.xdg_config, exist_ok=True)
         os.makedirs(self.xdg_cache, exist_ok=True)
+        os.makedirs(self.xdg_data, exist_ok=True)
 
     def packages_root(self):
         return os.path.join(self.xdg_cache, "opencode", "packages")
 
     def run_ferry(self, *extra, config=None, port=None, home=None,
-                  install=False, cache=None, xdg_config=None, env_extra=None):
+                  install=False, cache=None, xdg_config=None, xdg_data=None,
+                  env_extra=None):
         cfg = config or self.cfg
         cmd = ["zsh", FERRY, "opencode", "--host", "127.0.0.1",
                "--port", str(port if port is not None else self.port),
@@ -163,6 +171,7 @@ class FerryOpencodeCase(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k not in skip}
         env["XDG_CONFIG_HOME"] = xdg_config or self.xdg_config
         env["XDG_CACHE_HOME"] = cache or self.xdg_cache
+        env["XDG_DATA_HOME"] = xdg_data or self.xdg_data
         if home is not None:
             env["HOME"] = home
         if env_extra:
@@ -914,7 +923,10 @@ class TestGoalPluginTuiConfig(FerryOpencodeCase):
             "$schema": "https://opencode.ai/tui.json",
             "plugin": [self.PLUGIN],
         })
-        self.assertIn("tui.json: written", out)
+        # Nothing is installed yet on this machine, so there is no colon-free
+        # copy to point at: the spec goes in as the BOOTSTRAP form and the
+        # status line says so. See TestGoalPluginTuiCopy for the install path.
+        self.assertIn("tui.json: spec, TUI copy pending install", out)
 
     def test_merged_into_an_existing_tui_config_without_touching_other_keys(self):
         os.makedirs(self.oc_dir, exist_ok=True)
@@ -1119,23 +1131,22 @@ os.makedirs(os.path.join(root, "dist"), exist_ok=True)
 with open(os.path.join(root, "package.json"), "w") as f:
     json.dump({"name": "opencode-goal-plugin",
                "version": os.environ.get("FERRY_TEST_STUB_VERSION", "0.10.1")}, f)
-for half in ("goal-plugin.js", "goal-tui.js"):
+halves = ["goal-plugin.js", "goal-tui.js"]
+# A cache that installed the SERVER half and not the TUI half: the shape the
+# pre-install must report, and the one the TUI copy must refuse to make.
+if os.environ.get("FERRY_TEST_STUB_NO_TUI") == "1":
+    halves.remove("goal-tui.js")
+for half in halves:
     open(os.path.join(root, "dist", half), "w").close()
 print("Plugin package ready")
 print("Installed %s" % spec)
 '''
 
 
-class TestGoalPluginPreInstall(FerryOpencodeCase):
-    """Writing a spec installs nothing. This is what makes the failure visible.
-
-    A plugin that fails to install during a normal opencode start is published
-    as a Session event and never logged (plugin/index.ts:198-201 -> :139-141,
-    no-op reporters at :191-192), the entry is dropped (loader.ts:234) and npm
-    plugins are never retried (loader.ts:178) - which is exactly how v1.29.4
-    shipped a spec that had never once loaded. `opencode plugin <spec> --global`
-    is the only production entry point that PRINTS the real error.
-    """
+class GoalPluginStubCase(FerryOpencodeCase):
+    """A fake `opencode` on PATH that populates the package cache like the real
+    one: <cache>/opencode/packages/<spec>/node_modules/opencode-goal-plugin with
+    a package.json and both dist halves."""
 
     PLUGIN = TestGoalPlugin.PLUGIN
 
@@ -1149,7 +1160,7 @@ class TestGoalPluginPreInstall(FerryOpencodeCase):
         os.chmod(self.stub, 0o755)
         self.record = os.path.join(self.dir, "stub-record.json")
 
-    def run_install(self, *extra, fail=False, version=None, **kw):
+    def run_install(self, *extra, fail=False, version=None, no_tui=False, **kw):
         env = {
             "PATH": self.bin + os.pathsep + os.environ.get("PATH", ""),
             "FERRY_TEST_RECORD": self.record,
@@ -1162,11 +1173,25 @@ class TestGoalPluginPreInstall(FerryOpencodeCase):
             env["FERRY_TEST_STUB_FAIL"] = "1"
         if version:
             env["FERRY_TEST_STUB_VERSION"] = version
+        if no_tui:
+            env["FERRY_TEST_STUB_NO_TUI"] = "1"
         return self.run_ferry(*extra, install=True, env_extra=env, **kw)
 
     def recorded(self):
         with open(self.record) as f:
             return json.load(f)
+
+
+class TestGoalPluginPreInstall(GoalPluginStubCase):
+    """Writing a spec installs nothing. This is what makes the failure visible.
+
+    A plugin that fails to install during a normal opencode start is published
+    as a Session event and never logged (plugin/index.ts:198-201 -> :139-141,
+    no-op reporters at :191-192), the entry is dropped (loader.ts:234) and npm
+    plugins are never retried (loader.ts:178) - which is exactly how v1.29.4
+    shipped a spec that had never once loaded. `opencode plugin <spec> --global`
+    is the only production entry point that PRINTS the real error.
+    """
 
     def test_it_runs_opencode_plugin_with_the_spec_and_global(self):
         self.run_install()
@@ -1187,7 +1212,7 @@ class TestGoalPluginPreInstall(FerryOpencodeCase):
         for key in ("xdg_config_home", "xdg_data_home", "xdg_state_home"):
             self.assertIsNotNone(rec[key], key)
             self.assertNotEqual(rec[key], self.xdg_config, key)
-            self.assertNotIn(rec[key], (self.dir, self.xdg_cache), key)
+            self.assertNotIn(rec[key], (self.dir, self.xdg_cache, self.xdg_data), key)
 
     def test_the_child_keeps_the_real_package_cache(self):
         """The sandbox is for the config patch, NOT for the package cache:
@@ -1229,6 +1254,255 @@ class TestGoalPluginPreInstall(FerryOpencodeCase):
             json.dump({"plugin": [fork]}, f)
         self.run_install()
         self.assertFalse(os.path.exists(self.record))
+
+
+class TestGoalPluginTuiCopy(GoalPluginStubCase):
+    """tui.json must NOT name the spec: the TUI half cannot load from the cache.
+
+    opencode installs a package at `<cache>/opencode/packages/<spec verbatim>/
+    node_modules/<pkg>` (packages/core/src/npm.ts:43-47,79), so the canonical
+    tarball spec's directory contains the component
+    `opencode-goal-plugin@https:`. Bun's runtime plugin runner splits a module
+    path at the FIRST colon into `namespace:path`, so a module under a colon
+    path never reaches opentui's host-module shim (plugin/tui/runtime.ts:47),
+    which is what rewrites `import ... from "solid-js"` into
+    `opentui:runtime-module:solid-js`. Bun's native resolver then fails with
+    `Cannot find package 'solid-js'` and the sidebar is silently dropped — while
+    the SERVER half loads from that very spec, which is what hid it in v1.30.1.
+    Reproduced with the same bundle copied byte-for-byte: a colon-free directory
+    loads, `/tmp/x/https:/x/...` and `/tmp/x/a:b/...` do not.
+
+    So opencode.json keeps the spec and tui.json gets a file:// URL for the
+    colon-free copy ferry maintains under $XDG_DATA_HOME/ferry/.
+    """
+
+    REF = TestGoalPlugin.REF
+    PKG = TestGoalPlugin.PKG
+    MARKER = ".ferry-goal-plugin"
+
+    def setUp(self):
+        super().setUp()
+        self.oc_dir = os.path.join(self.xdg_config, "opencode")
+        self.global_cfg = os.path.join(self.oc_dir, "opencode.json")
+        self.tui = os.path.join(self.oc_dir, "tui.json")
+        self.copy = os.path.join(self.xdg_data, "ferry", "opencode-goal-plugin")
+        # Spelled out rather than round-tripped through pathlib, so a bug shared
+        # with the implementation's as_uri() call cannot pass. Safe because the
+        # scratch path has no character percent-encoding would touch — asserted.
+        self.assertNotIn(":", self.copy)
+        self.assertNotIn("#", self.copy)
+        self.assertEqual(self.copy, urllib.parse.quote(self.copy))
+        self.uri = "file://" + self.copy
+
+    def read_tui(self):
+        with open(self.tui) as f:
+            return json.load(f)
+
+    def seed_copy(self, version=None, marker_spec=None, leftover=None):
+        """A managed copy already on disk, as a previous run would have left it."""
+        os.makedirs(os.path.join(self.copy, "dist"), exist_ok=True)
+        with open(os.path.join(self.copy, "package.json"), "w") as f:
+            json.dump({"name": self.PKG, "version": version or "0.10.1"}, f)
+        open(os.path.join(self.copy, "dist", "goal-tui.js"), "w").close()
+        open(os.path.join(self.copy, "dist", "goal-plugin.js"), "w").close()
+        if leftover:
+            open(os.path.join(self.copy, leftover), "w").close()
+        with open(os.path.join(self.copy, self.MARKER), "w") as f:
+            f.write("%s\n%s\n%s\n" % (marker_spec or self.PLUGIN,
+                                      "v" + (version or "0.10.1"), self.PKG))
+
+    def copy_version(self):
+        with open(os.path.join(self.copy, "package.json")) as f:
+            return json.load(f)["version"]
+
+    def fingerprint(self):
+        """Every file in the copy with its size and mtime, for a no-touch claim."""
+        out = {}
+        for root, _dirs, files in os.walk(self.copy):
+            for name in files:
+                p = os.path.join(root, name)
+                st = os.stat(p)
+                out[os.path.relpath(p, self.copy)] = (st.st_size, st.st_mtime_ns)
+        return out
+
+    # ── the install path ──────────────────────────────────────────────────
+    def test_an_install_run_points_tui_json_at_a_copy_it_made(self):
+        out = self.run_install(config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [self.uri])
+        # The CONTROL that makes the line above mean something: opencode.json
+        # keeps the tarball spec, because the SERVER half resolves out of the
+        # cache next to the `zod` installed with it.
+        with open(self.global_cfg) as f:
+            self.assertEqual(json.load(f)["plugin"], [self.PLUGIN])
+        self.assertTrue(os.path.isfile(os.path.join(self.copy, self.MARKER)))
+        self.assertEqual(self.copy_version(), "0.10.1")
+        self.assertTrue(os.path.exists(os.path.join(self.copy, "dist", "goal-tui.js")))
+        self.assertIn("TUI plugin: %s (0.10.1) -> %s" % (self.copy, self.tui), out)
+
+    def test_the_marker_records_the_spec_the_copy_came_from(self):
+        """A copy with no provenance cannot be refreshed on a ref bump, and
+        cannot be told apart from a directory somebody else put there."""
+        self.run_install(config=self.global_cfg)
+        with open(os.path.join(self.copy, self.MARKER)) as f:
+            self.assertEqual(f.read().splitlines(),
+                             [self.PLUGIN, self.REF, self.PKG])
+
+    def test_a_second_install_run_is_idempotent(self):
+        self.run_install(config=self.global_cfg)
+        out = self.run_install(config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [self.uri])
+        self.assertNotIn("WARNING", out)
+
+    # ── --no-install ──────────────────────────────────────────────────────
+    def test_no_install_on_a_fresh_machine_keeps_the_spec_and_says_pending(self):
+        out = self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [self.PLUGIN])
+        self.assertIn("tui.json: spec, TUI copy pending install", out)
+        self.assertNotIn(self.uri, out)
+        self.assertFalse(os.path.exists(self.copy))
+
+    def test_no_install_with_a_good_copy_uses_it_and_touches_nothing(self):
+        self.seed_copy()
+        before = self.fingerprint()
+        out = self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [self.uri])
+        self.assertIn("tui.json: " + self.uri, out)
+        self.assertNotIn("pending install", out)
+        self.assertEqual(self.fingerprint(), before)
+
+    # ── refusals ──────────────────────────────────────────────────────────
+    def test_a_directory_without_the_marker_is_left_alone(self):
+        """The managed path could be someone's checkout. Ferry deletes only what
+        it can prove it wrote."""
+        os.makedirs(self.copy, exist_ok=True)
+        theirs = os.path.join(self.copy, "not-ours.txt")
+        with open(theirs, "w") as f:
+            f.write("mine")
+        out = self.run_install(config=self.global_cfg)
+        self.assertIn("not ferry's", out)
+        self.assertIn("left alone", out)
+        with open(theirs) as f:                      # control: still theirs
+            self.assertEqual(f.read(), "mine")
+        self.assertFalse(os.path.exists(os.path.join(self.copy, "package.json")))
+        self.assertEqual(self.read_tui()["plugin"], [self.PLUGIN])
+
+    def test_a_colon_in_the_data_home_falls_back_to_the_spec(self):
+        """A managed path with a ':' in it reproduces the very Bun bug the copy
+        exists to dodge, so there is no point making one."""
+        bad = os.path.join(self.dir, "a:b")
+        os.makedirs(bad, exist_ok=True)
+        out = self.run_install(config=self.global_cfg, xdg_data=bad)
+        self.assertIn("contains ':' or '#'", out)
+        self.assertEqual(self.read_tui()["plugin"], [self.PLUGIN])
+        self.assertFalse(os.path.exists(os.path.join(bad, "ferry")))
+        # Control: the pre-install still ran, so this is a TUI-copy refusal and
+        # not a run that fell over before it got there.
+        self.assertIn("installed opencode-goal-plugin 0.10.1", out)
+
+    def test_a_cache_without_the_tui_bundle_is_reported_not_copied(self):
+        out = self.run_install(config=self.global_cfg, no_tui=True)
+        self.assertIn("TUI plugin: not copied", out)
+        self.assertIn("goal-tui.js", out)
+        self.assertEqual(self.read_tui()["plugin"], [self.PLUGIN])
+        self.assertFalse(os.path.exists(self.copy))
+
+    # ── a ref bump ────────────────────────────────────────────────────────
+    def test_a_stale_copy_is_replaced_wholesale_and_named(self):
+        self.seed_copy(version="0.9.0", leftover="gone-in-0.10.1.js")
+        out = self.run_install(config=self.global_cfg)
+        self.assertIn("copy holds 0.9.0, expected 0.10.1", out)
+        self.assertIn("refreshed after the install below", out)
+        self.assertEqual(self.copy_version(), "0.10.1")
+        self.assertEqual(self.read_tui()["plugin"], [self.uri])
+        # Wholesale, not merged: a file the old version shipped is gone.
+        self.assertFalse(os.path.exists(os.path.join(self.copy, "gone-in-0.10.1.js")))
+
+    def test_no_install_with_a_stale_copy_says_how_to_fix_it(self):
+        self.seed_copy(version="0.9.0")
+        out = self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertIn("copy holds 0.9.0, expected 0.10.1", out)
+        self.assertIn("rerun without --no-install", out)
+        self.assertEqual(self.copy_version(), "0.9.0")   # nothing refreshed it
+
+    def test_a_current_copy_prints_no_stale_note(self):
+        """Control for the two above: the note must key on the VERSION, not on
+        the copy merely existing."""
+        self.seed_copy()
+        out = self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertNotIn("copy holds", out)
+
+    # ── the managed entry is ferry's, every other path is not ─────────────
+    def test_a_managed_entry_in_opencode_json_is_migrated_to_the_spec(self):
+        """The server half must never load from the copy: its dependencies were
+        installed beside it in the cache, not beside the copy."""
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.global_cfg, "w") as f:
+            json.dump({"plugin": [self.uri]}, f)
+        self.run_ferry("--no-install", config=self.global_cfg)
+        with open(self.global_cfg) as f:
+            self.assertEqual(json.load(f)["plugin"], [self.PLUGIN])
+
+    def test_the_managed_entry_and_the_spec_collapse_to_one_in_tui_json(self):
+        self.seed_copy()
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.tui, "w") as f:
+            json.dump({"plugin": [self.PLUGIN, self.uri]}, f)
+        self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [self.uri])
+
+    def test_a_managed_tuple_entry_keeps_its_options(self):
+        self.seed_copy()
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.tui, "w") as f:
+            json.dump({"plugin": [[self.PLUGIN, {"enabled": True}]]}, f)
+        self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [[self.uri, {"enabled": True}]])
+
+    def test_the_install_rewrite_keeps_tuple_options_too(self):
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.tui, "w") as f:
+            json.dump({"plugin": [[self.PLUGIN, {"enabled": True}]]}, f)
+        self.run_install(config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [[self.uri, {"enabled": True}]])
+
+    def test_someone_elses_path_entries_are_untouched_in_both_files(self):
+        """A `file://` URL and an absolute path that are NOT ferry's managed
+        copy are forks, and forks are never rewritten."""
+        theirs = ["file:///Users/someone/code/my-fork",
+                  "/Users/someone/plugins/tidy.js"]
+        os.makedirs(self.oc_dir, exist_ok=True)
+        for path in (self.global_cfg, self.tui):
+            with open(path, "w") as f:
+                json.dump({"plugin": list(theirs)}, f)
+        self.run_ferry("--no-install", config=self.global_cfg)
+        with open(self.global_cfg) as f:
+            self.assertEqual(json.load(f)["plugin"], theirs + [self.PLUGIN])
+        self.assertEqual(self.read_tui()["plugin"], theirs + [self.PLUGIN])
+
+    def test_a_local_fork_is_mirrored_into_tui_json_verbatim(self):
+        """When a fork satisfies the server half it satisfies the TUI half too,
+        and ferry has no copy of somebody's fork to point at."""
+        fork = "/Users/someone/code/opencode-goal-plugin/dist/server.js"
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.global_cfg, "w") as f:
+            json.dump({"plugin": [fork]}, f)
+        out = self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [fork])
+        self.assertIn("upstream not added", out)
+        self.assertFalse(os.path.exists(self.copy))
+
+    def test_the_canonical_cache_directory_survives_the_tui_rewrite(self):
+        """tui.json moving off the spec is NOT a migration: opencode.json still
+        points at that cache directory, and purging it would leave an offline
+        laptop with no plugin at all."""
+        self.run_install(config=self.global_cfg)
+        canon = os.path.join(self.packages_root(), *TestGoalPluginCacheHygiene
+                             .CANONICAL_REL.split(os.sep))
+        installed = os.path.join(canon, "node_modules", self.PKG, "package.json")
+        self.assertTrue(os.path.exists(installed), installed)
+        out = self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertTrue(os.path.exists(installed), out)
+        self.assertNotIn("Cache purged", out)
 
 
 class TestSnapshots(FerryOpencodeCase):

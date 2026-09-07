@@ -500,7 +500,17 @@ class TestSuperProfile(FerryOpencodeCase):
 
 
 class TestGoalPlugin(FerryOpencodeCase):
-    PLUGIN = "github:sblattj/OpenCode-goal-plugin"
+    # The entry ferry writes is PINNED to a git ref: opencode caches a git
+    # plugin under ~/.cache/opencode/packages/<spec> and never refreshes it
+    # once node_modules exists, so the spec string has to change for a new
+    # plugin version to install. Bump alongside GOAL_PLUGIN_REF.
+    BASE = "github:sblattj/OpenCode-goal-plugin"
+    PLUGIN = "github:sblattj/OpenCode-goal-plugin#v0.9.1"
+    GOAL_COMMAND = {
+        "description": "Set a session-scoped goal and auto-continue until complete.",
+        "template": "$ARGUMENTS",
+        "agent": "build",
+    }
 
     def test_appended_when_absent(self):
         self.run_ferry()
@@ -517,17 +527,71 @@ class TestGoalPlugin(FerryOpencodeCase):
         self.run_ferry()
         self.assertEqual(self.read()["plugin"].count(self.PLUGIN), 1)
 
-    def test_a_version_pinned_entry_counts_as_present(self):
+    def test_a_pin_to_the_current_ref_is_left_alone(self):
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [f"{self.PLUGIN}#v0.9.1"]}, f)
+            json.dump({"plugin": [self.PLUGIN]}, f)
         self.run_ferry()
-        self.assertEqual(self.read()["plugin"], [f"{self.PLUGIN}#v0.9.1"])
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_an_unpinned_entry_is_rewritten_to_the_pinned_spec(self):
+        """opencode keys its package cache on the spec STRING and never
+        refreshes a cached git plugin, so an unpinned entry pins a machine to
+        whatever commit it first fetched. Rewriting it is the rollout."""
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.BASE]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_an_older_pin_is_rewritten_to_the_current_ref(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [f"{self.BASE}#v0.9.0"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_an_unpinned_tuple_entry_is_repinned_and_keeps_its_options(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [[self.BASE, {"enabled": True}]]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [[self.PLUGIN, {"enabled": True}]])
+
+    def test_repinning_is_idempotent_on_a_second_run(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.BASE]}, f)
+        self.run_ferry()
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
 
     def test_the_pkg_plus_options_tuple_form_counts_as_present(self):
         with open(self.cfg, "w") as f:
             json.dump({"plugin": [[self.PLUGIN, {"enabled": True}]]}, f)
         self.run_ferry()
         self.assertEqual(len(self.read()["plugin"]), 1)
+
+    # ── the plugin's /goal slash command (opencode's top-level `command`) ──
+    def test_goal_command_is_added_when_command_is_absent(self):
+        self.run_ferry()
+        self.assertEqual(self.read()["command"]["goal"], self.GOAL_COMMAND)
+
+    def test_an_unrelated_command_is_preserved(self):
+        mine = {"description": "mine", "template": "hi"}
+        with open(self.cfg, "w") as f:
+            json.dump({"command": {"mine": mine}}, f)
+        self.run_ferry()
+        cmds = self.read()["command"]
+        self.assertEqual(cmds["mine"], mine)
+        self.assertEqual(cmds["goal"], self.GOAL_COMMAND)
+
+    def test_a_customised_goal_command_is_left_unchanged(self):
+        custom = {"description": "my own goal", "template": "$ARGUMENTS", "agent": "plan"}
+        with open(self.cfg, "w") as f:
+            json.dump({"command": {"goal": custom}}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["command"]["goal"], custom)
+
+    def test_the_goal_command_is_a_no_op_on_a_second_run(self):
+        self.run_ferry()
+        self.run_ferry()
+        self.assertEqual(self.read()["command"], {"goal": self.GOAL_COMMAND})
 
     def test_legacy_prevalentware_plugin_is_migrated_to_new_plugin(self):
         with open(self.cfg, "w") as f:

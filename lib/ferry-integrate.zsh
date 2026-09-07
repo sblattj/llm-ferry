@@ -267,7 +267,16 @@ cmd_opencode() {
   # machine's identity and a one-shot fleet override, never a real model id.
   # `plugin` gets the goal plugin appended only when no entry already IS that
   # plugin - which includes a LOCAL PATH to a fork of it, since opencode accepts
-  # a filesystem path and a private fork can only be named that way. Every OTHER key in the
+  # a filesystem path and a private fork can only be named that way. The entry
+  # is PINNED to a git ref (GOAL_PLUGIN_REF) because opencode caches a git
+  # plugin under ~/.cache/opencode/packages/<spec> and never refreshes it once
+  # node_modules exists there: an unpinned spec is frozen at the commit the
+  # machine first fetched. The spec string IS the cache key, so bumping the ref
+  # per release is what forces a fresh install, and an unpinned or stale-ref
+  # entry ferry finds is rewritten to the current pin on every run.
+  # `command.goal` is MERGED in (never taken over) so the plugin's /goal slash
+  # command exists; a user's own `goal` and every other command are left alone.
+  # Every OTHER key in the
   # file is left exactly as it was, and the whole original is snapshotted to
   # <name>.<UTC>.jsonc first, so a takeover is always reversible.
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
@@ -347,7 +356,19 @@ cfg_path = os.path.expanduser(cfg_path)
 base = f"http://{host}:{port}/v1"
 
 SCHEMA = "https://opencode.ai/config.json"
-GOAL_PLUGIN = "github:sblattj/OpenCode-goal-plugin"
+GOAL_PLUGIN_BASE = "github:sblattj/OpenCode-goal-plugin"
+# PIN THE REF, and bump it on every release that ships a new plugin version.
+# opencode installs a plugin into ~/.cache/opencode/packages/<the spec string>/
+# and, if node_modules/<pkg> already exists in that directory, returns
+# IMMEDIATELY without refetching. An UNPINNED `github:` spec therefore freezes
+# a machine at whatever commit it happened to fetch first - hosts sat on plugin
+# 0.9.0 for weeks while the fork's HEAD was 0.9.1, and nothing short of deleting
+# the cache would move them. The spec string is the cache key, so a NEW string
+# means a NEW directory and a guaranteed fresh install. That is why the ref is
+# pinned here and why cutting a plugin release means bumping GOAL_PLUGIN_REF.
+# Current spec, spelled out for grep: github:sblattj/OpenCode-goal-plugin#v0.9.1
+GOAL_PLUGIN_REF = "v0.9.1"
+GOAL_PLUGIN = f"{GOAL_PLUGIN_BASE}#{GOAL_PLUGIN_REF}"
 LEGACY_GOAL_PLUGINS = {
     "@prevalentware/opencode-goal-plugin",
     "opencode-goal-plugin",
@@ -361,7 +382,16 @@ LEGACY_GOAL_PLUGINS = {
 # can only be named by path. A path never equals the npm name, so a presence
 # check on the name alone re-appended upstream on EVERY run, leaving opencode
 # loading both the fork and the very package the fork exists to replace.
-GOAL_PLUGIN_DIR = GOAL_PLUGIN.rsplit("/", 1)[-1].lower()
+GOAL_PLUGIN_DIR = GOAL_PLUGIN_BASE.rsplit("/", 1)[-1].lower()
+
+# opencode's own `command` config key (top-level), NOT the
+# ~/.config/opencode/command/*.md files ferry installs for /fan-out. The goal
+# plugin's README requires this entry or its /goal slash command never appears.
+GOAL_COMMAND = {
+    "description": "Set a session-scoped goal and auto-continue until complete.",
+    "template": "$ARGUMENTS",
+    "agent": "build",
+}
 
 # opencode 1.18.23 ships SEVEN built-in agents. Verified two ways so a future
 # rename gets caught: the published schema's $defs.Config.properties.agent names
@@ -613,8 +643,15 @@ if set_default:
             return entry.rsplit("@", 1)[0]
         return entry
 
-    # Upgrade / replace legacy goal plugins if present
+    # Upgrade / replace legacy goal plugins if present, and re-pin OUR OWN entry
+    # whenever it is unpinned or pinned to a stale ref. Ferry owns this entry:
+    # any other ref is drift, and rewriting it is the only way a new plugin
+    # version ever reaches an already-installed machine (see GOAL_PLUGIN_REF).
+    # pkg_name() has already stripped any trailing #ref, so this matches the
+    # unpinned string, "#v0.9.0", and the ["pkg", {opts}] tuple alike. A LOCAL
+    # path fork never matches here and keeps its counts-as-present behaviour.
     legacy_lower = {x.lower() for x in LEGACY_GOAL_PLUGINS}
+    legacy_lower.add(GOAL_PLUGIN_BASE.lower())
     migrated = []
     for p in plugins:
         p_name = pkg_name(p)
@@ -644,7 +681,8 @@ if set_default:
         name = pkg_name(entry)
         if not isinstance(name, str):
             return False
-        if name.lower() == GOAL_PLUGIN.lower():
+        # pkg_name() strips the #ref, so compare against the UNPINNED base.
+        if name.lower() == GOAL_PLUGIN_BASE.lower():
             return True
         # Match the package's directory name as a whole PATH SEGMENT, with or
         # without a file extension, so ".../opencode-goal-plugin/dist/server.js"
@@ -661,6 +699,17 @@ if set_default:
         plugins.append(GOAL_PLUGIN)
         goal_entry = GOAL_PLUGIN
     cfg["plugin"] = plugins
+
+    # MERGE, never take over: the plugin's /goal slash command needs a
+    # top-level `command.goal` entry or it never appears in opencode. Only the
+    # `goal` key is ours, and only when it is absent - a user who customised it
+    # keeps their version verbatim, and no other command is touched.
+    commands = cfg.get("command")
+    if not isinstance(commands, dict):
+        commands = {}
+    if "goal" not in commands:
+        commands["goal"] = dict(GOAL_COMMAND)
+    cfg["command"] = commands
 
 os.makedirs(os.path.dirname(cfg_path) or ".", exist_ok=True)
 with open(cfg_path, "w") as f:
@@ -680,7 +729,7 @@ if set_default:
     # we would have added. Printing GOAL_PLUGIN unconditionally claimed an
     # install that never happened whenever a local fork was already present.
     label = goal_entry[0] if isinstance(goal_entry, list) and goal_entry else goal_entry
-    print(f"    Plugin:         {label}")
+    print(f"    Plugin:         {label}  (/goal command wired)")
     if label != GOAL_PLUGIN:
         print(f"                    (counts as {GOAL_PLUGIN}; upstream not added)")
 else:

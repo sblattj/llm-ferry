@@ -109,7 +109,7 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 
 `ferry share` prints both the `.local` name **and** the raw LAN IP — use the IP form if `.local` doesn't resolve on your network. The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint with its cloud role defaults, and adds a `host-code` shell shortcut. It also installs three opencode lane shortcuts into `~/.zshrc` (idempotent, per-invocation):
 
-- `opencode-cloud` — the **cloud role lanes**: `heavy` drives (build/plan), `medium` handles general work when advertised (otherwise `flash` does), `flash` handles explore, and `super-flash` handles compaction, title, and summary.
+- `opencode-cloud` — the **cloud role lanes**: `heavy` drives (build/plan), `medium` handles the `standard` worker when advertised (otherwise `flash` does), `flash` handles `light` and explore, and `super-flash` handles compaction, title, and summary.
 - `opencode-local` — the **GPU pair**: `local-orch` drives, `local-sub` runs the fan-out. Nothing leaves the host.
 - `opencode-super` — the **cheapest cloud profile**, new in v1.21: `heavy` still drives, while `super-flash` runs every non-driver agent.
 - bare `opencode` — whichever profile you used **last** (cloud until you pick another; the last-used lane is remembered in `~/.config/ferry/last-lane`).
@@ -403,12 +403,12 @@ router_settings:
 
 **Add models with Claude Code.** This repo bundles two skills — [`add-fallback-orchestrator`](.claude/skills/add-fallback-orchestrator/SKILL.md) and [`add-worker-model`](.claude/skills/add-worker-model/SKILL.md) — that walk Claude through editing your `litellm.yaml` correctly: the strict-failover-chain vs. load-balanced-pool distinction, the independent-capacity rule for fallbacks, and the per-project-quota gotcha **plus the Google ToS line a worker-key pool must not cross**. Just ask Claude Code to "add a fallback orchestrator" or "add another worker key."
 
-> LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). The cloud defaults use `heavy` for build/plan, `medium` for general when advertised (otherwise `flash`), `flash` for explore, and `super-flash` for compaction, title, and summary. The local pair remains `local-orch` for driving and `local-sub` for its other roles.
+> LiteLLM only **routes and fails over** — the "driver delegates to workers" agent logic lives in **your client** (opencode / Claude Code / etc.). The cloud defaults use `heavy` for build/plan, `medium` for the `standard` worker when advertised (otherwise `flash`), `flash` for `light` and explore, and `super-flash` for compaction, title, and summary. The local pair remains `local-orch` for driving and `local-sub` for its other roles.
 
 **opencode auto-wiring.** On a client, `ferry opencode` takes opencode's config over so **every** agent routes through the host. Add `--local` to pick the GPU pair instead of the cloud pair:
 
 ```bash
-ferry opencode            # heavy drives; medium handles general when advertised; flash explores; super-flash compacts
+ferry opencode            # heavy drives; medium handles standard when advertised; flash runs light and explore; super-flash compacts
 ferry opencode --local    # local-orch drives, local-sub fans out
 ```
 
@@ -419,20 +419,21 @@ It is a **surgical takeover, not a merge**. Four keys belong to ferry and are re
 | `model` | `ferry/<driver>` |
 | `small_model` | `ferry/<housekeeper>` (`super-flash` by default in cloud mode) |
 | `permission` | `"allow"` |
-| `agent` | all seven built-ins pinned (below) |
+| `agent` | six built-ins pinned, `general` disabled, `light`/`standard` added (below) |
 
 `plugin` is *appended* to, never replaced — [`github:sblattj/OpenCode-goal-plugin#v0.9.1`](https://github.com/sblattj/OpenCode-goal-plugin) (pre-bundled standalone distribution) is added if it isn't already there (and legacy `opencode-goal-plugin` / `@prevalentware/opencode-goal-plugin` entries are upgraded). The entry is **pinned to a git ref, and ferry bumps that ref each release**: opencode caches a git plugin under `~/.cache/opencode/packages/<spec>` and never refreshes it once installed, so only a new spec string forces a new version in — which is why an unpinned or stale-ref entry is rewritten to the current pin on every run. A local filesystem path to your own fork still counts as present and is left alone. Ferry also merges a top-level `command.goal` entry into the config (never overwriting one you wrote) so the plugin's `/goal` slash command actually appears.
 
-All seven of opencode's built-in agents get pinned to the cloud defaults, so nothing silently escapes to a model you aren't paying for on purpose:
+opencode's `task` tool has no `model` parameter: the driver picks an agent by **name**, and each agent is pinned to one ferry lane in the config. The built-in `general` agent is **disabled** (`"general": {"disable": true}`) so it can no longer soak up a stray dispatch, and two custom subagents take its place, pinned by complexity band. The `task` tool surfaces each subagent's `description` to the driver, so the complexity band lives in the description text and the driver — not ferry — decides which agent a given piece of work goes to; the lane behind each name stays the host's business and can change without the driver noticing:
 
 | role | agents | cloud | GPU |
 |---|---|---|---|
 | driver | `build`, `plan` | `heavy` | `local-orch` |
-| general | `general` | `medium` when advertised; otherwise `flash` | `local-sub` |
+| light (0-50) | `light` | `flash` | `local-sub` |
+| standard (51-100) | `standard` | `medium` when advertised; otherwise `flash` | `local-sub` |
 | explore | `explore` | `flash` | `local-sub` |
 | compaction / title / summary | `compaction`, `title`, `summary` | `super-flash` | `local-sub` |
 
-When the host advertises `medium`, it is the default for `general`; if the catalogue lacks it or cannot be reached, `general` uses `flash`. `compaction` defaults to `super-flash`. Explicit overrides still take precedence.
+`light` and `standard` are custom subagents, not opencode built-ins; `general` is disabled outright rather than pinned. When the host advertises `medium`, it is the default for `standard`; if the catalogue lacks it or cannot be reached, `standard` uses `flash`. `light` and `explore` always use `flash` in the cloud pair. `compaction` defaults to `super-flash`. Explicit overrides still take precedence.
 
 `medium` remains selectable as
 `ferry opencode --model medium` for a substantive coding task or review. In the
@@ -441,7 +442,7 @@ shares the subscription's limits with the other ChatGPT lanes. Its independent
 OpenRouter fallback can incur paid OpenRouter billing. The lane is a role and
 routing choice, not a benchmark claim.
 
-`compaction`, `title`, and `summary` use `super-flash`; `small_model` follows that inexpensive lane because opencode's schema describes it as the model "for tasks like title generation". Use `--small-model <lane>` to override `general` and `explore`, or `--housekeeper <lane>` to override `compaction`, `title`, and `summary`.
+`compaction`, `title`, and `summary` use `super-flash`; `small_model` follows that inexpensive lane because opencode's schema describes it as the model "for tasks like title generation". Use `--small-model <lane>` to override `light`, `standard`, and `explore` together, or `--housekeeper <lane>` to override `compaction`, `title`, and `summary`.
 
 On the GPU pair there is no third lane, so every non-driver role shares `local-sub`.
 
@@ -467,7 +468,7 @@ fleets existed.
 
 | Template fleet | `heavy` | `medium` | `flash` | `super-flash` |
 |---|---|---|---|---|
-| `domestic` | GPT-6 Astra → GPT-5.6 Sol, both on the ChatGPT subscription at `xhigh` | GPT-5.6 Terra on the ChatGPT subscription (`xhigh`) → GPT-5.6 Terra on OpenRouter (`xhigh`); used by general when advertised | OpenRouter GPT-5.6 Luna (`xhigh`) → Gemini Flash Latest (`xhigh`) → GPT-5.6 Terra (`xhigh`); used by explore | `openrouter/~google/gemini-flash-latest` (`minimal`, throughput); deliberate empty fallback list; used by compaction/title/summary |
+| `domestic` | GPT-6 Astra → GPT-5.6 Sol, both on the ChatGPT subscription at `xhigh` | GPT-5.6 Terra on the ChatGPT subscription (`xhigh`) → GPT-5.6 Terra on OpenRouter (`xhigh`); used by standard when advertised | OpenRouter GPT-5.6 Luna (`xhigh`) → Gemini Flash Latest (`xhigh`) → GPT-5.6 Terra (`xhigh`); used by light and explore | `openrouter/~google/gemini-flash-latest` (`minimal`, throughput); deliberate empty fallback list; used by compaction/title/summary |
 
 The route template provisions the domestic fleet only. Its commented
 `international.medium` guidance uses Z.ai `glm-5.3` with thinking enabled at
@@ -824,7 +825,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `serve-hf [--port P]` | host | Start the experimental HuggingFace pass-through proxy (default `8096`) |
 | `serve-proxy [--port P]` | host | Start the general HTTP(S) download forward proxy (default `8097`) |
 | `env [--host H] [--proxy-port P] [--hf-port P2] [--write]` | client | Emit shell exports so this laptop routes downloads via the host proxy |
-| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--key KEY] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, global `model` (`heavy`), `small_model` (`super-flash`), and all seven built-in agents pinned to lane names. Defaults: build/plan → `heavy`; general → `medium` when advertised, otherwise `flash`; explore → `flash`; compaction/title/summary → `super-flash`. `--small-model` overrides general/explore; `--housekeeper` overrides compaction/title/summary. `--super` keeps `heavy` driving and sends every non-driver agent to `super-flash`. `--key` writes the master key into the configs (v1.22) — without it they carry the keyless `local` placeholder, which a hardened front door rejects. Snapshots the original first |
+| `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--key KEY] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, global `model` (`heavy`), `small_model` (`super-flash`), six built-in agents pinned to lane names, `general` disabled, and the custom `light`/`standard` subagents added. Defaults: build/plan → `heavy`; light → `flash`; standard → `medium` when advertised, otherwise `flash`; explore → `flash`; compaction/title/summary → `super-flash`. `--small-model` overrides light/standard/explore; `--housekeeper` overrides compaction/title/summary. `--super` keeps `heavy` driving and sends every non-driver agent to `super-flash`. `--key` writes the master key into the configs (v1.22) — without it they carry the keyless `local` placeholder, which a hardened front door rejects. Snapshots the original first |
 | `claude [--host H] [--port P] [--key KEY] [--wrappers]` | dual | Point Claude Code at the ferry endpoint by lane name: installs the `claude-ferry` / `claude-ferry-local` / `claude-ferry-super` wrappers into `~/.zshrc` and writes `~/.config/ferry/claude.json` recording the lane map. `--key` bakes the master key into the wrappers (v1.22); `--wrappers` installs the `~/.zshrc` block only (the host-reset shim) |
 
 Run `ferry --help` for the built-in usage banner.

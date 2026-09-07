@@ -19,8 +19,9 @@ Follow these rules EVERY time you call the `task` tool:
 
 1. The call MUST have exactly these three fields - nothing else:
    - `description`: a short 3-5 word label for the subtask
-   - `subagent_type`: the string "general"
+   - `subagent_type`: the string "light"
    - `prompt`: the complete, self-contained brief
+   - `light` is the default worker (local lanes route it to `local-sub`); a `standard` subagent also exists for tasks rated above 50 of 100 complexity, and the built-in `general` agent is disabled.
 2. NEVER pass `task_id`, `command`, `model`, or any other field. `task_id` is
    reserved for resuming an existing session and must start with "ses" - if
    you invent one, the call fails.

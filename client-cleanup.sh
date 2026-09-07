@@ -105,12 +105,15 @@ fi
 echo ""
 
 # --- The surgical unwiring both opencode config files share -----------------
-# `ferry opencode` writes THREE things a cleanup has to take back out:
+# `ferry opencode` writes FOUR things a cleanup has to take back out:
 #   1. provider.ferry in opencode.json (the takeover proper);
 #   2. the goal-plugin spec in the `plugin` array of opencode.json AND of
 #      tui.json (v1.30.1 mirrors it: opencode reads TUI-half plugins from
 #      tui.json only);
-#   3. a top-level `command.goal` in opencode.json, the plugin's /goal command.
+#   3. a top-level `command.goal` in opencode.json, the plugin's /goal command;
+#   4. since v1.30.3, ferry's OWN copy of the installed package, kept at
+#      ${XDG_DATA_HOME:-$HOME/.local/share}/ferry/opencode-goal-plugin — the
+#      directory tui.json now points at. Section 4c removes it.
 # One function does one file, so sections 4 and 4b cannot drift apart. Anything
 # else in either file is left exactly as it was, and the original is snapshotted
 # to <name>.<UTC>.jsonc before the first write — the same convention `ferry
@@ -124,9 +127,19 @@ echo ""
 # opencode accepts a path and Bun cannot resolve a private repo over `github:`,
 # so a hard fork of this plugin can only be named that way, and it is the
 # user's entry, not ferry's.
+#
+# ONE path is the exception, and it is ferry's own (v1.30.3): opencode cannot
+# load the TUI half out of its own package cache, because that cache directory
+# carries the spec verbatim in its name and Bun's plugin runner splits a module
+# path at the first colon into namespace:path — so the bundle's bare `solid-js`
+# import is never rewritten and the load dies with "Cannot find package
+# 'solid-js'". ferry therefore keeps a colon-free COPY of the package it owns
+# and writes THAT into tui.json as a file:// URL. is_managed_tui_entry() below
+# recognises it by LOCATION and runs ahead of the local-path exclusion; every
+# other path entry still belongs to the user.
 unwire_goal_plugin() {   # <config path> <opencode|tui>
   python3 - "$1" "$2" <<'PYEOF'
-import json, sys, shutil, datetime, os
+import json, sys, shutil, datetime, os, urllib.parse
 
 path, mode = sys.argv[1], sys.argv[2]
 
@@ -147,11 +160,53 @@ GOAL_COMMAND = {
     "template": "$ARGUMENTS",
     "agent": "build",
 }
+# The ownership stamp ferry drops inside its managed copy ("<spec>\n<ref>\n<pkg>\n"):
+# its PRESENCE is what separates our directory from one a user happened to put at
+# that path. Section 4c does the actual check in shell, so nothing below reads
+# this — it is declared here, under the name lib/ferry-integrate.zsh uses, so the
+# two halves of ferry cannot end up stamping and looking for different files.
+GOAL_TUI_MARKER = ".ferry-goal-plugin"
 
 
 def raw_spec(entry):
     """The spec string of a plugin entry ("spec" or ["spec", {opts}])."""
     return entry[0] if isinstance(entry, list) and entry else entry
+
+
+def goal_tui_dir():
+    """Where ferry keeps its own colon-free copy of the goal plugin.
+
+    Kept byte-identical to the shell computation in section 4c
+    (${XDG_DATA_HOME:-$HOME/.local/share}/ferry/opencode-goal-plugin) and to
+    lib/ferry-integrate.zsh, so the entry we match and the directory we delete
+    can never be two different places.
+    """
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+        os.path.expanduser("~"), ".local", "share")
+    return os.path.abspath(os.path.join(base, "ferry", "opencode-goal-plugin"))
+
+
+def is_managed_tui_entry(entry):
+    """Is this entry ferry's OWN managed copy rather than a user's fork?
+
+    It arrives as the file:// URL pathlib's as_uri() produces (percent-encoded
+    when the path has spaces), and could be hand-edited into a plain or `~`
+    path, so all three are normalised before the comparison. Symlinks are NOT
+    resolved: `ferry opencode` builds the entry from the same $HOME string this
+    runs under, and realpath() on one side only would make them differ.
+    """
+    raw = raw_spec(entry)
+    if not isinstance(raw, str):
+        return False
+    low = raw.lower()
+    if low.startswith("file://"):
+        raw = urllib.parse.unquote(raw[len("file://"):])
+    elif low.startswith("file:"):
+        raw = urllib.parse.unquote(raw[len("file:"):])
+    elif not raw.startswith(("/", ".", "~")):
+        return False
+    raw = os.path.abspath(os.path.normpath(os.path.expanduser(raw)))
+    return raw == goal_tui_dir()
 
 
 def pkg_name(entry):
@@ -181,10 +236,18 @@ def is_path_entry(entry):
 
 
 def is_goal_spec(entry):
-    """Any REMOTE spelling of ferry's goal plugin. A local path is excluded."""
+    """Any spelling of ferry's goal plugin that is ferry's to remove.
+
+    Every REMOTE spelling, plus the one LOCAL path ferry itself writes — its
+    managed copy. Ordering matters: the managed check has to run BEFORE the
+    local-path exclusion, or the file:// URL v1.30.3 puts in tui.json reads as
+    somebody's fork and is left behind forever.
+    """
     raw = raw_spec(entry)
     if not isinstance(raw, str):
         return False
+    if is_managed_tui_entry(raw):
+        return True
     if is_path_entry(raw):
         return False
     name = pkg_name(raw)
@@ -286,14 +349,24 @@ print(f"    Previous file kept beside it as .{stamp}.jsonc")
 PYEOF
 }
 
-# grep_goal_plugin: does this file name ferry's goal plugin REMOTELY? Used by
-# --dry-run only, where there is no parsed config to inspect. The second grep is
-# what keeps a local fork out of the report: a path entry's opening quote is
-# followed by /, ., ~ or file:, and ferry writes these files with indent=2, so
-# every array element sits on its own line.
+# grep_goal_plugin: does this file name ferry's goal plugin in a spelling that
+# is ferry's to remove — any REMOTE one, or the managed copy? Used by --dry-run
+# only, where there is no parsed config to inspect. The second grep is what
+# keeps a local fork out of the report: a path entry's opening quote is followed
+# by /, ., ~ or file:, and ferry writes these files with indent=2, so every
+# array element sits on its own line. The third grep lets exactly one path back
+# in. Being a text match rather than the python's exact path comparison, it can
+# over-report a fork that happens to live under a directory called ferry/ — a
+# dry run says "would", and the run itself still decides by location.
 grep_goal_plugin() {
-  grep -iE '"[^"]*opencode-goal-plugin' "$1" 2>/dev/null \
-    | grep -qvE '"(/|\.|~|file:)'
+  if grep -iE '"[^"]*opencode-goal-plugin' "$1" 2>/dev/null \
+       | grep -qvE '"(/|\.|~|file:)'; then
+    return 0
+  fi
+  # ...plus the single path entry that IS ours: ferry's managed copy, which
+  # sits under <data dir>/ferry/ and reaches tui.json as a file:// URL. A
+  # user's fork elsewhere on disk still fails both greps.
+  grep -qiE '"(file:|/)[^"]*ferry/opencode-goal-plugin' "$1" 2>/dev/null
 }
 
 # --- 4. Unwire opencode's own default config --------------------------------
@@ -333,7 +406,10 @@ echo ""
 # ~/.config/opencode/tui.json, because opencode reads TUI-half plugins from
 # tui.json/tui.jsonc alone — opencode.json's `plugin` array feeds the server
 # loader only. Cleaning opencode.json and stopping there left the sidebar half
-# still wired. Path convention: $HOME/.config, spelled literally, exactly as
+# still wired. Since v1.30.3 the entry mirrored here is no longer the npm spec
+# but a file:// URL pointing at ferry's own copy of the package (section 4c
+# removes the copy itself), so this is the one place a local path is ours.
+# Path convention: $HOME/.config, spelled literally, exactly as
 # every other path in this script; a machine that relocates its config with
 # XDG_CONFIG_HOME is out of scope for the piped one-liner and should point the
 # script at the real HOME instead.
@@ -352,6 +428,36 @@ if [[ -f "$TUI_CFG" ]]; then
   fi
 else
   echo "    Not present — skipping."
+fi
+echo ""
+
+# --- 4c. Remove ferry's own copy of the goal plugin package -----------------
+# v1.30.3 stopped pointing tui.json at opencode's package cache — that cache
+# directory's name contains the spec verbatim, colons and all, and Bun's plugin
+# runner splits a module path at the first colon, so the TUI half never loads
+# from there. ferry keeps a colon-free copy instead, and owns it: the copy is
+# stamped with a .ferry-goal-plugin marker naming the spec, ref and package it
+# was made from. No marker, no removal — the path could be anything on a
+# machine ferry never touched. XDG_DATA_HOME is honoured because the copy is
+# INSTALLED against it, so ignoring it here would orphan the real directory
+# while deleting a path that never existed.
+GOAL_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ferry"
+GOAL_TUI_DIR="$GOAL_DATA_DIR/opencode-goal-plugin"
+echo ">>> Removing ferry's own copy of the goal plugin ($GOAL_TUI_DIR)..."
+if [[ -d "$GOAL_TUI_DIR" ]]; then
+  if [[ -f "$GOAL_TUI_DIR/.ferry-goal-plugin" ]]; then
+    run rm -rf "$GOAL_TUI_DIR"
+    echo "    Removed $GOAL_TUI_DIR (ferry's TUI copy of the goal plugin)"
+  else
+    echo "    $GOAL_TUI_DIR exists but carries no ferry marker — left alone."
+  fi
+else
+  echo "    Not present — skipping."
+fi
+# The parent goes only if we just emptied it — ~/.local/share/ferry is ferry's
+# data root, and anything else living there is not this section's business.
+if [[ -d "$GOAL_DATA_DIR" ]]; then
+  run rmdir "$GOAL_DATA_DIR" 2>/dev/null || true
 fi
 echo ""
 

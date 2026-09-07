@@ -238,11 +238,25 @@ for oc_target in "${oc_targets[@]}"; do
   # env -u OPENCODE_CONFIG: `ferry opencode` honours that variable as its
   # default target, so a shell that exports one would redirect all of these
   # writes onto the same file.
-  if ! env -u OPENCODE_CONFIG "$FERRY_BIN" opencode \
+  #
+  # FERRY_GOAL_SKILL_QUIET: a client has no checkout, so `ferry opencode`
+  # reports the goal skill as not installed — once per target, each in its own
+  # process. That is one fact, not three, and it is stated once below.
+  if ! FERRY_GOAL_SKILL_QUIET=1 env -u OPENCODE_CONFIG "$FERRY_BIN" opencode \
         --host "$HOST_NAME" --port "$HOST_PORT" --config "$oc_path" $oc_flag "${key_args[@]}"; then
     RESET_FAILED=1
   fi
 done
+
+# Said once, for the run as a whole (see FERRY_GOAL_SKILL_QUIET above). A reset
+# re-writes configs; the skill files ride in client-bootstrap.sh's heredocs and
+# a client has no checkout to copy them out of, so this is the one thing a
+# reset structurally cannot deliver.
+if [[ "$OC_MODE" != "none" ]]; then
+  echo "    Skill:   using-the-goal-plugin is bootstrap-only, like the shell wrappers —"
+  echo "             a reset writes configs, never skill files. Re-run client-bootstrap.sh"
+  echo "             in its default scope to refresh the client's copy."
+fi
 
 # --- 3. Re-apply the Claude Code wiring --------------------------------------
 # The one deliberate ~/.zshrc exception (see the header): the opencode WRAPPER

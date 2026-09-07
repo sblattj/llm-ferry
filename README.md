@@ -421,7 +421,31 @@ It is a **surgical takeover, not a merge**. Four keys belong to ferry and are re
 | `permission` | `"allow"` |
 | `agent` | six built-ins pinned, `general` disabled, `light`/`standard` added (below) |
 
-`plugin` is *appended* to, never replaced — [`github:sblattj/OpenCode-goal-plugin#v0.9.1`](https://github.com/sblattj/OpenCode-goal-plugin) (pre-bundled standalone distribution) is added if it isn't already there (and legacy `opencode-goal-plugin` / `@prevalentware/opencode-goal-plugin` entries are upgraded). The entry is **pinned to a git ref, and ferry bumps that ref each release**: opencode caches a git plugin under `~/.cache/opencode/packages/<spec>` and never refreshes it once installed, so only a new spec string forces a new version in — which is why an unpinned or stale-ref entry is rewritten to the current pin on every run. A local filesystem path to your own fork still counts as present and is left alone. Ferry also merges a top-level `command.goal` entry into the config (never overwriting one you wrote) so the plugin's `/goal` slash command actually appears.
+`plugin` is *appended* to, never replaced — the [OpenCode goal plugin](https://github.com/sblattj/OpenCode-goal-plugin) is added if it isn't already there, in exactly this form:
+
+```
+opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.1.tar.gz
+```
+
+**The spelling is the whole feature.** On opencode 1.18.29 a bare `github:owner/repo#tag` spec (which is what ferry ≤ v1.29.4 wrote) *installs to disk and then never loads*: npm-package-arg returns no name for it, so `Npm.add` throws after a perfectly successful reify, the entry is dropped, and **nothing is logged anywhere** — the package cache fills up and the plugin has never once run. Prefixing the package name fixes that. On top of it, any *git* spec whose `package.json` declares a `build`/`prepack` script dies inside opencode's bundled installer (`git dep preparation failed`), so the pinned form is a **remote tarball**, which is fetched by a code path that never runs that step at all.
+
+Everything around that entry follows from it:
+
+- **Migration.** Every earlier spelling ferry (or you) could have written — bare npm name, `@prevalentware/…`, `github:…`, `github:…#ref`, a `git+https://` URL, a plain or name-prefixed tarball URL, the `["pkg", {opts}]` tuple form (options preserved) — is rewritten to the canonical spec on every run and de-duplicated to a single entry. A local filesystem path to your own fork still counts as present and is left alone.
+- **`tui.json`.** The plugin ships two halves, and opencode reads TUI plugins **only** from `~/.config/opencode/tui.json` — never from `opencode.json`'s `plugin` array. So the full takeover mirrors the same entry into `tui.json` (creating it with `"$schema": "https://opencode.ai/tui.json"` if absent, snapshotting any previous one, leaving every other key alone). Without it the `/goal` command works and the sidebar panel silently never appears. Use `--tui-config PATH` to point it elsewhere or `--no-tui-config` to skip it. A `--config` outside `~/.config/opencode` (the ferry lane profiles) never gets one.
+- **Cache hygiene.** The spec string *is* opencode's cache key (`~/.cache/opencode/packages/<spec>`), and opencode never invalidates it — no TTL, no version check. Ferry removes the per-spec directory of every entry it just migrated away from, plus the known-dead ones, and removes the canonical directory itself when it holds an *interrupted* install (an empty `node_modules/opencode-goal-plugin` is treated as installed forever). Only directories carrying the package name are ever touched; `--keep-cache` opts out.
+- **Pre-install.** Writing a spec installs nothing, and a failure at opencode's next start is invisible. So after writing, ferry runs `opencode plugin '<spec>' --global` in a throwaway config sandbox (real package cache, 120 s cap), then verifies the cached `package.json` version and both `dist/goal-plugin.js` and `dist/goal-tui.js`. Success prints the installed version; failure prints a warning with the real error and **still exits 0** — the config is correct either way, and an offline laptop shouldn't fail a bootstrap. `--no-install` skips it.
+
+Ferry also merges a top-level `command.goal` entry into the config (never overwriting one you wrote) so the plugin's `/goal` slash command actually appears.
+
+Verify an install at any time:
+
+```bash
+find "${XDG_CACHE_HOME:-$HOME/.cache}/opencode/packages" \
+  -path '*/node_modules/opencode-goal-plugin/package.json' -exec grep -m1 '"version"' {} +
+```
+
+`find`, not a glob: a spec's slashes become directories, so the tarball form lands eight levels down at `packages/opencode-goal-plugin@https:/github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.1.tar.gz/` — a single-level `packages/*opencode-goal-plugin*/…` pattern matches only the older `github:`-shaped directories and reports a healthy install as missing.
 
 opencode's `task` tool has no `model` parameter: the driver picks an agent by **name**, and each agent is pinned to one ferry lane in the config. The built-in `general` agent is **disabled** (`"general": {"disable": true}`) so it can no longer soak up a stray dispatch, and two custom subagents take its place, pinned by complexity band. The `task` tool surfaces each subagent's `description` to the driver, so the complexity band lives in the description text and the driver — not ferry — decides which agent a given piece of work goes to; the lane behind each name stays the host's business and can change without the driver noticing:
 

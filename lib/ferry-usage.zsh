@@ -40,6 +40,7 @@ Commands:
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
   opencode           [Client] Auto-wire opencode to route through the host (detects served models)
                         ferry opencode [--host H] [--port P] [--config PATH] [--model M] [--small-model SM] [--super] [--no-default]
+                        ferry opencode [--tui-config PATH | --no-tui-config] [--keep-cache] [--no-install]
   claude             [Dual] Wire Claude Code to the ferry endpoint: installs the
                        claude-ferry / claude-ferry-local wrappers (cloud: heavy/flash,
                        local: local-orch/local-sub) and records the lane map

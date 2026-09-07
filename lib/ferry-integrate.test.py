@@ -500,7 +500,7 @@ class TestSuperProfile(FerryOpencodeCase):
 
 
 class TestGoalPlugin(FerryOpencodeCase):
-    PLUGIN = "@prevalentware/opencode-goal-plugin"
+    PLUGIN = "opencode-goal-plugin"
 
     def test_appended_when_absent(self):
         self.run_ferry()
@@ -518,19 +518,34 @@ class TestGoalPlugin(FerryOpencodeCase):
         self.assertEqual(self.read()["plugin"].count(self.PLUGIN), 1)
 
     def test_a_version_pinned_entry_counts_as_present(self):
-        # The leading @ is a scope, not a version separator — a naive split
-        # would read "@prevalentware/...@0.1.30" as a different package and
-        # append a second, conflicting copy.
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [f"{self.PLUGIN}@0.1.30"]}, f)
+            json.dump({"plugin": [f"{self.PLUGIN}@0.9.0"]}, f)
         self.run_ferry()
-        self.assertEqual(self.read()["plugin"], [f"{self.PLUGIN}@0.1.30"])
+        self.assertEqual(self.read()["plugin"], [f"{self.PLUGIN}@0.9.0"])
 
     def test_the_pkg_plus_options_tuple_form_counts_as_present(self):
         with open(self.cfg, "w") as f:
             json.dump({"plugin": [[self.PLUGIN, {"enabled": True}]]}, f)
         self.run_ferry()
         self.assertEqual(len(self.read()["plugin"]), 1)
+
+    def test_legacy_prevalentware_plugin_is_migrated_to_new_plugin(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": ["@prevalentware/opencode-goal-plugin"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_legacy_version_pinned_entry_is_migrated(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": ["@prevalentware/opencode-goal-plugin@0.1.30"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_legacy_tuple_entry_is_migrated(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [["@prevalentware/opencode-goal-plugin", {"enabled": True}]]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [[self.PLUGIN, {"enabled": True}]])
 
     # ── a LOCAL fork of the same plugin ───────────────────────────────────
     LOCAL_FORK = "/Users/someone/code/opencode-goal-plugin/dist/server.js"
@@ -571,7 +586,7 @@ class TestGoalPlugin(FerryOpencodeCase):
 
     def test_the_status_line_reports_what_actually_satisfies_the_check(self):
         """It printed GOAL_PLUGIN unconditionally, so a run that appended nothing
-        still read as 'installed @prevalentware/...' - the operator's only
+        still read as 'installed opencode-goal-plugin' - the operator's only
         on-screen evidence, and it disagreed with the file."""
         with open(self.cfg, "w") as f:
             json.dump({"plugin": [self.LOCAL_FORK]}, f)

@@ -795,7 +795,7 @@ eval "$(ferry env)"        # or: eval "$(ferry env --host your-mac.local)"
 uvx whosaid ...            # uv/PyPI, huggingface_hub, git, curl — now download via the host
 ```
 
-`ferry env` prints the `HTTP(S)_PROXY` / `HF_ENDPOINT` / `NO_PROXY` exports on stdout so it stays `eval`-able (add `--write` to persist them into `~/.zshrc`). The proxy handles HTTPS via `CONNECT` tunneling and plain HTTP by forwarding, and covers **anything that honors the standard proxy env vars**. It routes each request straight through **the host's own connection with no caching** — the host just needs internet. Stop it with `ferry down`.
+`ferry env` prints the `HTTP(S)_PROXY` / `HF_ENDPOINT` / `NO_PROXY` exports on stdout so it stays `eval`-able (add `--write` to persist them into `~/.zshrc`). The proxy handles HTTPS via `CONNECT` tunneling and plain HTTP by forwarding, and covers **anything that honors the standard proxy env vars**. The tunnel applies backpressure, so a CDN pushing a multi-GB model file cannot outrun a slower LAN client (before v1.32.1 the tunnel dropped such downloads after about 1 MB with `peer closed connection without sending complete message body`). It routes each request straight through **the host's own connection with no caching** — the host just needs internet. Stop it with `ferry down`.
 
 ## Reverse expose: publish a client's port through the host
 

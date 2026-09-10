@@ -152,18 +152,36 @@ class Proxy(BaseHTTPRequestHandler):
         self.send_response(200, "Connection established")
         self.end_headers()
         client = self.connection
-        client.setblocking(0)
-        upstream.setblocking(0)
+        # Both sockets stay BLOCKING. select() tells us which side has bytes to
+        # read; sendall() then blocks until the other side has taken them. That
+        # blocking is the backpressure: a fast upstream (a CDN pushing a
+        # multi-GB model file) cannot outrun a slower LAN client. With
+        # non-blocking sockets sendall() raises BlockingIOError (EAGAIN) the
+        # moment the client's receive buffer fills, and the tunnel used to
+        # swallow that and close, so the client saw "peer closed connection
+        # without sending complete message body" after ~1 MB.
+        client.setblocking(True)
+        upstream.settimeout(None)
+        peers = {client: upstream, upstream: client}
+        open_reads = [client, upstream]
         try:
-            while True:
-                r, _, _ = select.select([client, upstream], [], [], 60)
+            while open_reads:
+                r, _, _ = select.select(open_reads, [], [], 300)
                 if not r:
                     break
                 for s in r:
                     data = s.recv(65536)
                     if not data:
-                        return
-                    (upstream if s is client else client).sendall(data)
+                        # EOF on this side: half-close the other side so it
+                        # sees the end, but keep relaying the reverse direction
+                        # until it also finishes.
+                        open_reads.remove(s)
+                        try:
+                            peers[s].shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        continue
+                    peers[s].sendall(data)
         except Exception:
             pass
         finally:
@@ -171,6 +189,7 @@ class Proxy(BaseHTTPRequestHandler):
                 upstream.close()
             except Exception:
                 pass
+            self.close_connection = True
 
     def do_GET(self):
         # Plain-HTTP forwarding: fetch the absolute URL and relay the response.

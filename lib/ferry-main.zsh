@@ -34,6 +34,7 @@ case "$COMMAND" in
   claude)        cmd_claude "$@" ;;
   fleet)         cmd_fleet "$@" ;;
   update)        cmd_update "$@" ;;
+  migrate)       cmd_migrate "$@" ;;
   dash)          cmd_dash "$@" ;;
   --help|-h)     usage ;;
   *)             echo "Unknown command: $COMMAND"; usage ;;

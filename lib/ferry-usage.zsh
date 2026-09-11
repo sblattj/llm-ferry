@@ -20,6 +20,11 @@ Commands:
                        a host rebuilds from its checkout, a client re-pulls
                        the CLI from its host
                        ferry update [--full] [--host|--client] [--dry-run]
+  migrate            [Client] Promote THIS machine from a client into a host:
+                       ensure a repo checkout (clone if needed), carry the master
+                       key forward, seed the route config, provision host deps,
+                       archive the client profile, and bring the endpoint up local
+                       ferry migrate [--dir PATH] [--repo URL] [--full] [--pull] [--dry-run] [--yes]
   dash               [Host] Live dashboard for the route proxy
                        ferry dash [--open] [--port P] [--ferry URL]   # lightweight stdlib page (localhost:8091)
                        ferry dash --grafana [--open]                  # full Grafana+VictoriaMetrics stack (localhost:3001)

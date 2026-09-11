@@ -333,6 +333,20 @@ It then re-applies the opencode takeover to the host's own three configs — wir
 
 `git pull --ff-only` runs first and never rebases or merges — divergence and uncommitted changes to tracked files stop the run, since both are decisions for a human. Being offline only warns.
 
+#### Promoting a client into a host
+
+A laptop that has been a **client** of someone else's ferry can become a **host** of its own with one command. `ferry migrate` is the reverse of `client-bootstrap.sh`:
+
+```bash
+ferry migrate --dry-run   # print every step, change nothing (run this first)
+ferry migrate             # do it (asks once before it starts)
+ferry migrate --full      # ...and reload the GPU lanes at the end
+```
+
+A client's `ferry` is a lone script in `~/.local/bin` with no repo behind it, so `ferry migrate` first makes sure a checkout exists — the one this CLI already lives in, or one it clones to `--dir` (default `~/gdev/llm-ferry`, else `~/llm-ferry`) — then runs the engine, [`client-to-host.sh`](client-to-host.sh), from it. Run that script directly if you already have the repo. In order it: carries the client's front-door master key forward into `~/.config/ferry/secrets.env` (a key already there wins; the value is never printed), seeds `~/.config/ferry/litellm.yaml` from the template if absent, runs `ferry install` from the checkout (OS-aware: uv + litellm everywhere, plus mlx-vlm and the ~16.6GB default models on macOS only; installs the host's shell wrappers at `127.0.0.1` and symlinks `ferry` into the checkout), then **archives `~/.config/ferry/client.json` to `client.json.pre-migrate.<UTC>`** — that one move is what leaves `CLIENT_MODE` (ferry decides host-vs-client purely on that file) — and runs `host-reset.sh` to validate the route config, bounce the proxy and share server, and re-wire opencode/claude at `127.0.0.1`. Because `host-reset` reads that bearer from the `client.json` this step just archived, a keyed front door would leave the host's own tools sending the `local` placeholder, so the migration re-applies the opencode/claude wiring with the master key as a final pass.
+
+It is reversible: `mv ~/.config/ferry/client.json.pre-migrate.<UTC> ~/.config/ferry/client.json` puts the machine back to being a client. The archive happens **after** the dependency install and **before** the reset, so a failed install leaves a recoverable client and `host-reset.sh` never sees the `client.json` it refuses to run beside. If a run stops between the archive and a healthy endpoint, re-running `ferry migrate` reports the box already left client mode and points at `host-reset.sh` to finish, rather than migrating again.
+
 ---
 
 <sub>Everything below is the full reference — route configs, fallback chains, dashboards, file/model ferrying, and the forward proxy.</sub>

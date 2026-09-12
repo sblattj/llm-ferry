@@ -115,7 +115,7 @@ curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 - `opencode-super` — the **cheapest cloud profile**, new in v1.21: `heavy` still drives, while `super-flash` runs every non-driver agent.
 - bare `opencode` — whichever profile you used **last** (cloud until you pick another; the last-used lane is remembered in `~/.config/ferry/last-lane`).
 
-Both need `ferry up` on the host, which serves all six domestic-template lanes at once.
+Both need `ferry up` on the host, which serves all seven domestic-template lanes at once.
 
 **Claude Code works too, as of v1.20.** The ferry endpoint speaks the Anthropic
 `/v1/messages` protocol, so Claude Code can run on the ferry backend with no
@@ -286,7 +286,7 @@ Two details that would otherwise skew it: a `POST /hq` that returned non-200 mea
 ### More host commands
 
 ```bash
-ferry up             # THE STACK: all six domestic-template lanes on one endpoint (port 8090)
+ferry up             # THE STACK: all seven domestic-template lanes on one endpoint (port 8090)
 ferry up --route     # cloud lanes only — no GPU weights resident
 ferry up --local-orch # just the local-orch GPU lane, alone on 8090
 ferry up --local-sub  # just the local-sub GPU lane, alone on 8090
@@ -354,7 +354,7 @@ It is reversible: `mv ~/.config/ferry/client.json.pre-migrate.<UTC> ~/.config/fe
 
 ## Contents
 
-- [The stack — six lanes on one endpoint](#the-stack--six-lanes-on-one-endpoint)
+- [The stack — seven lanes on one endpoint](#the-stack--seven-lanes-on-one-endpoint)
 - [Fleets](#fleets)
 - [The local GPU lanes](#the-local-gpu-lanes)
 - [Dashboards & observability](#dashboards--observability)
@@ -370,9 +370,9 @@ It is reversible: `mv ~/.config/ferry/client.json.pre-migrate.<UTC> ~/.config/fe
 - [Development](#development)
 - [License](#license)
 
-## The stack — six lanes on one endpoint
+## The stack — seven lanes on one endpoint
 
-`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: six named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus two local MLX servers.
+`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: seven named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus two local MLX servers.
 
 | Lane | Where it runs | What it is |
 |---|---|---|
@@ -380,6 +380,7 @@ It is reversible: `mv ~/.config/ferry/client.json.pre-migrate.<UTC> ~/.config/fe
 | **`medium`** | cloud | General work when advertised; the domestic template runs GPT-5.6 Terra at xhigh with an OpenRouter Terra fallback |
 | **`flash`** | cloud | Explore worker; the domestic template runs GPT-5.6 Luna at xhigh, then Gemini Flash Latest, then Terra |
 | **`super-flash`** | cloud | Compaction, title, and summary; `openrouter/~google/gemini-flash-latest` at minimal reasoning with throughput routing and no fallback |
+| **`schematron`** | cloud | HTML→JSON structured extraction at temperature 0 (`openrouter/inference-net/schematron-v2-turbo`, no fallback); used by cdp-toolkit `extract_page` |
 | **`local-orch`** | host GPU | The smart local model (Qwen 3.8-27B nvfp4 + MTP speculative draft) |
 | **`local-sub`** | host GPU | The cheap local fan-out model (Nemotron 3 Nano 30B A3B NVFP4) |
 
@@ -390,7 +391,7 @@ instructions override above for what replaces the injected prompt, the
 resolution order, and how to verify it.
 
 ```bash
-ferry up      # all six domestic-template lanes, on http://<host>.local:8090/v1
+ferry up      # all seven domestic-template lanes, on http://<host>.local:8090/v1
 ```
 
 A lane **name is the contract**. The model behind it is swappable on the host without editing a single client — that is why the lanes are named for their *role* rather than for a model id. Clients just name a lane:

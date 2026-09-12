@@ -85,11 +85,18 @@ class VncServeTest(unittest.TestCase):
         self.fail("serve-vnc never listened")
 
     def stop(self):
+        """Terminate the daemon and return everything it printed. Idempotent, because it
+        is both an addCleanup and something a test calls directly to read the log."""
+        if getattr(self, "_stopped", False):
+            return self._daemon_log
+        self._stopped = True
         if self.proc.poll() is None:
             self.proc.terminate()
             try: self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired: self.proc.kill()
+        self._daemon_log = self.proc.stdout.read() if self.proc.stdout else ""
         if self.proc.stdout: self.proc.stdout.close()
+        return self._daemon_log
 
     def get(self, path):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -279,6 +286,108 @@ class BridgeTest(VncServeTest):
         second = WsClient(self.port, f"/ws/{self.echo.port}")
         self.addCleanup(second.close)
         self.assertEqual(second.status, 403)
+
+    # --- hardening (fix round 1) ---------------------------------------------
+    @staticmethod
+    def drain_to_eof(ws, timeout=10):
+        """Read until the server closes; returns the bytes it sent first."""
+        ws.sock.settimeout(timeout)
+        out = b""
+        while True:
+            chunk = ws.sock.recv(65536)
+            if not chunk:
+                return out
+            out += chunk
+
+    def test_disconnect_mid_header_is_not_a_traceback(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.assertEqual(ws.status, 101)
+        ws.sock.sendall(b"\x82\xfe")   # masked, 16-bit length announced, then nothing
+        ws.sock.close()
+        time.sleep(0.5)
+        self.assertEqual(self.get("/")[0], 200, "daemon stopped serving after a torn frame")
+        log = self.stop()
+        self.assertNotIn("Traceback", log, log)
+
+    def test_ping_does_not_splice_into_a_large_frame(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        size = 70000
+        payload = bytes((i * 7) % 251 for i in range(size))
+        ws.send(payload)
+        ws.send(b"hi", opcode=0x9)
+        got, pongs = b"", []
+        while len(got) < size or not pongs:
+            op, data = ws.recv()
+            if op == 0xA:
+                pongs.append(data)
+            elif op == 0x2:
+                got += data
+            else:
+                self.fail(f"unexpected opcode 0x{op:x}")
+        self.assertEqual(pongs, [b"hi"])
+        self.assertEqual(got, payload)
+
+    def test_oversized_declared_length_closes_without_hanging(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 101)
+        too_big = (1 << 20) + 1
+        ws.sock.sendall(bytes([0x82, 0x80 | 127]) + struct.pack("!Q", too_big) + b"\x12\x34\x56\x78")
+        self.assertEqual(self.drain_to_eof(ws), b"")
+
+    def test_unmasked_client_frame_is_rejected_with_1002(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 101)
+        ws.sock.sendall(bytes([0x82, 2]) + b"hi")   # no mask bit, no masking key
+        op, data = ws.recv()
+        self.assertEqual(op, 0x8)
+        self.assertEqual(struct.unpack("!H", data[:2])[0], 1002)
+
+
+def daemon_source():
+    """The python the zsh module heredocs into python3, as text."""
+    with open(os.path.join(REPO, "lib", "ferry-vnc.zsh")) as f:
+        src = f.read()
+    return src.split("<<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
+
+
+class FrameEncoderTest(unittest.TestCase):
+    """Exec just the shipped `frame` helper out of the daemon source, so the encoder
+    under test is literally the text that ships — the wire cannot prove the 64-bit
+    branch, because the pump's recv(65536) may return short."""
+
+    def setUp(self):
+        m = re.search(r"^def frame\(.*?(?=\n\ndef )", daemon_source(), re.S | re.M)
+        self.assertIsNotNone(m, "could not find `def frame(` in lib/ferry-vnc.zsh")
+        ns = {"struct": struct}
+        exec(m.group(0), ns)
+        self.frame = ns["frame"]
+
+    def test_seven_bit_length_below_126(self):
+        self.assertEqual(self.frame(b"x" * 125)[:2], bytes([0x82, 125]))
+
+    def test_sixteen_bit_branch_from_126_to_65535(self):
+        for n in (126, 65535):
+            f = self.frame(b"x" * n)
+            self.assertEqual(f[1], 126, n)
+            self.assertEqual(struct.unpack("!H", f[2:4])[0], n)
+            self.assertEqual(len(f), 4 + n)
+
+    def test_sixty_four_bit_branch_at_65536(self):
+        f = self.frame(b"x" * 65536)
+        self.assertEqual(f[1], 127)
+        self.assertEqual(struct.unpack("!Q", f[2:10])[0], 65536)
+        self.assertEqual(len(f), 10 + 65536)
+
+    def test_opcode_rides_in_the_first_byte_with_fin_set(self):
+        self.assertEqual(self.frame(b"hi", 0xA)[0], 0x8A)
+        self.assertEqual(self.frame(b"", 0x8)[:2], bytes([0x88, 0]))
 
 
 if __name__ == "__main__":

@@ -596,11 +596,12 @@ cmd_up() {
   fi
 
   if [[ "$LAUNCH_MODE" == "stack" ]]; then
-    # ── THE STACK: one door, six lanes ─────────────────────────────────────
+    # ── THE STACK: one door, seven lanes ────────────────────────────────────
     #   litellm on $target_port  ->  heavy        (cloud: GPT-6 Astra, ChatGPT subscription, Sol fallback)
     #                            ->  medium       (cloud: GPT-5.6 Terra, ChatGPT subscription, OpenRouter Terra fallback)
     #                            ->  flash        (cloud: GPT-5.6 Luna via OpenRouter, Gemini/Terra fallbacks)
     #                            ->  super-flash  (cloud: Gemini Flash Latest via OpenRouter, Gemini-only; no model fallback)
+    #                            ->  schematron   (cloud: OpenRouter schematron-v2-turbo, HTML→JSON extraction; no fallback)
     #                            ->  local-orch   (MLX on :$LOCAL_ORCH_PORT)
     #                            ->  local-sub    (MLX on :$LOCAL_SUB_PORT)
     # The two MLX ports are INTERNAL plumbing — clients only ever talk to
@@ -613,12 +614,13 @@ cmd_up() {
     _ferry_warn_missing_keys
 
     echo "================================================================="
-    echo "   FERRY STACK — six lanes, one endpoint"
+    echo "   FERRY STACK — seven lanes, one endpoint"
     echo "================================================================="
     echo "   heavy        cloud   GPT-6 Astra (ChatGPT subscription), Sol fallback"
     echo "   medium       cloud   GPT-5.6 Terra (ChatGPT subscription), OpenRouter Terra fallback"
     echo "   flash        cloud   GPT-5.6 Luna (OpenRouter), Gemini/Terra fallbacks"
     echo "   super-flash  cloud   Gemini Flash Latest (OpenRouter), Gemini-only; no model fallback"
+    echo "   schematron   cloud   HTML→JSON extraction (OpenRouter schematron-v2-turbo); no fallback"
     echo "   local-orch   GPU     $LOCAL_MODEL_ORCH"
     echo "   local-sub    GPU     $LOCAL_MODEL_SUB"
     echo "================================================================="

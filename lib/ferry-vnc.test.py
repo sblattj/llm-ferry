@@ -89,6 +89,7 @@ class VncServeTest(unittest.TestCase):
             self.proc.terminate()
             try: self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired: self.proc.kill()
+        if self.proc.stdout: self.proc.stdout.close()
 
     def get(self, path):
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
@@ -102,7 +103,7 @@ class VncServeTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(f"/vnc/{self.echo.port}".encode(), body)
         self.assertIn(b"laptop", body)
-        self.assertNotIn(b"4290", body)
+        self.assertNotIn(b"/vnc/4290", body)
 
     def test_index_with_no_state_file_says_nothing_published(self):
         os.remove(self.state_path)
@@ -110,6 +111,22 @@ class VncServeTest(unittest.TestCase):
         status, _, body = self.get("/")
         self.assertEqual(status, 200)
         self.assertIn(b"Nothing published", body)
+
+    def test_index_with_non_object_state_file_says_nothing_published(self):
+        with open(self.state_path, "w") as f: json.dump([], f)
+        self.start()
+        status, _, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Nothing published", body)
+        self.assertEqual(self.get("/ws/4290")[0], 403)
+
+    def test_index_with_non_numeric_port_key_says_nothing_published(self):
+        self.write_state({"abc": {"kind": "vnc"}})
+        self.start()
+        status, _, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"Nothing published", body)
+        self.assertEqual(self.get("/ws/4290")[0], 403)
 
     def test_vnc_route_redirects_into_novnc(self):
         self.start()

@@ -2851,10 +2851,62 @@ except KeyboardInterrupt:
 PYEOF
 }
 
-# novnc_fetch — Task 5 fills this in.
+# novnc_fetch — one pinned tarball, checksum-verified, only the viewer tree kept.
+# Downloaded rather than vendored: ~250 files of someone else's JS do not belong
+# in a repo whose clients fetch `ferry` as one script. Re-run to change versions.
 novnc_fetch() {
-  echo "Error: noVNC fetch is not implemented yet."
-  return 1
+  echo ">>> Fetching noVNC $NOVNC_VERSION -> $NOVNC_DIR"
+  python3 - "$NOVNC_URL" "$NOVNC_SHA256" "$NOVNC_DIR" "$NOVNC_VERSION" <<'PYEOF'
+import hashlib, os, shutil, sys, tarfile, tempfile, urllib.request
+url, want, dest, version = sys.argv[1:5]
+prefix = f"noVNC-{version}/"
+keep = ("app/", "core/", "vendor/", "vnc.html")
+tmp = tempfile.mkdtemp(prefix="ferry-novnc-")
+try:
+    tgz = os.path.join(tmp, "novnc.tar.gz")
+    h = hashlib.sha256()
+    with urllib.request.urlopen(url, timeout=120) as r, open(tgz, "wb") as f:
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+            f.write(chunk)
+    if h.hexdigest() != want:
+        print(f"Error: checksum mismatch for {url}\n       got  {h.hexdigest()}\n       want {want}")
+        sys.exit(1)
+    out = os.path.join(tmp, "tree")
+    os.makedirs(out)
+    with tarfile.open(tgz, "r:gz") as tf:
+        members = []
+        for m in tf.getmembers():
+            if not m.name.startswith(prefix):
+                continue
+            rel = m.name[len(prefix):]
+            if not rel.startswith(keep) or not (m.isfile() or m.isdir()):
+                continue
+            m.name = rel
+            members.append(m)
+        try:
+            tf.extractall(out, members=members, filter="data")
+        except TypeError:                      # python < 3.12 has no filter kwarg
+            tf.extractall(out, members=members)
+    if not os.path.isfile(os.path.join(out, "vnc.html")):
+        print("Error: the tarball has no vnc.html under " + prefix)
+        sys.exit(1)
+    with open(os.path.join(out, "VERSION"), "w") as f:
+        f.write(version + "\n")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    shutil.move(out, dest)
+    print(f"    noVNC {version} installed ({sum(len(fs) for _, _, fs in os.walk(dest))} files).")
+except (OSError, tarfile.TarError) as e:
+    print(f"Error: fetching noVNC failed: {e}")
+    sys.exit(1)
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+PYEOF
 }
 # ----------------- FERRY TRANSFER COMMANDS -----------------
 

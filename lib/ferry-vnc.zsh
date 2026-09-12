@@ -71,6 +71,7 @@ from urllib.parse import unquote
 
 PORT, BIND, STATE_FILE, NOVNC_DIR = int(sys.argv[1]), sys.argv[2], sys.argv[3], os.path.realpath(sys.argv[4])
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+MAX_FRAME = 1 << 20   # a client-declared frame length is untrusted input; RFB never needs more
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css",
          ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png",
          ".ico": "image/x-icon", ".mp3": "audio/mpeg", ".oga": "audio/ogg",
@@ -119,35 +120,55 @@ def unmask(data, mask):
     return (int.from_bytes(data, "big") ^ int.from_bytes(m, "big")).to_bytes(len(data), "big")
 
 def read_frame(rfile):
-    """(opcode, payload) or None at EOF. Reads through the handler's buffered rfile so
-    bytes that arrived with the request headers are not lost."""
+    """(opcode, payload, masked), or None at EOF / on a short read / on an oversized
+    frame. Reads through the handler's buffered rfile so bytes that arrived with the
+    request headers are not lost. EVERY read is length-checked: a client that vanishes
+    mid-header would otherwise hand struct.unpack a short buffer, and struct.error is
+    not an OSError, so it would escape the handler and dump a traceback into the log on
+    a routine abrupt disconnect."""
     head = rfile.read(2)
     if len(head) < 2:
         return None
     opcode, n = head[0] & 0x0F, head[1] & 0x7F
     masked = bool(head[1] & 0x80)
     if n == 126:
-        n = struct.unpack("!H", rfile.read(2))[0]
+        ext = rfile.read(2)
+        if len(ext) < 2:
+            return None
+        n = struct.unpack("!H", ext)[0]
     elif n == 127:
-        n = struct.unpack("!Q", rfile.read(8))[0]
-    mask = rfile.read(4) if masked else None
+        ext = rfile.read(8)
+        if len(ext) < 8:
+            return None
+        n = struct.unpack("!Q", ext)[0]
+    if n > MAX_FRAME:
+        return None
+    mask = None
+    if masked:
+        mask = rfile.read(4)
+        if len(mask) < 4:
+            return None
     data = rfile.read(n) if n else b""
     if len(data) < n:
         return None
-    return opcode, (unmask(data, mask) if mask else data)
+    return opcode, (unmask(data, mask) if mask else data), masked
 
-def pump_tcp_to_ws(upstream, ws, closing):
+def pump_tcp_to_ws(upstream, ws, closing, lock):
     """TCP -> WS until upstream EOF. `closing` is set by the handler thread once it has
     already sent a close frame, so the shutdown it performs to wake this recv does not
-    put a second, spurious close frame on a socket the client is watching for EOF."""
+    put a second, spurious close frame on a socket the client is watching for EOF.
+    `lock` serialises sendall with the handler thread's pongs and close echo — without
+    it a pong can splice into the middle of a large frame's payload."""
     try:
         while True:
             chunk = upstream.recv(65536)
             if not chunk:
                 break
-            ws.sendall(frame(chunk))
+            with lock:
+                ws.sendall(frame(chunk))
         if not closing.is_set():
-            ws.sendall(frame(struct.pack("!H", 1000), 0x8))
+            with lock:
+                ws.sendall(frame(struct.pack("!H", 1000), 0x8))
     except OSError:
         pass
 
@@ -217,7 +238,8 @@ class Handler(BaseHTTPRequestHandler):
         ws = self.connection
         upstream.settimeout(None)
         closing = threading.Event()
-        t = threading.Thread(target=pump_tcp_to_ws, args=(upstream, ws, closing), daemon=True)
+        lock = threading.Lock()   # both threads write to ws; every sendall holds this
+        t = threading.Thread(target=pump_tcp_to_ws, args=(upstream, ws, closing, lock), daemon=True)
         t.start()
         log(f"bridge open {self.address_string()} -> 127.0.0.1:{port}")
         try:
@@ -225,18 +247,32 @@ class Handler(BaseHTTPRequestHandler):
                 got = read_frame(self.rfile)
                 if got is None:
                     break
-                opcode, data = got
-                if opcode in (0x0, 0x1, 0x2):
-                    upstream.sendall(data)
-                elif opcode == 0x9:
-                    ws.sendall(frame(data, 0xA))
-                elif opcode == 0x8:
+                opcode, data, masked = got
+                if not masked:
+                    # RFC 6455 6.1: a client frame must be masked; fail the connection.
                     closing.set()
                     try:
-                        ws.sendall(frame(data[:2], 0x8))
+                        with lock:
+                            ws.sendall(frame(struct.pack("!H", 1002), 0x8))
                     except OSError:
                         pass
                     break
+                # FIN/fragmentation is deliberately ignored: this is a byte stream onto RFB.
+                if opcode in (0x0, 0x1, 0x2):
+                    upstream.sendall(data)
+                elif opcode == 0x9:
+                    with lock:
+                        ws.sendall(frame(data, 0xA))
+                elif opcode == 0x8:
+                    closing.set()
+                    try:
+                        with lock:
+                            ws.sendall(frame(data[:2], 0x8))
+                    except OSError:
+                        pass
+                    break
+                else:
+                    log(f"ignoring unknown WebSocket opcode 0x{opcode:x} from {self.address_string()}")
         except OSError:
             pass
         finally:

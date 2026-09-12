@@ -62,7 +62,7 @@ log `$LOG_DIR/vnc-8099.log`), host-only like `ferry relay`. Three routes:
 | Route | What |
 |---|---|
 | `GET /` | Index: every entry of the relay state file with `kind == "vnc"`, as links to `/vnc/<port>`, plus client name and since-time. Empty state or missing file renders "nothing published". |
-| `GET /vnc/<port>` | The viewer page: noVNC's `vnc.html` served with the WebSocket path pre-set to `/ws/<port>` (via `?path=ws/<port>&autoconnect=1&resize=scale`). |
+| `GET /vnc/<port>` | 302 to `/novnc/vnc.html?autoconnect=1&resize=scale&path=ws/<port>` when `<port>` is published as vnc, else 404. A redirect rather than a re-served page, because `vnc.html` loads `app/…` and `vendor/…` by relative path and must live at its own directory. |
 | `GET /novnc/…` | Static files from `~/.config/ferry/novnc/` (the unpacked release). |
 | `GET /ws/<port>` | WebSocket → TCP bridge to `127.0.0.1:<port>`. |
 
@@ -126,7 +126,7 @@ phone browser ──ws────▶ host:8099 /ws/5900 ──tcp──▶ host
 | noVNC not fetched | `serve-vnc` exits 1 naming `ferry serve-vnc --fetch`. |
 | Checksum mismatch | Fetch aborts, partial download removed, exit 1. |
 | `/ws/<port>` not published as vnc | HTTP 403, connection closed. |
-| Published port unreachable | Bridge sends WebSocket close 1011 and closes. |
+| Published port unreachable | The TCP dial happens before the upgrade, so the answer is HTTP 502 and no WebSocket is opened. |
 | Client leaves (laptop lid shut) | Relay reaps; state file loses the entry; next `/ws` is 403; live bridges close when the TCP side EOFs. |
 | Bad WebSocket handshake | HTTP 400. |
 

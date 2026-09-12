@@ -311,7 +311,28 @@ novnc_fetch() {
 import hashlib, os, shutil, sys, tarfile, tempfile, urllib.request
 url, want, dest, version = sys.argv[1:5]
 prefix = f"noVNC-{version}/"
-keep = ("app/", "core/", "vendor/", "vnc.html")
+dirs = ("app", "core", "vendor")
+
+
+def safe_member(m):
+    """True if m's prefix-stripped .name is safe to extract: no absolute path, no
+    '..' traversal segment, and either exactly "vnc.html" or under one of the
+    app/core/vendor directories. This is the ONLY thing that protects extraction
+    on pre-3.12 Python (no `filter=` kwarg, so it falls back below); on 3.12+
+    tf.extractall(..., filter="data") is an additional backstop, not the sole
+    line of defense — safety must not depend on the interpreter version."""
+    rel = m.name
+    if os.path.isabs(rel):
+        return False
+    norm = os.path.normpath(rel)
+    if norm == ".." or norm.startswith(".." + os.sep) or any(seg == ".." for seg in norm.split(os.sep)):
+        return False
+    if not (m.isfile() or m.isdir()):
+        return False
+    top = norm.split(os.sep, 1)[0]
+    return norm == "vnc.html" or top in dirs
+
+
 tmp = tempfile.mkdtemp(prefix="ferry-novnc-")
 try:
     tgz = os.path.join(tmp, "novnc.tar.gz")
@@ -333,10 +354,9 @@ try:
         for m in tf.getmembers():
             if not m.name.startswith(prefix):
                 continue
-            rel = m.name[len(prefix):]
-            if not rel.startswith(keep) or not (m.isfile() or m.isdir()):
+            m.name = m.name[len(prefix):]
+            if not safe_member(m):
                 continue
-            m.name = rel
             members.append(m)
         try:
             tf.extractall(out, members=members, filter="data")
@@ -348,11 +368,16 @@ try:
     with open(os.path.join(out, "VERSION"), "w") as f:
         f.write(version + "\n")
     os.makedirs(os.path.dirname(dest), exist_ok=True)
+    old = dest + ".old"
+    if os.path.isdir(old):                     # a stale leftover from a crash mid-swap
+        shutil.rmtree(old)
     if os.path.isdir(dest):
-        shutil.rmtree(dest)
-    shutil.move(out, dest)
+        os.rename(dest, old)                    # keep the previous good install until
+    shutil.move(out, dest)                      # the new one is fully in place
+    if os.path.isdir(old):
+        shutil.rmtree(old)
     print(f"    noVNC {version} installed ({sum(len(fs) for _, _, fs in os.walk(dest))} files).")
-except (OSError, tarfile.TarError) as e:
+except (OSError, ValueError, tarfile.TarError) as e:
     print(f"Error: fetching noVNC failed: {e}")
     sys.exit(1)
 finally:

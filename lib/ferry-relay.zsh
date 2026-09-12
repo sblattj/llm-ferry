@@ -596,6 +596,10 @@ cmd_expose_vnc() {
       *) passthrough+=("$1"); shift ;;
     esac
   done
+  if [[ -n "${local_port//[0-9]/}" || -z "$local_port" ]]; then
+    echo "Error: --local must be a port number (got '$local_port')"
+    exit 1
+  fi
   rfb_preflight "$local_port" || exit 1
   local kind="vnc"
   cmd_expose "$local_port" "${passthrough[@]}"

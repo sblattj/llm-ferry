@@ -251,13 +251,16 @@ class StatusReportsVncTest(unittest.TestCase):
 class WsClient:
     """Just enough RFC 6455 to test the server side: masked frames out, unmasked in."""
 
-    def __init__(self, port, path, key="dGhlIHNhbXBsZSBub25jZQ==", send_key=True, protocol="binary"):
+    def __init__(self, port, path, key="dGhlIHNhbXBsZSBub25jZQ==", send_key=True, protocol="binary",
+                 extra_headers=None):
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
         req = f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
         if send_key:
             req += f"Sec-WebSocket-Key: {key}\r\n"
         if protocol:
             req += f"Sec-WebSocket-Protocol: {protocol}\r\n"
+        for k, v in (extra_headers or {}).items():
+            req += f"{k}: {v}\r\n"
         self.sock.sendall((req + "\r\n").encode())
         raw = b""
         while b"\r\n\r\n" not in raw:
@@ -425,6 +428,71 @@ class BridgeTest(VncServeTest):
         op, data = ws.recv()
         self.assertEqual(op, 0x8)
         self.assertEqual(struct.unpack("!H", data[:2])[0], 1002)
+
+    # --- origin check + protocol echo + header timeout (fix round 2) --------
+    def test_cross_origin_websocket_is_refused(self):
+        """WebSockets ignore same-origin policy, so a page loaded from anywhere on the
+        LAN could otherwise open ws://host:8099/ws/<port> against a screen it has no
+        business touching."""
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}", extra_headers={"Origin": "http://evil.example"})
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 403)
+
+    def test_same_origin_websocket_still_upgrades(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}",
+                      extra_headers={"Origin": f"http://127.0.0.1:{self.port}"})
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 101)
+
+    def test_missing_origin_still_upgrades(self):
+        """Native clients (and WsClient itself, normally) send no Origin header at
+        all; that must keep working."""
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 101)
+
+    def test_protocol_header_absent_when_not_offered(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}", protocol=None)
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 101)
+        self.assertNotIn("sec-websocket-protocol", ws.headers)
+
+    def test_idle_connection_before_upgrade_is_not_closed_within_two_seconds(self):
+        """Handler.timeout=30 must not be so short it kills the header phase almost
+        immediately, and the daemon must keep serving other requests while a client
+        sits idle. The 30s expiry itself is not asserted here — waiting it out would
+        slow the whole suite for no extra confidence."""
+        self.start()
+        idle = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        self.addCleanup(idle.close)
+        idle.settimeout(2)
+        with self.assertRaises(socket.timeout):
+            idle.recv(1)   # if the server had closed it, this would return b"" at once
+        self.assertEqual(self.get("/")[0], 200, "daemon stopped serving while a connection idled")
+
+    def test_bridged_session_survives_a_short_idle_then_echoes(self):
+        """A live RFB session must not be killed by the header-phase idle timeout once
+        upgraded. With timeout=30 a 1.5s idle can't distinguish 'timeout removed' from
+        'timeout just hasn't fired yet', so the source assertion below is what actually
+        proves self.connection.settimeout(None) is in effect; this half only proves the
+        bridge still works correctly after a short idle."""
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        time.sleep(1.5)
+        ws.send(b"x")
+        op, data = ws.recv()
+        self.assertEqual(op, 0x2)
+        self.assertEqual(data, b"x")
+        src = daemon_source()
+        serve_ws_src = src.split("def serve_ws(self, port):", 1)[1].split("\nclass Server", 1)[0]
+        self.assertIn("self.connection.settimeout(None)", serve_ws_src,
+                       "source assertion, not behavioural: proves the post-upgrade "
+                       "settimeout(None) call ships inside serve_ws")
 
 
 class FetchTest(VncServeTest):

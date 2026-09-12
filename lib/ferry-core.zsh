@@ -260,6 +260,15 @@ RELAY_TOKEN_FILE="$HOME/.config/ferry/relay-token"
 RELAY_STATE_FILE="$HOME/.config/ferry/relay-published.json"
 RELAY_LOG="$LOG_DIR/relay-$RELAY_PORT.log"
 
+# Browser VNC viewer (`ferry serve-vnc`): noVNC served from the host plus a
+# WebSocket->TCP bridge onto ports the relay has published as kind=vnc.
+VNC_PORT="8099"
+VNC_LOG="$LOG_DIR/vnc-$VNC_PORT.log"
+NOVNC_VERSION="1.7.0"
+NOVNC_URL="${FERRY_NOVNC_URL:-https://github.com/novnc/noVNC/archive/refs/tags/v$NOVNC_VERSION.tar.gz}"
+NOVNC_SHA256="${FERRY_NOVNC_SHA256:-b1003a11b6e6e8d8f7f5e5586daae7f8ca651d8aee0aa155ff9ac841c48f52c6}"
+NOVNC_DIR="$HOME/.config/ferry/novnc"
+
 # Load local secrets if present (e.g. GEMINI_API_KEY). Export the variable in your
 # shell, or drop it in ~/.config/ferry/secrets.env — never commit real API keys.
 if [[ -f "$HOME/.config/ferry/secrets.env" ]]; then

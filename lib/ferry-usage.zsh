@@ -69,6 +69,8 @@ Ferrying models & files across the LAN:
   send <path> <cli>  [Host] Push a file/dir to a listening client  [--port P]
   serve-hf           [Host] Start EXPERIMENTAL HuggingFace pass-through proxy [--port P] (default $HF_PORT)
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
+  serve-vnc          [Host] Serve the browser VNC viewer for ports published with
+                       'ferry expose-vnc' [--port P] [--bind ADDR] [--fetch] (default $VNC_PORT)
 
 Encrypted transfer over an UNTRUSTED channel (no LAN required):
   drop <file>|-      [Dual] Encrypt to a self-contained .ferrydrop blob + print a fresh

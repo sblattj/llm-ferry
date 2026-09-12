@@ -400,12 +400,47 @@ class FetchTest(VncServeTest):
         self.start()
         self.assertEqual(self.get("/novnc/core/rfb.js")[2], b"// rfb")
 
+    def test_fetch_with_invalid_url_scheme_fails_cleanly(self):
+        r = self.fetch("not-a-valid-url-scheme", "0" * 64)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+        self.assertIn("fetching noVNC failed", r.stdout)
+
+    def test_fetch_ignores_path_traversal_members(self):
+        shutil.rmtree(self.novnc)
+        ver = novnc_version()
+        path = os.path.join(self.tmp, "evil.tar.gz")
+        with tarfile.open(path, "w:gz") as tf:
+            for name, data in ((f"noVNC-{ver}/vnc.html", b"<html>real viewer</html>"),
+                               (f"noVNC-{ver}/app/ok.js", b"// ok"),
+                               (f"noVNC-{ver}/app/../../evil.txt", b"pwned"),
+                               (f"noVNC-{ver}/vnc.htmlx", b"not the viewer")):
+                info = tarfile.TarInfo(name); info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        with open(path, "rb") as f:
+            sha = hashlib.sha256(f.read()).hexdigest()
+        r = self.fetch("file://" + path, sha)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(os.path.isfile(os.path.join(self.novnc, "app", "ok.js")))
+        self.assertFalse(os.path.exists(os.path.join(self.novnc, "vnc.htmlx")))
+        for root, _, files in os.walk(self.tmp):
+            self.assertNotIn("evil.txt", files, f"traversal member escaped into {root}")
+
 
 def daemon_source():
     """The python the zsh module heredocs into python3, as text."""
     with open(os.path.join(REPO, "lib", "ferry-vnc.zsh")) as f:
         src = f.read()
     return src.split("<<'PYEOF'\n", 1)[1].split("\nPYEOF", 1)[0]
+
+
+def fetch_source():
+    """The python the zsh module heredocs into python3 for `novnc_fetch` (the SECOND
+    `<<'PYEOF'` block in the file — the first is the daemon `daemon_source()` reads),
+    as text."""
+    with open(os.path.join(REPO, "lib", "ferry-vnc.zsh")) as f:
+        src = f.read()
+    return src.split("<<'PYEOF'\n")[2].split("\nPYEOF", 1)[0]
 
 
 class FrameEncoderTest(unittest.TestCase):
@@ -439,6 +474,56 @@ class FrameEncoderTest(unittest.TestCase):
     def test_opcode_rides_in_the_first_byte_with_fin_set(self):
         self.assertEqual(self.frame(b"hi", 0xA)[0], 0x8A)
         self.assertEqual(self.frame(b"", 0x8)[:2], bytes([0x88, 0]))
+
+
+class FakeTarMember:
+    def __init__(self, name, isfile=True, isdir=False):
+        self.name, self._isfile, self._isdir = name, isfile, isdir
+    def isfile(self):
+        return self._isfile
+    def isdir(self):
+        return self._isdir
+
+
+class SafeMemberTest(unittest.TestCase):
+    """Exec just the shipped `safe_member` traversal predicate out of the fetch
+    heredoc, so the check under test is literally the text that ships. This proves
+    the predicate itself, independent of the tf.extractall(filter="data") 3.12+
+    backstop that FetchTest.test_fetch_ignores_path_traversal_members exercises
+    end-to-end through the real interpreter on this host."""
+
+    def setUp(self):
+        # Captures both the `dirs = (...)` allowlist AND `def safe_member` together —
+        # safe_member reads `dirs` out of its enclosing (module) scope, so execing the
+        # function alone with a hand-typed `dirs` would test a reimplementation, not
+        # the shipped allowlist.
+        m = re.search(r"^dirs = .*?(?=\n\n\ntmp = )", fetch_source(), re.S | re.M)
+        self.assertIsNotNone(m, "could not find `dirs = ` / `def safe_member(` in lib/ferry-vnc.zsh")
+        ns = {"os": os}
+        exec(m.group(0), ns)
+        self.safe_member = ns["safe_member"]
+
+    def test_rejects_relative_traversal_out_of_the_tree(self):
+        self.assertFalse(self.safe_member(FakeTarMember("app/../../evil.txt")))
+
+    def test_rejects_absolute_paths(self):
+        self.assertFalse(self.safe_member(FakeTarMember("/etc/passwd")))
+
+    def test_accepts_files_under_kept_directories(self):
+        self.assertTrue(self.safe_member(FakeTarMember("app/ok.js")))
+        self.assertTrue(self.safe_member(FakeTarMember("core/rfb.js")))
+        self.assertTrue(self.safe_member(FakeTarMember("vendor/pako/x.js")))
+
+    def test_vnc_html_matches_only_exactly(self):
+        self.assertTrue(self.safe_member(FakeTarMember("vnc.html")))
+        self.assertFalse(self.safe_member(FakeTarMember("vnc.htmlx")))
+
+    def test_rejects_paths_outside_the_kept_set(self):
+        self.assertFalse(self.safe_member(FakeTarMember("tests/big.js")))
+        self.assertFalse(self.safe_member(FakeTarMember("README.md")))
+
+    def test_rejects_non_file_non_dir_members(self):
+        self.assertFalse(self.safe_member(FakeTarMember("app/link.js", isfile=False, isdir=False)))
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ case "$COMMAND" in
   inbox)         cmd_inbox "$@" ;;
   relay)         cmd_relay "$@" ;;
   expose)        cmd_expose "$@" ;;
+  expose-vnc)    cmd_expose_vnc "$@" ;;
   offer)         cmd_offer "$@" ;;
   pull)          cmd_pull "$@" ;;
   get)           cmd_get "$@" ;;

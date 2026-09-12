@@ -75,6 +75,18 @@ class EchoService(threading.Thread):
             pass
 
 
+class RfbService(EchoService):
+    """A fake VNC server: greets with the RFB ProtocolVersion, then echoes."""
+
+    def serve(self, conn):
+        try:
+            conn.sendall(b"RFB 003.008\n")
+        except OSError:
+            conn.close()
+            return
+        super().serve(conn)
+
+
 class RelayTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="ferry-relay-home-")
@@ -334,6 +346,39 @@ class RelayTest(unittest.TestCase):
         first = self.token()
         self.run_ferry("relay", "--token")
         self.assertEqual(first, self.token(), "the token must be stable across runs")
+
+
+class ExposeVncTest(RelayTest):
+    def start_expose_vnc(self, local):
+        return self.ferry("expose-vnc", "--local", str(local), "--as", str(self.public_port),
+                          "--host", "127.0.0.1", "--port", str(self.relay_port),
+                          "--token", self.token())
+
+    def test_refuses_a_local_port_that_is_not_rfb(self):
+        self.start_relay()
+        r = self.run_ferry("expose-vnc", "--local", str(self.echo.port), "--as", str(self.public_port),
+                           "--host", "127.0.0.1", "--port", str(self.relay_port), "--token", self.token())
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("not a VNC server", r.stdout)
+        self.assertNotIn(str(self.public_port), self.state())
+
+    def test_refuses_a_closed_local_port(self):
+        self.start_relay()
+        r = self.run_ferry("expose-vnc", "--local", str(free_port()), "--as", str(self.public_port),
+                           "--host", "127.0.0.1", "--port", str(self.relay_port), "--token", self.token())
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("Screen Sharing", r.stdout)
+
+    def test_publishes_an_rfb_service_as_kind_vnc(self):
+        rfb = RfbService()
+        rfb.start()
+        self.addCleanup(rfb.shutdown)
+        self.start_relay()
+        self.start_expose_vnc(rfb.port)
+        self.wait_for_port(self.public_port, "the published VNC port")
+        self.assertEqual(self.state()[str(self.public_port)]["kind"], "vnc")
+        with socket.create_connection(("127.0.0.1", self.public_port), timeout=10) as s:
+            self.assertEqual(s.recv(12), b"RFB 003.008\n")
 
 
 if __name__ == "__main__":

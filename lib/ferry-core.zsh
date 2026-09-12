@@ -102,6 +102,11 @@ PROXY_PORT="8097"
 RELAY_PORT="8098"         # reverse-expose control port — clients dial IN to publish OUT
 LOCAL_ORCH_PORT="8092"    # MLX backend for the `local-orch` lane
 LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
+# Dedicated door for the schematron extraction lane (`ferry up --schematron`):
+# a scraper workload targets :8094 while the stack keeps :8090, so neither
+# door's restarts can disturb the other. 8094 is the one gap left in the
+# 8090-8099 block (only scripts/bench-spec-ab.py ever borrows it, ad hoc).
+SCHEMATRON_PORT="${FERRY_SCHEMATRON_PORT:-8094}"
 # NOTE: 8091 is deliberately skipped — `ferry dash` binds it. The stack and the
 # dashboard are meant to run together, so the lanes start above it.
 

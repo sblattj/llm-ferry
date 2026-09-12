@@ -81,7 +81,7 @@ cmd_relay() {
   # never quietly shadow the inference endpoint or the share server. Built from
   # the same constants those services use — 8091 is the dashboard, which is a
   # literal there too.
-  local reserved="$PORT,8091,$SHARE_PORT,$HF_PORT,$PROXY_PORT,$LOCAL_ORCH_PORT,$LOCAL_SUB_PORT,$relay_port,$VNC_PORT"
+  local reserved="$PORT,8091,$SHARE_PORT,$HF_PORT,$PROXY_PORT,$LOCAL_ORCH_PORT,$LOCAL_SUB_PORT,$SCHEMATRON_PORT,$relay_port,$VNC_PORT"
 
   if (( ! foreground )); then
     if lsof -nP -iTCP:"$relay_port" -sTCP:LISTEN >/dev/null 2>&1; then

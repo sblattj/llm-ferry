@@ -71,6 +71,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 - 📦 **Ferry models & files across the LAN** — stream whole models from the host's HuggingFace cache, offer/fetch arbitrary files, or push over netcat.
 - 🕳️ **Forward proxy for offline clients** — route a client's uv/PyPI/HuggingFace/git downloads through the host's connection.
 - 🔄 **Reverse tunnel for locked-down clients** — publish one of a client's own local ports through the host, with the client only ever dialling out (`ferry relay` on the host, `ferry expose <port>` on the client).
+- 🖥️ **VNC through the host** — publish a laptop's screen with `ferry expose-vnc`; the host serves a browser viewer (`ferry serve-vnc`), so a phone needs only a URL.
 - 🔐 **Encrypted drop for machines off the LAN, new in v1.17** — `ferry drop` writes an authenticated, self-contained blob you can move over any channel ferry doesn't trust; `ferry pickup` verifies and decrypts it. The passphrase, not the carrier, is the security boundary.
 - 🪶 **Single-file CLI** — `zsh` + `python3` **standard library** only; `litellm`/`mlx` installed via `uv` only when you actually serve inference (plus `openssl`, an OS-provided binary, for `drop`/`pickup`). Clients fetch the CLI as one script over the LAN.
 
@@ -734,6 +735,7 @@ with an explanation rather than a stack trace.
 | **8096** | HuggingFace pass-through proxy (experimental) | `ferry serve-hf` |
 | **8097** | General HTTP(S) download forward proxy | `ferry serve-proxy` |
 | **8098** | Reverse-relay control port — a client dials this to register, then publishes one of its own local ports through the host | `ferry relay` |
+| **8099** | Browser VNC viewer + WebSocket bridge onto ports published with `ferry expose-vnc` | `ferry serve-vnc` |
 | **9099** | Default netcat port for direct `ferry send` / `ferry receive` | `ferry send` / `ferry receive` |
 | **3001 / 8429 / 9428 / 9092** | Grafana / VictoriaMetrics / VictoriaLogs / metrics exporter (localhost only) | `ferry dash --grafana` |
 
@@ -841,6 +843,33 @@ ferry status    # lists every published port, its client, and when it started
 ferry down      # tears down the relay and everything published through it
 ```
 
+### VNC: see a client's screen from a browser
+
+```bash
+# client
+ferry expose-vnc --token <token>   # preflights 127.0.0.1:5900, publishes it as kind: vnc
+
+# host
+ferry serve-vnc --fetch            # once: download the pinned noVNC release
+ferry serve-vnc                    # browser viewer + WebSocket bridge on 8099
+```
+
+`ferry expose-vnc` is `ferry expose` with two differences: it reads up to 12
+bytes back from `127.0.0.1:<local>` first and refuses to publish anything that
+doesn't greet `RFB …` (a dead port never reaches the relay), and it registers
+with `"kind": "vnc"` instead of `"tcp"`, so the host can tell a screen from a
+plain tunnel. `ferry serve-vnc` reads that same relay state: `/ws/<port>`
+bridges a WebSocket to `127.0.0.1:<port>` only for a port the relay currently
+lists as `vnc` — a port that isn't published, or is published as plain `tcp`,
+is `403`. The first run needs `--fetch` to pull the pinned noVNC 1.7.0 release
+(checksum-verified) into `~/.config/ferry/novnc/`.
+
+**Security.** The relay token authenticates the publisher, same as `expose`;
+it says nothing about who reaches the screen afterward, so the VNC server's
+own password is what gates the screen. The viewer serves plain HTTP on the
+LAN like every other ferry port — pass `--bind 127.0.0.1` to `ferry serve-vnc`
+to keep it off the LAN entirely.
+
 ## Remote access (Tailscale)
 
 The endpoint is a LAN appliance; ferry publishes nothing to the internet. When you want it from *outside* the LAN, front it with [Tailscale Serve](https://tailscale.com/kb/1242/tailscale-serve) — one command on the host puts a real TLS certificate and your tailnet's identity in front of the same local port, so the master key gets a TLS wire to travel over and only devices on your tailnet (plus anyone you explicitly share the node with) can knock:
@@ -910,6 +939,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `inbox [-n N] [-f] [--all] [--path]` | host | Read that file back, dated and attributed from the share server's access log where the receipt still exists |
 | `relay [--port P] [--bind ADDR] [--foreground] [--token]` | host | Accept reverse-expose registrations so a client can publish one of its own local ports through this host (control port `8098`) |
 | `expose <port> [--as PUBLIC] [--host H] [--port P] [--token T]` | client | Publish this client's `127.0.0.1:<port>` from the host, dialling only outbound |
+| `expose-vnc [--local PORT] [--as PUBLIC] [--host H] [--port P] [--token T]` | client | `expose`, with an RFB preflight on `127.0.0.1:<local>` and `"kind": "vnc"` in the registration, so the host can list it as a screen |
 | `offer <path>...` | host | Record files/dirs in `offered.json` for clients to fetch |
 | `pull <model-id> [--host H] [--port P] [--transport http\|hf\|nc] [--to DIR]` | client | Pull a model from the host cache (three transports) |
 | `get <name> [--host H] [--port P] [--to DIR]` | client | Fetch an offered file/dir by basename |
@@ -917,6 +947,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `send <path> <client-host> [--port P]` | host | Push a file/dir to a listening client via netcat (default `9099`) |
 | `serve-hf [--port P]` | host | Start the experimental HuggingFace pass-through proxy (default `8096`) |
 | `serve-proxy [--port P]` | host | Start the general HTTP(S) download forward proxy (default `8097`) |
+| `serve-vnc [--port P] [--bind ADDR] [--foreground] [--fetch]` | host | Serve the browser VNC viewer + WebSocket bridge for ports published with `ferry expose-vnc` (default `8099`); `--fetch` downloads the pinned noVNC release and exits |
 | `env [--host H] [--proxy-port P] [--hf-port P2] [--write]` | client | Emit shell exports so this laptop routes downloads via the host proxy |
 | `opencode [--host H] [--port P] [--config PATH] [--local\|--cloud] [--key KEY] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: `permission`, global `model` (`heavy`), `small_model` (`super-flash`), six built-in agents pinned to lane names, `general` disabled, and the custom `light`/`standard` subagents added. Defaults: build/plan → `heavy`; light → `flash`; standard → `medium` when advertised, otherwise `flash`; explore → `flash`; compaction/title/summary → `super-flash`. `--small-model` overrides light/standard/explore; `--housekeeper` overrides compaction/title/summary. `--super` keeps `heavy` driving and sends every non-driver agent to `super-flash`. `--key` writes the master key into the configs (v1.22) — without it they carry the keyless `local` placeholder, which a hardened front door rejects. Snapshots the original first |
 | `claude [--host H] [--port P] [--key KEY] [--wrappers]` | dual | Point Claude Code at the ferry endpoint by lane name: installs the `claude-ferry` / `claude-ferry-local` / `claude-ferry-super` wrappers into `~/.zshrc` and writes `~/.config/ferry/claude.json` recording the lane map. `--key` bakes the master key into the wrappers (v1.22); `--wrappers` installs the `~/.zshrc` block only (the host-reset shim) |
@@ -925,7 +956,7 @@ Run `ferry --help` for the built-in usage banner.
 
 ## Development
 
-`ferry` is assembled from per-domain modules so the CLI isn't one file to reason about. Source lives in [`lib/`](lib/) as **16 modules**: `ferry-core` (bootstrap, LAN/mDNS discovery, config, secrets), `ferry-usage`, `ferry-install`, `ferry-serve` (up/down/status/catalog), `ferry-share` (LAN share server + telemetry), `ferry-inbox` (read the telemetry back), `ferry-relay` (reverse expose), `ferry-transfer` (pull/get/send/receive/offer), `ferry-drop` (encrypted off-LAN transfer), `ferry-proxy` (serve-hf/serve-proxy), `ferry-integrate` (env/opencode), `ferry-claude` (Claude Code wiring), `ferry-fleet` (fleet selection), `ferry-dash`, `ferry-update`, and `ferry-main` (dispatch). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules and regenerate:
+`ferry` is assembled from per-domain modules so the CLI isn't one file to reason about. Source lives in [`lib/`](lib/) as **18 modules**: `ferry-core` (bootstrap, LAN/mDNS discovery, config, secrets), `ferry-usage`, `ferry-install`, `ferry-serve` (up/down/status/catalog), `ferry-share` (LAN share server + telemetry), `ferry-inbox` (read the telemetry back), `ferry-relay` (reverse expose), `ferry-vnc` (browser VNC viewer + WebSocket bridge), `ferry-transfer` (pull/get/send/receive/offer), `ferry-drop` (encrypted off-LAN transfer), `ferry-proxy` (serve-hf/serve-proxy), `ferry-integrate` (env/opencode), `ferry-claude` (Claude Code wiring), `ferry-fleet` (fleet selection), `ferry-dash`, `ferry-update`, `ferry-migrate` (promote a client into a host), and `ferry-main` (dispatch). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules and regenerate:
 
 ```bash
 ./build.zsh            # regenerate ./ferry from lib/ferry-*.zsh

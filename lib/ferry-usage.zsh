@@ -43,7 +43,7 @@ Commands:
                        ferry expose <port> [--as PUBLIC] [--host H] [--token T]
   expose-vnc         [Client] Publish this machine's VNC server (5900) through the host,
                        tagged so 'ferry serve-vnc' can show it in a browser
-                       ferry expose-vnc [--local PORT] [--as PUBLIC] [--host H] [--token T]
+                       ferry expose-vnc [--local PORT] [--as PUBLIC] [--host H] [--port P] [--token T]
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
   opencode           [Client] Auto-wire opencode to route through the host (detects served models)
@@ -70,7 +70,7 @@ Ferrying models & files across the LAN:
   serve-hf           [Host] Start EXPERIMENTAL HuggingFace pass-through proxy [--port P] (default $HF_PORT)
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
   serve-vnc          [Host] Serve the browser VNC viewer for ports published with
-                       'ferry expose-vnc' [--port P] [--bind ADDR] [--fetch] (default $VNC_PORT)
+                       'ferry expose-vnc' [--port P] [--bind ADDR] [--foreground] [--fetch] (default $VNC_PORT)
 
 Encrypted transfer over an UNTRUSTED channel (no LAN required):
   drop <file>|-      [Dual] Encrypt to a self-contained .ferrydrop blob + print a fresh

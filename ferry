@@ -324,7 +324,7 @@ Commands:
                        ferry expose <port> [--as PUBLIC] [--host H] [--token T]
   expose-vnc         [Client] Publish this machine's VNC server (5900) through the host,
                        tagged so 'ferry serve-vnc' can show it in a browser
-                       ferry expose-vnc [--local PORT] [--as PUBLIC] [--host H] [--token T]
+                       ferry expose-vnc [--local PORT] [--as PUBLIC] [--host H] [--port P] [--token T]
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
   opencode           [Client] Auto-wire opencode to route through the host (detects served models)
@@ -351,7 +351,7 @@ Ferrying models & files across the LAN:
   serve-hf           [Host] Start EXPERIMENTAL HuggingFace pass-through proxy [--port P] (default $HF_PORT)
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
   serve-vnc          [Host] Serve the browser VNC viewer for ports published with
-                       'ferry expose-vnc' [--port P] [--bind ADDR] [--fetch] (default $VNC_PORT)
+                       'ferry expose-vnc' [--port P] [--bind ADDR] [--foreground] [--fetch] (default $VNC_PORT)
 
 Encrypted transfer over an UNTRUSTED channel (no LAN required):
   drop <file>|-      [Dual] Encrypt to a self-contained .ferrydrop blob + print a fresh
@@ -1576,7 +1576,7 @@ try:
     pub = json.load(open(sys.argv[1]))
     if not isinstance(pub, dict):
         pub = {}
-    pub = {p: i for p, i in pub.items() if str(p).isdigit() and isinstance(i, dict)}
+    pub = {p: i for p, i in pub.items() if str(p).isascii() and str(p).isdigit() and isinstance(i, dict)}
     if not pub:
         print("    No ports published right now.")
     for port, info in sorted(pub.items(), key=lambda kv: int(kv[0])):
@@ -1601,7 +1601,7 @@ try:
     if not isinstance(pub, dict):
         pub = {}
     screens = {p: i for p, i in pub.items()
-               if str(p).isdigit() and isinstance(i, dict) and i.get("kind") == "vnc"}
+               if str(p).isascii() and str(p).isdigit() and isinstance(i, dict) and i.get("kind") == "vnc"}
     if not screens:
         print("    No screens published right now (client: ferry expose-vnc).")
     for port, info in sorted(screens.items(), key=lambda kv: int(kv[0])):
@@ -2573,6 +2573,10 @@ cmd_expose_vnc() {
       *) passthrough+=("$1"); shift ;;
     esac
   done
+  if [[ -n "${local_port//[0-9]/}" || -z "$local_port" ]]; then
+    echo "Error: --local must be a port number (got '$local_port')"
+    exit 1
+  fi
   rfb_preflight "$local_port" || exit 1
   local kind="vnc"
   cmd_expose "$local_port" "${passthrough[@]}"
@@ -2753,6 +2757,8 @@ def pump_tcp_to_ws(upstream, ws, closing, lock):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 30   # a client that connects and sends nothing must not pin a thread forever;
+                   # BaseHTTPRequestHandler closes the request on this timeout by itself.
 
     def log_message(self, fmt, *args):
         log(f"{self.address_string()} {fmt % args}")
@@ -2797,6 +2803,11 @@ class Handler(BaseHTTPRequestHandler):
     def serve_ws(self, port):
         if port not in published_vnc():
             return self.reply(403, b"that port is not published as a VNC screen")
+        origin = self.headers.get("Origin")
+        if origin:
+            origin_host = origin.split("//", 1)[-1]
+            if origin_host != self.headers.get("Host", ""):
+                return self.reply(403, b"cross-origin WebSocket refused")
         key = self.headers.get("Sec-WebSocket-Key")
         if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
             return self.reply(400, b"expected a WebSocket upgrade")
@@ -2813,6 +2824,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Sec-WebSocket-Protocol", "binary")
         self.end_headers()
         self.wfile.flush()
+        self.connection.settimeout(None)   # a live RFB session must not be killed by
+                                            # the header-phase idle timeout above.
         self.close_connection = True
         ws = self.connection
         upstream.settimeout(None)

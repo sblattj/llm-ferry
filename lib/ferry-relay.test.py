@@ -389,6 +389,12 @@ class ExposeVncTest(RelayTest):
                           "--host", "127.0.0.1", "--port", str(self.relay_port),
                           "--token", self.token())
 
+    def test_local_port_must_be_a_number(self):
+        r = self.run_ferry("expose-vnc", "--local", "abc")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("must be a port number", r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+
     def test_refuses_a_local_port_that_is_not_rfb(self):
         self.start_relay()
         r = self.run_ferry("expose-vnc", "--local", str(self.echo.port), "--as", str(self.public_port),

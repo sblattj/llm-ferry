@@ -2633,9 +2633,9 @@ def published_vnc():
     try:
         with open(STATE_FILE) as f:
             pub = json.load(f)
-    except (OSError, ValueError):
+        return {int(p): i for p, i in pub.items() if isinstance(i, dict) and i.get("kind") == "vnc"}
+    except (OSError, ValueError, AttributeError, TypeError):
         return {}
-    return {int(p): i for p, i in pub.items() if isinstance(i, dict) and i.get("kind") == "vnc"}
 
 def index_html():
     rows = []

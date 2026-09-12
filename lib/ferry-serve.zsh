@@ -1000,15 +1000,18 @@ cmd_status() {
 import json, sys
 try:
     pub = json.load(open(sys.argv[1]))
+    if not isinstance(pub, dict):
+        pub = {}
+    pub = {p: i for p, i in pub.items() if str(p).isdigit() and isinstance(i, dict)}
+    if not pub:
+        print("    No ports published right now.")
+    for port, info in sorted(pub.items(), key=lambda kv: int(kv[0])):
+        label = f" ({info['label']})" if info.get("label") else ""
+        kind = info.get("kind", "tcp")
+        print(f"    Published {info.get('bind', '?')}:{port} [{kind}] for {info.get('client', '?')}{label}"
+              f"  since {info.get('since', '?')}")
 except Exception:
     sys.exit(0)
-if not pub:
-    print("    No ports published right now.")
-for port, info in sorted(pub.items(), key=lambda kv: int(kv[0])):
-    label = f" ({info['label']})" if info.get("label") else ""
-    kind = info.get("kind", "tcp")
-    print(f"    Published {info.get('bind', '?')}:{port} [{kind}] for {info.get('client', '?')}{label}"
-          f"  since {info.get('since', '?')}")
 PYEOF
     fi
   fi
@@ -1021,13 +1024,16 @@ PYEOF
 import json, sys
 try:
     pub = json.load(open(sys.argv[1]))
+    if not isinstance(pub, dict):
+        pub = {}
+    screens = {p: i for p, i in pub.items()
+               if str(p).isdigit() and isinstance(i, dict) and i.get("kind") == "vnc"}
+    if not screens:
+        print("    No screens published right now (client: ferry expose-vnc).")
+    for port, info in sorted(screens.items(), key=lambda kv: int(kv[0])):
+        print(f"    Screen {info.get('label') or info.get('client', '?')}: http://{sys.argv[2]}:{sys.argv[3]}/vnc/{port}")
 except Exception:
     sys.exit(0)
-screens = {p: i for p, i in pub.items() if i.get("kind") == "vnc"}
-if not screens:
-    print("    No screens published right now (client: ferry expose-vnc).")
-for port, info in sorted(screens.items(), key=lambda kv: int(kv[0])):
-    print(f"    Screen {info.get('label') or info.get('client', '?')}: http://{sys.argv[2]}:{sys.argv[3]}/vnc/{port}")
 PYEOF
     fi
   fi

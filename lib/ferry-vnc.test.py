@@ -169,6 +169,18 @@ class VncServeTest(unittest.TestCase):
             status, _, _ = self.get(f"/ws/{port}")
             self.assertEqual(status, 403, port)
 
+    def test_unicode_digit_port_is_403_not_a_traceback(self):
+        # U+00B2 passes str.isdigit() but int() rejects it; sent raw so the
+        # request line is decoded as latin-1 and the glyph lands in the path.
+        self.start()
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        s.sendall(b"GET /ws/" + bytes([0xB2]) + b" HTTP/1.1\r\nHost: x\r\n\r\n")
+        head = s.recv(4096); s.close()
+        self.assertTrue(head.startswith(b"HTTP/1.1 403"), head)
+        status, _, _ = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Traceback", self.stop())
+
     def test_refuses_to_start_without_novnc(self):
         shutil.rmtree(self.novnc)
         r = subprocess.run(["zsh", FERRY, "serve-vnc", "--foreground", "--port", str(self.port)],

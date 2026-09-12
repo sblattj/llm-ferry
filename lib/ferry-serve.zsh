@@ -484,6 +484,7 @@ cmd_up() {
   local CLOUD_PROVIDER=""
   local CLOUD_MODEL=""
   local target_port="$PORT"
+  local port_given=0
   local skip_catalog=0
 
   # No arguments = the FULL STACK (all four lanes on one endpoint). The
@@ -541,6 +542,16 @@ cmd_up() {
           skip_catalog=1
           shift
           ;;
+        --schematron)
+          # The extraction lane ALONE on its OWN door (default :$SCHEMATRON_PORT):
+          # a scraper workload runs alongside — or instead of — the main stack,
+          # and :$PORT is never touched. The default port applies only when the
+          # operator has not already passed -p, so both flag orders behave.
+          LAUNCH_MODE="schematron"
+          (( port_given )) || target_port="$SCHEMATRON_PORT"
+          skip_catalog=1
+          shift
+          ;;
         -m|--model)
           LAUNCH_MODE="cloud"
           CLOUD_MODEL="$2"
@@ -550,6 +561,7 @@ cmd_up() {
           ;;
         -p|--port)
           target_port="$2"
+          port_given=1
           shift 2
           ;;
         *)
@@ -566,7 +578,22 @@ cmd_up() {
   # port. Doing only the port check lets a still-shutting-down litellm survive into
   # the launch below and corrupt the fresh log — see _ferry_reset_log.
   _ferry_stop_litellm "$target_port"
-  _ferry_free_port "$target_port"
+  if [[ "$LAUNCH_MODE" == "schematron" ]]; then
+    # A COMPANION door: its port is nobody's by default, so anything still
+    # holding it after the by-name reap above is NOT ferry's — refuse rather
+    # than kill -9 it the way the main-door modes do (_ferry_free_port).
+    # Silently reaping an unknown listener on a port the operator never
+    # promised ferry is a different risk class than recycling :$PORT.
+    if lsof -nP -iTCP:"$target_port" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "Error: port $target_port is held by a process that is not a ferry proxy."
+      echo "       'ferry up --schematron' runs beside the main stack and refuses to"
+      echo "       kill unknown listeners. Free the port, or pick another:"
+      echo "         ferry up --schematron -p <port>"
+      exit 1
+    fi
+  else
+    _ferry_free_port "$target_port"
+  fi
 
   # Port-accurate cloud/route log name (the global CLOUD_LOG is pinned to the default port).
   local cloud_log="$LOG_DIR/cloud-proxy-$target_port.log"
@@ -765,6 +792,128 @@ cmd_up() {
     else
       echo "    Served lanes:  curl -s http://127.0.0.1:$target_port/v1/models"
     fi
+  elif [[ "$LAUNCH_MODE" == "schematron" ]]; then
+    # ONE lane on its OWN door: a filtered copy of the route config carrying
+    # ONLY the `schematron` deployment, so a scraper workload gets a dedicated
+    # endpoint that runs alongside (or instead of) the main stack. This door
+    # never touches :$PORT, and :$PORT never touches it back: a different
+    # config file, a different log, and the port refusal above instead of a
+    # silent reap.
+    if ! command -v litellm >/dev/null 2>&1; then
+      echo "Error: 'litellm' is missing. Run: ferry install"
+      exit 1
+    fi
+    _ferry_require_route_config
+    _ferry_warn_missing_keys
+
+    # Filter with a real YAML parser, not text slicing: operators keep
+    # commented-out example blocks in litellm.yaml, and a hand-rolled block
+    # extractor trips on exactly those. PyYAML is not stdlib, so run the
+    # extractor on the first interpreter that has it — the host python3 when
+    # it does, else the litellm tool venv's own python (guaranteed there: the
+    # catalogue front itself imports yaml from that interpreter).
+    # Deterministic destination, regenerated on every launch, written
+    # atomically so a litellm still reading the old copy never sees a
+    # half-written file.
+    local filt_py=""
+    if python3 -c "import yaml" >/dev/null 2>&1; then
+      filt_py=python3
+    else
+      local cand; cand="$(_ferry_front_python 2>/dev/null)" || cand=""
+      if [[ -n "$cand" ]] && "$cand" -c "import yaml" >/dev/null 2>&1; then
+        filt_py="$cand"
+      fi
+    fi
+    if [[ -z "$filt_py" ]]; then
+      echo "Error: no python with PyYAML to filter the route config."
+      echo "       Run: ferry install"
+      exit 1
+    fi
+    local schematron_config="$HOME/.config/ferry/litellm-schematron.yaml"
+    local upstream
+    upstream="$("$filt_py" - "$FERRY_ROUTE_CONFIG" "$schematron_config" schematron <<'SCHEMFILTER_EOF'
+import os
+import sys
+
+import yaml
+
+src, dst, lane = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src) as fh:
+    cfg = yaml.safe_load(fh) or {}
+
+# Keep ONLY this lane's deployment(s): fallback hops of other lanes would
+# 401-or-500 without their primaries, and this door's catalogue is one name.
+deployments = [m for m in (cfg.get("model_list") or [])
+               if isinstance(m, dict) and m.get("model_name") == lane]
+if not deployments:
+    sys.exit("Error: no '%s' deployment in %s — add one (see litellm-route-example.yaml)."
+             % (lane, src))
+
+out = {"model_list": deployments}
+
+# master_key rides in general_settings; dropped and this door would be the one
+# unauthenticated listener on 0.0.0.0. Kept verbatim, like everything below:
+# trim to what one lane needs, but never rewrite values.
+if isinstance(cfg.get("general_settings"), dict):
+    out["general_settings"] = cfg["general_settings"]
+
+# drop_params / num_retries / request_timeout / callbacks travel as a unit —
+# the prometheus callback mounts /metrics on THIS app (no second port), so it
+# cannot collide with the main door's own /metrics.
+if isinstance(cfg.get("litellm_settings"), dict):
+    out["litellm_settings"] = cfg["litellm_settings"]
+
+router_settings = dict(cfg.get("router_settings") or {})
+fallbacks = router_settings.get("fallbacks")
+if isinstance(fallbacks, list):
+    # Other lanes' entries name model groups this file no longer carries.
+    router_settings["fallbacks"] = [e for e in fallbacks
+                                    if isinstance(e, dict) and lane in e]
+out["router_settings"] = router_settings
+
+if os.path.dirname(dst):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+tmp = dst + ".tmp"
+with open(tmp, "w") as fh:
+    yaml.safe_dump(out, fh, sort_keys=False, default_flow_style=False)
+os.replace(tmp, dst)
+
+# The upstream model string, for the launch banner.
+print(deployments[0].get("litellm_params", {}).get("model", lane))
+SCHEMFILTER_EOF
+)" || exit 1
+
+    local schematron_log="$LOG_DIR/schematron-$target_port.log"
+    echo ">>> Serving ONLY the schematron lane (filtered from $FERRY_ROUTE_CONFIG):"
+    echo "    Config: $schematron_config"
+    echo "    Port:   $target_port"
+    _ferry_reset_log "$schematron_log"
+    # _ferry_launch_front is trivially reusable here: the filtered config
+    # carries the lane's own `public: true`, so the catalogue filter trims
+    # /v1/models to exactly this lane — no fallback hops exist to hide. One
+    # worker: this door serves one extraction lane, not the multi-lane pool.
+    if ! _ferry_launch_front "$schematron_config" "$target_port" "$schematron_log" 1; then
+      echo "    note: catalogue filter unavailable — serving litellm directly"
+      _ferry_export_chatgpt_instructions
+      nohup litellm \
+        --config "$schematron_config" \
+        --port "$target_port" \
+        --num_workers 1 \
+        --host 0.0.0.0 >> "$schematron_log" 2>&1 & disown
+    fi
+    _ferry_wait_http "http://127.0.0.1:$target_port/health/liveliness" "schematron" 120 readiness || true
+
+    echo "================================================================="
+    echo "   FERRY SCHEMATRON — extraction lane"
+    echo "================================================================="
+    echo "   Endpoint:  http://$MDNS_NAME:$target_port/v1"
+    echo "   Model:     schematron  (upstream: $upstream)"
+    echo "   Main door :$PORT is untouched — this door is independent of it."
+    echo "-----------------------------------------------------------------"
+    echo "   cdp-toolkit: export CDP_EXTRACT_BASE_URL=http://127.0.0.1:$target_port/v1"
+    echo "   Stop this door only: ferry down --port $target_port"
+    echo "   Log: $schematron_log"
+    echo "================================================================="
   fi
 }
 
@@ -772,6 +921,31 @@ cmd_down() {
   if (( CLIENT_MODE )); then
     echo "Error: Command 'ferry down' is only available on the LLM-Ferry Host Mac."
     exit 1
+  fi
+
+  # `ferry down --port P` stops ONLY the ferry proxy on :P — the way to take
+  # down a companion door (e.g. the schematron extractor on :$SCHEMATRON_PORT)
+  # without disturbing the main endpoint or the GPU lanes.
+  local stop_port=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -p|--port)
+        stop_port="$2"
+        shift 2
+        ;;
+      *)
+        echo "Unknown option: $1"
+        usage
+        ;;
+    esac
+  done
+
+  if [[ -n "$stop_port" ]]; then
+    echo ">>> Stopping ONLY the ferry proxy on :$stop_port (everything else stays up)..."
+    _ferry_stop_litellm "$stop_port"
+    _ferry_free_port "$stop_port"
+    echo ">>> Success: :$stop_port cleared."
+    return 0
   fi
 
   echo ">>> Stopping all LLM-Ferry servers, cloud proxies, and share servers..."

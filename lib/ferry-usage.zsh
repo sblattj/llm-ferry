@@ -11,6 +11,7 @@ Commands:
   install            Install uv, litellm, and link globally (+ mlx-vlm & models on macOS)
   up                 [Host] Start local GPU server or cloud API proxy (boots Catalog by default)
   down               [Host] Stop all running servers (local, cloud, sharing)
+                        ferry down [--port P]   # --port P: stop ONLY the ferry proxy on :P
   reload             [Host] Restart ONLY the litellm front door (re-reads the
                        route config); the GPU lanes stay warm. The fast path for
                        editing ~/.config/ferry/litellm.yaml.
@@ -104,13 +105,18 @@ Options for 'up':
   -c, --cloud        Proxy to default cloud model ($DEFAULT_CLOUD_MODEL)
   -m, --model <id>   Proxy directly to any specific LiteLLM cloud model string
   -r, --route        Serve only the CLOUD lanes (orch + flash) from the litellm config
-                       Uses ~/.config/ferry/litellm.yaml (seeded from template on first run)
-  -i, --interactive  Force launch the interactive lane/model selection catalog
+                        Uses ~/.config/ferry/litellm.yaml (seeded from template on first run)
+   --schematron      Serve ONLY the schematron extraction lane, on its OWN door
+                        (default :$SCHEMATRON_PORT): a filtered copy of the route
+                        config with just the schematron deployment, so a scraper
+                        workload runs alongside the main stack without touching :$PORT
+   -i, --interactive  Force launch the interactive lane/model selection catalog
   -p, --port <port>  Override listening port [default: $PORT]
 
 Examples:
   ferry up             # The full stack: orch + flash + local-orch + local-sub on :$PORT
   ferry up --route     # Cloud lanes only (no GPU weights resident)
+  ferry up --schematron # The extraction lane alone, on its own door (:$SCHEMATRON_PORT)
   ferry up --local-sub # Just the Nemotron subagent lane, alone on :$PORT
   ferry up -i          # Interactive catalog (query Gemini's live model list)
   ferry dash --open    # Open the live route-proxy dashboard in your browser

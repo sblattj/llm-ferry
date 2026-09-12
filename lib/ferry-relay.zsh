@@ -414,6 +414,10 @@ cmd_expose() {
   echo ">>> Publishing 127.0.0.1:$local_port  ->  $host:$public_port"
   echo "    (through the relay control port $host:$relay_port — this machine only dials OUT)"
   echo "    Ctrl-C to stop."
+  if [[ "${kind:-tcp}" == "vnc" ]]; then
+    echo "    Native client: vnc://$host:$public_port"
+    echo "    Browser:       http://$host:${VNC_PORT:-}/vnc/$public_port   (host runs 'ferry serve-vnc')"
+  fi
   # exec, not a child: the tunnel's lifetime IS this process's lifetime. Run the
   # python as a child and `kill <the pid you started>` kills only the zsh wrapper,
   # leaving the control connection open and the host still publishing a port whose
@@ -544,4 +548,55 @@ finally:
     except OSError:
         pass
 PYEOF
+}
+
+# rfb_preflight <port> — refuse to publish a port that is not speaking RFB.
+# A VNC server greets FIRST ("RFB 003.008\n"), so one read settles it.
+rfb_preflight() {
+  python3 - "$1" <<'PYEOF'
+import socket, sys
+port = int(sys.argv[1])
+# The connect and the greeting-read are two different failures: a refused/
+# unreachable connect means nothing is listening at all, while a connect that
+# succeeds but never sends "RFB " (including a read that times out or hits
+# EOF) means something IS listening there, just not a VNC server.
+try:
+    s = socket.create_connection(("127.0.0.1", port), timeout=3)
+except OSError as e:
+    print(f"Error: nothing is listening on 127.0.0.1:{port} ({e}).")
+    print("       Turn on Screen Sharing (macOS: System Settings > General > Sharing)")
+    print("       or start your VNC server, then run this again.")
+    sys.exit(1)
+with s:
+    s.settimeout(3)
+    try:
+        greeting = s.recv(12)
+    except OSError:
+        greeting = b""
+    if not greeting.startswith(b"RFB "):
+        print(f"Error: 127.0.0.1:{port} is not a VNC server (no RFB greeting; got {greeting[:12]!r}).")
+        sys.exit(1)
+    print(f"    VNC server on 127.0.0.1:{port} greets {greeting.strip().decode(errors='replace')}")
+PYEOF
+}
+
+# cmd_expose_vnc — `ferry expose 5900` with a preflight and a kind tag, so the
+# host can list it as a screen and serve the browser viewer for it.
+cmd_expose_vnc() {
+  local local_port="5900" passthrough=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --local) local_port="$2"; shift 2 ;;
+      -h|--help)
+        echo "Usage: ferry expose-vnc [--local PORT] [--as PUBLIC] [--host H] [--port P] [--token T]"
+        echo "  --local PORT  the VNC server on THIS machine [default: 5900]"
+        echo "  (every other flag is passed to 'ferry expose'; see 'ferry expose --help')"
+        echo "Runs in the foreground — Ctrl-C stops publishing."
+        return 0 ;;
+      *) passthrough+=("$1"); shift ;;
+    esac
+  done
+  rfb_preflight "$local_port" || exit 1
+  local kind="vnc"
+  cmd_expose "$local_port" "${passthrough[@]}"
 }

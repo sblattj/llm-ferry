@@ -23,6 +23,12 @@ def novnc_version():
     return m.group(1)
 
 
+def vnc_port():
+    with open(FERRY) as f:
+        m = re.search(r'^VNC_PORT="(\d+)"', f.read(), re.M)
+    return int(m.group(1))
+
+
 class EchoService(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
@@ -169,6 +175,61 @@ class VncServeTest(unittest.TestCase):
                            env=self.env(), capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 1, r.stdout)
         self.assertIn("serve-vnc --fetch", r.stdout)
+
+
+class StatusReportsVncTest(unittest.TestCase):
+    """`ferry status` (cmd_status in lib/ferry-serve.zsh) reports the browser VNC
+    viewer. VNC_PORT is a fixed global (unlike serve-vnc's own --port), so the
+    check below reuses whatever already listens there rather than claiming it —
+    a stray unrelated process on that port satisfies cmd_status's lsof check
+    just as well, and this way the test never fights another listener for it."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = vnc_port()
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="ferry-status-home-")
+        self.tmp = tempfile.mkdtemp(prefix="ferry-status-tmp-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        os.makedirs(os.path.join(self.tmp, "ferry-logs"), exist_ok=True)
+        cfg = os.path.join(self.home, ".config", "ferry")
+        os.makedirs(cfg, exist_ok=True)
+        self.state_path = os.path.join(cfg, "relay-published.json")
+        self._listener = None
+        try:
+            socket.create_connection(("127.0.0.1", self.port), timeout=0.5).close()
+        except OSError:
+            self._listener = socket.socket()
+            self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._listener.bind(("127.0.0.1", self.port))
+            self._listener.listen(1)
+            self.addCleanup(self._listener.close)
+
+    def write_state(self, obj):
+        with open(self.state_path, "w") as f:
+            json.dump(obj, f)
+
+    def status(self):
+        e = os.environ.copy(); e["HOME"] = self.home; e["TMPDIR"] = self.tmp
+        r = subprocess.run(["zsh", FERRY, "status"], env=e, capture_output=True,
+                           text=True, timeout=60)
+        return r.stdout
+
+    def test_viewer_online_lists_each_vnc_screen(self):
+        self.write_state({"5901": {"client": "10.0.0.7", "label": "laptop", "kind": "vnc",
+                                    "since": "2026-09-12 10:00:00", "bind": "0.0.0.0"}})
+        out = self.status()
+        self.assertIn("VNC viewer is", out)
+        self.assertRegex(out, r"Screen laptop: http://\S+:%d/vnc/5901" % self.port)
+
+    def test_tcp_only_state_says_no_screens_published(self):
+        self.write_state({"4290": {"client": "10.0.0.8", "label": "dev", "kind": "tcp",
+                                    "since": "2026-09-12 10:00:00", "bind": "0.0.0.0"}})
+        out = self.status()
+        self.assertIn("VNC viewer is", out)
+        self.assertIn("No screens published", out)
 
 
 class WsClient:

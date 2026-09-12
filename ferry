@@ -2647,6 +2647,59 @@ def index_html():
     return ("<!doctype html><meta charset=utf-8><title>ferry screens</title>"
             "<h1>Screens published through this host</h1>" + body).encode()
 
+def accept_key(key):
+    return base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
+
+def frame(payload, opcode=0x2):
+    n = len(payload)
+    head = bytes([0x80 | opcode])
+    if n < 126:
+        head += bytes([n])
+    elif n < 65536:
+        head += bytes([126]) + struct.pack("!H", n)
+    else:
+        head += bytes([127]) + struct.pack("!Q", n)
+    return head + payload
+
+def unmask(data, mask):
+    if not data:
+        return data
+    m = (mask * (len(data) // 4 + 1))[:len(data)]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(m, "big")).to_bytes(len(data), "big")
+
+def read_frame(rfile):
+    """(opcode, payload) or None at EOF. Reads through the handler's buffered rfile so
+    bytes that arrived with the request headers are not lost."""
+    head = rfile.read(2)
+    if len(head) < 2:
+        return None
+    opcode, n = head[0] & 0x0F, head[1] & 0x7F
+    masked = bool(head[1] & 0x80)
+    if n == 126:
+        n = struct.unpack("!H", rfile.read(2))[0]
+    elif n == 127:
+        n = struct.unpack("!Q", rfile.read(8))[0]
+    mask = rfile.read(4) if masked else None
+    data = rfile.read(n) if n else b""
+    if len(data) < n:
+        return None
+    return opcode, (unmask(data, mask) if mask else data)
+
+def pump_tcp_to_ws(upstream, ws, closing):
+    """TCP -> WS until upstream EOF. `closing` is set by the handler thread once it has
+    already sent a close frame, so the shutdown it performs to wake this recv does not
+    put a second, spurious close frame on a socket the client is watching for EOF."""
+    try:
+        while True:
+            chunk = upstream.recv(65536)
+            if not chunk:
+                break
+            ws.sendall(frame(chunk))
+        if not closing.is_set():
+            ws.sendall(frame(struct.pack("!H", 1000), 0x8))
+    except OSError:
+        pass
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -2693,8 +2746,61 @@ class Handler(BaseHTTPRequestHandler):
     def serve_ws(self, port):
         if port not in published_vnc():
             return self.reply(403, b"that port is not published as a VNC screen")
-        # Task 4 replaces this line with the real bridge.
-        self.reply(501, b"bridge not implemented")
+        key = self.headers.get("Sec-WebSocket-Key")
+        if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
+            return self.reply(400, b"expected a WebSocket upgrade")
+        try:
+            upstream = socket.create_connection(("127.0.0.1", port), timeout=10)
+        except OSError as e:
+            log(f"bridge to 127.0.0.1:{port} failed: {e}")
+            return self.reply(502, b"the published port did not answer")
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept_key(key))
+        if "binary" in [p.strip() for p in self.headers.get("Sec-WebSocket-Protocol", "").split(",")]:
+            self.send_header("Sec-WebSocket-Protocol", "binary")
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        ws = self.connection
+        upstream.settimeout(None)
+        closing = threading.Event()
+        t = threading.Thread(target=pump_tcp_to_ws, args=(upstream, ws, closing), daemon=True)
+        t.start()
+        log(f"bridge open {self.address_string()} -> 127.0.0.1:{port}")
+        try:
+            while True:
+                got = read_frame(self.rfile)
+                if got is None:
+                    break
+                opcode, data = got
+                if opcode in (0x0, 0x1, 0x2):
+                    upstream.sendall(data)
+                elif opcode == 0x9:
+                    ws.sendall(frame(data, 0xA))
+                elif opcode == 0x8:
+                    closing.set()
+                    try:
+                        ws.sendall(frame(data[:2], 0x8))
+                    except OSError:
+                        pass
+                    break
+        except OSError:
+            pass
+        finally:
+            closing.set()
+            try:
+                upstream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            t.join(timeout=5)   # join BEFORE close: closing an fd another thread is
+            upstream.close()    # blocked in recv() on is an fd-reuse hazard.
+            try:
+                ws.close()
+            except OSError:
+                pass
+            log(f"bridge closed 127.0.0.1:{port}")
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True

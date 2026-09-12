@@ -164,5 +164,122 @@ class VncServeTest(unittest.TestCase):
         self.assertIn("serve-vnc --fetch", r.stdout)
 
 
+class WsClient:
+    """Just enough RFC 6455 to test the server side: masked frames out, unmasked in."""
+
+    def __init__(self, port, path, key="dGhlIHNhbXBsZSBub25jZQ==", send_key=True, protocol="binary"):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        req = f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n"
+        if send_key:
+            req += f"Sec-WebSocket-Key: {key}\r\n"
+        if protocol:
+            req += f"Sec-WebSocket-Protocol: {protocol}\r\n"
+        self.sock.sendall((req + "\r\n").encode())
+        raw = b""
+        while b"\r\n\r\n" not in raw:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                break
+            raw += chunk
+        head, _, self.rest = raw.partition(b"\r\n\r\n")
+        lines = head.decode(errors="replace").split("\r\n")
+        self.status = int(lines[0].split()[1])
+        self.headers = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:])}
+
+    def send(self, payload, opcode=0x2):
+        mask = b"\x12\x34\x56\x78"
+        n = len(payload)
+        head = bytes([0x80 | opcode])
+        if n < 126: head += bytes([0x80 | n])
+        elif n < 65536: head += bytes([0x80 | 126]) + struct.pack("!H", n)
+        else: head += bytes([0x80 | 127]) + struct.pack("!Q", n)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(head + mask + masked)
+
+    def _exact(self, n):
+        buf = self.rest[:n]; self.rest = self.rest[n:]
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise EOFError
+            buf += chunk
+        return buf
+
+    def recv(self):
+        b0, b1 = self._exact(2)
+        n = b1 & 0x7F
+        if n == 126: n = struct.unpack("!H", self._exact(2))[0]
+        elif n == 127: n = struct.unpack("!Q", self._exact(8))[0]
+        assert not (b1 & 0x80), "server frames must not be masked"
+        return b0 & 0x0F, self._exact(n)
+
+    def close(self):
+        self.sock.close()
+
+
+class BridgeTest(VncServeTest):
+    def test_handshake_accept_key_is_rfc6455(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 101)
+        self.assertEqual(ws.headers["sec-websocket-accept"], "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+        self.assertEqual(ws.headers["sec-websocket-protocol"], "binary")
+
+    def test_missing_key_is_400(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}", send_key=False)
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 400)
+
+    def test_all_three_payload_lengths_round_trip(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        for size in (1, 200, 70000):
+            payload = bytes((i * 7) % 251 for i in range(size))
+            ws.send(payload)
+            got = b""
+            while len(got) < size:
+                op, data = ws.recv()
+                self.assertEqual(op, 0x2)
+                got += data
+            self.assertEqual(got, payload, size)
+
+    def test_ping_gets_pong(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        ws.send(b"hi", opcode=0x9)
+        self.assertEqual(ws.recv(), (0xA, b"hi"))
+
+    def test_close_is_echoed_and_tcp_side_closes(self):
+        self.start()
+        ws = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(ws.close)
+        ws.send(struct.pack("!H", 1000), opcode=0x8)
+        op, data = ws.recv()
+        self.assertEqual(op, 0x8)
+        self.assertEqual(ws.sock.recv(1), b"")   # server closed after the close handshake
+
+    def test_unreachable_published_port_is_502(self):
+        dead = free_port()
+        self.write_state({str(dead): {"client": "x", "label": "gone", "kind": "vnc", "since": "", "bind": "0.0.0.0"}})
+        self.start()
+        ws = WsClient(self.port, f"/ws/{dead}")
+        self.addCleanup(ws.close)
+        self.assertEqual(ws.status, 502)
+
+    def test_port_that_stops_being_published_is_403_next_time(self):
+        self.start()
+        first = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(first.close)
+        self.assertEqual(first.status, 101)
+        self.write_state({})
+        second = WsClient(self.port, f"/ws/{self.echo.port}")
+        self.addCleanup(second.close)
+        self.assertEqual(second.status, 403)
+
+
 if __name__ == "__main__":
     unittest.main()

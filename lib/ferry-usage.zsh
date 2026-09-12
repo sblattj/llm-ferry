@@ -41,6 +41,9 @@ Commands:
   expose <port>      [Client] Publish 127.0.0.1:<port> from the host, dialling only
                        outbound — for a laptop that cannot accept inbound at all
                        ferry expose <port> [--as PUBLIC] [--host H] [--token T]
+  expose-vnc         [Client] Publish this machine's VNC server (5900) through the host,
+                       tagged so 'ferry serve-vnc' can show it in a browser
+                       ferry expose-vnc [--local PORT] [--as PUBLIC] [--host H] [--token T]
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
   opencode           [Client] Auto-wire opencode to route through the host (detects served models)

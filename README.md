@@ -292,6 +292,8 @@ ferry up --local-orch # just the local-orch GPU lane, alone on 8090
 ferry up --local-sub  # just the local-sub GPU lane, alone on 8090
 ferry up -c          # cloud proxy to the default cloud model, on port 8090
 ferry up -m <id>     # cloud proxy for a specific LiteLLM model id
+ferry up --schematron # the HTML→JSON extraction lane ALONE, on its own door (8094) —
+                     # runs alongside the stack; the main 8090 endpoint is untouched
 ferry up -i          # interactive catalog (queries Gemini's live model list)
 ferry reload         # [Host] restart ONLY the front door — re-reads litellm.yaml and
                      # ~/.config/ferry/chatgpt-instructions.txt; GPU lanes stay warm
@@ -403,6 +405,8 @@ curl -s http://your-mac.local:8090/v1/chat/completions \
 ```
 
 **How it fits together.** LiteLLM on `:8090` is the only door. The two GPU lanes are `mlx_vlm.server` processes on internal loopback ports (`8092`, `8093`) that LiteLLM fronts as ordinary OpenAI-compatible backends — so a local model and a cloud model are indistinguishable to a client apart from the name it asks for.
+
+**The extraction lane also has its own door.** `ferry up --schematron` serves ONLY that lane on `:8094` (default), from a filtered copy of the same route config — a scraper workload can hammer extraction while the seven-lane endpoint on `:8090` keeps serving agents, and neither door's restarts disturb the other. Point cdp-toolkit at it with `CDP_EXTRACT_BASE_URL=http://127.0.0.1:8094/v1`, and retire just that door with `ferry down --port 8094`.
 
 The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — the `domestic.heavy` driver (its legacy `orch`/`orchestrator` names still resolve to it — see [Fleets](#fleets)) and `domestic.medium` primary log in through the existing ChatGPT device-code session (written to `~/.config/litellm/chatgpt/auth.json`, no API key needed); `domestic.medium`'s independent Terra fallback and the `domestic.flash`/`domestic.super-flash` routes need `OPENROUTER_API_KEY` exported (in your shell or `~/.config/ferry/secrets.env`) — then re-run.
 
@@ -732,6 +736,7 @@ with an explanation rather than a stack trace.
 | **8091** | Live route-proxy dashboard (localhost only) | `ferry dash` |
 | **8092** | `local-orch` MLX backend (**internal** — clients use 8090) | `ferry up` |
 | **8093** | `local-sub` MLX backend (**internal** — clients use 8090) | `ferry up` |
+| **8094** | Dedicated `schematron` extraction door — ONLY that lane, served beside the main endpoint | `ferry up --schematron` |
 | **8095** | LAN share server — client bootstrap, model/file ferry routes, client telemetry | `ferry share` |
 | **8096** | HuggingFace pass-through proxy (experimental) | `ferry serve-hf` |
 | **8097** | General HTTP(S) download forward proxy | `ferry serve-proxy` |
@@ -928,8 +933,8 @@ Everything runs on your own hardware and network. The front door answers only re
 | Command | Mode | What it does |
 |---|---|---|
 | `install` | host | Install `uv`, `litellm` (+ `mlx-vlm` & default models on macOS), link `ferry` globally |
-| `up [--local-orch\|--local-sub\|-c\|-m <id>\|-r\|-i] [-p <port>]` | host | **No args → the full stack**: `heavy` + `medium` + `flash` + `super-flash` (cloud) and `local-orch` + `local-sub` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub` → one GPU lane alone; `-c`/`-m` → a single cloud model; `-i` → interactive catalog |
-| `down` | host | Stop all servers, cloud proxies, and share/proxy servers |
+| `up [--local-orch\|--local-sub\|-c\|-m <id>\|-r\|--schematron\|-i] [-p <port>]` | host | **No args → the full stack**: `heavy` + `medium` + `flash` + `super-flash` (cloud) and `local-orch` + `local-sub` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub` → one GPU lane alone; `-c`/`-m` → a single cloud model; `--schematron` → ONLY the extraction lane on its own door (`8094`, default), from a filtered copy of the route config, so a scraper runs beside the stack without touching `8090`; `-i` → interactive catalog |
+| `down [--port P]` | host | Stop all servers, cloud proxies, and share/proxy servers; `--port P` stops ONLY the ferry proxy on that port (the way to retire a companion door like `:8094` without touching `8090`) |
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up. Detects the role from `~/.config/ferry/client.json` and runs that side's reset: a **host** rebuilds the CLI from its own checkout, re-links it, and bounces the proxy; a **client** re-pulls the CLI from its host. `--full` also reloads the GPU lanes (host only) |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |

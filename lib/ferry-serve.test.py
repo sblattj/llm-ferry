@@ -223,8 +223,8 @@ class TestShippedLaunchLines(unittest.TestCase):
 
     def test_every_litellm_launch_exports_the_chatgpt_instructions(self):
         blocks = self._litellm_launch_blocks()
-        # stack + cloud + route + the cmd_reload fallback.
-        self.assertEqual(len(blocks), 4)
+        # stack + cloud + route + schematron + the cmd_reload fallback.
+        self.assertEqual(len(blocks), 5)
         for lineno, preceding in blocks:
             self.assertTrue(
                 any("_ferry_export_chatgpt_instructions" in l for l in preceding),
@@ -348,6 +348,171 @@ class TestRouteTemplateMediumLane(unittest.TestCase):
         self.assertNotIn("domestic.super-flash-luna", self.deployments)
         self.assertNotIn("domestic.super-flash-luna", self.template_text)
         self.assertNotIn("international.super-flash", self.deployments)
+
+
+class TestSchematronDoor(unittest.TestCase):
+    """v1.35.0: `ferry up --schematron` serves ONLY the extraction lane on its
+    own port, so a scraper workload runs beside the main stack. The invariants
+    that keep it a true companion door, not a second main door:
+
+      * its own conventional port, env-overridable, that no other ferry
+        service claims;
+      * it must NOT recycle the main door's port, and must refuse (not kill -9)
+        a foreign holder of its own port;
+      * the served config is the route config FILTERED to the schematron
+        deployment — never the whole file, never a hand-sliced text file.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FERRY) as fh:
+            cls.src = fh.read()
+
+    def test_port_default_and_env_override(self):
+        self.assertIn('SCHEMATRON_PORT="${FERRY_SCHEMATRON_PORT:-8094}"', self.src)
+        # 8094 must be claimed by nothing else: the only other mentions of the
+        # literal are the schematron declaration's own comments.
+        for line in self.src.splitlines():
+            if "8094" in line and "SCHEMATRON_PORT" not in line:
+                self.assertIn("#", line.strip()[:1],
+                              "8094 is claimed outside the SCHEMATRON_PORT block: %r" % line)
+
+    def test_relay_reserves_the_schematron_port(self):
+        # A client exposure must never shadow the extraction door.
+        self.assertIn("$SCHEMATRON_PORT,$relay_port", self.src)
+
+    def test_flag_parses_to_a_mode_with_its_own_default_port(self):
+        # The case body opens with a rationale comment, so assert the pieces
+        # rather than a regex across the comment block.
+        self.assertIn("--schematron)", self.src)
+        self.assertIn('LAUNCH_MODE="schematron"', self.src)
+        self.assertIn('(( port_given )) || target_port="$SCHEMATRON_PORT"', self.src)
+        # -p before OR after --schematron must both win over the default.
+        self.assertIn('target_port="$2"\n          port_given=1', self.src)
+
+    def test_schematron_refuses_a_foreign_port_holder_instead_of_reaping(self):
+        # The main-door modes _ferry_free_port (kill -9) their target; the
+        # schematron branch must take the other path — refuse with a message.
+        m = re.search(
+            r'if \[\[ "\$LAUNCH_MODE" == "schematron" \]\]; then(.*?)\n  else\n'
+            r'\s*_ferry_free_port "\$target_port"',
+            self.src, re.S)
+        self.assertIsNotNone(m, "schematron mode must not share the free_port reap")
+        self.assertIn("lsof", m.group(1))
+        self.assertIn("refuses", m.group(1))
+        self.assertIn("exit 1", m.group(1))
+
+    def test_the_filtered_config_is_regenerated_deterministically(self):
+        self.assertIn(
+            'schematron_config="$HOME/.config/ferry/litellm-schematron.yaml"',
+            self.src)
+
+    def test_wait_uses_the_public_liveliness_route(self):
+        self.assertIn(
+            '_ferry_wait_http "http://127.0.0.1:$target_port/health/liveliness"'
+            ' "schematron" 120 readiness', self.src)
+
+    def test_log_is_port_accurate_and_reset_first(self):
+        self.assertIn('schematron_log="$LOG_DIR/schematron-$target_port.log"', self.src)
+        self.assertIn('_ferry_reset_log "$schematron_log"', self.src)
+        self.assertIn('>> "$schematron_log" 2>&1 & disown', self.src)
+        self.assertEqual(self.src.count('host 0.0.0.0 > "$schematron_log"'), 0)
+
+    def test_banner_names_the_lane_the_endpoint_and_the_cdp_hook(self):
+        self.assertIn("FERRY SCHEMATRON — extraction lane", self.src)
+        self.assertIn("CDP_EXTRACT_BASE_URL=http://127.0.0.1:$target_port/v1", self.src)
+
+    def test_down_takes_a_port_to_stop_one_door_only(self):
+        m = re.search(r"cmd_down\(\) \{(.*?)\n  while \[\[ \$# -gt 0 \]\]", self.src, re.S)
+        self.assertIsNotNone(m, "cmd_down no longer parses --port")
+        self.assertIn('local stop_port=""', m.group(1))
+        self.assertIn('stop_port="$2"', self.src)
+        self.assertIn('_ferry_stop_litellm "$stop_port"', self.src)
+
+    def test_the_dispatcher_forwards_flags_to_cmd_down(self):
+        # `ferry down --port 8094` once hit a dispatch line that dropped "$@",
+        # so the scoped stop silently ran as a FULL down and took :8090 with
+        # it. Text assertions inside cmd_down cannot see that; this one pins
+        # the dispatcher itself.
+        self.assertRegex(self.src, r"down\)\s+cmd_down \"\$@\" ;;")
+
+
+class TestSchematronFilter(unittest.TestCase):
+    """Run the REAL shipped extractor against the REAL shipped template.
+
+    Textual assertions over cmd_up cannot see whether the filter keeps the
+    lane servable: these execute the embedded SCHEMFILTER_EOF python (extracted
+    from the built `ferry`) and load its output with PyYAML, asserting the
+    exact shape the schematron door serves.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import yaml
+
+        with open(FERRY) as fh:
+            cls.src = fh.read()
+        m = re.search(r"<<'SCHEMFILTER_EOF'\n(.*?)\nSCHEMFILTER_EOF", cls.src, re.S)
+        assert m is not None, "the schematron filter heredoc is missing from ferry"
+        cls.script = m.group(1)
+
+        cls.dst = tempfile.mkdtemp() + "/litellm-schematron.yaml"
+        cls.template = os.path.join(REPO, "litellm-route-example.yaml")
+        cls.proc = subprocess.run(
+            ["python3", "-c", cls.script, cls.template, cls.dst, "schematron"],
+            capture_output=True, text=True, timeout=60)
+        assert cls.proc.returncode == 0, cls.proc.stderr
+        with open(cls.dst) as fh:
+            cls.filtered = yaml.safe_load(fh)
+
+    def test_stdout_is_the_upstream_model_for_the_banner(self):
+        self.assertEqual(self.proc.stdout.strip(),
+                         "openrouter/inference-net/schematron-v2-turbo")
+
+    def test_model_list_is_exactly_the_schematron_deployment(self):
+        self.assertEqual(len(self.filtered["model_list"]), 1)
+        dep = self.filtered["model_list"][0]
+        self.assertEqual(dep["model_name"], "schematron")
+        self.assertEqual(dep["litellm_params"]["model"],
+                         "openrouter/inference-net/schematron-v2-turbo")
+        self.assertEqual(dep["litellm_params"]["temperature"], 0)
+        self.assertIs(dep["model_info"]["public"], True)
+
+    def test_no_other_lane_or_hop_leaks_into_the_door(self):
+        text = open(self.dst).read()
+        for foreign in ("domestic.heavy", "local-orch", "local-sub",
+                        "super-flash", "gemini", "chatgpt/"):
+            self.assertNotIn(foreign, text,
+                             "%r leaked into the filtered config" % foreign)
+
+    def test_master_key_survives_the_filter(self):
+        # Without it this door would be the one unauthenticated listener on
+        # 0.0.0.0 while the main door stays keyed.
+        self.assertEqual(self.filtered["general_settings"]["master_key"],
+                         "os.environ/LITELLM_MASTER_KEY")
+
+    def test_litellm_settings_travel_untouched(self):
+        for key in ("drop_params", "num_retries", "request_timeout", "callbacks"):
+            self.assertIn(key, self.filtered["litellm_settings"])
+        self.assertIs(self.filtered["litellm_settings"]["drop_params"], True)
+
+    def test_fallbacks_trim_to_the_schematron_entry_only(self):
+        self.assertEqual(self.filtered["router_settings"]["fallbacks"],
+                         [{"schematron": []}])
+
+    def test_a_config_without_the_lane_errors_rather_than_serving_empty(self):
+        empty = tempfile.mkdtemp() + "/no-lane.yaml"
+        with open(empty, "w") as fh:
+            fh.write("model_list:\n  - model_name: flash\n"
+                     "    litellm_params: {model: openrouter/x, "
+                     "api_key: os.environ/K}\n")
+        dst2 = empty + ".out"
+        r = subprocess.run(
+            ["python3", "-c", self.script, empty, dst2, "schematron"],
+            capture_output=True, text=True, timeout=60)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no 'schematron' deployment", r.stderr)
+        self.assertFalse(os.path.exists(dst2), "a failed filter must not write a config")
 
 
 class TestStatusTestCommand(unittest.TestCase):

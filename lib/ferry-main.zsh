@@ -30,6 +30,7 @@ case "$COMMAND" in
   pickup)        cmd_pickup "$@" ;;
   serve-hf)      cmd_serve_hf "$@" ;;
   serve-proxy)   cmd_serve_proxy "$@" ;;
+  serve-vnc)     cmd_serve_vnc "$@" ;;
   env)           cmd_env "$@" ;;
   opencode)      cmd_opencode "$@" ;;
   claude)        cmd_claude "$@" ;;

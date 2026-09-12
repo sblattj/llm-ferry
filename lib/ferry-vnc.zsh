@@ -207,7 +207,8 @@ class Handler(BaseHTTPRequestHandler):
 
     @staticmethod
     def port_of(text):
-        return int(text) if text.isdigit() else -1
+        # isascii() too: str.isdigit() accepts glyphs like U+00B2 that int() rejects.
+        return int(text) if (text.isascii() and text.isdigit()) else -1
 
     def serve_static(self, rel):
         full = os.path.realpath(os.path.join(NOVNC_DIR, rel))

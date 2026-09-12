@@ -2142,6 +2142,7 @@ def splice(a, b):
 def serve_registration(ctrl, addr, req):
     public_port = int(req.get("public_port", 0))
     label = str(req.get("label", ""))[:120]
+    kind = "vnc" if req.get("kind") == "vnc" else "tcp"
     if public_port < 1024 or public_port > 65535:
         send_json(ctrl, {"ok": False, "error": f"public port {public_port} out of range (1024-65535)"})
         return
@@ -2162,7 +2163,7 @@ def serve_registration(ctrl, addr, req):
 
     send_json(ctrl, {"ok": True, "public_port": public_port, "bind": bind_addr})
     with published_lock:
-        published[public_port] = {"client": addr[0], "label": label,
+        published[public_port] = {"client": addr[0], "label": label, "kind": kind,
                                   "since": time.strftime("%Y-%m-%d %H:%M:%S"), "bind": bind_addr}
     write_state()
     log(f"published {bind_addr}:{public_port} for {addr[0]} {('(' + label + ')') if label else ''}")
@@ -2351,10 +2352,10 @@ cmd_expose() {
   # leaving the control connection open and the host still publishing a port whose
   # client is gone. Interactive Ctrl-C signals the whole process group and papers
   # over that; anything supervising ferry by pid does not.
-  exec python3 - "$host" "$relay_port" "$local_port" "$public_port" "$token" "$RELAY_TOKEN_FILE" "$(hostname -s 2>/dev/null || echo client)" <<'PYEOF'
+  exec python3 - "$host" "$relay_port" "$local_port" "$public_port" "$token" "$RELAY_TOKEN_FILE" "$(hostname -s 2>/dev/null || echo client)" "${kind:-tcp}" <<'PYEOF'
 import json, os, socket, sys, threading, time
 
-host, relay_port, local_port, public_port, token, token_file, label = sys.argv[1:8]
+host, relay_port, local_port, public_port, token, token_file, label, kind = sys.argv[1:9]
 relay_port, local_port, public_port = int(relay_port), int(local_port), int(public_port)
 
 def read_line(sock, limit=4096):
@@ -2428,7 +2429,7 @@ except OSError as e:
     print("       Is 'ferry relay' running on the host?")
     sys.exit(1)
 
-send_json(ctrl, {"op": "register", "token": token, "public_port": public_port, "label": label})
+send_json(ctrl, {"op": "register", "token": token, "public_port": public_port, "label": label, "kind": kind})
 reply = read_line(ctrl)
 if reply is None:
     print("Error: the relay closed the connection during registration.")

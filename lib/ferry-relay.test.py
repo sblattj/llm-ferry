@@ -35,6 +35,22 @@ def free_port():
     return port
 
 
+def relay_status_source():
+    """The python `cmd_status`'s reverse-relay listing heredocs into python3 —
+    the FIRST `<<'PYEOF'` block after `cmd_status() {` in the built ferry (the
+    VNC-viewer block's heredoc, which prints `Screen ...` lines instead of
+    `Published ...` lines, is the second one and is not what this reads).
+    That opening line reads `<<'PYEOF' || true`, not a bare `<<'PYEOF'`
+    immediately followed by a newline, so the marker is split off first and
+    its own line (` || true`) is dropped before taking the heredoc body."""
+    with open(FERRY) as f:
+        src = f.read()
+    body = src[src.index("cmd_status() {"):]
+    after_marker = body.split("<<'PYEOF'", 1)[1]
+    after_open_line = after_marker.split("\n", 1)[1]
+    return after_open_line.split("\nPYEOF", 1)[0]
+
+
 class EchoService(threading.Thread):
     """The 'local service' on the client: echoes whatever it is sent."""
 
@@ -170,12 +186,28 @@ class RelayTest(unittest.TestCase):
                 got += chunk
         return bytes(got)
 
+    def state_path(self):
+        return os.path.join(self.home, ".config", "ferry", "relay-published.json")
+
     def state(self):
-        path = os.path.join(self.home, ".config", "ferry", "relay-published.json")
+        path = self.state_path()
         if not os.path.exists(path):
             return {}
         with open(path) as f:
             return json.load(f)
+
+    def status_kind_tags(self):
+        """Run the REAL `cmd_status` relay-listing python (extracted verbatim from
+        the built ferry) against this test's real state file, and return its
+        stdout. `ferry status` itself can't be used here: its relay block gates
+        on `lsof -nP -iTCP:"$RELAY_PORT"`, and $RELAY_PORT is the fixed global
+        8098 while this suite's relay listens on a free_port() to allow parallel
+        runs — faking a listener on 8098 to make that gate pass is exactly what
+        the review told this suite not to do, so this runs the actual print
+        logic directly instead of reimplementing it."""
+        return subprocess.run(["python3", "-", self.state_path()],
+                              input=relay_status_source(), capture_output=True,
+                              text=True, timeout=10)
 
     # --- the byte path ------------------------------------------------------
     def test_bytes_round_trip_through_the_tunnel(self):
@@ -246,6 +278,9 @@ class RelayTest(unittest.TestCase):
         self.wait_for_port(self.public_port, "the published port")
         entry = self.state()[str(self.public_port)]
         self.assertEqual(entry["kind"], "tcp")
+        r = self.status_kind_tags()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("[tcp]", r.stdout)
 
     def test_a_visitor_is_dropped_cleanly_when_the_local_service_is_down(self):
         """The tunnel must not hang or die when the thing behind it isn't there."""
@@ -379,6 +414,9 @@ class ExposeVncTest(RelayTest):
         self.assertEqual(self.state()[str(self.public_port)]["kind"], "vnc")
         with socket.create_connection(("127.0.0.1", self.public_port), timeout=10) as s:
             self.assertEqual(s.recv(12), b"RFB 003.008\n")
+        r = self.status_kind_tags()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("[vnc]", r.stdout)
 
 
 if __name__ == "__main__":

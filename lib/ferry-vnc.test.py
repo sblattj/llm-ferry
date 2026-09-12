@@ -213,23 +213,39 @@ class StatusReportsVncTest(unittest.TestCase):
 
     def status(self):
         e = os.environ.copy(); e["HOME"] = self.home; e["TMPDIR"] = self.tmp
-        r = subprocess.run(["zsh", FERRY, "status"], env=e, capture_output=True,
-                           text=True, timeout=60)
-        return r.stdout
+        return subprocess.run(["zsh", FERRY, "status"], env=e, capture_output=True,
+                              text=True, timeout=60)
 
     def test_viewer_online_lists_each_vnc_screen(self):
         self.write_state({"5901": {"client": "10.0.0.7", "label": "laptop", "kind": "vnc",
                                     "since": "2026-09-12 10:00:00", "bind": "0.0.0.0"}})
-        out = self.status()
+        out = self.status().stdout
         self.assertIn("VNC viewer is", out)
         self.assertRegex(out, r"Screen laptop: http://\S+:%d/vnc/5901" % self.port)
 
     def test_tcp_only_state_says_no_screens_published(self):
         self.write_state({"4290": {"client": "10.0.0.8", "label": "dev", "kind": "tcp",
                                     "since": "2026-09-12 10:00:00", "bind": "0.0.0.0"}})
-        out = self.status()
+        out = self.status().stdout
         self.assertIn("VNC viewer is", out)
         self.assertIn("No screens published", out)
+
+    # --- fix round 1: a malformed state file must not print a traceback -----
+    def test_a_json_list_state_file_does_not_crash_status(self):
+        with open(self.state_path, "w") as f:
+            json.dump([], f)
+        r = self.status()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+
+    def test_a_non_numeric_key_is_skipped_but_a_valid_screen_still_prints(self):
+        self.write_state({"abc": {"kind": "vnc"},
+                          "5901": {"kind": "vnc", "client": "x", "bind": "0.0.0.0", "since": "now"}})
+        r = self.status()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+        self.assertIn("Screen x: http://", r.stdout)
+        self.assertIn("/vnc/5901", r.stdout)
 
 
 class WsClient:

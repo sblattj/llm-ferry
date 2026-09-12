@@ -807,6 +807,10 @@ cmd_down() {
   # Terminate the general HTTP(S) download forward proxy (tagged with its sentinel arg).
   pkill -f "ferry-proxy-marker" || true
 
+  # Terminate the browser VNC viewer (its bridges die with it; the published
+  # ports themselves belong to the relay, killed just below).
+  pkill -f "ferry-vnc-marker" || true
+
   # Terminate the reverse-expose relay. Killing it drops every control connection,
   # which is what makes each client's published port close with it — an exposure
   # must not survive the thing that was supposed to be publishing it.
@@ -1002,8 +1006,28 @@ if not pub:
     print("    No ports published right now.")
 for port, info in sorted(pub.items(), key=lambda kv: int(kv[0])):
     label = f" ({info['label']})" if info.get("label") else ""
-    print(f"    Published {info.get('bind', '?')}:{port} for {info.get('client', '?')}{label}"
+    kind = info.get("kind", "tcp")
+    print(f"    Published {info.get('bind', '?')}:{port} [{kind}] for {info.get('client', '?')}{label}"
           f"  since {info.get('since', '?')}")
+PYEOF
+    fi
+  fi
+
+  # Browser VNC viewer: one URL per screen a client has published with expose-vnc.
+  if lsof -nP -iTCP:"$VNC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo ">>> VNC viewer is \033[1;32mONLINE\033[0m (http://$MDNS_NAME:$VNC_PORT)"
+    if [[ -f "$RELAY_STATE_FILE" ]]; then
+      python3 - "$RELAY_STATE_FILE" "$MDNS_NAME" "$VNC_PORT" <<'PYEOF' || true
+import json, sys
+try:
+    pub = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+screens = {p: i for p, i in pub.items() if i.get("kind") == "vnc"}
+if not screens:
+    print("    No screens published right now (client: ferry expose-vnc).")
+for port, info in sorted(screens.items(), key=lambda kv: int(kv[0])):
+    print(f"    Screen {info.get('label') or info.get('client', '?')}: http://{sys.argv[2]}:{sys.argv[3]}/vnc/{port}")
 PYEOF
     fi
   fi

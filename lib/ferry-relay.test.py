@@ -228,6 +228,13 @@ class RelayTest(unittest.TestCase):
         self.assertEqual(entry["client"], "127.0.0.1")
         self.assertTrue(entry["since"])
 
+    def test_plain_expose_is_recorded_as_kind_tcp(self):
+        self.start_relay()
+        self.start_expose()
+        self.wait_for_port(self.public_port, "the published port")
+        entry = self.state()[str(self.public_port)]
+        self.assertEqual(entry["kind"], "tcp")
+
     def test_a_visitor_is_dropped_cleanly_when_the_local_service_is_down(self):
         """The tunnel must not hang or die when the thing behind it isn't there."""
         self.start_relay()

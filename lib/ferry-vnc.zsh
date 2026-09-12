@@ -174,6 +174,8 @@ def pump_tcp_to_ws(upstream, ws, closing, lock):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 30   # a client that connects and sends nothing must not pin a thread forever;
+                   # BaseHTTPRequestHandler closes the request on this timeout by itself.
 
     def log_message(self, fmt, *args):
         log(f"{self.address_string()} {fmt % args}")
@@ -218,6 +220,11 @@ class Handler(BaseHTTPRequestHandler):
     def serve_ws(self, port):
         if port not in published_vnc():
             return self.reply(403, b"that port is not published as a VNC screen")
+        origin = self.headers.get("Origin")
+        if origin:
+            origin_host = origin.split("//", 1)[-1]
+            if origin_host != self.headers.get("Host", ""):
+                return self.reply(403, b"cross-origin WebSocket refused")
         key = self.headers.get("Sec-WebSocket-Key")
         if self.headers.get("Upgrade", "").lower() != "websocket" or not key:
             return self.reply(400, b"expected a WebSocket upgrade")
@@ -234,6 +241,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Sec-WebSocket-Protocol", "binary")
         self.end_headers()
         self.wfile.flush()
+        self.connection.settimeout(None)   # a live RFB session must not be killed by
+                                            # the header-phase idle timeout above.
         self.close_connection = True
         ws = self.connection
         upstream.settimeout(None)

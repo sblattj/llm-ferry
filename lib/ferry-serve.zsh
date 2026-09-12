@@ -1002,7 +1002,7 @@ try:
     pub = json.load(open(sys.argv[1]))
     if not isinstance(pub, dict):
         pub = {}
-    pub = {p: i for p, i in pub.items() if str(p).isdigit() and isinstance(i, dict)}
+    pub = {p: i for p, i in pub.items() if str(p).isascii() and str(p).isdigit() and isinstance(i, dict)}
     if not pub:
         print("    No ports published right now.")
     for port, info in sorted(pub.items(), key=lambda kv: int(kv[0])):
@@ -1027,7 +1027,7 @@ try:
     if not isinstance(pub, dict):
         pub = {}
     screens = {p: i for p, i in pub.items()
-               if str(p).isdigit() and isinstance(i, dict) and i.get("kind") == "vnc"}
+               if str(p).isascii() and str(p).isdigit() and isinstance(i, dict) and i.get("kind") == "vnc"}
     if not screens:
         print("    No screens published right now (client: ferry expose-vnc).")
     for port, info in sorted(screens.items(), key=lambda kv: int(kv[0])):

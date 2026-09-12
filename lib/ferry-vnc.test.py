@@ -6,7 +6,7 @@ Run:  python3 lib/ferry-vnc.test.py
 Spawns the real built `ferry` with a throwaway $HOME holding a hand-written relay
 state file and a stub noVNC directory, then talks HTTP and WebSocket to it.
 """
-import base64, hashlib, http.client, json, os, re, shutil, socket, struct, subprocess, tempfile, threading, time, unittest
+import base64, hashlib, http.client, io, json, os, re, shutil, socket, struct, subprocess, tarfile, tempfile, threading, time, unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FERRY = os.path.join(REPO, "ferry")
@@ -348,6 +348,57 @@ class BridgeTest(VncServeTest):
         op, data = ws.recv()
         self.assertEqual(op, 0x8)
         self.assertEqual(struct.unpack("!H", data[:2])[0], 1002)
+
+
+class FetchTest(VncServeTest):
+    def make_tarball(self):
+        ver = novnc_version()
+        path = os.path.join(self.tmp, "novnc.tar.gz")
+        with tarfile.open(path, "w:gz") as tf:
+            for name, data in ((f"noVNC-{ver}/vnc.html", b"<html>real viewer</html>"),
+                               (f"noVNC-{ver}/app/ui.js", b"// ui"),
+                               (f"noVNC-{ver}/core/rfb.js", b"// rfb"),
+                               (f"noVNC-{ver}/vendor/pako/x.js", b"// pako"),
+                               (f"noVNC-{ver}/tests/big.js", b"// not wanted"),
+                               (f"noVNC-{ver}/README.md", b"nope")):
+                info = tarfile.TarInfo(name); info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+        with open(path, "rb") as f:
+            return path, hashlib.sha256(f.read()).hexdigest()
+
+    def fetch(self, url, sha):
+        e = self.env(); e["FERRY_NOVNC_URL"] = url; e["FERRY_NOVNC_SHA256"] = sha
+        return subprocess.run(["zsh", FERRY, "serve-vnc", "--fetch"], env=e,
+                              capture_output=True, text=True, timeout=120)
+
+    def test_fetch_extracts_only_the_viewer_tree(self):
+        shutil.rmtree(self.novnc)
+        path, sha = self.make_tarball()
+        r = self.fetch("file://" + path, sha)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(os.path.join(self.novnc, "vnc.html"), "rb") as f:
+            self.assertEqual(f.read(), b"<html>real viewer</html>")
+        self.assertTrue(os.path.isfile(os.path.join(self.novnc, "core", "rfb.js")))
+        self.assertTrue(os.path.isfile(os.path.join(self.novnc, "vendor", "pako", "x.js")))
+        self.assertFalse(os.path.exists(os.path.join(self.novnc, "tests")))
+        self.assertFalse(os.path.exists(os.path.join(self.novnc, "README.md")))
+        with open(os.path.join(self.novnc, "VERSION")) as f:
+            self.assertEqual(f.read().strip(), novnc_version())
+
+    def test_fetch_refuses_a_bad_checksum_and_leaves_the_old_tree(self):
+        path, _ = self.make_tarball()
+        r = self.fetch("file://" + path, "0" * 64)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("checksum", r.stdout.lower())
+        with open(os.path.join(self.novnc, "vnc.html")) as f:
+            self.assertEqual(f.read(), "<html>stub viewer</html>")
+
+    def test_serve_starts_after_fetch(self):
+        shutil.rmtree(self.novnc)
+        path, sha = self.make_tarball()
+        self.assertEqual(self.fetch("file://" + path, sha).returncode, 0)
+        self.start()
+        self.assertEqual(self.get("/novnc/core/rfb.js")[2], b"// rfb")
 
 
 def daemon_source():

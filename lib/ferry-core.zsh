@@ -107,6 +107,12 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # door's restarts can disturb the other. 8094 is the one gap left in the
 # 8090-8099 block (only scripts/bench-spec-ab.py ever borrows it, ad hoc).
 SCHEMATRON_PORT="${FERRY_SCHEMATRON_PORT:-8094}"
+# MLX backend for the `local-schematron` lane (v1.36.0). 8100, not a gap in the
+# 8090-8099 block: that block is FULL — 8090 front, 8091 dash, 8092/8093 the two
+# older MLX lanes, 8094 the schematron door, 8095 share, 8096 HF, 8097 proxy,
+# 8098 relay, 8099 VNC. So the ferry range continues upward at 8100 rather than
+# reaching below the front door.
+LOCAL_SCHEMATRON_PORT="${FERRY_LOCAL_SCHEMATRON_PORT:-8100}"
 # NOTE: 8091 is deliberately skipped — `ferry dash` binds it. The stack and the
 # dashboard are meant to run together, so the lanes start above it.
 
@@ -122,8 +128,9 @@ SCHEMATRON_PORT="${FERRY_SCHEMATRON_PORT:-8094}"
 #                   compaction/title/summary; Gemini-only, no model fallback
 #   local-orch   -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
 #   local-sub    -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
+#   schematron   -> Schematron-8B 8-bit MLX on the host GPU (HTML→JSON)
 #
-# The cloud lanes live in the litellm route config; the two local lanes are the
+# The cloud lanes live in the litellm route config; the three local lanes are the
 # MLX servers this script launches, wired into that same config as
 # openai-compatible backends on 127.0.0.1.
 
@@ -140,6 +147,21 @@ LOCAL_DRAFT_ORCH="mlx-community/Qwen3.8-27B-MTP-8bit"
 LOCAL_MODEL_SUB="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
 LOCAL_DRAFT_SUB=""
 
+# Local EXTRACTION lane (v1.36.0) — the `schematron` lane runs ON-MACHINE.
+# Schematron-8B (a llama-arch fine-tune of Llama-3.1-8B specialised for
+# HTML→JSON structured extraction) at 8-bit MLX quant: ~8.5GB of weights, 32
+# layers, GQA with 8 KV heads x 128 head dim, 128k context. No MTP draft is
+# published for it -> no --draft-model on this lane.
+#
+# The PROMPT CONTRACT is the CLIENT's job, not ferry's. Schematron expects the
+# JSON schema INSIDE the user message (system "You are a helpful assistant";
+# user = "You are going to be given a JSON schema ... The schema is as
+# follows:\n\n<schema>\n\nHere is the HTML page:\n\n<html>\n\nMAKE SURE ITS
+# VALID JSON."). ferry fronts the model verbatim and never rewrites prompts —
+# cdp-toolkit's extract_page is the caller that builds that shape.
+LOCAL_MODEL_SCHEMATRON="pchamart/schematron8B-mlx-8bit"
+LOCAL_DRAFT_SCHEMATRON=""
+
 # Back-compat: the single-lane `--local` flag predates the stack and still means
 # "serve the local orchestrator model on its own".
 LOCAL_MODEL="$LOCAL_MODEL_ORCH"
@@ -154,11 +176,11 @@ LOCAL_DRAFT="$LOCAL_DRAFT_ORCH"
 # 56GB, idled at 35GB, and decoded ~60% faster (32 vs 20 tok/s at 64k context).
 # Set any of these to "" to drop the flag from the launch line.
 #
-# STACK MODE runs BOTH local lanes at these same generous settings (~15GB + ~18GB
-# of resident weights before any KV). That is a deliberate choice for best
-# single-lane latency; the tradeoff is that two simultaneously-busy deep-context
-# lanes CAN approach the wired ceiling. Watch it with `ferry status`, and shrink a
-# lane by exporting the per-lane overrides below.
+# STACK MODE runs ALL THREE local lanes at these same generous settings (~15GB +
+# ~18GB + ~8.5GB of resident weights before any KV — v1.36.0 added the third).
+# That is a deliberate choice for best single-lane latency; the tradeoff is that
+# simultaneously-busy deep-context lanes CAN approach the wired ceiling. Watch it
+# with `ferry status`, and shrink a lane by exporting the per-lane overrides below.
 LOCAL_KV_BITS="4"         # --kv-bits: 4-bit KV cache quant (weights stay nvfp4)
 LOCAL_MAX_KV="131072"     # --max-kv-size: prompt+max_tokens over this => clean 400, not OOM
 LOCAL_MAX_SEQS="4"        # --max-num-seqs: max concurrent sequences (subagent fan-out)
@@ -181,6 +203,19 @@ LOCAL_SUB_KV_BITS="${LOCAL_SUB_KV_BITS:-$LOCAL_KV_BITS}"
 LOCAL_SUB_MAX_KV="${LOCAL_SUB_MAX_KV:-$LOCAL_MAX_KV}"
 LOCAL_SUB_MAX_SEQS="${LOCAL_SUB_MAX_SEQS:-$LOCAL_MAX_SEQS}"
 LOCAL_SUB_APC_BLOCKS="${LOCAL_SUB_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
+# local-schematron runs UNQUANTIZED KV at the model's full 128k context. The
+# arithmetic is why that is affordable: 32 layers x 8 kv heads x 128 head dim x
+# 2 (K and V) x 2 bytes = 131 KB/token, so a full 128k stream is ~17GB of KV in
+# the worst case and a realistic single-page extraction is a small fraction of
+# that. Quantizing the cache would buy little and cost extraction fidelity on a
+# lane whose entire job is verbatim copying out of the prompt. max-num-seqs is
+# 2, not 4: this lane's prompts are whole HTML pages (deep prefill, shallow
+# decode), so admitting many concurrent extractions grows KV far faster than it
+# grows throughput.
+LOCAL_SCHEMATRON_KV_BITS=""
+LOCAL_SCHEMATRON_MAX_KV="${LOCAL_SCHEMATRON_MAX_KV:-131072}"
+LOCAL_SCHEMATRON_MAX_SEQS="${LOCAL_SCHEMATRON_MAX_SEQS:-2}"
+LOCAL_SCHEMATRON_APC_BLOCKS="${LOCAL_SCHEMATRON_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
 MDNS_NAME="$(detect_mdns_name)"
 
 # Default cloud model for `ferry serve --cloud`.
@@ -247,6 +282,7 @@ CLOUD_LOG="$LOG_DIR/cloud-proxy-$PORT.log"
 # Stack mode gives each MLX lane its own log so a crash is attributable to a lane.
 LOCAL_ORCH_LOG="$LOG_DIR/local-orch-$LOCAL_ORCH_PORT.log"
 LOCAL_SUB_LOG="$LOG_DIR/local-sub-$LOCAL_SUB_PORT.log"
+LOCAL_SCHEMATRON_LOG="$LOG_DIR/local-schematron-$LOCAL_SCHEMATRON_PORT.log"
 SHARE_LOG="$LOG_DIR/share-$SHARE_PORT.log"
 
 # Client telemetry (`ferry msg` / `ferry log` -> the share server's /hq) lands here.

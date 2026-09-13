@@ -1741,6 +1741,67 @@ def _load_state_or_die(state):
     return state
 
 
+def install_claude_oauth_hook(model_info_class=None):
+    """Swap the placeholder key for a live Claude-subscription OAuth token.
+
+    Claude-subscription lanes (model prefix `claude-oauth/`, placeholder
+    `api_key: "claude-oauth"` — see litellm-route-example.yaml) carry no real
+    key; the credential is the access token in ~/.config/ferry/claude/auth.json.
+    Patch only the final header-build step (validate_environment), after
+    routing/fallback selection, mirroring install_chatgpt_system_compat. On the
+    claude-oauth path we substitute the live token as api_key (litellm turns an
+    sk-ant-oat… token into Bearer + oauth beta natively), then overlay the
+    Claude Code-identical header set so the subscription endpoint accepts it.
+    Other anthropic lanes are returned untouched.
+    """
+    if model_info_class is None:
+        try:
+            from litellm.llms.anthropic.common_utils import AnthropicModelInfo
+            model_info_class = AnthropicModelInfo
+        except Exception:
+            return
+    original = model_info_class.validate_environment
+    if getattr(original, "_ferry_claude_oauth", False):
+        return
+
+    from functools import wraps
+
+    @wraps(original)
+    def validate(self, headers, model, messages, optional_params, litellm_params,
+                 api_key=None, api_base=None):
+        is_oauth = False
+        if api_key == "claude-oauth":
+            is_oauth = True
+        elif isinstance(litellm_params, dict):
+            lp_model = str(litellm_params.get("model", ""))
+            is_oauth = lp_model.startswith("claude-oauth/")
+        if is_oauth:
+            try:
+                from ferry_claude_provider import build_headers
+            except Exception:
+                try:
+                    from front.ferry_claude_provider import build_headers
+                except Exception:
+                    build_headers = None
+            if build_headers is not None:
+                try:
+                    from ferry_claude_oauth import ensure_valid_token
+                except Exception:
+                    from front.ferry_claude_oauth import ensure_valid_token
+                import os as _os
+                token_path = _os.environ.get(
+                    "FERRY_CLAUDE_TOKEN_PATH",
+                    _os.path.expanduser("~/.config/ferry/claude/auth.json"))
+                access_token = ensure_valid_token(token_path).access_token
+                streaming = bool((optional_params or {}).get("stream"))
+                return build_headers(access_token, streaming=streaming, model=model)
+        return original(self, headers, model, messages, optional_params,
+                        litellm_params, api_key=api_key, api_base=api_base)
+
+    validate._ferry_claude_oauth = True
+    model_info_class.validate_environment = validate
+
+
 def install_chatgpt_system_compat(config_class=None):
     """Preserve system prompts as developer messages on ChatGPT Responses.
 
@@ -1921,6 +1982,7 @@ def build_app(litellm_app=None):
         from litellm.proxy.proxy_server import app as litellm_app
 
     install_chatgpt_system_compat()
+    install_claude_oauth_hook()
     if tap_enabled():
         install_reasoning_usage_hook()
 

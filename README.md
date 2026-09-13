@@ -294,6 +294,7 @@ ferry up -c          # cloud proxy to the default cloud model, on port 8090
 ferry up -m <id>     # cloud proxy for a specific LiteLLM model id
 ferry up --schematron # the HTML→JSON extraction lane ALONE, on its own door (8094) —
                      # runs alongside the stack; the main 8090 endpoint is untouched
+ferry up --local-schematron  # just the Schematron-8B MLX backend, raw, no litellm in front
 ferry up -i          # interactive catalog (queries Gemini's live model list)
 ferry reload         # [Host] restart ONLY the front door — re-reads litellm.yaml and
                      # ~/.config/ferry/chatgpt-instructions.txt; GPU lanes stay warm
@@ -356,7 +357,7 @@ It is reversible: `mv ~/.config/ferry/client.json.pre-migrate.<UTC> ~/.config/fe
 
 ## Contents
 
-- [The stack — seven lanes on one endpoint](#the-stack--seven-lanes-on-one-endpoint)
+- [The stack — eight lanes on one endpoint](#the-stack--eight-lanes-on-one-endpoint)
 - [Fleets](#fleets)
 - [The local GPU lanes](#the-local-gpu-lanes)
 - [Dashboards & observability](#dashboards--observability)
@@ -372,9 +373,9 @@ It is reversible: `mv ~/.config/ferry/client.json.pre-migrate.<UTC> ~/.config/fe
 - [Development](#development)
 - [License](#license)
 
-## The stack — seven lanes on one endpoint
+## The stack — eight lanes on one endpoint
 
-`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: seven named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus two local MLX servers.
+`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: eight named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus three local MLX servers.
 
 | Lane | Where it runs | What it is |
 |---|---|---|
@@ -382,7 +383,8 @@ It is reversible: `mv ~/.config/ferry/client.json.pre-migrate.<UTC> ~/.config/fe
 | **`medium`** | cloud | General work when advertised; the domestic template runs GPT-5.6 Terra at xhigh with an OpenRouter Terra fallback |
 | **`flash`** | cloud | Explore worker; the domestic template runs GPT-5.6 Luna at xhigh, then Gemini Flash Latest, then Terra |
 | **`super-flash`** | cloud | Compaction, title, and summary; `openrouter/~google/gemini-flash-latest` at minimal reasoning with throughput routing and no fallback |
-| **`schematron`** | cloud | HTML→JSON structured extraction at temperature 0 (`openrouter/inference-net/schematron-v2-turbo`, no fallback); used by cdp-toolkit `extract_page` |
+| **`schematron`** | host GPU | HTML→JSON structured extraction at temperature 0, **on-machine** since v1.36.0 (`pchamart/schematron8B-mlx-8bit`, an 8-bit MLX quant of Schematron-8B, on internal port 8100); no fallback; used by cdp-toolkit `extract_page` |
+| **`schematron-cloud`** | cloud | The same extraction job off-box (`openrouter/inference-net/schematron-v2-turbo`, temperature 0). A lane you ask for **by name** — nothing falls back to it from `schematron`, deliberately: the two are different models, and a consumer that pinned a schema to one must never be swapped onto the other |
 | **`local-orch`** | host GPU | The smart local model (Qwen 3.8-27B nvfp4 + MTP speculative draft) |
 | **`local-sub`** | host GPU | The cheap local fan-out model (Nemotron 3 Nano 30B A3B NVFP4) |
 
@@ -406,7 +408,9 @@ curl -s http://your-mac.local:8090/v1/chat/completions \
 
 **How it fits together.** LiteLLM on `:8090` is the only door. The two GPU lanes are `mlx_vlm.server` processes on internal loopback ports (`8092`, `8093`) that LiteLLM fronts as ordinary OpenAI-compatible backends — so a local model and a cloud model are indistinguishable to a client apart from the name it asks for.
 
-**The extraction lane also has its own door.** `ferry up --schematron` serves ONLY that lane on `:8094` (default), from a filtered copy of the same route config — a scraper workload can hammer extraction while the seven-lane endpoint on `:8090` keeps serving agents, and neither door's restarts disturb the other. Point cdp-toolkit at it with `CDP_EXTRACT_BASE_URL=http://127.0.0.1:8094/v1`, and retire just that door with `ferry down --port 8094`.
+**The extraction lane also has its own door.** `ferry up --schematron` serves ONLY that lane on `:8094` (default), from a filtered copy of the same route config — a scraper workload can hammer extraction while the eight-lane endpoint on `:8090` keeps serving agents, and neither door's restarts disturb the other. Point cdp-toolkit at it with `CDP_EXTRACT_BASE_URL=http://127.0.0.1:8094/v1`, and retire just that door with `ferry down --port 8094`.
+
+Since v1.36.0 that door also brings up the lane's **local MLX backend** on `:8100` — or reuses it untouched when the main stack already has it warm, because both wire the `schematron` deployment to the same loopback port. `ferry down --port 8094` stops the backend too, but only when the main stack on `:8090` is down; with the stack up, the companion door is the borrower and leaves the lane alone.
 
 The first run seeds `~/.config/ferry/litellm.yaml` from [`litellm-route-example.yaml`](litellm-route-example.yaml) and **stops** so you can edit it — the `domestic.heavy` driver (its legacy `orch`/`orchestrator` names still resolve to it — see [Fleets](#fleets)) and `domestic.medium` primary log in through the existing ChatGPT device-code session (written to `~/.config/litellm/chatgpt/auth.json`, no API key needed); `domestic.medium`'s independent Terra fallback and the `domestic.flash`/`domestic.super-flash` routes need `OPENROUTER_API_KEY` exported (in your shell or `~/.config/ferry/secrets.env`) — then re-run.
 
@@ -605,15 +609,19 @@ regenerates its config. This is documented behavior, not a bug to work around.
 
 ## The local GPU lanes
 
-Both GPU lanes run under `mlx-vlm` and start together with `ferry up`; each can also be served alone on `:8090` with `ferry up --local-orch` / `--local-sub`.
+All three GPU lanes run under `mlx-vlm` and start together with `ferry up`; each can also be served alone on `:8090` with `ferry up --local-orch` / `--local-sub` / `--local-schematron`.
 
 **`local-orch` — Qwen 3.8-27B nvfp4** (~15 GB) with `mlx-community/Qwen3.8-27B-MTP-8bit` as a speculative draft model. The heavier, more capable local model, and the only local lane with an MTP drafter, so speculative decoding applies to it.
 
 **`local-sub` — NVIDIA Nemotron 3 Nano 30B A3B NVFP4** (~18 GB). A `nemotron_h` hybrid MoE — only 6 of 52 layers are full attention with just 2 KV heads × 128 head dim — so the KV cache is ~6 KB/token, under 1 GB per 128k-token agent stream. That plus ~3B active params (A3B) is what makes it the right lane for **concurrent subagents**: many parallel streams fit in RAM and decode stays fast. No speculative draft model exists for it.
 
-Both are just **defaults** — swap either for any MLX-compatible model your Mac's unified memory can hold by editing `LOCAL_MODEL_ORCH` / `LOCAL_MODEL_SUB` in `lib/ferry-core.zsh` (then `./build.zsh`), and point the matching deployment in `litellm.yaml` at the new HuggingFace id. Local GPU serving is **macOS / Apple Silicon only**; on Linux `ferry up` degrades to the cloud lanes automatically.
+**`schematron` — Schematron-8B, 8-bit MLX** (`pchamart/schematron8B-mlx-8bit`, ~8.5 GB) on internal port `8100`. A llama-arch fine-tune of Llama-3.1-8B specialised for HTML→JSON structured extraction: 32 layers, GQA with 8 KV heads x 128 head dim, 128k context. The KV cache is left **unquantized** — 131 KB/token, so even a full 128k stream is affordable, and quantizing it would cost extraction fidelity on a lane whose whole job is verbatim copying out of the prompt. `LOCAL_SCHEMATRON_MAX_SEQS` defaults to 2, not 4, because this lane's prompts are whole HTML pages: deep prefill, shallow decode, so concurrency grows KV much faster than it grows throughput. No speculative draft model exists for it.
 
-**Memory.** Running both lanes keeps ~33 GB of weights resident before any KV cache. The governor below is what keeps that safe; per-lane overrides (`LOCAL_SUB_MAX_KV=65536`, etc.) let you shrink one lane without touching the other.
+**The schematron prompt contract is the client's job.** The model expects the JSON schema **inside the user message** — system `You are a helpful assistant`, then a user turn of the form `You are going to be given a JSON schema ... The schema is as follows:\n\n<schema>\n\nHere is the HTML page:\n\n<html>\n\nMAKE SURE ITS VALID JSON.` ferry fronts the model verbatim and rewrites no prompts; cdp-toolkit's `extract_page` is the caller that builds that shape.
+
+All three are just **defaults** — swap any of them for an MLX-compatible model your Mac's unified memory can hold by editing `LOCAL_MODEL_ORCH` / `LOCAL_MODEL_SUB` / `LOCAL_MODEL_SCHEMATRON` in `lib/ferry-core.zsh` (then `./build.zsh`), and point the matching deployment in `litellm.yaml` at the new HuggingFace id. Local GPU serving is **macOS / Apple Silicon only**; on Linux `ferry up` degrades to the cloud lanes automatically.
+
+**Memory.** Running all three lanes keeps ~42 GB of weights resident before any KV cache. The governor below is what keeps that safe; per-lane overrides (`LOCAL_SUB_MAX_KV=65536`, etc.) let you shrink one lane without touching the other.
 
 ## Dashboards & observability
 
@@ -742,6 +750,7 @@ with an explanation rather than a stack trace.
 | **8097** | General HTTP(S) download forward proxy | `ferry serve-proxy` |
 | **8098** | Reverse-relay control port — a client dials this to register, then publishes one of its own local ports through the host | `ferry relay` |
 | **8099** | Browser VNC viewer + WebSocket bridge onto ports published with `ferry expose-vnc` | `ferry serve-vnc` |
+| **8100** | `local-schematron` MLX backend (**internal** — clients use 8090, or the 8094 door). 8100 and not a gap in 8090-8099 because that block is full | `ferry up`, `ferry up --schematron` |
 | **9099** | Default netcat port for direct `ferry send` / `ferry receive` | `ferry send` / `ferry receive` |
 | **3001 / 8429 / 9428 / 9092** | Grafana / VictoriaMetrics / VictoriaLogs / metrics exporter (localhost only) | `ferry dash --grafana` |
 
@@ -933,7 +942,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | Command | Mode | What it does |
 |---|---|---|
 | `install` | host | Install `uv`, `litellm` (+ `mlx-vlm` & default models on macOS), link `ferry` globally |
-| `up [--local-orch\|--local-sub\|-c\|-m <id>\|-r\|--schematron\|-i] [-p <port>]` | host | **No args → the full stack**: `heavy` + `medium` + `flash` + `super-flash` (cloud) and `local-orch` + `local-sub` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub` → one GPU lane alone; `-c`/`-m` → a single cloud model; `--schematron` → ONLY the extraction lane on its own door (`8094`, default), from a filtered copy of the route config, so a scraper runs beside the stack without touching `8090`; `-i` → interactive catalog |
+| `up [--local-orch\|--local-sub\|--local-schematron\|-c\|-m <id>\|-r\|--schematron\|-i] [-p <port>]` | host | **No args → the full stack**: `heavy` + `medium` + `flash` + `super-flash` + `schematron-cloud` (cloud) and `local-orch` + `local-sub` + `schematron` (GPU) on `8090`. `-r`/`--route` → cloud lanes only; `--local-orch`/`--local-sub`/`--local-schematron` → one GPU lane alone, raw; `-c`/`-m` → a single cloud model; `--schematron` → ONLY the extraction lane on its own door (`8094`, default), from a filtered copy of the route config plus its local MLX backend on `8100`, so a scraper runs beside the stack without touching `8090`; `-i` → interactive catalog |
 | `down [--port P]` | host | Stop all servers, cloud proxies, and share/proxy servers; `--port P` stops ONLY the ferry proxy on that port (the way to retire a companion door like `:8094` without touching `8090`) |
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up. Detects the role from `~/.config/ferry/client.json` and runs that side's reset: a **host** rebuilds the CLI from its own checkout, re-links it, and bounces the proxy; a **client** re-pulls the CLI from its host. `--full` also reloads the GPU lanes (host only) |

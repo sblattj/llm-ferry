@@ -466,17 +466,34 @@ class TestSchematronFilter(unittest.TestCase):
             cls.filtered = yaml.safe_load(fh)
 
     def test_stdout_is_the_upstream_model_for_the_banner(self):
+        # v1.36.0: the primary is the LOCAL MLX backend, so the banner's
+        # upstream is the HuggingFace id mlx_vlm preloaded, not an OpenRouter
+        # model string. The filter is unchanged — it prints deployments[0] —
+        # but what deployments[0] IS has moved on-machine.
         self.assertEqual(self.proc.stdout.strip(),
-                         "openrouter/inference-net/schematron-v2-turbo")
+                         "openai/pchamart/schematron8B-mlx-8bit")
 
     def test_model_list_is_exactly_the_schematron_deployment(self):
         self.assertEqual(len(self.filtered["model_list"]), 1)
         dep = self.filtered["model_list"][0]
         self.assertEqual(dep["model_name"], "schematron")
         self.assertEqual(dep["litellm_params"]["model"],
-                         "openrouter/inference-net/schematron-v2-turbo")
+                         "openai/pchamart/schematron8B-mlx-8bit")
+        self.assertEqual(dep["litellm_params"]["api_base"],
+                         "http://127.0.0.1:8100/v1")
         self.assertEqual(dep["litellm_params"]["temperature"], 0)
         self.assertIs(dep["model_info"]["public"], True)
+
+    def test_the_cloud_sibling_does_not_ride_along(self):
+        """`schematron-cloud` is a DIFFERENT lane, and this door serves one.
+
+        The filter matches model_name EXACTLY, so the sibling is excluded — but
+        a substring-matching regression would quietly make the cloud extractor
+        callable through a door whose whole point is that it is local.
+        """
+        names = [m["model_name"] for m in self.filtered["model_list"]]
+        self.assertNotIn("schematron-cloud", names)
+        self.assertNotIn("openrouter/", open(self.dst).read())
 
     def test_no_other_lane_or_hop_leaks_into_the_door(self):
         text = open(self.dst).read()
@@ -513,6 +530,341 @@ class TestSchematronFilter(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("no 'schematron' deployment", r.stderr)
         self.assertFalse(os.path.exists(dst2), "a failed filter must not write a config")
+
+
+class TestLocalSchematronLane(unittest.TestCase):
+    """v1.36.0: the `schematron` lane runs ON THE HOST GPU as a third MLX lane.
+
+    Everything here reads the GENERATED `ferry`, because that single file is
+    what actually ships — an edit to lib/ferry-*.zsh that is never rebuilt is
+    exactly the regression these assertions exist to catch.
+
+    The invariants:
+
+      * the lane has its own model, log, governor and port, and the port is
+        claimed by nothing else;
+      * plain `ferry up` launches THREE mlx lanes, not two, and waits on all
+        three;
+      * `ferry up --schematron` now has a backend to start, and REUSES a warm
+        one rather than reaping a lane the main stack may be serving through;
+      * `ferry down` (both forms) and `ferry status` know about the new port.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FERRY) as fh:
+            cls.src = fh.read()
+
+    # ---- constants -------------------------------------------------------
+    def test_lane_constants_exist(self):
+        self.assertIn('LOCAL_MODEL_SCHEMATRON="pchamart/schematron8B-mlx-8bit"',
+                      self.src)
+        self.assertIn('LOCAL_DRAFT_SCHEMATRON=""', self.src)
+        self.assertIn('LOCAL_SCHEMATRON_LOG="$LOG_DIR/local-schematron-'
+                      '$LOCAL_SCHEMATRON_PORT.log"', self.src)
+
+    def test_kv_governor_is_unquantized_at_full_context(self):
+        """bf16 KV is a deliberate choice, not an omission.
+
+        8 kv heads x 128 head dim x 32 layers x 2 x 2 bytes = 131 KB/token, so
+        the full 128k window is affordable; quantizing would cost fidelity on a
+        lane whose job is verbatim copying. An empty KV_BITS drops the flag
+        entirely (see _ferry_launch_mlx), which is the point.
+        """
+        self.assertIn('LOCAL_SCHEMATRON_KV_BITS=""', self.src)
+        self.assertIn('LOCAL_SCHEMATRON_MAX_KV="${LOCAL_SCHEMATRON_MAX_KV:-131072}"',
+                      self.src)
+        # Deep prefill, shallow decode: concurrency grows KV faster than
+        # throughput, so this lane admits fewer sequences than the others.
+        self.assertIn('LOCAL_SCHEMATRON_MAX_SEQS="${LOCAL_SCHEMATRON_MAX_SEQS:-2}"',
+                      self.src)
+        self.assertIn('LOCAL_SCHEMATRON_APC_BLOCKS="${LOCAL_SCHEMATRON_APC_BLOCKS:'
+                      '-$LOCAL_APC_BLOCKS}"', self.src)
+
+    def test_port_default_and_env_override(self):
+        self.assertIn(
+            'LOCAL_SCHEMATRON_PORT="${FERRY_LOCAL_SCHEMATRON_PORT:-8100}"', self.src)
+        # 8100 must be claimed by nothing else in the shipped script: the only
+        # other mentions of the literal are comments.
+        for line in self.src.splitlines():
+            if "8100" in line and "LOCAL_SCHEMATRON_PORT" not in line:
+                self.assertEqual(line.strip()[:1], "#",
+                                 "8100 is claimed outside the lane's own "
+                                 "declaration: %r" % line)
+
+    def test_relay_reserves_the_lane_port(self):
+        # A client exposure must never shadow an internal inference backend.
+        # Asserted in its grouping with the other two MLX lane ports, which is
+        # what it is: internal plumbing, not a door.
+        self.assertIn("$LOCAL_ORCH_PORT,$LOCAL_SUB_PORT,$LOCAL_SCHEMATRON_PORT",
+                      self.src)
+
+    # ---- the stack -------------------------------------------------------
+    def _launch_mlx_labels(self, block):
+        return re.findall(r'_ferry_launch_mlx "([\w-]+)"', block)
+
+    def _stack_block(self):
+        m = re.search(r'if \[\[ "\$LAUNCH_MODE" == "stack" \]\]; then(.*?)'
+                      r'\n  elif \[\[ "\$LAUNCH_MODE" == "local-orch"',
+                      self.src, re.S)
+        self.assertIsNotNone(m, "the stack branch of cmd_up is missing")
+        return m.group(1)
+
+    def test_stack_launches_three_mlx_lanes(self):
+        labels = self._launch_mlx_labels(self._stack_block())
+        self.assertEqual(labels, ["local-orch", "local-sub", "local-schematron"],
+                         "the stack must launch all three MLX lanes, in order")
+
+    def test_stack_passes_the_lane_its_own_port_log_and_governor(self):
+        block = self._stack_block()
+        m = re.search(r'_ferry_launch_mlx "local-schematron" (.*?)\n\n', block, re.S)
+        self.assertIsNotNone(m, "the local-schematron launch line is missing")
+        call = m.group(1)
+        for arg in ('"$LOCAL_MODEL_SCHEMATRON"', '"$LOCAL_DRAFT_SCHEMATRON"',
+                    '"$LOCAL_SCHEMATRON_PORT"', '"$LOCAL_SCHEMATRON_LOG"',
+                    '"$LOCAL_SCHEMATRON_KV_BITS"', '"$LOCAL_SCHEMATRON_MAX_KV"',
+                    '"$LOCAL_SCHEMATRON_MAX_SEQS"', '"$LOCAL_SCHEMATRON_APC_BLOCKS"'):
+            self.assertIn(arg, call,
+                          "the stack launch drops %s — a lane launched with "
+                          "another lane's governor is the silent failure" % arg)
+
+    def test_stack_frees_the_port_before_launching(self):
+        self.assertIn('_ferry_free_port "$LOCAL_SCHEMATRON_PORT"',
+                      self._stack_block())
+
+    def test_stack_waits_for_the_lane_to_be_warm(self):
+        """A 200 on /v1/models IS the weights-resident signal for an MLX lane.
+
+        900s, like the other two: a cold 8.5GB load out of the HF cache
+        legitimately takes tens of seconds, and more when three lanes stream
+        concurrently.
+        """
+        block = self._stack_block()
+        self.assertIn(
+            '_ferry_wait_http "http://127.0.0.1:$LOCAL_SCHEMATRON_PORT/v1/models"',
+            block)
+        m = re.search(r'\$LOCAL_SCHEMATRON_PORT/v1/models" "local-schematron" (\d+)',
+                      block)
+        self.assertIsNotNone(m, "the lane's readiness wait has no timeout")
+        self.assertEqual(m.group(1), "900")
+
+    # ---- the --schematron door ------------------------------------------
+    def _door_block(self):
+        m = re.search(r'elif \[\[ "\$LAUNCH_MODE" == "schematron" \]\]; then(.*?)'
+                      r'\n  fi\n\}', self.src, re.S)
+        self.assertIsNotNone(m, "the schematron door branch is missing")
+        return m.group(1)
+
+    def test_the_door_launches_the_lane_behind_its_litellm_front(self):
+        block = self._door_block()
+        self.assertIn('_ferry_launch_mlx "local-schematron"', block,
+                      "the door fronts a LOCAL backend now — it must start one")
+        self.assertIn('"$LOCAL_SCHEMATRON_PORT" "$LOCAL_SCHEMATRON_LOG"', block)
+
+    def test_the_door_reuses_a_warm_lane_instead_of_reaping_it(self):
+        """The main stack wires the same deployment to the same port.
+
+        So a door that killed :$LOCAL_SCHEMATRON_PORT to claim it would take
+        extraction out from under a running stack. It must probe first and
+        launch only on a cold port — and it must never _ferry_free_port it.
+        """
+        block = self._door_block()
+        self.assertIn("$LOCAL_SCHEMATRON_PORT/v1/models", block)
+        self.assertIn("schem_lane_warm=1", block)
+        self.assertNotIn('_ferry_free_port "$LOCAL_SCHEMATRON_PORT"', block,
+                         "the companion door must never reap the shared lane")
+
+    def test_the_door_waits_for_the_lane(self):
+        block = self._door_block()
+        m = re.search(r'\$LOCAL_SCHEMATRON_PORT/v1/models" "local-schematron" (\d+)',
+                      block)
+        self.assertIsNotNone(m, "the door does not wait for its own backend")
+        self.assertEqual(m.group(1), "900")
+
+    def test_the_door_still_refuses_a_foreign_holder_of_its_litellm_port(self):
+        """v1.35.0 behaviour, unchanged: the DOOR's port is refused, not reaped.
+
+        Adding a backend must not have quietly turned the companion door into
+        a main door that kill -9s whatever holds :8094.
+        """
+        m = re.search(
+            r'if \[\[ "\$LAUNCH_MODE" == "schematron" \]\]; then(.*?)\n  else\n',
+            self.src, re.S)
+        self.assertIsNotNone(m)
+        self.assertIn("refuses to", m.group(1))
+        # Comments must be stripped first: this block's whole rationale comment
+        # NAMES _ferry_free_port as the thing it is declining to do, so a raw
+        # substring scan can never fail and would prove nothing.
+        code = "\n".join(l for l in m.group(1).splitlines()
+                         if not l.strip().startswith("#"))
+        self.assertNotIn("_ferry_free_port", code)
+
+    def test_the_door_is_gated_on_apple_silicon_now_that_it_is_local(self):
+        m = re.search(r'if \[\[ "\$LAUNCH_MODE" == "stack" \|\| '
+                      r'"\$LAUNCH_MODE" == local-\* (.*?)\]\]; then', self.src)
+        self.assertIsNotNone(m, "the GPU prerequisite guard is missing")
+        self.assertIn('"$LAUNCH_MODE" == "schematron"', m.group(1),
+                      "the door's backend is MLX, so it needs the MLX guard")
+
+    # ---- the solo mode ---------------------------------------------------
+    def test_solo_flag_parses_to_its_own_mode(self):
+        self.assertIn("--local-schematron)", self.src)
+        self.assertIn('LAUNCH_MODE="local-schematron"', self.src)
+
+    def test_solo_mode_serves_the_lane_on_the_target_port(self):
+        m = re.search(r'elif \[\[ "\$LAUNCH_MODE" == "local-schematron" \]\]; '
+                      r'then(.*?)\n  elif ', self.src, re.S)
+        self.assertIsNotNone(m, "the --local-schematron branch is missing")
+        block = m.group(1)
+        self.assertIn('_ferry_launch_mlx "local-schematron" '
+                      '"$LOCAL_MODEL_SCHEMATRON"', block)
+        self.assertIn('"$target_port" "$LOCAL_LOG"', block)
+        self.assertIn('"http://127.0.0.1:$target_port/v1/models" '
+                      '"local-schematron" 900', block)
+
+    def test_the_interactive_catalog_offers_the_lane(self):
+        self.assertIn('options.append(("local-schematron"', self.src)
+        self.assertIn('"$chosen_model" == "local-schematron"', self.src)
+
+    # ---- down ------------------------------------------------------------
+    def test_down_frees_the_lane_port(self):
+        self.assertIn('for _p in "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" '
+                      '"$LOCAL_SCHEMATRON_PORT"; do', self.src)
+
+    def test_down_port_stops_the_backend_only_when_the_stack_is_gone(self):
+        """`ferry down --port 8094` owns the lane only if nothing else does.
+
+        With the main stack up, :$PORT is serving `schematron` through the very
+        same backend, so the companion door is the borrower and must leave it
+        alone. With no stack, the door owns it and must not strand ~8.5GB of
+        weights.
+        """
+        m = re.search(r'if \[\[ -n "\$stop_port" \]\]; then(.*?)\n    return 0',
+                      self.src, re.S)
+        self.assertIsNotNone(m, "the `down --port` branch is missing")
+        block = m.group(1)
+        self.assertIn('"$stop_port" == "$SCHEMATRON_PORT"', block)
+        # The stack check must come FIRST — the guard is what makes it safe.
+        guard = block.index('lsof -nP -iTCP:"$PORT" -sTCP:LISTEN')
+        reap = block.index('_ferry_free_port "$LOCAL_SCHEMATRON_PORT"')
+        self.assertLess(guard, reap,
+                        "the lane is reaped without first checking for a "
+                        "running main stack")
+
+    # ---- status ----------------------------------------------------------
+    def test_status_lists_and_labels_the_lane_port(self):
+        self.assertIn('for p in "$PORT" "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" '
+                      '"$LOCAL_SCHEMATRON_PORT" "$SHARE_PORT"; do', self.src)
+        self.assertIn('_label="local-schematron lane (internal)"', self.src)
+
+    def test_status_treats_it_as_an_mlx_backend_not_a_front_door(self):
+        """Both MLX-only branches must include it.
+
+        One reports phys_footprint (RSS is blind to wired GPU memory); the
+        other reads --model from argv instead of printing /v1/models, which on
+        an MLX lane lists the whole HF cache rather than what is loaded. Miss
+        either and the new lane is rendered as if it were the endpoint.
+        """
+        cond = ('[[ "$p" == "$LOCAL_ORCH_PORT" || "$p" == "$LOCAL_SUB_PORT" '
+                '|| "$p" == "$LOCAL_SCHEMATRON_PORT" ]]')
+        self.assertEqual(self.src.count(cond), 2)
+
+
+class TestRouteExampleSchematronSplit(unittest.TestCase):
+    """The shipped template pins the local/cloud split, loaded as real YAML.
+
+    A textual assertion cannot see whether the two deployments are actually
+    two lanes, nor whether a fallback quietly bridges them — and a bridge is
+    precisely the failure this design exists to prevent.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import yaml
+
+        cls.path = os.path.join(REPO, "litellm-route-example.yaml")
+        with open(cls.path) as fh:
+            cls.cfg = yaml.safe_load(fh)
+        cls.by_name = {}
+        for dep in cls.cfg["model_list"]:
+            cls.by_name.setdefault(dep["model_name"], []).append(dep)
+
+    def test_schematron_is_the_local_lane_on_the_loopback_port(self):
+        deps = self.by_name["schematron"]
+        self.assertEqual(len(deps), 1, "the local lane takes no fallback hops")
+        params = deps[0]["litellm_params"]
+        self.assertEqual(params["model"], "openai/pchamart/schematron8B-mlx-8bit")
+        # The backend is ferry's own MLX lane: loopback only, never the LAN.
+        self.assertEqual(params["api_base"], "http://127.0.0.1:8100/v1")
+        self.assertEqual(params["api_key"], "local")
+        self.assertEqual(params["temperature"], 0)
+        self.assertEqual(params["timeout"], 600)
+        self.assertIs(deps[0]["model_info"]["public"], True)
+        self.assertEqual(deps[0]["model_info"]["id"], "local-schematron-mlx")
+
+    def test_the_api_base_port_matches_the_lane_ferry_actually_launches(self):
+        """The config can only FRONT a backend; it cannot conjure one.
+
+        If these two numbers drift, every extraction call 500s against a port
+        nobody serves — and the config looks perfectly correct while it does.
+        """
+        with open(FERRY) as fh:
+            ferry_src = fh.read()
+        m = re.search(r'LOCAL_SCHEMATRON_PORT="\$\{FERRY_LOCAL_SCHEMATRON_PORT:'
+                      r'-(\d+)\}"', ferry_src)
+        self.assertIsNotNone(m, "ferry declares no LOCAL_SCHEMATRON_PORT")
+        self.assertEqual(
+            self.by_name["schematron"][0]["litellm_params"]["api_base"],
+            "http://127.0.0.1:%s/v1" % m.group(1))
+
+    def test_the_model_string_matches_the_one_mlx_preloads(self):
+        """The string after `openai/` is sent to the backend VERBATIM.
+
+        It must be the exact HuggingFace id mlx_vlm loaded, or the call misses
+        the warm model and triggers a fresh load — or a download.
+        """
+        with open(FERRY) as fh:
+            ferry_src = fh.read()
+        m = re.search(r'LOCAL_MODEL_SCHEMATRON="([^"]+)"', ferry_src)
+        self.assertIsNotNone(m, "ferry declares no LOCAL_MODEL_SCHEMATRON")
+        self.assertEqual(
+            self.by_name["schematron"][0]["litellm_params"]["model"],
+            "openai/%s" % m.group(1))
+
+    def test_schematron_cloud_keeps_the_openrouter_deployment(self):
+        deps = self.by_name["schematron-cloud"]
+        self.assertEqual(len(deps), 1)
+        params = deps[0]["litellm_params"]
+        self.assertEqual(params["model"],
+                         "openrouter/inference-net/schematron-v2-turbo")
+        self.assertEqual(params["temperature"], 0)
+        self.assertNotIn("api_base", params, "the cloud lane is not loopback")
+        self.assertIs(deps[0]["model_info"]["public"], True,
+                      "it is a lane you ask for by name, not a hidden hop")
+        self.assertEqual(deps[0]["model_info"]["id"], "or-schematron-v2-turbo")
+
+    def test_nothing_falls_back_from_local_to_cloud(self):
+        """The load-bearing assertion of this whole release.
+
+        Two reasons it must hold: a local lane that silently ships the page
+        off-box defeats the point of asking for it, and the two models extract
+        differently — so a schema-pinned consumer must never be swapped from
+        one onto the other mid-flight.
+        """
+        fallbacks = self.cfg["router_settings"]["fallbacks"]
+        entries = {k: v for e in fallbacks for k, v in e.items()}
+        self.assertIn("schematron", entries)
+        self.assertEqual(entries["schematron"], [],
+                         "`schematron` must have NO fallback hops at all")
+        self.assertIn("schematron-cloud", entries)
+        self.assertEqual(entries["schematron-cloud"], [])
+        # Belt and braces: no OTHER lane may route to the cloud extractor
+        # either, which is how a bridge would sneak back in.
+        for lane, hops in entries.items():
+            self.assertNotIn("schematron-cloud", hops or [],
+                             "%r falls back to the cloud extractor" % lane)
+            if lane != "schematron":
+                self.assertNotIn("schematron", hops or [])
 
 
 class TestStatusTestCommand(unittest.TestCase):

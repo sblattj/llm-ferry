@@ -112,6 +112,12 @@ LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # door's restarts can disturb the other. 8094 is the one gap left in the
 # 8090-8099 block (only scripts/bench-spec-ab.py ever borrows it, ad hoc).
 SCHEMATRON_PORT="${FERRY_SCHEMATRON_PORT:-8094}"
+# MLX backend for the `local-schematron` lane (v1.36.0). 8100, not a gap in the
+# 8090-8099 block: that block is FULL — 8090 front, 8091 dash, 8092/8093 the two
+# older MLX lanes, 8094 the schematron door, 8095 share, 8096 HF, 8097 proxy,
+# 8098 relay, 8099 VNC. So the ferry range continues upward at 8100 rather than
+# reaching below the front door.
+LOCAL_SCHEMATRON_PORT="${FERRY_LOCAL_SCHEMATRON_PORT:-8100}"
 # NOTE: 8091 is deliberately skipped — `ferry dash` binds it. The stack and the
 # dashboard are meant to run together, so the lanes start above it.
 
@@ -127,8 +133,9 @@ SCHEMATRON_PORT="${FERRY_SCHEMATRON_PORT:-8094}"
 #                   compaction/title/summary; Gemini-only, no model fallback
 #   local-orch   -> Qwen3.8-27B-nvfp4 on the host GPU (+ MTP speculative draft)
 #   local-sub    -> NVIDIA Nemotron 3 Nano 30B A3B NVFP4 on the host GPU
+#   schematron   -> Schematron-8B 8-bit MLX on the host GPU (HTML→JSON)
 #
-# The cloud lanes live in the litellm route config; the two local lanes are the
+# The cloud lanes live in the litellm route config; the three local lanes are the
 # MLX servers this script launches, wired into that same config as
 # openai-compatible backends on 127.0.0.1.
 
@@ -145,6 +152,21 @@ LOCAL_DRAFT_ORCH="mlx-community/Qwen3.8-27B-MTP-8bit"
 LOCAL_MODEL_SUB="mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
 LOCAL_DRAFT_SUB=""
 
+# Local EXTRACTION lane (v1.36.0) — the `schematron` lane runs ON-MACHINE.
+# Schematron-8B (a llama-arch fine-tune of Llama-3.1-8B specialised for
+# HTML→JSON structured extraction) at 8-bit MLX quant: ~8.5GB of weights, 32
+# layers, GQA with 8 KV heads x 128 head dim, 128k context. No MTP draft is
+# published for it -> no --draft-model on this lane.
+#
+# The PROMPT CONTRACT is the CLIENT's job, not ferry's. Schematron expects the
+# JSON schema INSIDE the user message (system "You are a helpful assistant";
+# user = "You are going to be given a JSON schema ... The schema is as
+# follows:\n\n<schema>\n\nHere is the HTML page:\n\n<html>\n\nMAKE SURE ITS
+# VALID JSON."). ferry fronts the model verbatim and never rewrites prompts —
+# cdp-toolkit's extract_page is the caller that builds that shape.
+LOCAL_MODEL_SCHEMATRON="pchamart/schematron8B-mlx-8bit"
+LOCAL_DRAFT_SCHEMATRON=""
+
 # Back-compat: the single-lane `--local` flag predates the stack and still means
 # "serve the local orchestrator model on its own".
 LOCAL_MODEL="$LOCAL_MODEL_ORCH"
@@ -159,11 +181,11 @@ LOCAL_DRAFT="$LOCAL_DRAFT_ORCH"
 # 56GB, idled at 35GB, and decoded ~60% faster (32 vs 20 tok/s at 64k context).
 # Set any of these to "" to drop the flag from the launch line.
 #
-# STACK MODE runs BOTH local lanes at these same generous settings (~15GB + ~18GB
-# of resident weights before any KV). That is a deliberate choice for best
-# single-lane latency; the tradeoff is that two simultaneously-busy deep-context
-# lanes CAN approach the wired ceiling. Watch it with `ferry status`, and shrink a
-# lane by exporting the per-lane overrides below.
+# STACK MODE runs ALL THREE local lanes at these same generous settings (~15GB +
+# ~18GB + ~8.5GB of resident weights before any KV — v1.36.0 added the third).
+# That is a deliberate choice for best single-lane latency; the tradeoff is that
+# simultaneously-busy deep-context lanes CAN approach the wired ceiling. Watch it
+# with `ferry status`, and shrink a lane by exporting the per-lane overrides below.
 LOCAL_KV_BITS="4"         # --kv-bits: 4-bit KV cache quant (weights stay nvfp4)
 LOCAL_MAX_KV="131072"     # --max-kv-size: prompt+max_tokens over this => clean 400, not OOM
 LOCAL_MAX_SEQS="4"        # --max-num-seqs: max concurrent sequences (subagent fan-out)
@@ -186,6 +208,19 @@ LOCAL_SUB_KV_BITS="${LOCAL_SUB_KV_BITS:-$LOCAL_KV_BITS}"
 LOCAL_SUB_MAX_KV="${LOCAL_SUB_MAX_KV:-$LOCAL_MAX_KV}"
 LOCAL_SUB_MAX_SEQS="${LOCAL_SUB_MAX_SEQS:-$LOCAL_MAX_SEQS}"
 LOCAL_SUB_APC_BLOCKS="${LOCAL_SUB_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
+# local-schematron runs UNQUANTIZED KV at the model's full 128k context. The
+# arithmetic is why that is affordable: 32 layers x 8 kv heads x 128 head dim x
+# 2 (K and V) x 2 bytes = 131 KB/token, so a full 128k stream is ~17GB of KV in
+# the worst case and a realistic single-page extraction is a small fraction of
+# that. Quantizing the cache would buy little and cost extraction fidelity on a
+# lane whose entire job is verbatim copying out of the prompt. max-num-seqs is
+# 2, not 4: this lane's prompts are whole HTML pages (deep prefill, shallow
+# decode), so admitting many concurrent extractions grows KV far faster than it
+# grows throughput.
+LOCAL_SCHEMATRON_KV_BITS=""
+LOCAL_SCHEMATRON_MAX_KV="${LOCAL_SCHEMATRON_MAX_KV:-131072}"
+LOCAL_SCHEMATRON_MAX_SEQS="${LOCAL_SCHEMATRON_MAX_SEQS:-2}"
+LOCAL_SCHEMATRON_APC_BLOCKS="${LOCAL_SCHEMATRON_APC_BLOCKS:-$LOCAL_APC_BLOCKS}"
 MDNS_NAME="$(detect_mdns_name)"
 
 # Default cloud model for `ferry serve --cloud`.
@@ -252,6 +287,7 @@ CLOUD_LOG="$LOG_DIR/cloud-proxy-$PORT.log"
 # Stack mode gives each MLX lane its own log so a crash is attributable to a lane.
 LOCAL_ORCH_LOG="$LOG_DIR/local-orch-$LOCAL_ORCH_PORT.log"
 LOCAL_SUB_LOG="$LOG_DIR/local-sub-$LOCAL_SUB_PORT.log"
+LOCAL_SCHEMATRON_LOG="$LOG_DIR/local-schematron-$LOCAL_SCHEMATRON_PORT.log"
 SHARE_LOG="$LOG_DIR/share-$SHARE_PORT.log"
 
 # Client telemetry (`ferry msg` / `ferry log` -> the share server's /hq) lands here.
@@ -369,16 +405,22 @@ Encrypted transfer over an UNTRUSTED channel (no LAN required):
                        ferry pickup <blob> [--to PATH] [--pass-file FILE]
 
 Options for 'up':
-  (no flags)         THE STACK — all seven lanes on one endpoint (:$PORT):
+  (no flags)         THE STACK — all eight lanes on one endpoint (:$PORT):
                        heavy        cloud  GPT-6 Astra (ChatGPT subscription), Sol fallback
                        medium       cloud  GPT-5.6 Terra (ChatGPT subscription), OpenRouter Terra fallback
                        flash        cloud  GPT-5.6 Luna (OpenRouter), Gemini/Terra fallbacks
                        super-flash  cloud  Gemini Flash Latest (OpenRouter), Gemini-only; no model fallback
-                       schematron   cloud  HTML→JSON extraction (OpenRouter schematron-v2-turbo); temperature 0, no fallback
+                       schematron   GPU    HTML→JSON extraction, ON-MACHINE ($LOCAL_MODEL_SCHEMATRON);
+                                             temperature 0, no fallback
+                       schematron-cloud  cloud  the same job off-box (OpenRouter
+                                             schematron-v2-turbo), BY NAME ONLY
                        local-orch   GPU    $LOCAL_MODEL_ORCH
                        local-sub    GPU    $LOCAL_MODEL_SUB
-                     The GPU lanes run on internal ports $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT;
-                     clients only ever address :$PORT and pick a lane by name.
+                     The GPU lanes run on internal ports
+                     $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT/$LOCAL_SCHEMATRON_PORT; clients only ever
+                     address :$PORT and pick a lane by name. The cloud extractor
+                     is still reachable, as its own lane 'schematron-cloud' —
+                     nothing falls back to it from 'schematron'.
   -a, --all, --stack Same as no flags (explicit form)
   -l, --local, --local-orch
                      Launch ONLY the local orchestrator lane ($LOCAL_MODEL_ORCH)
@@ -386,6 +428,11 @@ Options for 'up':
   -s, --sub, --local-sub
                      Launch ONLY the local subagent lane ($LOCAL_MODEL_SUB)
                        [macOS / Apple Silicon only]
+  --local-schematron Launch ONLY the local extraction lane ($LOCAL_MODEL_SCHEMATRON),
+                       raw on the target port with NO litellm in front — address it
+                       by its HuggingFace id, not by the 'schematron' lane name.
+                       For the lane NAME, use --schematron (a litellm door) or the
+                       full stack.  [macOS / Apple Silicon only]
   -o, --orch         Alias of --local-orch. NOTE: the orchestrator lane is now Qwen;
                        Nemotron moved to --local-sub.
   -c, --cloud        Proxy to default cloud model ($DEFAULT_CLOUD_MODEL)
@@ -395,15 +442,19 @@ Options for 'up':
    --schematron      Serve ONLY the schematron extraction lane, on its OWN door
                         (default :$SCHEMATRON_PORT): a filtered copy of the route
                         config with just the schematron deployment, so a scraper
-                        workload runs alongside the main stack without touching :$PORT
+                        workload runs alongside the main stack without touching :$PORT.
+                        Since v1.36.0 it also starts the lane's local MLX backend on
+                        :$LOCAL_SCHEMATRON_PORT — or REUSES it untouched if the main
+                        stack already has it warm.
    -i, --interactive  Force launch the interactive lane/model selection catalog
   -p, --port <port>  Override listening port [default: $PORT]
 
 Examples:
-  ferry up             # The full stack: orch + flash + local-orch + local-sub on :$PORT
+  ferry up             # The full stack: orch + flash + local-orch + local-sub + schematron on :$PORT
   ferry up --route     # Cloud lanes only (no GPU weights resident)
   ferry up --schematron # The extraction lane alone, on its own door (:$SCHEMATRON_PORT)
   ferry up --local-sub # Just the Nemotron subagent lane, alone on :$PORT
+  ferry up --local-schematron  # Just the Schematron-8B extraction lane, alone on :$PORT
   ferry up -i          # Interactive catalog (query Gemini's live model list)
   ferry dash --open    # Open the live route-proxy dashboard in your browser
   ferry status         # Per-lane health, memory, and served lane names
@@ -660,11 +711,12 @@ chat_models.sort(key=lambda x: x[0], reverse=True)
 
 # Generate list of options
 options = []
-# Option 1 is ALWAYS the full stack: every lane on one endpoint. Options 2-3 are the
+# Option 1 is ALWAYS the full stack: every lane on one endpoint. Options 2-4 are the
 # single GPU lanes for when you want ONE model on :8090 and nothing else resident.
-options.append(("stack", "FULL STACK - orch + flash (cloud) + local-orch + local-sub (GPU), one endpoint"))
+options.append(("stack", "FULL STACK - orch + flash (cloud) + local-orch + local-sub + schematron (GPU), one endpoint"))
 options.append(("local-orch", "Local GPU Qwen 3.8-27B nvfp4 only (local-orch lane, APC + speculative MTP)"))
 options.append(("local-sub", "Local GPU NVIDIA Nemotron 3 Nano 30B A3B NVFP4 only (local-sub lane)"))
+options.append(("local-schematron", "Local GPU Schematron-8B 8-bit only (local-schematron lane, HTML->JSON)"))
 
 for _, m_id, m_desc in chat_models:
     options.append((f"gemini/{m_id}", f"[Cloud] {m_desc} (gemini/{m_id})"))
@@ -696,7 +748,8 @@ PYEOF
 )
 
   if [[ "$chosen_model" == "stack" || "$chosen_model" == "local" \
-     || "$chosen_model" == "local-orch" || "$chosen_model" == "local-sub" ]]; then
+     || "$chosen_model" == "local-orch" || "$chosen_model" == "local-sub" \
+     || "$chosen_model" == "local-schematron" ]]; then
     LAUNCH_MODE="$chosen_model"
   elif [[ "$chosen_model" == "__ERROR:"* ]]; then
     echo "Error parsing live models. Falling back to the full stack."
@@ -1100,6 +1153,14 @@ cmd_up() {
           skip_catalog=1
           shift
           ;;
+        --local-schematron)
+          # The local EXTRACTION lane alone on the target port: raw mlx_vlm,
+          # no litellm in front. Distinct from `--schematron`, which serves the
+          # litellm DOOR (and now launches this lane behind it).
+          LAUNCH_MODE="local-schematron"
+          skip_catalog=1
+          shift
+          ;;
         -o|--orch)
           # `--orch` predates the lane split, when the local orchestrator WAS
           # Nemotron. The orchestrator lane is now Qwen; Nemotron is the subagent
@@ -1188,7 +1249,11 @@ cmd_up() {
   # Local GPU serving is Apple MLX — macOS / Apple Silicon only. In STACK mode a
   # non-Mac degrades to the cloud lanes rather than failing outright, because the
   # cloud half of the stack is perfectly servable on Linux.
-  if [[ "$LAUNCH_MODE" == "stack" || "$LAUNCH_MODE" == local-* ]]; then
+  # v1.36.0 adds "schematron" to this guard: that door's backend is now a local
+  # MLX lane, not a cloud model, so it needs the same Apple-Silicon prerequisite
+  # as the other GPU modes. It does NOT get the stack's degrade-to-cloud path —
+  # a door whose one lane is local has nothing left to serve without the GPU.
+  if [[ "$LAUNCH_MODE" == "stack" || "$LAUNCH_MODE" == local-* || "$LAUNCH_MODE" == "schematron" ]]; then
     if (( ! IS_MAC )); then
       if [[ "$LAUNCH_MODE" == "stack" ]]; then
         echo ">>> Local GPU lanes need Apple MLX (macOS / Apple Silicon only)."
@@ -1209,15 +1274,16 @@ cmd_up() {
   fi
 
   if [[ "$LAUNCH_MODE" == "stack" ]]; then
-    # ── THE STACK: one door, seven lanes ────────────────────────────────────
+    # ── THE STACK: one door, eight lanes ────────────────────────────────────
     #   litellm on $target_port  ->  heavy        (cloud: GPT-6 Astra, ChatGPT subscription, Sol fallback)
     #                            ->  medium       (cloud: GPT-5.6 Terra, ChatGPT subscription, OpenRouter Terra fallback)
     #                            ->  flash        (cloud: GPT-5.6 Luna via OpenRouter, Gemini/Terra fallbacks)
     #                            ->  super-flash  (cloud: Gemini Flash Latest via OpenRouter, Gemini-only; no model fallback)
-    #                            ->  schematron   (cloud: OpenRouter schematron-v2-turbo, HTML→JSON extraction; no fallback)
+    #                            ->  schematron   (MLX on :$LOCAL_SCHEMATRON_PORT, HTML→JSON extraction; no fallback)
+    #                            ->  schematron-cloud (cloud: OpenRouter schematron-v2-turbo; a SEPARATE lane, never a fallback)
     #                            ->  local-orch   (MLX on :$LOCAL_ORCH_PORT)
     #                            ->  local-sub    (MLX on :$LOCAL_SUB_PORT)
-    # The two MLX ports are INTERNAL plumbing — clients only ever talk to
+    # The three MLX ports are INTERNAL plumbing — clients only ever talk to
     # $target_port, and the lane names there are the contract they bind to.
     if ! command -v litellm >/dev/null 2>&1; then
       echo "Error: 'litellm' is missing. Run: ferry install"
@@ -1227,29 +1293,34 @@ cmd_up() {
     _ferry_warn_missing_keys
 
     echo "================================================================="
-    echo "   FERRY STACK — seven lanes, one endpoint"
+    echo "   FERRY STACK — eight lanes, one endpoint"
     echo "================================================================="
     echo "   heavy        cloud   GPT-6 Astra (ChatGPT subscription), Sol fallback"
     echo "   medium       cloud   GPT-5.6 Terra (ChatGPT subscription), OpenRouter Terra fallback"
     echo "   flash        cloud   GPT-5.6 Luna (OpenRouter), Gemini/Terra fallbacks"
     echo "   super-flash  cloud   Gemini Flash Latest (OpenRouter), Gemini-only; no model fallback"
-    echo "   schematron   cloud   HTML→JSON extraction (OpenRouter schematron-v2-turbo); no fallback"
+    echo "   schematron   GPU     $LOCAL_MODEL_SCHEMATRON (HTML→JSON); no fallback"
+    echo "   schematron-cloud  cloud  OpenRouter schematron-v2-turbo — BY NAME ONLY, never a fallback"
     echo "   local-orch   GPU     $LOCAL_MODEL_ORCH"
     echo "   local-sub    GPU     $LOCAL_MODEL_SUB"
     echo "================================================================="
 
     _ferry_free_port "$LOCAL_ORCH_PORT"
     _ferry_free_port "$LOCAL_SUB_PORT"
+    _ferry_free_port "$LOCAL_SCHEMATRON_PORT"
 
-    # Both MLX lanes start first and load CONCURRENTLY: the two loads are
-    # dominated by streaming ~33GB out of the HF cache, so overlapping them is
-    # markedly faster than serialising, and neither blocks the other's warm-up.
+    # All three MLX lanes start first and load CONCURRENTLY: the loads are
+    # dominated by streaming ~42GB out of the HF cache, so overlapping them is
+    # markedly faster than serialising, and none blocks another's warm-up.
     _ferry_launch_mlx "local-orch" "$LOCAL_MODEL_ORCH" "$LOCAL_DRAFT_ORCH" \
       "$LOCAL_ORCH_PORT" "$LOCAL_ORCH_LOG" \
       "$LOCAL_ORCH_KV_BITS" "$LOCAL_ORCH_MAX_KV" "$LOCAL_ORCH_MAX_SEQS" "$LOCAL_ORCH_APC_BLOCKS"
     _ferry_launch_mlx "local-sub" "$LOCAL_MODEL_SUB" "$LOCAL_DRAFT_SUB" \
       "$LOCAL_SUB_PORT" "$LOCAL_SUB_LOG" \
       "$LOCAL_SUB_KV_BITS" "$LOCAL_SUB_MAX_KV" "$LOCAL_SUB_MAX_SEQS" "$LOCAL_SUB_APC_BLOCKS"
+    _ferry_launch_mlx "local-schematron" "$LOCAL_MODEL_SCHEMATRON" "$LOCAL_DRAFT_SCHEMATRON" \
+      "$LOCAL_SCHEMATRON_PORT" "$LOCAL_SCHEMATRON_LOG" \
+      "$LOCAL_SCHEMATRON_KV_BITS" "$LOCAL_SCHEMATRON_MAX_KV" "$LOCAL_SCHEMATRON_MAX_SEQS" "$LOCAL_SCHEMATRON_APC_BLOCKS"
 
     # litellm does NOT probe its backends at boot, so the front door can come up
     # in parallel with the GPU lanes. A call that arrives before a lane is warm
@@ -1279,6 +1350,7 @@ cmd_up() {
     _ferry_wait_http "http://127.0.0.1:$target_port/health/liveliness" "front"      120 readiness || true
     _ferry_wait_http "http://127.0.0.1:$LOCAL_ORCH_PORT/v1/models"   "local-orch" 900 || true
     _ferry_wait_http "http://127.0.0.1:$LOCAL_SUB_PORT/v1/models"    "local-sub"  900 || true
+    _ferry_wait_http "http://127.0.0.1:$LOCAL_SCHEMATRON_PORT/v1/models" "local-schematron" 900 || true
 
     echo "================================================================="
     echo ">>> Stack up. Lanes served on http://$MDNS_NAME:$target_port/v1 :"
@@ -1312,6 +1384,19 @@ cmd_up() {
       "$target_port" "$LOCAL_LOG" \
       "$LOCAL_SUB_KV_BITS" "$LOCAL_SUB_MAX_KV" "$LOCAL_SUB_MAX_SEQS" "$LOCAL_SUB_APC_BLOCKS"
     _ferry_wait_http "http://127.0.0.1:$target_port/v1/models" "local-sub" 900 || true
+
+  elif [[ "$LAUNCH_MODE" == "local-schematron" ]]; then
+    # ONE lane on the target port: the local HTML→JSON extraction model, raw,
+    # with no litellm in front. Clients address it by its HuggingFace id
+    # ($LOCAL_MODEL_SCHEMATRON), not by the `schematron` lane name — that name
+    # only exists on a litellm door (`ferry up` or `ferry up --schematron`).
+    echo ">>> Launching the local-schematron lane alone (no route proxy)."
+    echo "    (the JSON schema goes INSIDE the user message — see the Schematron"
+    echo "     prompt contract in lib/ferry-core.zsh; ferry never rewrites prompts)"
+    _ferry_launch_mlx "local-schematron" "$LOCAL_MODEL_SCHEMATRON" "$LOCAL_DRAFT_SCHEMATRON" \
+      "$target_port" "$LOCAL_LOG" \
+      "$LOCAL_SCHEMATRON_KV_BITS" "$LOCAL_SCHEMATRON_MAX_KV" "$LOCAL_SCHEMATRON_MAX_SEQS" "$LOCAL_SCHEMATRON_APC_BLOCKS"
+    _ferry_wait_http "http://127.0.0.1:$target_port/v1/models" "local-schematron" 900 || true
 
   elif [[ "$LAUNCH_MODE" == "cloud" ]]; then
     # Start cloud API proxy
@@ -1473,6 +1558,24 @@ SCHEMFILTER_EOF
     echo ">>> Serving ONLY the schematron lane (filtered from $FERRY_ROUTE_CONFIG):"
     echo "    Config: $schematron_config"
     echo "    Port:   $target_port"
+
+    # v1.36.0: the `schematron` deployment is now a LOCAL MLX backend, so this
+    # door has a backend to start — it used to front a cloud model and launch
+    # nothing. REUSE, DO NOT REAP: the main stack launches the very same lane on
+    # :$LOCAL_SCHEMATRON_PORT, so if that port already answers /v1/models this
+    # door simply fronts the warm process. Killing it would take extraction out
+    # from under a running stack. Only a cold port gets a fresh launch.
+    local schem_lane_warm=0
+    if [[ "$(curl -sS -m 3 -o /dev/null -w '%{http_code}' \
+             "http://127.0.0.1:$LOCAL_SCHEMATRON_PORT/v1/models" 2>/dev/null || true)" == "200" ]]; then
+      schem_lane_warm=1
+      echo ">>> [local-schematron] already warm on :$LOCAL_SCHEMATRON_PORT — reusing it (not reaped)."
+    else
+      _ferry_launch_mlx "local-schematron" "$LOCAL_MODEL_SCHEMATRON" "$LOCAL_DRAFT_SCHEMATRON" \
+        "$LOCAL_SCHEMATRON_PORT" "$LOCAL_SCHEMATRON_LOG" \
+        "$LOCAL_SCHEMATRON_KV_BITS" "$LOCAL_SCHEMATRON_MAX_KV" "$LOCAL_SCHEMATRON_MAX_SEQS" "$LOCAL_SCHEMATRON_APC_BLOCKS"
+    fi
+
     _ferry_reset_log "$schematron_log"
     # _ferry_launch_front is trivially reusable here: the filtered config
     # carries the lane's own `public: true`, so the catalogue filter trims
@@ -1488,14 +1591,23 @@ SCHEMFILTER_EOF
         --host 0.0.0.0 >> "$schematron_log" 2>&1 & disown
     fi
     _ferry_wait_http "http://127.0.0.1:$target_port/health/liveliness" "schematron" 120 readiness || true
+    _ferry_wait_http "http://127.0.0.1:$LOCAL_SCHEMATRON_PORT/v1/models" "local-schematron" 900 || true
 
     echo "================================================================="
     echo "   FERRY SCHEMATRON — extraction lane"
     echo "================================================================="
     echo "   Endpoint:  http://$MDNS_NAME:$target_port/v1"
     echo "   Model:     schematron  (upstream: $upstream)"
+    if (( schem_lane_warm )); then
+      echo "   Backend:   MLX on :$LOCAL_SCHEMATRON_PORT (was ALREADY warm — reused, not restarted)"
+    else
+      echo "   Backend:   MLX on :$LOCAL_SCHEMATRON_PORT (launched by this door)"
+      echo "   Log (MLX): $LOCAL_SCHEMATRON_LOG"
+    fi
     echo "   Main door :$PORT is untouched — this door is independent of it."
     echo "-----------------------------------------------------------------"
+    echo "   The JSON schema goes INSIDE the user message (Schematron's prompt"
+    echo "   contract) — ferry fronts the model verbatim and rewrites nothing."
     echo "   cdp-toolkit: export CDP_EXTRACT_BASE_URL=http://127.0.0.1:$target_port/v1"
     echo "   Stop this door only: ferry down --port $target_port"
     echo "   Log: $schematron_log"
@@ -1530,6 +1642,36 @@ cmd_down() {
     echo ">>> Stopping ONLY the ferry proxy on :$stop_port (everything else stays up)..."
     _ferry_stop_litellm "$stop_port"
     _ferry_free_port "$stop_port"
+
+    # v1.36.0: the schematron door now has a LOCAL MLX backend behind it, and a
+    # door taken down without its backend leaves ~8.5GB of weights resident
+    # forever. So stopping THAT door also stops the lane — but ONLY when the
+    # main stack is down.
+    #
+    # The rule, and why it is conditional: `ferry up` (stack) wires its own
+    # `schematron` deployment at the SAME :$LOCAL_SCHEMATRON_PORT. If :$PORT is
+    # listening, the stack is serving extraction through that very process, and
+    # reaping it here would silently break a lane the operator never asked to
+    # touch. The companion door is the borrower in that case, never the owner.
+    #
+    # SCOPE: this keys on the CONVENTIONAL door port ($SCHEMATRON_PORT, itself
+    # FERRY_SCHEMATRON_PORT-overridable), not on "any door serving the filtered
+    # config". A door started ad hoc on some other port with `-p` is not
+    # recognised as the lane's owner, so its `down --port` leaves the backend
+    # resident — stop that one with `ferry down` or by freeing :8100 directly.
+    # Deliberate: guessing ownership from a port the operator chose per-run is
+    # how you end up reaping a lane that something else is using.
+    if [[ "$stop_port" == "$SCHEMATRON_PORT" ]]; then
+      if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo ">>> Leaving the local-schematron lane on :$LOCAL_SCHEMATRON_PORT up:"
+        echo "    the main stack on :$PORT is running and serves the schematron lane through it."
+      elif lsof -nP -iTCP:"$LOCAL_SCHEMATRON_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo ">>> Also stopping the local-schematron MLX lane on :$LOCAL_SCHEMATRON_PORT"
+        echo "    (no main stack on :$PORT, so nothing else is using it)."
+        _ferry_free_port "$LOCAL_SCHEMATRON_PORT"
+      fi
+    fi
+
     echo ">>> Success: :$stop_port cleared."
     return 0
   fi
@@ -1544,7 +1686,7 @@ cmd_down() {
   # than mlx_vlm.server ended up holding one (a wedged uvicorn child, a stale
   # process from a killed run). Without this a later `ferry up` finds the port
   # taken and the lane silently never binds.
-  for _p in "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT"; do
+  for _p in "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" "$LOCAL_SCHEMATRON_PORT"; do
     if lsof -nP -iTCP:"$_p" -sTCP:LISTEN >/dev/null 2>&1; then
       lsof -ti tcp:"$_p" | xargs kill -9 2>/dev/null || true
     fi
@@ -1677,15 +1819,16 @@ cmd_status() {
   echo "Host active LAN IP:  http://$LAN_IP"
   echo "================================================================="
 
-  # Check active ports. $PORT is the client-facing door; the two lane ports are
+  # Check active ports. $PORT is the client-facing door; the three lane ports are
   # INTERNAL backends (only populated in stack mode) and are labelled as such so
   # an OFFLINE lane port is not mistaken for the endpoint being down.
   local _label
-  for p in "$PORT" "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" "$SHARE_PORT"; do
+  for p in "$PORT" "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" "$LOCAL_SCHEMATRON_PORT" "$SHARE_PORT"; do
     case "$p" in
       "$PORT")            _label="endpoint" ;;
       "$LOCAL_ORCH_PORT") _label="local-orch lane (internal)" ;;
       "$LOCAL_SUB_PORT")  _label="local-sub lane (internal)" ;;
+      "$LOCAL_SCHEMATRON_PORT") _label="local-schematron lane (internal)" ;;
       "$SHARE_PORT")      _label="client share" ;;
       *)                  _label="" ;;
     esac
@@ -1696,12 +1839,12 @@ cmd_status() {
 
       # phys_footprint is the number that matters for an MLX lane — RSS is blind
       # to wired GPU memory, so `ps` cheerfully under-reports a 50GB model server.
-      if [[ "$p" == "$LOCAL_ORCH_PORT" || "$p" == "$LOCAL_SUB_PORT" ]] && command -v footprint >/dev/null 2>&1; then
+      if [[ "$p" == "$LOCAL_ORCH_PORT" || "$p" == "$LOCAL_SUB_PORT" || "$p" == "$LOCAL_SCHEMATRON_PORT" ]] && command -v footprint >/dev/null 2>&1; then
         local fp=$(footprint "$pid" 2>/dev/null | grep -iE "phys_footprint" | head -1 | tr -s ' ')
         [[ -n "$fp" ]] && echo "    Memory: $fp"
       fi
 
-      if [[ "$p" == "$LOCAL_ORCH_PORT" || "$p" == "$LOCAL_SUB_PORT" ]]; then
+      if [[ "$p" == "$LOCAL_ORCH_PORT" || "$p" == "$LOCAL_SUB_PORT" || "$p" == "$LOCAL_SCHEMATRON_PORT" ]]; then
         # An MLX lane's /v1/models lists the whole HuggingFace CACHE, not what is
         # loaded — printing it would advertise eight models this lane cannot serve
         # without a reload. The launch line is the truth, so read --model from argv.
@@ -2246,7 +2389,7 @@ cmd_relay() {
   # never quietly shadow the inference endpoint or the share server. Built from
   # the same constants those services use — 8091 is the dashboard, which is a
   # literal there too.
-  local reserved="$PORT,8091,$SHARE_PORT,$HF_PORT,$PROXY_PORT,$LOCAL_ORCH_PORT,$LOCAL_SUB_PORT,$SCHEMATRON_PORT,$relay_port,$VNC_PORT"
+  local reserved="$PORT,8091,$SHARE_PORT,$HF_PORT,$PROXY_PORT,$LOCAL_ORCH_PORT,$LOCAL_SUB_PORT,$LOCAL_SCHEMATRON_PORT,$SCHEMATRON_PORT,$relay_port,$VNC_PORT"
 
   if (( ! foreground )); then
     if lsof -nP -iTCP:"$relay_port" -sTCP:LISTEN >/dev/null 2>&1; then

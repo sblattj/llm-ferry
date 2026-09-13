@@ -32,9 +32,13 @@
 #                        with no model fallback in domestic or international
 #                        fleets; this template provisions domestic only.
 #   schematron         -> HTML→JSON STRUCTURED EXTRACTION TOOL LANE (used by
-#                        cdp-toolkit extract_page). Not one of the four agent
-#                        role lanes, and deliberately NOT fleet-prefixed —
-#                        see the deployment block below.
+#                        cdp-toolkit extract_page). Since v1.36.0 this runs ON
+#                        THE HOST GPU: Schematron-8B 8-bit via mlx_vlm.server on
+#                        :8100. Not one of the four agent role lanes, and
+#                        deliberately NOT fleet-prefixed — see the block below.
+#   schematron-cloud   -> the SAME job off-box (OpenRouter schematron-v2-turbo),
+#                        as a separate lane you ask for BY NAME. Nothing falls
+#                        back to it from `schematron`; that is on purpose.
 #   local-orch         -> the host GPU's "smart" model, via mlx_vlm.server on :8092
 #   local-sub          -> the host GPU's cheap fan-out model, via mlx_vlm.server on :8093
 #
@@ -360,24 +364,62 @@ model_list:
   # `local-orch`/`local-sub`, and like them it lands in Signal Studio's
   # "Shared" view rather than a fleet tab.
   #
-  # LOCAL-FIRST WAS NOT EXPRESSIBLE HERE (checked 2026-09-12). The natural
-  # primary is the local extraction release
-  # `inference-net/schematron-v2-granite-4.0-h-micro` on the host GPU, but a
-  # route-config deployment cannot declare an MLX server: `ferry up` launches
-  # exactly two mlx_vlm.server processes (local-orch on :8092, local-sub on
-  # :8093) from the ferry-core catalog, and this file only FRONTS backends
-  # that are already running — the string after `openai/` must be the exact
-  # HuggingFace id mlx_vlm preloaded WARM (see the local lanes below). A
-  # deployment pointing `openai/inference-net/schematron-v2-granite-4.0-h-micro`
-  # at a loopback port nobody serves would 500 on every call, so the primary
-  # here is the cloud extraction model. Wiring the local weights in as the
-  # first hop means teaching ferry-serve.zsh a third MLX lane — not a config
-  # edit.
+  # LOCAL-FIRST IS NOW EXPRESSIBLE (v1.36.0, 2026-09-12). It was not before, and
+  # the comment that used to sit here explained why: a route-config deployment
+  # cannot CONJURE an MLX server, it can only FRONT one that is already running,
+  # and `ferry up` launched exactly two mlx_vlm.server processes (local-orch on
+  # :8092, local-sub on :8093). Pointing `openai/<some-extraction-model>` at a
+  # loopback port nobody served would have 500'd on every call. v1.36.0 removes
+  # exactly that obstacle: ferry-serve.zsh now launches a THIRD MLX lane,
+  # `local-schematron`, on :8100 — in stack mode, and behind
+  # `ferry up --schematron` too — so this deployment fronts a real warm backend.
+  #
+  # The model is `pchamart/schematron8B-mlx-8bit`: an 8-bit MLX quant of
+  # inference-net/Schematron-8B, ~8.5GB resident. The string after `openai/` is
+  # sent to the backend VERBATIM and MUST be the exact HuggingFace id mlx_vlm
+  # preloaded — same rule as the two local lanes below. Keep it in lockstep with
+  # LOCAL_MODEL_SCHEMATRON in lib/ferry-core.zsh.
+  #
+  # NO FALLBACK TO THE CLOUD, DELIBERATELY. The cloud deployment still exists —
+  # as its OWN lane, `schematron-cloud`, immediately below — but nothing routes
+  # to it automatically. Same doctrine as local-orch/local-sub: the point of a
+  # local lane is that the request stays on this machine, so a dead GPU lane must
+  # surface as an error rather than silently shipping the page off-box. It is
+  # also the schema-pinning rule: schematron-8B and schematron-v2-turbo are
+  # different models with different extraction behaviour, and a consumer that has
+  # pinned a schema to one must never be swapped onto the other mid-flight. A
+  # caller that WANTS the cloud model asks for it by name.
+  #
+  # PROMPT CONTRACT — THE CLIENT'S JOB, NOT FERRY'S. Schematron expects the JSON
+  # schema INSIDE the user message: system "You are a helpful assistant", user =
+  # "You are going to be given a JSON schema ... The schema is as
+  # follows:\n\n<schema>\n\nHere is the HTML page:\n\n<html>\n\nMAKE SURE ITS
+  # VALID JSON." ferry fronts the model verbatim and rewrites no prompts;
+  # cdp-toolkit's extract_page is the caller that builds that shape.
   #
   # temperature 0: extraction is deterministic by design. No reasoning block:
   # this is a fine-tuned extractor, not a reasoning model, and the role lanes'
-  # `reasoning.effort` shapes do not apply.
+  # `reasoning.effort` shapes do not apply. `timeout` overrides the global
+  # request_timeout — a cold deep-context prefill on-GPU can outrun it.
   - model_name: schematron
+    litellm_params:
+      model: openai/pchamart/schematron8B-mlx-8bit
+      api_base: http://127.0.0.1:8100/v1
+      api_key: "local"      # required-but-unused placeholder; mlx_vlm.server has no --api-key
+      temperature: 0
+      timeout: 600
+    model_info:
+      public: true        # advertised in /v1/models — a lane, not a hop
+      id: local-schematron-mlx
+
+  # -- schematron-cloud: the OFF-BOX extraction lane, by explicit request ------
+  # The former `schematron` primary, kept as a lane of its own so the cloud
+  # deployment stays reachable without being reachable BY ACCIDENT. Nothing
+  # falls back to it (see router_settings.fallbacks: `schematron-cloud` carries
+  # an empty list, exactly like `schematron`). Ask for it by name when you want
+  # OpenRouter to do the extraction — e.g. the host GPU is busy, the page is
+  # huge, or you are A/B-ing the two extractors.
+  - model_name: schematron-cloud
     litellm_params:
       model: openrouter/inference-net/schematron-v2-turbo
       api_key: os.environ/OPENROUTER_API_KEY
@@ -559,4 +601,4 @@ router_settings:
   # place.
   # To enable the optional international recipe above on an otherwise complete
   # international fleet, add: {"international.medium": ["international.medium-glm"]}
-  fallbacks: [{"domestic.heavy": ["domestic.heavy-sol"]}, {"domestic.medium": ["domestic.medium-terra"]}, {"domestic.flash": ["domestic.flash-gemini", "domestic.flash-terra"]}, {"domestic.super-flash": []}, {"schematron": []}]
+  fallbacks: [{"domestic.heavy": ["domestic.heavy-sol"]}, {"domestic.medium": ["domestic.medium-terra"]}, {"domestic.flash": ["domestic.flash-gemini", "domestic.flash-terra"]}, {"domestic.super-flash": []}, {"schematron": []}, {"schematron-cloud": []}]

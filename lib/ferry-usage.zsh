@@ -83,16 +83,22 @@ Encrypted transfer over an UNTRUSTED channel (no LAN required):
                        ferry pickup <blob> [--to PATH] [--pass-file FILE]
 
 Options for 'up':
-  (no flags)         THE STACK — all seven lanes on one endpoint (:$PORT):
+  (no flags)         THE STACK — all eight lanes on one endpoint (:$PORT):
                        heavy        cloud  GPT-6 Astra (ChatGPT subscription), Sol fallback
                        medium       cloud  GPT-5.6 Terra (ChatGPT subscription), OpenRouter Terra fallback
                        flash        cloud  GPT-5.6 Luna (OpenRouter), Gemini/Terra fallbacks
                        super-flash  cloud  Gemini Flash Latest (OpenRouter), Gemini-only; no model fallback
-                       schematron   cloud  HTML→JSON extraction (OpenRouter schematron-v2-turbo); temperature 0, no fallback
+                       schematron   GPU    HTML→JSON extraction, ON-MACHINE ($LOCAL_MODEL_SCHEMATRON);
+                                             temperature 0, no fallback
+                       schematron-cloud  cloud  the same job off-box (OpenRouter
+                                             schematron-v2-turbo), BY NAME ONLY
                        local-orch   GPU    $LOCAL_MODEL_ORCH
                        local-sub    GPU    $LOCAL_MODEL_SUB
-                     The GPU lanes run on internal ports $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT;
-                     clients only ever address :$PORT and pick a lane by name.
+                     The GPU lanes run on internal ports
+                     $LOCAL_ORCH_PORT/$LOCAL_SUB_PORT/$LOCAL_SCHEMATRON_PORT; clients only ever
+                     address :$PORT and pick a lane by name. The cloud extractor
+                     is still reachable, as its own lane 'schematron-cloud' —
+                     nothing falls back to it from 'schematron'.
   -a, --all, --stack Same as no flags (explicit form)
   -l, --local, --local-orch
                      Launch ONLY the local orchestrator lane ($LOCAL_MODEL_ORCH)
@@ -100,6 +106,11 @@ Options for 'up':
   -s, --sub, --local-sub
                      Launch ONLY the local subagent lane ($LOCAL_MODEL_SUB)
                        [macOS / Apple Silicon only]
+  --local-schematron Launch ONLY the local extraction lane ($LOCAL_MODEL_SCHEMATRON),
+                       raw on the target port with NO litellm in front — address it
+                       by its HuggingFace id, not by the 'schematron' lane name.
+                       For the lane NAME, use --schematron (a litellm door) or the
+                       full stack.  [macOS / Apple Silicon only]
   -o, --orch         Alias of --local-orch. NOTE: the orchestrator lane is now Qwen;
                        Nemotron moved to --local-sub.
   -c, --cloud        Proxy to default cloud model ($DEFAULT_CLOUD_MODEL)
@@ -109,15 +120,19 @@ Options for 'up':
    --schematron      Serve ONLY the schematron extraction lane, on its OWN door
                         (default :$SCHEMATRON_PORT): a filtered copy of the route
                         config with just the schematron deployment, so a scraper
-                        workload runs alongside the main stack without touching :$PORT
+                        workload runs alongside the main stack without touching :$PORT.
+                        Since v1.36.0 it also starts the lane's local MLX backend on
+                        :$LOCAL_SCHEMATRON_PORT — or REUSES it untouched if the main
+                        stack already has it warm.
    -i, --interactive  Force launch the interactive lane/model selection catalog
   -p, --port <port>  Override listening port [default: $PORT]
 
 Examples:
-  ferry up             # The full stack: orch + flash + local-orch + local-sub on :$PORT
+  ferry up             # The full stack: orch + flash + local-orch + local-sub + schematron on :$PORT
   ferry up --route     # Cloud lanes only (no GPU weights resident)
   ferry up --schematron # The extraction lane alone, on its own door (:$SCHEMATRON_PORT)
   ferry up --local-sub # Just the Nemotron subagent lane, alone on :$PORT
+  ferry up --local-schematron  # Just the Schematron-8B extraction lane, alone on :$PORT
   ferry up -i          # Interactive catalog (query Gemini's live model list)
   ferry dash --open    # Open the live route-proxy dashboard in your browser
   ferry status         # Per-lane health, memory, and served lane names

@@ -34,6 +34,7 @@ case "$COMMAND" in
   env)           cmd_env "$@" ;;
   opencode)      cmd_opencode "$@" ;;
   claude)        cmd_claude "$@" ;;
+  auth-claude)   cmd_auth_claude "$@" ;;
   fleet)         cmd_fleet "$@" ;;
   update)        cmd_update "$@" ;;
   migrate)       cmd_migrate "$@" ;;

@@ -45,4 +45,7 @@ jobs:
           # default and the posted summary did not flag it; the review of a
           # big chunk on a reasoning model runs well past a minute.
           PRXREF_LLM_TIMEOUT: ${{ vars.PRXREF_LLM_TIMEOUT || '180' }}
-        run: uvx prxref review --pr-url "${{ github.event.pull_request.html_url }}" -v
+          # Repository context (prxref 0.16+): off, diff or repo. Off unless the
+          # repository variable opts in; see prxref's README, Repository Context.
+          PRXREF_REPO_CONTEXT: ${{ vars.PRXREF_REPO_CONTEXT || 'off' }}
+        run: uvx prxref@latest review --pr-url "${{ github.event.pull_request.html_url }}" -v

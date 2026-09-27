@@ -96,7 +96,7 @@ try:
     c = json.load(open(sys.argv[1]))
 except Exception:
     c = {}
-print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}\t{c.get('master_key','')}")
+print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}\t{c.get('api_key') or c.get('master_key','')}")
 PYEOF
 )
   # Peel the fields off one at a time. A `##*\t` shortcut for the last field
@@ -162,7 +162,7 @@ echo "================================================================="
 key_args=()
 if [[ -n "$saved_key" ]]; then
   key_args=(--key "$saved_key")
-  echo "Auth: using the master_key stored in $CLIENT_JSON (value never printed)"
+  echo "Auth: using the key stored in $CLIENT_JSON (value never printed)"
 fi
 
 # --- 1. Re-pull the CLI -----------------------------------------------------

@@ -16,6 +16,10 @@
 # wins), it is stored as "master_key" in ~/.config/ferry/client.json, carried
 # on every connectivity probe, and picked up from the profile by the ferry CLI
 # when it wires the opencode/claude configs. The key is never echoed.
+# From v1.39.0 a host that issues per-device keys trades the master key for one
+# at bootstrap: client.json then holds "api_key" + "key_name" and NO master_key.
+# Only re-running this script migrates an existing client; `ferry update` never
+# touches credentials.
 #
 # HOW MUCH OF OPENCODE THIS TOUCHES is a flag, because the answer is not the same
 # on a laptop that already has an opencode setup of its own. Three modes:
@@ -269,6 +273,58 @@ else
   CLAUDE_MODE="none"
 fi
 
+# Per-device keys (v1.39.0). A host from v1.39.0 on mints a device key for the
+# master key (POST /v1/ferry/keys/enroll); only that device key is stored, so
+# the master never has to live on this laptop and the host can revoke this one
+# machine alone. A re-run rotates the key under the same name (the name is kept
+# in client.json as key_name). Any failure — an older host answers 404/501 —
+# falls back to storing the master key exactly as before. Keys never printed.
+DEVICE_KEY=""
+DEVICE_KEY_NAME=""
+if [[ -n "$MASTER_KEY" ]]; then
+  echo ">>> Enrolling this machine for its own device key..."
+  enroll_out=$(FERRY_ENROLL_MASTER="$MASTER_KEY" python3 - \
+      "http://$HOST_NAME:$HOST_PORT" "$CLIENT_NAME" "$HOME/.config/ferry/client.json" \
+      2>/dev/null <<'PYEOF'
+import json, os, sys, urllib.request
+base, name, profile = sys.argv[1], sys.argv[2], sys.argv[3]
+replace = False
+try:
+    prior = json.load(open(profile))
+    if isinstance(prior.get("key_name"), str) and prior["key_name"]:
+        name, replace = prior["key_name"], True
+except Exception:
+    pass
+body = {"name": name or "device"}
+if replace:
+    body["replace"] = True
+req = urllib.request.Request(
+    base + "/v1/ferry/keys/enroll", data=json.dumps(body).encode(), method="POST",
+    headers={"Authorization": "Bearer " + os.environ["FERRY_ENROLL_MASTER"],
+             "Content-Type": "application/json"})
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        doc = json.load(resp)
+except Exception:
+    sys.exit(0)
+key, got = doc.get("key"), doc.get("name")
+safe = set("abcdefghijklmnopqrstuvwxyz0123456789-")
+if (isinstance(key, str) and key.startswith("fk-") and set(key) <= safe
+        and isinstance(got, str) and got and set(got) <= safe):
+    print(got + "\t" + key)
+PYEOF
+  ) || enroll_out=""
+  if [[ "$enroll_out" == *$'\t'fk-* ]]; then
+    DEVICE_KEY_NAME="${enroll_out%%$'\t'*}"
+    DEVICE_KEY="${enroll_out#*$'\t'}"
+    echo "    Enrolled device key '$DEVICE_KEY_NAME' (the master key is NOT stored on this machine)."
+    APIKEY_HINT="your ferry device key (stored as api_key in ~/.config/ferry/client.json)"
+    BEARER_HINT="your ferry device key"
+  else
+    echo "    This host does not issue device keys (older than v1.39.0) — storing the master key."
+  fi
+fi
+
 # Write local client JSON config profile
 echo ">>> Creating client configuration profile..."
 mkdir -p "$HOME/.config/ferry"
@@ -281,8 +337,11 @@ mkdir -p "$HOME/.config/ferry"
 # master_key rides in the profile ONLY when a key was supplied. Its absence is
 # how every reader (client-reset.sh, the ferry CLI) knows this host takes no
 # key — so the JSON shape below is byte-stable when MASTER_KEY is empty.
+# api_key/key_name replace master_key when the host issued a device key.
 MASTER_KEY_JSON=""
-if [[ -n "$MASTER_KEY" ]]; then
+if [[ -n "$DEVICE_KEY" ]]; then
+  MASTER_KEY_JSON=$(printf ',\n  "api_key": "%s",\n  "key_name": "%s"' "$DEVICE_KEY" "$DEVICE_KEY_NAME")
+elif [[ -n "$MASTER_KEY" ]]; then
   MASTER_KEY_JSON=$(printf ',\n  "master_key": "%s"' "$MASTER_KEY")
 fi
 cat <<EOF > "$HOME/.config/ferry/client.json"

@@ -164,6 +164,19 @@ class TestUse(FerryFleetCase):
         self.assertEqual(_FleetHandler.LAST_HEADERS.get("X-Ferry-Client"), "laptop")
         self.assertEqual(_FleetHandler.LAST_HEADERS.get("Authorization"), "Bearer k1")
 
+    def test_a_device_key_in_the_profile_is_the_bearer(self):
+        cfg = os.path.join(self.home, ".config", "ferry", "client.json")
+        with open(cfg) as f:
+            prof = json.load(f)
+        prof.pop("master_key")
+        prof["api_key"] = "fk-laptop-" + "b" * 32
+        with open(cfg, "w") as f:
+            json.dump(prof, f)
+        proc = self.run_fleet("use", "international")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(_FleetHandler.LAST_HEADERS.get("Authorization"),
+                         "Bearer fk-laptop-" + "b" * 32)
+
     def test_use_clear_posts_null_fleet(self):
         proc = self.run_fleet("use", "--clear")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

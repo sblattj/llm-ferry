@@ -239,7 +239,8 @@ except Exception:
   if [[ -z "$cl_key" ]]; then
     cl_key=$(python3 -c "import json, os, sys
 try:
-    print(json.load(open(os.path.expanduser(sys.argv[1]))).get('master_key') or '')
+    c = json.load(open(os.path.expanduser(sys.argv[1])))
+    print(c.get('api_key') or c.get('master_key') or '')
 except Exception:
     pass" "$HOME/.config/ferry/client.json" 2>/dev/null)
   fi
@@ -281,7 +282,8 @@ cfg = {
 # default, and recording it would make the mirror claim an auth setup that
 # does not exist.
 if key and key != "local":
-    cfg["master_key"] = key
+    # A per-device key (v1.39.0) is not the master and must not be named as one.
+    cfg["api_key" if key.startswith("fk-") else "master_key"] = key
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)

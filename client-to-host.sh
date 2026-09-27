@@ -176,6 +176,9 @@ fi
 # already present in secrets.env always wins; the value is never printed.
 echo ""
 say ">>> Carrying the client's master key forward (if any)..."
+# master_key ONLY, never api_key: a per-device key (v1.39.0) authenticates one
+# laptop to one host and must never become a new host's LITELLM_MASTER_KEY. A
+# client that only holds a device key gets a freshly generated master instead.
 CLIENT_KEY="$(python3 -c "import json,os;print((json.load(open(os.path.expanduser('$CLIENT_JSON'))).get('master_key') or ''))" 2>/dev/null || true)"
 if [[ -z "$CLIENT_KEY" ]]; then
   ok "no master_key in client.json — host-reset will generate one if the route config needs it."

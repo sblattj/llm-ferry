@@ -28,7 +28,8 @@ Still open from the follow-up docs:
 
 - [ ] **06 Per-client virtual keys with budgets.** Every multi-user LAN claim
       depends on it, and it is the prerequisite for 13 (spend rollups),
-      25 (transcripts) and 08 (key rotation). Build first.
+      25 (transcripts) and 08 (key rotation). Build first. Design draft
+      awaiting review: [client-keys spec](superpowers/specs/2026-09-27-client-keys-design.md).
 - [ ] **34 Ollama-native API** (`/api/tags`, `/api/chat`). Many tools speak
       only Ollama; also answers the "ollama converging from below" threat.
 - [ ] **01 Session affinity.** Pin a conversation to one deployment — matters

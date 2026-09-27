@@ -106,6 +106,9 @@ Commands:
   fleet              [Dual] Read or switch which fleet (routing set) bare lane
                        names resolve to
                         ferry fleet ls | show | use <fleet> [--default] | use --clear
+  keys               [Host] Per-device client keys: mint, list, revoke, and
+                       limit (lanes, requests/min, monthly token budget)
+                        ferry keys add <name> | list | revoke <name> | set <name> ...
   help [command]     Show this banner, or one command's usage. Every command
                        also answers -h/--help WITHOUT running (ferry reload --help
                        only prints help); 'dash' forwards --help to its script

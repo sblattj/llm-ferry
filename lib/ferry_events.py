@@ -59,6 +59,7 @@ _EMPTY = {
     "reasoning_tokens": None, "cached_input_tokens": None,
     "response_complete": None,
     "resp_bytes": 0, "client_ip": "", "path": "", "schema_warnings": [],
+    "key": "",
 }
 
 # Request-side tool-schema rules: shapes a provider is KNOWN to reject in a way

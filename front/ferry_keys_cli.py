@@ -123,17 +123,17 @@ def main(argv=None):
         if args.verb == "list":
             return _list()
         if args.verb == "revoke":
-            K.revoke(args.name)
+            entry = K.revoke(args.name)
             print("ferry keys: revoked %r; it is refused from the next request on."
-                  % args.name, file=sys.stderr)
+                  % entry["name"], file=sys.stderr)
             return 0
         changes = {field: getattr(args, field)
                    for field in ("expires", "lanes", "rpm", "budget_tokens")
                    if hasattr(args, field)}
         if not changes:
             parser.error("set needs at least one of --expires --lanes --rpm --budget-tokens")
-        K.update(args.name, **changes)
-        print("ferry keys: updated %r." % args.name, file=sys.stderr)
+        entry = K.update(args.name, **changes)
+        print("ferry keys: updated %r." % entry["name"], file=sys.stderr)
         return 0
     except (K.KeyNameError, K.KeyStoreError, OSError) as err:
         print("ferry keys: %s" % err, file=sys.stderr)

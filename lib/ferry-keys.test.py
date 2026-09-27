@@ -82,6 +82,7 @@ class TestAdd(CliCase):
             with self.subTest(args=args):
                 p = self.cli("add", "x", *args)
                 self.assertEqual(p.returncode, 2)
+                self.assertIn("error: argument " + args[0], p.stderr)
         self.assertFalse(os.path.exists(self.keys))
 
 
@@ -122,6 +123,17 @@ class TestListRevokeSet(CliCase):
         p = self.cli("revoke", "ghost")
         self.assertEqual(p.returncode, 1)
         self.assertIn("no key named", p.stderr)
+
+    def test_confirmations_print_the_stored_name(self):
+        self.cli("add", "MBP Work")
+        p = self.cli("set", "MBP Work", "--rpm", "7")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'mbp-work'", p.stderr)
+        self.assertNotIn("MBP Work", p.stderr)
+        p = self.cli("revoke", "MBP Work")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("'mbp-work'", p.stderr)
+        self.assertNotIn("MBP Work", p.stderr)
 
     def test_set_changes_and_clears_limits(self):
         self.cli("add", "laptop", "--rpm", "5")

@@ -75,11 +75,15 @@ def expires_from_date(day: str) -> str:
     return iso(dt.replace(tzinfo=datetime.timezone.utc))
 
 
+def _normalize(raw: str) -> str:
+    name = re.sub(r"[^a-z0-9-]+", "-", raw.strip().lower())
+    return re.sub(r"-{2,}", "-", name).strip("-")[:NAME_MAX].rstrip("-")
+
+
 def normalize_name(raw) -> str:
     if not isinstance(raw, str):
         raise KeyNameError("key name must be a string, got %r" % (raw,))
-    name = re.sub(r"[^a-z0-9-]+", "-", raw.strip().lower())
-    name = re.sub(r"-{2,}", "-", name).strip("-")[:NAME_MAX].rstrip("-")
+    name = _normalize(raw)
     if not name:
         raise KeyNameError("key name %r has no usable characters" % (raw,))
     if name in RESERVED_NAMES:
@@ -135,7 +139,9 @@ def _validate(doc, path) -> None:
                 or not isinstance(entry.get("sha256"), str)
                 or not _SHA_RE.match(entry["sha256"])):
             raise KeyStoreError("%s: malformed key entry %r" % (path, entry))
-        if entry["name"].strip().lower() in RESERVED_NAMES:
+        # Same rule as normalize_name, so "master.", "-master", "MASTER!"
+        # cannot be hand-edited in past the reserved check.
+        if _normalize(entry["name"]) in RESERVED_NAMES:
             raise KeyStoreError("%s: key name %r is reserved" % (path, entry["name"]))
         if entry["name"] in seen:
             raise KeyStoreError("%s: duplicate key name %r" % (path, entry["name"]))

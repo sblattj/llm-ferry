@@ -7,14 +7,10 @@
 # $CLIENT_HOST:$CLIENT_PORT with $CLIENT_MASTER_KEY; CLIENT_MODE=0 (the host)
 # talks to its own loopback front door with $LITELLM_MASTER_KEY.
 
-cmd_fleet() {
-  local verb="${1:-}"
-  [[ $# -gt 0 ]] && shift
-  local fleet="" flag=""
-
-  case "$verb" in
-    --help|-h|"")
-      cat <<'EOF'
+# `ferry fleet --help` text. A function of its own so the dispatcher in
+# lib/ferry-main.zsh can print it WITHOUT entering cmd_fleet.
+_ferry_fleet_usage() {
+  cat <<'EOF'
 ferry fleet — read or switch which routing fleet bare lane names resolve to.
 
 Usage:
@@ -28,6 +24,16 @@ Usage:
   ferry fleet use --clear           Clear your own selection (follow the default).
   ferry fleet --help                This message.
 EOF
+}
+
+cmd_fleet() {
+  local verb="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  local fleet="" flag=""
+
+  case "$verb" in
+    --help|-h|"")
+      _ferry_fleet_usage
       [[ "$verb" == "" ]] && exit 1
       return 0
       ;;

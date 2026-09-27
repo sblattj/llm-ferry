@@ -155,22 +155,10 @@ EOF
   echo "    (bare 'claude' is untouched — run: source $rc)"
 }
 
-cmd_claude() {
-  # Wire Claude Code to the ferry endpoint: install the claude-ferry[-local]
-  # shell wrappers AND write ~/.config/ferry/claude.json recording which lane
-  # plays which role. The JSON is the machine-readable twin of the wrappers —
-  # other tooling (host-reset.sh, tests) reads the mapping instead of parsing
-  # zshrc — so both are written in one pass and always agree.
-  local cl_host="" cl_port="" cl_key="" _wrappers_only=0
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --host)     cl_host="$2"; shift 2 ;;
-      --port)     cl_port="$2"; shift 2 ;;
-      --key)      cl_key="$2"; shift 2 ;;
-      --wrappers) _wrappers_only=1; shift ;;
-      --help|-h)
-        cat <<'EOF'
+# `ferry claude --help` text. A function of its own so the dispatcher in
+# lib/ferry-main.zsh can print it WITHOUT entering cmd_claude.
+_ferry_claude_usage() {
+  cat <<'EOF'
 ferry claude — point Claude Code at the ferry endpoint by lane name.
 
 Usage:
@@ -189,7 +177,23 @@ Usage:
 Lane map:  cloud  main=heavy   background=flash
            local  main=local-orch  background=local-sub
 EOF
-        return 0 ;;
+}
+
+cmd_claude() {
+  # Wire Claude Code to the ferry endpoint: install the claude-ferry[-local]
+  # shell wrappers AND write ~/.config/ferry/claude.json recording which lane
+  # plays which role. The JSON is the machine-readable twin of the wrappers —
+  # other tooling (host-reset.sh, tests) reads the mapping instead of parsing
+  # zshrc — so both are written in one pass and always agree.
+  local cl_host="" cl_port="" cl_key="" _wrappers_only=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host)     cl_host="$2"; shift 2 ;;
+      --port)     cl_port="$2"; shift 2 ;;
+      --key)      cl_key="$2"; shift 2 ;;
+      --wrappers) _wrappers_only=1; shift ;;
+      --help|-h)  _ferry_claude_usage; return 0 ;;
       *) echo "Unknown option for 'ferry claude': $1"; exit 1 ;;
     esac
   done

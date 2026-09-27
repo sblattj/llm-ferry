@@ -145,6 +145,44 @@ class EnrollCase(unittest.TestCase):
         self.assertIn("message", doc["error"])
         self.assertFalse(os.path.exists(self.keys))
 
+    def test_the_cap_edges_are_exact(self):
+        head = json.dumps({"name": "laptop"}).encode()
+        at_cap = head + b" " * (65536 - len(head))
+        over = head + b" " * (65537 - len(head))
+        self.assertEqual(len(at_cap), 65536)
+        self.assertEqual(len(over), 65537)
+        self.assertEqual(post(over, master())[0], 413)
+        self.assertFalse(os.path.exists(self.keys))
+        status, doc = post(at_cap, master())
+        self.assertEqual(status, 200)
+        self.assertEqual(doc["name"], "laptop")
+
+    def test_a_chunked_body_stops_being_read_at_the_cap(self):
+        chunk = b" " * 20000   # whitespace: valid JSON padding if it were parsed
+        chunks = [b'{"name": "laptop"}'] + [chunk] * 10   # ~200 KB offered
+        calls = []
+
+        async def receive():
+            i = len(calls)
+            calls.append(i)
+            return {"type": "http.request", "body": chunks[i],
+                    "more_body": i < len(chunks) - 1}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {"type": "http", "path": PATH, "method": "POST",
+                 "client": ("100.64.0.9", 1), "query_string": b"",
+                 "headers": [(b"authorization", ("Bearer " + MASTER).encode())]}
+        asyncio.run(FF.LaneCatalogueFilter(NeverApp(), frozenset())(scope, receive, send))
+        self.assertEqual(sent[0]["status"], 413)
+        self.assertFalse(os.path.exists(self.keys))
+        # 18 + 3*20000 = 60018 <= cap; the 5th message crosses it, and nothing after is read.
+        self.assertEqual(len(calls), 5)
+        self.assertLess(len(calls), len(chunks))
+
     def test_a_body_just_under_the_cap_is_accepted(self):
         raw = json.dumps({"name": "laptop"}).encode()
         raw = raw[:-1] + b"," + b'"p":"' + b"x" * (64 * 1024 - len(raw) - 8) + b'"}'

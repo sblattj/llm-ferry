@@ -33,6 +33,10 @@ _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _FIELDS = ("name", "sha256", "created", "expires", "revoked",
            "lanes", "rpm", "budget_tokens")
 _MUTABLE = ("expires", "lanes", "rpm", "budget_tokens")
+# Names the front door already uses as identities: scope["ferry.key"] ==
+# "master" marks the master credential, and "host" is the loopback caller's
+# sticky-fleet identity. A device key by either name would impersonate them.
+RESERVED_NAMES = frozenset({"master", "host"})
 
 
 class KeyStoreError(Exception):
@@ -78,6 +82,9 @@ def normalize_name(raw) -> str:
     name = re.sub(r"-{2,}", "-", name).strip("-")[:NAME_MAX].rstrip("-")
     if not name:
         raise KeyNameError("key name %r has no usable characters" % (raw,))
+    if name in RESERVED_NAMES:
+        raise KeyNameError("key name %r is reserved (%s)"
+                           % (name, ", ".join(sorted(RESERVED_NAMES))))
     return name
 
 
@@ -128,6 +135,8 @@ def _validate(doc, path) -> None:
                 or not isinstance(entry.get("sha256"), str)
                 or not _SHA_RE.match(entry["sha256"])):
             raise KeyStoreError("%s: malformed key entry %r" % (path, entry))
+        if entry["name"].strip().lower() in RESERVED_NAMES:
+            raise KeyStoreError("%s: key name %r is reserved" % (path, entry["name"]))
         if entry["name"] in seen:
             raise KeyStoreError("%s: duplicate key name %r" % (path, entry["name"]))
         seen.add(entry["name"])

@@ -177,6 +177,68 @@ def _catalog():
     return _CATALOG or None
 
 
+_KEYS_MODS = None
+
+
+def _keys_mods():
+    """(ferry_keys, ferry_keys_usage) from front/, loaded by path, or None.
+
+    Registered in sys.modules under their plain names so a caller that already
+    imported them (a test, the front door in the same process) shares them."""
+    global _KEYS_MODS
+    if _KEYS_MODS is None:
+        try:
+            import importlib.machinery
+            import importlib.util
+            import sys
+            mods = []
+            for name in ("ferry_keys", "ferry_keys_usage"):
+                if name not in sys.modules:
+                    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "front", name + ".py")
+                    spec = importlib.util.spec_from_loader(
+                        name, importlib.machinery.SourceFileLoader(name, path))
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    sys.modules[name] = module
+                mods.append(sys.modules[name])
+            _KEYS_MODS = tuple(mods)
+        except Exception:
+            _KEYS_MODS = False
+    return _KEYS_MODS or None
+
+
+def keys_summary():
+    """Device keys for the dash card. Names, status, limits and usage only:
+    a key or its hash never leaves the host's key store."""
+    mods = _keys_mods()
+    if mods is None:
+        return {"error": "the key store module (front/ferry_keys.py) is unavailable",
+                "keys": []}
+    keys_mod, usage_mod = mods
+    try:
+        doc = keys_mod.load()
+    except Exception as err:
+        return {"error": "keys.json unreadable: %s" % err, "keys": []}
+    error = None
+    try:
+        usage = usage_mod.Usage().summary()
+    except Exception as err:
+        usage, error = {}, "usage unavailable: %s" % err
+    rows = []
+    for entry in doc["keys"]:
+        used = usage.get(entry["name"], {})
+        rows.append({
+            "name": entry["name"], "status": keys_mod.status(entry),
+            "created": entry.get("created"), "expires": entry.get("expires"),
+            "lanes": entry.get("lanes"), "rpm": entry.get("rpm"),
+            "budget_tokens": entry.get("budget_tokens"),
+            "month_tokens": used.get("month_tokens", 0),
+            "minute_requests": used.get("minute_requests", 0),
+        })
+    return {"error": error, "keys": rows}
+
+
 def _provider_rule():
     """The provider derivation from lib/ferry_events.py, or a safe stand-in.
 
@@ -999,6 +1061,9 @@ def get_status():
         "models": models,
         "topology": topo,
         "fleet": fleet,
+        # Device keys (v1.39.0): read straight from the host's key store, so
+        # the card works while the front door is down.
+        "keys": keys_summary(),
         "activity": CFG["activity"].snapshot(),
         "config_path": CFG["config_path"],
         # The live half. `tap` reports whether events are being written at all,
@@ -1487,6 +1552,7 @@ PAGE = r"""<!doctype html>
   </section>
   <div class="operations">
     <section class="card full" id="live"><h2>Live traffic <span class="muted" id="livemeta"></span></h2><div id="tapoff" class="event" style="display:none"></div><div id="tpsnote" class="sub" style="display:none"></div><div id="livelanes" class="muted">Loading…</div><div class="feed-bar"><span class="sub" id="feedmeta"></span><button type="button" class="toggle" id="showall">show all lanes</button></div><div class="feed" id="feed"></div></section>
+    <section class="card full" id="keys"><h2>Device keys <span class="muted" id="keysmeta"></span></h2><div id="keyrows" class="muted">Loading…</div></section>
     <section class="card" id="orch"><h2>Driver</h2><div id="orchbody" class="muted">Loading…</div></section>
     <section class="card" id="work"><h2>Workers</h2><div id="workbody" class="muted">Loading…</div></section>
     <section class="card full" id="act"><h2>Recent activity <span class="muted" id="since"></span></h2><div class="stats" id="stats"></div><div class="spark" id="spark"></div><div class="codes" id="codes"></div><div id="clients" class="sub" style="margin-top:8px"></div><div id="event"></div></section>
@@ -1623,6 +1689,25 @@ function renderFleets(st){
     box.appendChild(mkFleetRow(name, fleet.clients[name],
       v=>postFleet({fleet:v, identity:name})));
   });
+}
+function renderKeys(ks){
+  const box=$('#keyrows'); box.innerHTML=''; box.className='';
+  const meta=$('#keysmeta');
+  const rows=(ks&&ks.keys)||[];
+  meta.textContent=rows.length?rows.filter(k=>k.status==='active').length+' active of '+rows.length:'';
+  if(ks&&ks.error&&!rows.length){ box.className='muted'; box.textContent=ks.error; return; }
+  if(!rows.length){ box.className='muted'; box.textContent='No device keys. Mint one on the host with: ferry keys add <name>'; return; }
+  rows.forEach(k=>{
+    const r=el('div','row');
+    r.appendChild(el('span',null,k.name));
+    r.appendChild(el('span',k.status==='active'?'ok':'bad',k.status));
+    const tokens=k.budget_tokens?k.month_tokens+' / '+k.budget_tokens+' tok':k.month_tokens+' tok';
+    const reqs=k.minute_requests+(k.rpm?' / '+k.rpm:'')+' req/min';
+    r.appendChild(el('span','muted',tokens+' this month · '+reqs+' · lanes '+(k.lanes?k.lanes.join(','):'all')
+      +(k.expires?' · expires '+String(k.expires).slice(0,10):'')));
+    box.appendChild(r);
+  });
+  if(ks.error) box.appendChild(el('div','muted',ks.error));
 }
 async function postFleet(body){
   await fetch('/api/fleet',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -2099,7 +2184,7 @@ function renderFeed(){
     r.appendChild(el('span','t',clock(e.t)));
     r.appendChild(el('span','st '+(ok?'ok':'bad'),String(e.status||'—')));
     const w=el('span','w');
-    w.textContent=(e.lane||'?')+' → '+shortModel(e.deployment||e.model)
+    w.textContent=(e.key?'['+e.key+'] ':'')+(e.lane||'?')+' → '+shortModel(e.deployment||e.model)
       +(e.provider?' ('+e.provider+')':'')
       +(e.fallbacks?'  ↳ after '+e.fallbacks+' fallback'+(e.fallbacks>1?'s':''):'')
       +(e.retries?'  ↻'+e.retries:'');
@@ -2159,7 +2244,7 @@ async function tick(){
     const pill=$('#uppill'); pill.className='pill '+(f.up?'up':'down'); pill.textContent=f.up?'● UP':'● DOWN';
     $('#updated').textContent='updated '+new Date(st.ts*1000).toLocaleTimeString();
     const foot=$('#foot');foot.replaceChildren(document.createTextNode('config '),el('code',null,st.config_path||''),document.createTextNode(' · log '),el('code',null,(st.activity||{}).log||'—'),document.createTextNode(' · auto-refresh 5s (no tokens)'));
-    renderOrch(st); renderWork(st); renderAct(st); renderLive(st); renderFleets(st);
+    renderOrch(st); renderWork(st); renderAct(st); renderLive(st); renderFleets(st); renderKeys(st.keys);
     openStream(st);
     // Only reseed the editor when the user has no unsaved edit. A 5s poll that
     // re-rendered mid-edit would drop a half-built chain and reset the Apply

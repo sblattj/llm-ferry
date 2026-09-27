@@ -1700,7 +1700,7 @@ function renderKeys(ks){
   rows.forEach(k=>{
     const r=el('div','row');
     r.appendChild(el('span',null,k.name));
-    r.appendChild(el('span',k.status==='active'?'ok':'bad',k.status));
+    r.appendChild(el('span',k.status==='active'?'ok':'err',k.status));
     const tokens=k.budget_tokens?k.month_tokens+' / '+k.budget_tokens+' tok':k.month_tokens+' tok';
     const reqs=k.minute_requests+(k.rpm?' / '+k.rpm:'')+' req/min';
     r.appendChild(el('span','muted',tokens+' this month · '+reqs+' · lanes '+(k.lanes?k.lanes.join(','):'all')

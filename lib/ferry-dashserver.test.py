@@ -717,6 +717,15 @@ class KeysSummaryTests(unittest.TestCase):
         self.assertEqual(s["keys"], [])
         self.assertTrue(s["error"].startswith("keys.json unreadable"), s["error"])
 
+    def test_key_store_module_unavailable_is_reported_not_raised(self):
+        with unittest.mock.patch.object(dash, "_keys_mods", return_value=None):
+            s = dash.keys_summary()
+        self.assertEqual(s["keys"], [])
+        self.assertIn("unavailable", s["error"])
+        self.assertIn("front/ferry_keys.py", s["error"])
+        self.assertFalse(os.path.exists(self.keys))
+        self.assertFalse(os.path.exists(self.db))
+
 
 if __name__ == "__main__":
     unittest.main()

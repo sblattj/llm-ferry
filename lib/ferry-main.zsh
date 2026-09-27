@@ -2,7 +2,7 @@
 # ----------------- PARSER -----------------
 
 # Help for ONE command, printed WITHOUT entering its cmd_ function. A command
-# with its own usage function (_ferry_<cmd>_usage: auth-claude, claude, fleet)
+# with its own usage function (_ferry_<cmd>_usage: auth-claude, claude, fleet, keys)
 # prints that; every other command prints its entry from the usage() banner.
 # Returns 1 when <cmd> is not a known command.
 _ferry_help_for() {
@@ -87,6 +87,7 @@ case "$COMMAND" in
   claude)        cmd_claude "$@" ;;
   auth-claude)   cmd_auth_claude "$@" ;;
   fleet)         cmd_fleet "$@" ;;
+  keys)          cmd_keys "$@" ;;
   update)        cmd_update "$@" ;;
   migrate)       cmd_migrate "$@" ;;
   dash)          cmd_dash "$@" ;;

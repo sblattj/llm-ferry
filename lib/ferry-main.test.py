@@ -5,7 +5,7 @@
 `cmd_reload` without "$@", so the flag never reached anything. The guard now
 answers -h/--help for every command before any cmd_ function runs.
 
-The harness sources lib/ferry-usage.zsh, the three modules that own a
+The harness sources lib/ferry-usage.zsh, the four modules that own a
 _ferry_<cmd>_usage function, then REPLACES every cmd_* with a stub that appends
 its name and argv to a marker file, then sources lib/ferry-main.zsh with the
 test's argv. No real command can run, so nothing here touches the live host.
@@ -26,7 +26,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 MAIN = os.path.join(HERE, "ferry-main.zsh")
 USAGE = os.path.join(HERE, "ferry-usage.zsh")
 USAGE_OWNERS = [os.path.join(HERE, m) for m in
-                ("ferry-claude.zsh", "ferry-fleet.zsh", "ferry-auth-claude.zsh")]
+                ("ferry-claude.zsh", "ferry-fleet.zsh", "ferry-auth-claude.zsh",
+                 "ferry-keys.zsh")]
 
 # Commands whose -h/--help is forwarded to a child script (see
 # _FERRY_PASSTHROUGH_CMDS in lib/ferry-main.zsh).
@@ -122,6 +123,8 @@ class DispatcherHelpGuard(unittest.TestCase):
         self.assertIn("Lane map:", proc.stdout)
         proc, _ = self.run_ferry("auth-claude", "login", "--help")
         self.assertIn("browser PKCE", proc.stdout)
+        proc, _ = self.run_ferry("keys", "--help")
+        self.assertIn("ferry keys revoke <name>", proc.stdout)
 
     def test_passthrough_forwards_help_to_the_command(self):
         proc, invoked = self.run_ferry("dash", "--grafana", "--help")

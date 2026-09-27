@@ -90,6 +90,9 @@ cmd_relay() {
       exit 1
     fi
 
+    # The expose line below carries the relay TOKEN — a value meant to be copied,
+    # so it must reach a pipe or a log as plain text (see _ferry_colors).
+    _ferry_colors
     echo "================================================================="
     echo "                    LLM-FERRY REVERSE RELAY"
     echo "================================================================="
@@ -98,7 +101,7 @@ cmd_relay() {
     echo "Log:            $RELAY_LOG"
     echo "================================================================="
     echo ">>> On the client, publish a local service through this host:"
-    echo "    \033[1;32mferry expose <local-port> --as <public-port> --token $token\033[0m"
+    echo "    ${C_GREEN}ferry expose <local-port> --as <public-port> --token $token${C_RESET}"
     echo "    (the token is saved on the client after the first successful run)"
     echo ""
     echo ">>> Whatever you expose keeps its OWN auth. The relay authenticates the"

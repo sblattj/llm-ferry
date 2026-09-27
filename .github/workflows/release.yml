@@ -1,0 +1,52 @@
+name: release
+
+# Pushing a v* tag creates its GitHub Release. Before this workflow existed,
+# `git push origin vX.Y.Z` was the whole release procedure and nothing made the
+# Release object, so the Releases page drifted behind the tags twice.
+#
+# Title, notes and the Latest flag come from scripts/release-notes.py (run it
+# locally to preview). Tags here are lightweight, so the source is the tagged
+# commit plus docs/releases/<tag>.md, never a tag message.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history and all tags: the notes fallback walks `git log`
+          # back to the previous tag, and Latest compares against every tag.
+          fetch-depth: 0
+
+      - name: Create the GitHub Release if it is missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to do."
+            exit 0
+          fi
+          title="$(python3 scripts/release-notes.py title "$TAG")"
+          latest="$(python3 scripts/release-notes.py latest "$TAG")"
+          python3 scripts/release-notes.py notes "$TAG" > "$RUNNER_TEMP/notes.md"
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          echo "title=$title latest=$latest"
+          gh release create "$TAG" --verify-tag \
+            --title "$title" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest="$latest" \
+            "${prerelease[@]}"

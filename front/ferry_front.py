@@ -737,6 +737,7 @@ LEGACY_HEAVY = frozenset({"orch", "orchestrator"})
 FLEET_HEADER = b"x-ferry-fleet"
 CLIENT_HEADER = b"x-ferry-client"
 FLEET_PATH = "/v1/ferry/fleet"
+KEYS_ENROLL_PATH = "/v1/ferry/keys/enroll"
 FLEET_STATE_ENV = "FERRY_FLEETS"
 HOST_IDENTITY = "host"
 
@@ -1447,6 +1448,8 @@ class LaneCatalogueFilter:
                     return await send({"type": "websocket.close", "code": 1008})
                 return await self._reply(send, status, key_error_body(
                     scope.get("path", ""), status, message))
+        if scope.get("type") == "http" and scope.get("path") == KEYS_ENROLL_PATH:
+            return await self._enroll(scope, receive, send)
         # The control plane first: GET /v1/ferry/chains, POST /v1/ferry/reorder,
         # and POST /v1/ferry/promote are answered HERE, before litellm ever sees
         # the request — litellm has no such routes and would 404 them, and more
@@ -1671,6 +1674,59 @@ class LaneCatalogueFilter:
             await self._reply(
                 send, 400, {"errors": ["could not read request body"]})
             return None
+
+    async def _enroll(self, scope, receive, send):
+        """Mint a device key for client-bootstrap.sh. Master key only.
+
+        `_bearer_ok` is deliberately NOT the gate: authenticate() has already
+        rewritten a device key's credential to the master, so only the
+        ORIGINAL credential class tells the real master apart —
+        scope["ferry.key"] == "master" with no scope["ferry.key_entry"] (an
+        admitted device key always carries one; the store also reserves the
+        name "master"). With no master configured, only a bare loopback
+        caller may enroll. Every error is an OpenAI-family body."""
+        def fail(status, message, otype, code):
+            return self._reply(send, status, key_error_body(
+                KEYS_ENROLL_PATH, status, message, code=code, openai_type=otype))
+
+        if scope.get("method", "GET").upper() != "POST":
+            return await fail(405, "use POST on %s" % KEYS_ENROLL_PATH,
+                              "invalid_request_error", "method_not_allowed")
+        is_master = (scope.get(KEY_SCOPE) == "master"
+                     and KEY_ENTRY_SCOPE not in scope)
+        if _master_key():
+            if not is_master:
+                return await fail(401, "enrolling a device key needs the master key",
+                                  "invalid_request_error", "invalid_api_key")
+        elif (not _is_loopback_client(scope) or scope.get(KEY_SCOPE)
+              or KEY_ENTRY_SCOPE in scope):
+            return await fail(403, "no master key is configured; enroll from "
+                                   "the host itself",
+                              "invalid_request_error", "enroll_not_allowed")
+        raw = await self._read_body(receive, send)
+        if raw is None:
+            return
+        try:
+            doc = json.loads(raw)
+        except Exception:
+            doc = None
+        if not isinstance(doc, dict) or not isinstance(doc.get("name"), str):
+            return await fail(400, 'body needs {"name": "<device>"}',
+                              "invalid_request_error", "invalid_key_name")
+        replace = doc.get("replace") is True
+        keys = None
+        try:
+            keys = _keys_module()
+            name, token = keys.add(doc["name"], unique=not replace,
+                                   replace=replace)
+        except Exception as err:
+            if isinstance(err, getattr(keys, "KeyNameError", ())):
+                return await fail(400, str(err), "invalid_request_error",
+                                  "invalid_key_name")
+            _key_warn(err)
+            return await fail(503, "the ferry key store is unwritable: %s" % err,
+                              "server_error", "key_store_unavailable")
+        return await self._reply(send, 200, {"name": name, "key": token})
 
     async def _fleet_rewrite(self, scope, receive, send, collector=None):
         """Resolve this request's fleet and return a one-shot replay `receive`.

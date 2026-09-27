@@ -909,6 +909,13 @@ class TestMasterKeyProbes(unittest.TestCase):
         self.assertIsNotNone(m, "_ferry_wait_http is missing from ferry")
         return m.group(0)
 
+    def colors_body(self):
+        # _ferry_wait_http gates its READY / NOT READY colour through the shared
+        # core helper, so the extracted function needs it defined alongside.
+        m = re.search(r"^C_GREEN=.*?\n_ferry_colors\(\) \{.*?\n\}", self.src, re.S | re.M)
+        self.assertIsNotNone(m, "_ferry_colors is missing from ferry")
+        return m.group(0)
+
     def run_wait_http(self, mode, server_status, require_bearer=None,
                       env_key=None, timeout="3"):
         """Execute the REAL extracted function against a throwaway HTTP server."""
@@ -935,7 +942,7 @@ class TestMasterKeyProbes(unittest.TestCase):
         url = f"http://127.0.0.1:{srv.server_address[1]}/probe"
 
         with tempfile.NamedTemporaryFile("w", suffix=".zsh", delete=False) as f:
-            f.write("set -u\n" + self.wait_http_body() + "\n"
+            f.write("set -u\n" + self.colors_body() + "\n" + self.wait_http_body() + "\n"
                     f"_ferry_wait_http '{url}' probe {timeout} {mode}\n"
                     "echo RC=$?\n")
             path = f.name

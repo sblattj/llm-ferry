@@ -392,23 +392,24 @@ _ferry_launch_mlx() {
 # installs probe exactly as they did before.
 _ferry_wait_http() {
   local url="$1" label="$2" timeout="${3:-600}" mode="${4:-content}" waited=0 code
+  _ferry_colors
   local -a hdr=()
   [[ -n "${LITELLM_MASTER_KEY:-}" ]] && hdr=(-H "Authorization: Bearer $LITELLM_MASTER_KEY")
   while (( waited < timeout )); do
     code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "${hdr[@]}" "$url" 2>/dev/null || true)"
     if [[ "$code" == 2* ]]; then
-      echo ">>> [$label] \033[1;32mREADY\033[0m (${waited}s)"
+      echo ">>> [$label] ${C_GREEN}READY${C_RESET} (${waited}s)"
       return 0
     fi
     if [[ "$mode" == "readiness" && "$code" == "401" ]]; then
-      echo ">>> [$label] \033[1;32mREADY\033[0m (${waited}s) — up; answering 401 (master_key auth on)"
+      echo ">>> [$label] ${C_GREEN}READY${C_RESET} (${waited}s) — up; answering 401 (master_key auth on)"
       return 0
     fi
     sleep 3
     waited=$(( waited + 3 ))
     (( waited % 15 == 0 )) && echo "    [$label] loading... ${waited}s"
   done
-  echo ">>> [$label] \033[1;33mNOT READY\033[0m after ${timeout}s - still loading, or check its log."
+  echo ">>> [$label] ${C_YELLOW}NOT READY${C_RESET} after ${timeout}s - still loading, or check its log."
   return 1
 }
 
@@ -778,7 +779,8 @@ cmd_up() {
       exit 1
     fi
 
-    echo ">>> Proxying to Cloud Model: \033[1;32m$CLOUD_MODEL\033[0m"
+    _ferry_colors
+    echo ">>> Proxying to Cloud Model: ${C_GREEN}$CLOUD_MODEL${C_RESET}"
     echo "    Port: $target_port"
     
     # Launch LiteLLM proxy
@@ -1138,6 +1140,7 @@ cmd_reload() {
 }
 
 cmd_status() {
+  _ferry_colors
   if (( CLIENT_MODE )); then
     echo "================================================================="
     echo "                 LLM-FERRY CLIENT DIAGNOSTICS"
@@ -1155,7 +1158,7 @@ cmd_status() {
     # bare MLX lane (ferry up --local), which serves no liveliness route.
     local probe_code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" 2>/dev/null || true)"
     if [[ "$probe_code" == 2* ]] || [[ "$probe_code" == "401" ]]; then
-      echo ">>> Connection Health: \033[1;32mONLINE\033[0m"
+      echo ">>> Connection Health: ${C_GREEN}ONLINE${C_RESET}"
       [[ "$probe_code" == "401" ]] && echo "    (front door is behind master_key auth — export LITELLM_MASTER_KEY to read the lane list)"
 
       # Query active model. Catalogue content: send the bearer when this box
@@ -1165,10 +1168,10 @@ cmd_status() {
       local models=$(curl -fsS -m 2 "${status_auth[@]}" "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" 2>/dev/null || echo "")
       if [[ -n "$models" ]]; then
         local active=$(echo "$models" | python3 -c "import json,sys; d=json.load(sys.stdin).get('data',[]); print(d[0]['id'] if d else 'None')")
-        echo "    Currently active model on Host: \033[1;32m$active\033[0m"
+        echo "    Currently active model on Host: ${C_GREEN}$active${C_RESET}"
       fi
     else
-      echo ">>> Connection Health: \033[1;31mOFFLINE\033[0m (Check Wi-Fi/cable or network status)"
+      echo ">>> Connection Health: ${C_RED}OFFLINE${C_RESET} (Check Wi-Fi/cable or network status)"
     fi
     echo "================================================================="
     return
@@ -1198,7 +1201,7 @@ cmd_status() {
     if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
       local pid=$(lsof -t -iTCP:"$p" -sTCP:LISTEN | head -1)
       local cmd=$(ps -p "$pid" -o comm= 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
-      echo ">>> Port $p ($_label) is \033[1;32mONLINE\033[0m (PID: $pid, Command: $cmd)"
+      echo ">>> Port $p ($_label) is ${C_GREEN}ONLINE${C_RESET} (PID: $pid, Command: $cmd)"
 
       # phys_footprint is the number that matters for an MLX lane — RSS is blind
       # to wired GPU memory, so `ps` cheerfully under-reports a 50GB model server.
@@ -1212,7 +1215,7 @@ cmd_status() {
         # loaded — printing it would advertise eight models this lane cannot serve
         # without a reload. The launch line is the truth, so read --model from argv.
         local loaded=$(ps -p "$pid" -o args= 2>/dev/null | sed -E 's/.*--model[= ]+([^ ]+).*/\1/')
-        [[ -n "$loaded" ]] && echo "    Model loaded: \033[1;32m$loaded\033[0m"
+        [[ -n "$loaded" ]] && echo "    Model loaded: ${C_GREEN}$loaded${C_RESET}"
         echo "    (internal backend — address this lane as a lane name on :$PORT, not here)"
       elif [[ "$p" != "$SHARE_PORT" ]]; then
         # The front door: list every lane it serves, not just the first one.
@@ -1224,7 +1227,7 @@ cmd_status() {
         if [[ -n "$models" ]]; then
           local served=$(echo "$models" | python3 -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "")
           if [[ -n "$served" ]]; then
-            echo "    Lanes served: \033[1;32m$served\033[0m"
+            echo "    Lanes served: ${C_GREEN}$served${C_RESET}"
             local first=${served%% *}
             # max_tokens 256, not 10. Every lane on this endpoint is now a
             # REASONING model, and reasoning tokens are drawn from the same
@@ -1243,26 +1246,26 @@ cmd_status() {
         fi
       fi
     else
-      echo ">>> Port $p ($_label) is \033[1;31mOFFLINE\033[0m"
+      echo ">>> Port $p ($_label) is ${C_RED}OFFLINE${C_RESET}"
     fi
   done
 
   # Experimental HuggingFace pass-through proxy (only reported when running).
   if lsof -nP -iTCP:"$HF_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     local hf_pid=$(lsof -t -iTCP:"$HF_PORT" -sTCP:LISTEN)
-    echo ">>> Port $HF_PORT is \033[1;32mONLINE\033[0m (HF pass-through proxy, PID: $hf_pid)"
+    echo ">>> Port $HF_PORT is ${C_GREEN}ONLINE${C_RESET} (HF pass-through proxy, PID: $hf_pid)"
   fi
 
   # General HTTP(S) download forward proxy (only reported when running).
   if lsof -nP -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo ">>> HTTP download proxy is \033[1;32mONLINE\033[0m (port $PROXY_PORT)"
+    echo ">>> HTTP download proxy is ${C_GREEN}ONLINE${C_RESET} (port $PROXY_PORT)"
   fi
 
   # Reverse-expose relay, and — the part that matters — every port a client has
   # published through it. A port opened on this machine on someone else's behalf
   # must be visible here, or nobody can answer "what is this host serving?".
   if lsof -nP -iTCP:"$RELAY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo ">>> Reverse relay is \033[1;32mONLINE\033[0m (control port $RELAY_PORT)"
+    echo ">>> Reverse relay is ${C_GREEN}ONLINE${C_RESET} (control port $RELAY_PORT)"
     if [[ -f "$RELAY_STATE_FILE" ]]; then
       python3 - "$RELAY_STATE_FILE" <<'PYEOF' || true
 import json, sys
@@ -1286,7 +1289,7 @@ PYEOF
 
   # Browser VNC viewer: one URL per screen a client has published with expose-vnc.
   if lsof -nP -iTCP:"$VNC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo ">>> VNC viewer is \033[1;32mONLINE\033[0m (http://$MDNS_NAME:$VNC_PORT)"
+    echo ">>> VNC viewer is ${C_GREEN}ONLINE${C_RESET} (http://$MDNS_NAME:$VNC_PORT)"
     if [[ -f "$RELAY_STATE_FILE" ]]; then
       python3 - "$RELAY_STATE_FILE" "$MDNS_NAME" "$VNC_PORT" <<'PYEOF' || true
 import json, sys

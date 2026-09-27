@@ -267,8 +267,9 @@ Ferry supplies **confidentiality, not delivery** — a deliberate limit that kee
 ```bash
 ferry pull mlx-community/Qwen3.8-27B-nvfp4 --host your-mac.local   # http: stream from the host's HF cache (8095)
 ferry pull org/model --host your-mac.local --transport hf          # EXPERIMENTAL: through the host's HF proxy
-ferry offer ~/datasets/eval.jsonl                                  # host: record files for clients
-ferry get eval.jsonl --host your-mac.local --to ./data             # client: fetch by basename
+ferry offer ~/datasets/eval.jsonl                                  # host: record files for clients (name = basename)
+ferry offer --as evals ~/datasets/v2                               # host: choose the name clients ask for
+ferry get eval.jsonl --host your-mac.local --to ./data             # client: fetch by name
 ferry receive --port 9099 --to ./incoming                          # direct push: client listens (netcat)
 ferry send ~/some/dir client-laptop.local --port 9099              # ...then the host pushes
 curl -fsS http://your-mac.local:8095/manifest                      # plain curl too: cached models + offered files
@@ -351,7 +352,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `fleet ls\|show\|use <name>` | both | List fleets, show resolved selections, set a caller's sticky fleet |
 | `relay` / `expose <port>` / `expose-vnc` | host / client | Reverse expose: client dials out, host publishes its port (RFB preflight for VNC) |
 | `serve-vnc [--bind ADDR] [--fetch]` | host | Browser VNC viewer + WebSocket bridge (default `8099`) |
-| `offer <path>...` / `get <name>` | host / client | Record files for clients; fetch an offered file/dir by basename |
+| `offer [--as NAME] <path>...` / `get <name>` | host / client | Record files for clients (a name collision is refused; `.app` bundles keep their signature; `--selftest` offers a fixture); fetch an offered file/dir by name |
 | `pull <model-id> [--transport http\|hf\|nc]` | client | Pull a model from the host cache (three transports) |
 | `receive` / `send <path> <client-host>` | client / host | Netcat tar stream (default port `9099`) |
 | `serve-hf` / `serve-proxy` / `env [--write]` | host / client | HF pass-through (8096) + HTTP(S) forward proxy (8097); `env` emits the client's proxy exports |

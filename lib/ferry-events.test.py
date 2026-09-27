@@ -140,7 +140,15 @@ class TestRecord(unittest.TestCase):
             "duration_ms", "overhead_ms", "cost", "resp_bytes",
             "client_ip", "path", "schema_warnings", "stream", "response_start_ms",
             "first_text_ms", "total_duration_ms", "input_tokens", "output_tokens",
-            "reasoning_tokens", "cached_input_tokens", "response_complete"})
+            "reasoning_tokens", "cached_input_tokens", "response_complete", "key"})
+
+    def test_key_defaults_to_empty_until_the_front_door_names_it(self):
+        # The front door writes the device key's NAME (or "master"); the
+        # record builder never sees a credential, so it can only say "".
+        r = E.record_from_headers([(b"authorization", b"Bearer fk-x-" + b"a" * 32)],
+                                  "", "/v1/chat/completions", 200)
+        self.assertEqual(r["key"], "")
+        self.assertNotIn("fk-x-", json.dumps(r))
 
     def test_schema_warnings_default_to_empty_until_the_front_door_scans(self):
         # record_from_headers never sees a request body; the front door attaches

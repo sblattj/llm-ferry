@@ -39,6 +39,7 @@ wrong fleet is worse than one that refuses to start.
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import importlib.machinery
 import importlib.util
@@ -1362,6 +1363,90 @@ def key_error_body(path, status, message, code=None, openai_type=None) -> dict:
                       "param": None, "code": code or ocode}}
 
 
+# ── device-key limits and token accounting ──────────────────────────────────
+# A device key's lanes, RPM and monthly token budget are checked AFTER fleet
+# resolution (a lane limit must see both the requested and the resolved
+# `<fleet>.<lane>`), and only a request that passed is charged. Tokens are
+# input + output: reasoning is already inside output (lib/ferry_metrics.py).
+# Tokens are added on completion, so every request already in flight when a
+# budget is crossed has passed admission: requests already in flight can
+# overshoot the budget, bounded by the key's concurrency, not by one request.
+# The SQLite calls (5 s busy timeout) run in a worker thread so a stuck writer
+# never stalls the event loop. Master and bare requests never touch any of it.
+KEY_ADMITTED_SCOPE = "ferry.key_admitted"
+_USAGES: dict = {}
+
+
+def _usage_module():
+    return _front_sibling("ferry_keys_usage")
+
+
+def _usage():
+    """One Usage per DB path per process; the path is read per call."""
+    mod = _usage_module()
+    path = mod.usage_path()
+    usage = _USAGES.get(path)
+    if usage is None:
+        usage = _USAGES[path] = mod.Usage(path)
+    return usage
+
+
+def _usage_forget(usage) -> None:
+    """Drop a cached Usage after it failed, so the next request builds a fresh
+    one. A cached instance skips schema creation, so a DB file deleted while
+    the front runs would otherwise fail ("no such table") until a restart."""
+    for path, cached in list(_USAGES.items()):
+        if cached is usage:
+            _USAGES.pop(path, None)
+
+
+def _usage_admit(name, rpm, budget_tokens):
+    """Usage.admit on the current DB; a failed instance is forgotten. Raises."""
+    usage = _usage()
+    try:
+        return usage.admit(name, rpm, budget_tokens)
+    except Exception:
+        _usage_forget(usage)
+        raise
+
+
+def _account_tokens(scope, observed) -> None:
+    """Charge an admitted device-key request its tokens. Never raises.
+
+    input + output only: reasoning tokens are already inside output
+    (lib/ferry_metrics.py). A refused request was never admitted, so its
+    error body costs nothing. Synchronous: callers run it off the event loop
+    (_charge_tokens)."""
+    try:
+        if not scope.get(KEY_ADMITTED_SCOPE):
+            return
+        tokens = 0
+        for field in ("input_tokens", "output_tokens"):
+            value = (observed or {}).get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                tokens += int(value)
+        if tokens:
+            usage = _usage()
+            try:
+                usage.add_tokens(scope[KEY_SCOPE], tokens)
+            except Exception:
+                _usage_forget(usage)
+                raise
+    except Exception as err:
+        _key_warn(err)
+
+
+async def _charge_tokens(scope, observed) -> None:
+    """_account_tokens in a worker thread; a no-op (no thread hop) for a
+    request that was never admitted. Never raises."""
+    try:
+        if observed is None or not scope.get(KEY_ADMITTED_SCOPE):
+            return
+        await asyncio.to_thread(_account_tokens, scope, observed)
+    except Exception as err:
+        _key_warn(err)
+
+
 _FLEET_WARNED: dict = {}
 FLEET_WARN_INTERVAL = 60.0
 
@@ -1634,7 +1719,11 @@ class LaneCatalogueFilter:
         strip = strip_headers_enabled() and not _is_loopback_client(scope)
         collector = module = token = None
         tapped = None
-        if tap_enabled():
+        emit = tap_enabled()
+        # A device-key request is metered whether or not the event tap is on:
+        # its token budget must not depend on FERRY_EVENTS.
+        metered = scope.get(KEY_ENTRY_SCOPE) is not None
+        if emit or metered:
             started_at = time.monotonic()
             try:
                 module = _metrics_module()
@@ -1642,7 +1731,7 @@ class LaneCatalogueFilter:
                 token = module.CURRENT_METRICS.set(collector)
             except Exception:
                 collector = None
-            tapped = self._tapped(scope, send, strip, collector)
+            tapped = self._tapped(scope, send, strip, collector, emit=emit)
             send = tapped
         elif strip:
             send = self._stripping(send)
@@ -1653,7 +1742,7 @@ class LaneCatalogueFilter:
         finally:
             try:
                 if tapped is not None:
-                    tapped.finish(False)
+                    await _charge_tokens(scope, tapped.finish(False))
             finally:
                 if token is not None:
                     module.CURRENT_METRICS.reset(token)
@@ -1717,6 +1806,7 @@ class LaneCatalogueFilter:
                     doc = json.loads(body)
                 except Exception:
                     doc = None
+        requested = doc.get("model") if isinstance(doc, dict) else None
         if isinstance(doc, dict) and tap_enabled():
             # The record still NAMES what was found — now with `fixed` per
             # entry — so a lane that hangs for one client stays traceable to
@@ -1752,7 +1842,13 @@ class LaneCatalogueFilter:
             if resolved and resolved != doc["model"]:
                 doc["model"] = resolved
                 changed = True
-        if (tap_enabled() and isinstance(doc, dict) and doc.get("stream") is True
+        entry = scope.get(KEY_ENTRY_SCOPE)
+        if entry is not None:
+            resolved = doc.get("model") if isinstance(doc, dict) else None
+            if not await self._key_admit(scope, send, entry, requested, resolved):
+                return None
+        if ((tap_enabled() or entry is not None) and isinstance(doc, dict)
+                and doc.get("stream") is True
                 and scope.get("path") in ("/v1/chat/completions", "/chat/completions")):
             options = doc.get("stream_options")
             if options is None or isinstance(options, dict):
@@ -1783,6 +1879,45 @@ class LaneCatalogueFilter:
             return await receive()
 
         return replay
+
+    async def _key_admit(self, scope, send, entry, requested, resolved) -> bool:
+        """Lane, RPM and budget gate for a device key. False = already replied.
+
+        An unparseable body has no model, so a lane-restricted key is refused
+        (fail-closed). The usage DB runs in a worker thread; any failure there
+        is a 503 for this key only."""
+        path = scope.get("path", "")
+        name = scope.get(KEY_SCOPE, "")
+        lanes = entry.get("lanes")
+        if not _keys_module().lane_allowed(lanes, requested, resolved):
+            await self._reply(send, 403, key_error_body(path, 403,
+                "ferry device key %r may not use model %r (allowed lanes: %s)"
+                % (name, requested, ", ".join(lanes or []))))
+            return False
+        try:
+            verdict = await asyncio.to_thread(
+                _usage_admit, name, entry.get("rpm"), entry.get("budget_tokens"))
+        except Exception as err:
+            _key_warn(err)
+            await self._reply(send, 503, key_error_body(path, 503,
+                "the ferry key usage store is unavailable, so device keys are "
+                "refused until it is fixed (see the host's front log)"))
+            return False
+        if not verdict.ok:
+            retry = [(b"retry-after", str(max(1, int(verdict.retry_after))).encode())]
+            if verdict.reason == "budget":
+                doc = key_error_body(path, 429,
+                    "ferry device key %r has used its monthly budget of %s tokens"
+                    % (name, entry.get("budget_tokens")),
+                    code="insufficient_quota", openai_type="insufficient_quota")
+            else:
+                doc = key_error_body(path, 429,
+                    "ferry device key %r is over its limit of %s requests per minute"
+                    % (name, entry.get("rpm")))
+            await self._reply(send, 429, doc, retry)
+            return False
+        scope[KEY_ADMITTED_SCOPE] = True
+        return True
 
     def _catalogue_fleet(self, scope):
         """The fleet whose lanes this caller's bare names should mean.
@@ -1851,12 +1986,17 @@ class LaneCatalogueFilter:
 
         return stripping
 
-    def _tapped(self, scope, send, strip=False, collector=None):
+    def _tapped(self, scope, send, strip=False, collector=None, emit=True):
         """Passively observe bounded response data; emit after final send.
 
         Original chunks and ordering survive unchanged. A failed/unfinished
         response still emits observed numeric data; observation failures never
         hide application or downstream-send exceptions.
+
+        `emit=False` meters without an event record (a device key with the
+        tap off). `finish` returns the observed numbers the first time it
+        runs (None after that); the async caller charges them to the key via
+        _charge_tokens, off the event loop.
         """
         rec = None
         nbytes = 0
@@ -1865,18 +2005,20 @@ class LaneCatalogueFilter:
         def finish(complete):
             nonlocal rec, emitted
             if emitted:
-                return
+                return None
             emitted = True
             observed = {}
             if collector is not None:
                 try:
-                    observed = collector.finish(complete=complete)
+                    observed = collector.finish(complete=complete) or {}
                 except Exception:
-                    pass
+                    observed = {}
+            if not emit:
+                return observed
             try:
                 tap = _tap()
                 if tap is None:
-                    return
+                    return observed
                 if rec is None:
                     client = scope.get("client") or ("", 0)
                     rec = tap.record_from_headers([], client[0], scope.get("path", ""), 0)
@@ -1884,22 +2026,25 @@ class LaneCatalogueFilter:
                 rec["resp_bytes"] = nbytes
                 rec["response_complete"] = bool(complete)
                 rec.update(observed)
+                rec["key"] = scope.get(KEY_SCOPE, "")
                 tap.offer(rec)
             except Exception:
                 pass
+            return observed
 
         async def tapped(message):
             nonlocal rec, nbytes
             mtype = message.get("type")
             if mtype == "http.response.start":
-                try:
-                    tap = _tap()
-                    if tap is not None:
-                        client = scope.get("client") or ("", 0)
-                        rec = tap.record_from_headers(message.get("headers") or [],
-                            client[0], scope.get("path", ""), message.get("status", 0))
-                except Exception:
-                    pass
+                if emit:
+                    try:
+                        tap = _tap()
+                        if tap is not None:
+                            client = scope.get("client") or ("", 0)
+                            rec = tap.record_from_headers(message.get("headers") or [],
+                                client[0], scope.get("path", ""), message.get("status", 0))
+                    except Exception:
+                        pass
                 if collector is not None:
                     try:
                         collector.start_response(message.get("headers") or [], message.get("status", 0))
@@ -1922,7 +2067,8 @@ class LaneCatalogueFilter:
                         pass
             result = await send(message)
             if mtype == "http.response.body" and not message.get("more_body"):
-                finish(True)
+                # The client already has its last byte; the charge follows.
+                await _charge_tokens(scope, finish(True))
             return result
 
         tapped.finish = finish

@@ -174,9 +174,9 @@ PYEOF
   # to another machine, so when stdout is redirected it must come out as plain
   # text a script can read — wrapping a secret in escape codes makes
   # `ferry drop f | grep passphrase` return something subtly wrong rather than
-  # something that obviously failed.
-  local g="" y="" z=""
-  if [[ -t 1 ]]; then g=$'\033[1;32m'; y=$'\033[1;33m'; z=$'\033[0m'; fi
+  # something that obviously failed. The gate is the shared _ferry_colors.
+  _ferry_colors
+  local g="$C_GREEN" y="$C_YELLOW" z="$C_RESET"
 
   echo ""
   echo "  ${g}${out}${z}  (${size} bytes, aes-256-cbc + pbkdf2@${FERRYDROP_ITER}, hmac-sha256)"
@@ -347,7 +347,7 @@ PYEOF
   fi
   [[ -d "$dest" ]] && dest="$dest/$name"
   cp "$work/pt" "$dest"
-  local g="" z=""
-  if [[ -t 1 ]]; then g=$'\033[1;32m'; z=$'\033[0m'; fi
+  _ferry_colors
+  local g="$C_GREEN" z="$C_RESET"
   echo "  ${g}${dest}${z}  ($(wc -c < "$dest" | tr -d ' ') bytes, verified)"
 }

@@ -30,6 +30,28 @@ APP_DIR="$(dirname "${0:A}")"
 # relay backgrounding itself) cannot compute this for itself.
 FERRY_BIN_PATH="${0:A}"
 
+# ---- Colour: for a human at a terminal, never for a pipe ----
+# _ferry_colors [fd] — set C_GREEN / C_YELLOW / C_RED / C_RESET for the stream
+# about to be written (fd 1 by default; pass 2 for a message going to stderr).
+# When that fd is not a terminal, everything we print may be scraped by a
+# script or pasted into another shell, and a value wrapped in escape codes (a
+# relay token, a drop passphrase, a `curl … | zsh` bootstrap line) comes back
+# subtly wrong rather than obviously broken — so the variables are empty.
+# Honours https://no-color.org: a non-empty NO_COLOR disables colour even on a
+# tty. Call it in the SAME redirection scope as the echo that uses the
+# variables: `[[ -t 1 ]]` tests fd 1 as the caller currently sees it, so a
+# function invoked as `f >log` correctly gets no colour.
+# This is the ONLY place in lib/ that may contain a literal escape sequence.
+C_GREEN="" C_YELLOW="" C_RED="" C_RESET=""
+_ferry_colors() {
+  local fd="${1:-1}"
+  if [[ -t $fd && -z "${NO_COLOR:-}" ]]; then
+    C_GREEN=$'\033[1;32m' C_YELLOW=$'\033[1;33m' C_RED=$'\033[1;31m' C_RESET=$'\033[0m'
+  else
+    C_GREEN="" C_YELLOW="" C_RED="" C_RESET=""
+  fi
+}
+
 # ---- OS detection & portable host helpers (macOS + Linux) ----
 case "$(uname -s)" in
   Darwin) IS_MAC=1 ;;

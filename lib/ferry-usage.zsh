@@ -1,6 +1,53 @@
 
 # Banner Help
+#
+# `usage` prints the whole banner and EXITS 0 (cmd_down and the dispatcher's
+# unknown-command arm rely on the exit). `_ferry_usage_text` is the same banner
+# without the exit, so `_ferry_usage_section` can cut one command's entry out of
+# it for `ferry <cmd> --help` / `ferry help <cmd>`.
 usage() {
+  _ferry_usage_text
+  exit 0
+}
+
+# Print ONE command's entry from the banner: the line `  <cmd>` (two-space
+# indent, then the name, then a space or end of line) plus every deeper-indented
+# continuation line under it. `expose` does not match `expose-vnc` because the
+# name must be followed by a space or the end of the line. `up` also gets its
+# "Options for 'up':" block, which is where its flags are documented.
+# Prints nothing and returns 1 when the banner has no entry for <cmd>.
+_ferry_usage_section() {
+  local cmd="$1" out
+  out="$(_ferry_usage_text | awk -v cmd="$cmd" '
+    function is_entry(l) { return l ~ /^  [^ ]/ }
+    {
+      if (inopts) {
+        if ($0 ~ /^$/) { inopts = 0; next }
+        print; next
+      }
+      if (grab) {
+        if ($0 ~ /^   / && !is_entry($0)) { print; next }
+        grab = 0
+      }
+      if ($0 == "Commands:") { incmds = 1; next }
+      if ($0 == "Options for '"'"'up'"'"':") {
+        incmds = 0
+        if (cmd == "up") { print ""; print; inopts = 1 }
+        next
+      }
+      if (incmds && is_entry($0)) {
+        name = substr($0, 3); sp = index(name, " ")
+        if (sp) name = substr(name, 1, sp - 1)
+        if (name == cmd) { print; grab = 1; next }
+      }
+    }')" || true
+  [[ -n "$out" ]] || return 1
+  print -r -- "$out"
+  print -r -- ""
+  print -r -- "(All commands: ferry --help)"
+}
+
+_ferry_usage_text() {
   cat <<EOF
 LLM-Ferry CLI (ferry) — Decoupled Local AI LAN sharing & Cloud proxying.
 
@@ -54,9 +101,14 @@ Commands:
                        claude-ferry / claude-ferry-local wrappers (cloud: heavy/flash,
                        local: local-orch/local-sub) and records the lane map
                         ferry claude [--host H] [--port P] [--wrappers]
+  auth-claude        [Dual] Claude Pro/Max subscription OAuth (browser PKCE)
+                        ferry auth-claude login | status | refresh | logout [--force]
   fleet              [Dual] Read or switch which fleet (routing set) bare lane
                        names resolve to
                         ferry fleet ls | show | use <fleet> [--default] | use --clear
+  help [command]     Show this banner, or one command's usage. Every command
+                       also answers -h/--help WITHOUT running (ferry reload --help
+                       only prints help); 'dash' forwards --help to its script
 
 Ferrying models & files across the LAN:
   offer <path>...    [Host] Record files/dirs in ~/.config/ferry/offered.json for clients to fetch
@@ -144,5 +196,4 @@ Examples:
   ferry msg "hello"    # Sends telemetry message back to the host Mac
   cat err.log | ferry log  # Stream errors back to host Mac
 EOF
-  exit 0
 }

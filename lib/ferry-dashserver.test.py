@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import socket
 import tempfile
 import threading
@@ -272,6 +273,12 @@ class HttpServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp_dir = tempfile.TemporaryDirectory()
+        # /status now reads the device-key store; keep every request in this
+        # class off the real ~/.config/ferry/keys.json and its usage DB.
+        cls.keys_env = unittest.mock.patch.dict(os.environ, {
+            "FERRY_KEYS_FILE": os.path.join(cls.tmp_dir.name, "keys.json"),
+            "FERRY_KEYS_DB": os.path.join(cls.tmp_dir.name, "keys-usage.sqlite")})
+        cls.keys_env.start()
         cls.cfg_path = os.path.join(cls.tmp_dir.name, "litellm.yaml")
         with open(cls.cfg_path, "w") as f:
             f.write(CONFIG)
@@ -294,6 +301,7 @@ class HttpServerTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.srv.shutdown()
         cls.srv.server_close()
+        cls.keys_env.stop()
         cls.tmp_dir.cleanup()
 
     def _get(self, path):
@@ -331,6 +339,14 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual(ctype, "application/json")
         data = json.loads(body.decode())
         self.assertIn("topology", data)
+
+    def test_status_carries_the_keys_card(self):
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(os.environ, {
+                "FERRY_KEYS_FILE": os.path.join(tmp, "keys.json"),
+                "FERRY_KEYS_DB": os.path.join(tmp, "u.sqlite")}):
+            status, _, body = self._get("/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["keys"], {"error": None, "keys": []})
 
     def test_probe_endpoint(self):
         with unittest.mock.patch.object(dash, "probe_backends", return_value={"mock": True}):
@@ -656,6 +672,59 @@ class MainEntrypointTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as ctx:
                     runpy.run_path(os.path.join(REPO, "ferry-dash"), run_name="__main__")
                 self.assertEqual(ctx.exception.code, 0)
+
+
+class KeysSummaryTests(unittest.TestCase):
+    """The dash's device-key card: names, status, limits and usage — never a
+    key or its hash. FERRY_KEYS_FILE / FERRY_KEYS_DB point into a temp dir."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ferry-dash-keys-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.keys = os.path.join(self.tmp, "keys.json")
+        self.db = os.path.join(self.tmp, "keys-usage.sqlite")
+        patcher = unittest.mock.patch.dict(os.environ, {
+            "FERRY_KEYS_FILE": self.keys, "FERRY_KEYS_DB": self.db})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_summary_has_status_limits_usage_and_no_secrets(self):
+        K, U = dash._keys_mods()
+        _, token = K.add("mbp", rpm=30, budget_tokens=1000)
+        K.add("old")
+        K.revoke("old")
+        U.Usage().add_tokens("mbp", 12)
+        s = dash.keys_summary()
+        self.assertIsNone(s["error"])
+        by = {k["name"]: k for k in s["keys"]}
+        self.assertEqual(by["mbp"]["status"], "active")
+        self.assertEqual((by["mbp"]["rpm"], by["mbp"]["budget_tokens"],
+                          by["mbp"]["month_tokens"]), (30, 1000, 12))
+        self.assertEqual(by["old"]["status"], "revoked")
+        text = json.dumps(s)
+        self.assertNotIn(token, text)
+        self.assertNotRegex(text, r"[0-9a-f]{64}")
+
+    def test_missing_store_is_empty_and_creates_nothing(self):
+        self.assertEqual(dash.keys_summary(), {"error": None, "keys": []})
+        self.assertFalse(os.path.exists(self.keys))
+        self.assertFalse(os.path.exists(self.db))
+
+    def test_corrupt_store_is_reported_not_raised(self):
+        with open(self.keys, "w") as fh:
+            fh.write("{nope")
+        s = dash.keys_summary()
+        self.assertEqual(s["keys"], [])
+        self.assertTrue(s["error"].startswith("keys.json unreadable"), s["error"])
+
+    def test_key_store_module_unavailable_is_reported_not_raised(self):
+        with unittest.mock.patch.object(dash, "_keys_mods", return_value=None):
+            s = dash.keys_summary()
+        self.assertEqual(s["keys"], [])
+        self.assertIn("unavailable", s["error"])
+        self.assertIn("front/ferry_keys.py", s["error"])
+        self.assertFalse(os.path.exists(self.keys))
+        self.assertFalse(os.path.exists(self.db))
 
 
 if __name__ == "__main__":

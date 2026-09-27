@@ -116,6 +116,59 @@ class TestAddAndPersist(StoreCase):
         self.assertEqual(cache.lookup(old)[1], "unknown")
         self.assertEqual(cache.lookup(new)[1], "ok")
 
+    def test_replace_applies_new_limits(self):
+        K.add("laptop", rpm=5, budget_tokens=100)
+        K.add("laptop", replace=True, rpm=9)
+        entry = K.find(K.load(), "laptop")
+        self.assertEqual((entry["rpm"], entry["budget_tokens"]), (9, 100))
+
+    def test_replace_without_limit_args_keeps_old_limits(self):
+        K.add("laptop", rpm=5, budget_tokens=100, lanes=["flash"])
+        K.add("laptop", replace=True)
+        entry = K.find(K.load(), "laptop")
+        self.assertEqual((entry["rpm"], entry["budget_tokens"], entry["lanes"]),
+                         (5, 100, ["flash"]))
+
+    def test_replace_of_an_expired_entry_is_admitted(self):
+        past = K.iso(datetime.datetime.now(UTC) - datetime.timedelta(days=1))
+        K.add("laptop", expires=past)
+        _, token = K.add("laptop", replace=True)
+        self.assertIsNone(K.find(K.load(), "laptop")["expires"])
+        self.assertEqual(K.KeyCache().lookup(token)[1], "ok")
+
+    def test_replace_with_future_expires_sets_it(self):
+        K.add("laptop")
+        future = K.iso(datetime.datetime.now(UTC) + datetime.timedelta(days=3))
+        _, token = K.add("laptop", replace=True, expires=future)
+        self.assertEqual(K.find(K.load(), "laptop")["expires"], future)
+        self.assertEqual(K.KeyCache().lookup(token)[1], "ok")
+
+    def test_replace_validates_limits_before_writing(self):
+        K.add("laptop", rpm=5)
+        with open(self.path) as fh:
+            before = fh.read()
+        with self.assertRaises(K.KeyNameError):
+            K.add("laptop", replace=True, rpm=0)
+        with open(self.path) as fh:
+            self.assertEqual(fh.read(), before)
+
+    def test_bad_expires_is_refused_before_any_write(self):
+        with self.assertRaises(K.KeyNameError):
+            K.add("x", expires="soon")
+        self.assertFalse(os.path.exists(self.path))
+        self.assertFalse(os.path.exists(self.path + ".lock"))
+        K.add("laptop")
+        with open(self.path) as fh:
+            before = fh.read()
+        for bad in ("soon", "2026-10-01", 5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(K.KeyNameError):
+                    K.update("laptop", expires=bad)
+        with open(self.path) as fh:
+            self.assertEqual(fh.read(), before)
+        K.update("laptop", expires="2030-01-01T00:00:00Z")
+        self.assertEqual(K.find(K.load(), "laptop")["expires"], "2030-01-01T00:00:00Z")
+
     def test_replace_of_a_missing_name_creates_it(self):
         self.assertEqual(K.add("fresh", replace=True)[0], "fresh")
 
@@ -156,6 +209,13 @@ class TestLifecycle(StoreCase):
         self.assertEqual(len(doc["keys"]), 1)
         self.assertIsNotNone(doc["keys"][0]["revoked"])
         self.assertEqual(K.status(doc["keys"][0]), "revoked")
+        self.assertEqual(K.KeyCache().lookup(token), (None, "revoked"))
+
+    def test_revoke_and_update_normalize_the_name(self):
+        _, token = K.add("laptop")
+        K.update("  LAPTOP ", rpm=7)
+        self.assertEqual(K.find(K.load(), "laptop")["rpm"], 7)
+        K.revoke("Laptop")
         self.assertEqual(K.KeyCache().lookup(token), (None, "revoked"))
 
     def test_revoke_unknown_raises(self):

@@ -107,6 +107,17 @@ def _check_limits(lanes, rpm, budget_tokens, err=KeyNameError, where="") -> None
             raise err("%s%s must be null or a positive integer" % (where, label))
 
 
+def _check_expires(expires) -> None:
+    """A non-None expiry must be an ISO instant iso() would write."""
+    if expires is None:
+        return
+    try:
+        parse_iso(expires)
+    except (TypeError, ValueError):
+        raise KeyNameError("expires must be null or YYYY-MM-DDTHH:MM:SSZ, got %r"
+                           % (expires,))
+
+
 def _validate(doc, path) -> None:
     if (not isinstance(doc, dict) or doc.get("version") != 1
             or not isinstance(doc.get("keys"), list)):
@@ -189,11 +200,15 @@ def add(name, *, path=None, expires=None, lanes=None, rpm=None,
     token exists outside the client.
 
     Collision: `replace` rotates the existing entry in place (new hash, new
-    created, revoked cleared, limits kept) so the old key dies on the next
-    request; `unique` takes the first free `<name>-N`; neither raises."""
+    created, revoked cleared) so the old key dies on the next request. Every
+    non-None limit argument (expires, lanes, rpm, budget_tokens) overrides the
+    kept value; a kept expiry already in the past is cleared, so a rotation
+    never mints a key that is dead on arrival. `unique` takes the first free
+    `<name>-N`; neither raises."""
     path = path or keys_path()
     base = normalize_name(name)
     _check_limits(lanes, rpm, budget_tokens)
+    _check_expires(expires)
     now = now or utcnow()
     with _locked(path):
         doc = load(path)
@@ -204,6 +219,11 @@ def add(name, *, path=None, expires=None, lanes=None, rpm=None,
             entry["sha256"] = hash_token(token)
             entry["created"] = iso(now)
             entry["revoked"] = None
+            given = {"expires": expires, "lanes": lanes, "rpm": rpm,
+                     "budget_tokens": budget_tokens}
+            entry.update({k: v for k, v in given.items() if v is not None})
+            if expires is None and status(entry, now) == "expired":
+                entry["expires"] = None
             save(doc, path)
             return base, token
         if entry is not None:
@@ -229,6 +249,7 @@ def add(name, *, path=None, expires=None, lanes=None, rpm=None,
 
 
 def revoke(name, *, path=None, now=None) -> dict:
+    name = normalize_name(name)
     path = path or keys_path()
     with _locked(path):
         doc = load(path)
@@ -246,6 +267,9 @@ def update(name, *, path=None, **changes) -> dict:
     if bad:
         raise KeyNameError("cannot change %s (allowed: %s)"
                            % (", ".join(bad), ", ".join(_MUTABLE)))
+    name = normalize_name(name)
+    if "expires" in changes:
+        _check_expires(changes["expires"])
     path = path or keys_path()
     with _locked(path):
         doc = load(path)

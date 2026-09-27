@@ -35,6 +35,28 @@ APP_DIR="$(dirname "${0:A}")"
 # relay backgrounding itself) cannot compute this for itself.
 FERRY_BIN_PATH="${0:A}"
 
+# ---- Colour: for a human at a terminal, never for a pipe ----
+# _ferry_colors [fd] — set C_GREEN / C_YELLOW / C_RED / C_RESET for the stream
+# about to be written (fd 1 by default; pass 2 for a message going to stderr).
+# When that fd is not a terminal, everything we print may be scraped by a
+# script or pasted into another shell, and a value wrapped in escape codes (a
+# relay token, a drop passphrase, a `curl … | zsh` bootstrap line) comes back
+# subtly wrong rather than obviously broken — so the variables are empty.
+# Honours https://no-color.org: a non-empty NO_COLOR disables colour even on a
+# tty. Call it in the SAME redirection scope as the echo that uses the
+# variables: `[[ -t 1 ]]` tests fd 1 as the caller currently sees it, so a
+# function invoked as `f >log` correctly gets no colour.
+# This is the ONLY place in lib/ that may contain a literal escape sequence.
+C_GREEN="" C_YELLOW="" C_RED="" C_RESET=""
+_ferry_colors() {
+  local fd="${1:-1}"
+  if [[ -t $fd && -z "${NO_COLOR:-}" ]]; then
+    C_GREEN=$'\033[1;32m' C_YELLOW=$'\033[1;33m' C_RED=$'\033[1;31m' C_RESET=$'\033[0m'
+  else
+    C_GREEN="" C_YELLOW="" C_RED="" C_RESET=""
+  fi
+}
+
 # ---- OS detection & portable host helpers (macOS + Linux) ----
 case "$(uname -s)" in
   Darwin) IS_MAC=1 ;;
@@ -1029,23 +1051,24 @@ _ferry_launch_mlx() {
 # installs probe exactly as they did before.
 _ferry_wait_http() {
   local url="$1" label="$2" timeout="${3:-600}" mode="${4:-content}" waited=0 code
+  _ferry_colors
   local -a hdr=()
   [[ -n "${LITELLM_MASTER_KEY:-}" ]] && hdr=(-H "Authorization: Bearer $LITELLM_MASTER_KEY")
   while (( waited < timeout )); do
     code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "${hdr[@]}" "$url" 2>/dev/null || true)"
     if [[ "$code" == 2* ]]; then
-      echo ">>> [$label] \033[1;32mREADY\033[0m (${waited}s)"
+      echo ">>> [$label] ${C_GREEN}READY${C_RESET} (${waited}s)"
       return 0
     fi
     if [[ "$mode" == "readiness" && "$code" == "401" ]]; then
-      echo ">>> [$label] \033[1;32mREADY\033[0m (${waited}s) — up; answering 401 (master_key auth on)"
+      echo ">>> [$label] ${C_GREEN}READY${C_RESET} (${waited}s) — up; answering 401 (master_key auth on)"
       return 0
     fi
     sleep 3
     waited=$(( waited + 3 ))
     (( waited % 15 == 0 )) && echo "    [$label] loading... ${waited}s"
   done
-  echo ">>> [$label] \033[1;33mNOT READY\033[0m after ${timeout}s - still loading, or check its log."
+  echo ">>> [$label] ${C_YELLOW}NOT READY${C_RESET} after ${timeout}s - still loading, or check its log."
   return 1
 }
 
@@ -1415,7 +1438,8 @@ cmd_up() {
       exit 1
     fi
 
-    echo ">>> Proxying to Cloud Model: \033[1;32m$CLOUD_MODEL\033[0m"
+    _ferry_colors
+    echo ">>> Proxying to Cloud Model: ${C_GREEN}$CLOUD_MODEL${C_RESET}"
     echo "    Port: $target_port"
     
     # Launch LiteLLM proxy
@@ -1775,6 +1799,7 @@ cmd_reload() {
 }
 
 cmd_status() {
+  _ferry_colors
   if (( CLIENT_MODE )); then
     echo "================================================================="
     echo "                 LLM-FERRY CLIENT DIAGNOSTICS"
@@ -1792,7 +1817,7 @@ cmd_status() {
     # bare MLX lane (ferry up --local), which serves no liveliness route.
     local probe_code="$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" 2>/dev/null || true)"
     if [[ "$probe_code" == 2* ]] || [[ "$probe_code" == "401" ]]; then
-      echo ">>> Connection Health: \033[1;32mONLINE\033[0m"
+      echo ">>> Connection Health: ${C_GREEN}ONLINE${C_RESET}"
       [[ "$probe_code" == "401" ]] && echo "    (front door is behind master_key auth — export LITELLM_MASTER_KEY to read the lane list)"
 
       # Query active model. Catalogue content: send the bearer when this box
@@ -1802,10 +1827,10 @@ cmd_status() {
       local models=$(curl -fsS -m 2 "${status_auth[@]}" "http://$CLIENT_HOST:$CLIENT_PORT/v1/models" 2>/dev/null || echo "")
       if [[ -n "$models" ]]; then
         local active=$(echo "$models" | python3 -c "import json,sys; d=json.load(sys.stdin).get('data',[]); print(d[0]['id'] if d else 'None')")
-        echo "    Currently active model on Host: \033[1;32m$active\033[0m"
+        echo "    Currently active model on Host: ${C_GREEN}$active${C_RESET}"
       fi
     else
-      echo ">>> Connection Health: \033[1;31mOFFLINE\033[0m (Check Wi-Fi/cable or network status)"
+      echo ">>> Connection Health: ${C_RED}OFFLINE${C_RESET} (Check Wi-Fi/cable or network status)"
     fi
     echo "================================================================="
     return
@@ -1835,7 +1860,7 @@ cmd_status() {
     if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
       local pid=$(lsof -t -iTCP:"$p" -sTCP:LISTEN | head -1)
       local cmd=$(ps -p "$pid" -o comm= 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
-      echo ">>> Port $p ($_label) is \033[1;32mONLINE\033[0m (PID: $pid, Command: $cmd)"
+      echo ">>> Port $p ($_label) is ${C_GREEN}ONLINE${C_RESET} (PID: $pid, Command: $cmd)"
 
       # phys_footprint is the number that matters for an MLX lane — RSS is blind
       # to wired GPU memory, so `ps` cheerfully under-reports a 50GB model server.
@@ -1849,7 +1874,7 @@ cmd_status() {
         # loaded — printing it would advertise eight models this lane cannot serve
         # without a reload. The launch line is the truth, so read --model from argv.
         local loaded=$(ps -p "$pid" -o args= 2>/dev/null | sed -E 's/.*--model[= ]+([^ ]+).*/\1/')
-        [[ -n "$loaded" ]] && echo "    Model loaded: \033[1;32m$loaded\033[0m"
+        [[ -n "$loaded" ]] && echo "    Model loaded: ${C_GREEN}$loaded${C_RESET}"
         echo "    (internal backend — address this lane as a lane name on :$PORT, not here)"
       elif [[ "$p" != "$SHARE_PORT" ]]; then
         # The front door: list every lane it serves, not just the first one.
@@ -1861,7 +1886,7 @@ cmd_status() {
         if [[ -n "$models" ]]; then
           local served=$(echo "$models" | python3 -c "import json,sys; print(' '.join(m['id'] for m in json.load(sys.stdin).get('data',[])))" 2>/dev/null || echo "")
           if [[ -n "$served" ]]; then
-            echo "    Lanes served: \033[1;32m$served\033[0m"
+            echo "    Lanes served: ${C_GREEN}$served${C_RESET}"
             local first=${served%% *}
             # max_tokens 256, not 10. Every lane on this endpoint is now a
             # REASONING model, and reasoning tokens are drawn from the same
@@ -1880,26 +1905,26 @@ cmd_status() {
         fi
       fi
     else
-      echo ">>> Port $p ($_label) is \033[1;31mOFFLINE\033[0m"
+      echo ">>> Port $p ($_label) is ${C_RED}OFFLINE${C_RESET}"
     fi
   done
 
   # Experimental HuggingFace pass-through proxy (only reported when running).
   if lsof -nP -iTCP:"$HF_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     local hf_pid=$(lsof -t -iTCP:"$HF_PORT" -sTCP:LISTEN)
-    echo ">>> Port $HF_PORT is \033[1;32mONLINE\033[0m (HF pass-through proxy, PID: $hf_pid)"
+    echo ">>> Port $HF_PORT is ${C_GREEN}ONLINE${C_RESET} (HF pass-through proxy, PID: $hf_pid)"
   fi
 
   # General HTTP(S) download forward proxy (only reported when running).
   if lsof -nP -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo ">>> HTTP download proxy is \033[1;32mONLINE\033[0m (port $PROXY_PORT)"
+    echo ">>> HTTP download proxy is ${C_GREEN}ONLINE${C_RESET} (port $PROXY_PORT)"
   fi
 
   # Reverse-expose relay, and — the part that matters — every port a client has
   # published through it. A port opened on this machine on someone else's behalf
   # must be visible here, or nobody can answer "what is this host serving?".
   if lsof -nP -iTCP:"$RELAY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo ">>> Reverse relay is \033[1;32mONLINE\033[0m (control port $RELAY_PORT)"
+    echo ">>> Reverse relay is ${C_GREEN}ONLINE${C_RESET} (control port $RELAY_PORT)"
     if [[ -f "$RELAY_STATE_FILE" ]]; then
       python3 - "$RELAY_STATE_FILE" <<'PYEOF' || true
 import json, sys
@@ -1923,7 +1948,7 @@ PYEOF
 
   # Browser VNC viewer: one URL per screen a client has published with expose-vnc.
   if lsof -nP -iTCP:"$VNC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo ">>> VNC viewer is \033[1;32mONLINE\033[0m (http://$MDNS_NAME:$VNC_PORT)"
+    echo ">>> VNC viewer is ${C_GREEN}ONLINE${C_RESET} (http://$MDNS_NAME:$VNC_PORT)"
     if [[ -f "$RELAY_STATE_FILE" ]]; then
       python3 - "$RELAY_STATE_FILE" "$MDNS_NAME" "$VNC_PORT" <<'PYEOF' || true
 import json, sys
@@ -1966,6 +1991,9 @@ cmd_share() {
     target_port=$((target_port + 1))
   done
 
+  # The curl lines below are meant to be copied into another machine's shell,
+  # so they must reach a pipe or a log as plain text (see _ferry_colors).
+  _ferry_colors
   echo "================================================================="
   echo "                SHARING LLM-FERRY CLIENT BOOTSTRAPPER"
   echo "================================================================="
@@ -1973,7 +2001,7 @@ cmd_share() {
   echo "Port bound:        $target_port"
   echo "================================================================="
   echo ">>> FIRST-TIME SETUP on any client laptop on the same LAN:"
-  echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-bootstrap.sh | zsh\033[0m"
+  echo "    ${C_GREEN}curl -fsSL http://$MDNS_NAME:$target_port/client-bootstrap.sh | zsh${C_RESET}"
   echo "    (or: curl -fsSL http://$LAN_IP:$target_port/client-bootstrap.sh | zsh)"
   echo "    Narrow the opencode scope on a laptop that already has its own setup:"
   echo "      ... /client-bootstrap.sh | zsh -s -- --profiles-only   (ferry's own profiles only)"
@@ -1981,12 +2009,12 @@ cmd_share() {
   echo ""
   echo ">>> CATCH UP an already-bootstrapped client (re-pull the CLI, re-apply"
   echo "    the opencode takeover; leaves ~/.zshrc alone):"
-  echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-reset.sh | zsh\033[0m"
+  echo "    ${C_GREEN}curl -fsSL http://$MDNS_NAME:$target_port/client-reset.sh | zsh${C_RESET}"
   echo "    (or: curl -fsSL http://$LAN_IP:$target_port/client-reset.sh | zsh)"
   echo ""
   echo ">>> REMOVE ferry from a client (CLI, profile, wrappers, guardrails;"
   echo "    keeps opencode's own session history unless --full --yes):"
-  echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-cleanup.sh | zsh -s -- --dry-run\033[0m"
+  echo "    ${C_GREEN}curl -fsSL http://$MDNS_NAME:$target_port/client-cleanup.sh | zsh -s -- --dry-run${C_RESET}"
   echo "    (drop --dry-run to apply)"
   echo "================================================================="
   echo ">>> Starting Dynamic Python HTTP share server in background..."
@@ -2398,6 +2426,9 @@ cmd_relay() {
       exit 1
     fi
 
+    # The expose line below carries the relay TOKEN — a value meant to be copied,
+    # so it must reach a pipe or a log as plain text (see _ferry_colors).
+    _ferry_colors
     echo "================================================================="
     echo "                    LLM-FERRY REVERSE RELAY"
     echo "================================================================="
@@ -2406,7 +2437,7 @@ cmd_relay() {
     echo "Log:            $RELAY_LOG"
     echo "================================================================="
     echo ">>> On the client, publish a local service through this host:"
-    echo "    \033[1;32mferry expose <local-port> --as <public-port> --token $token\033[0m"
+    echo "    ${C_GREEN}ferry expose <local-port> --as <public-port> --token $token${C_RESET}"
     echo "    (the token is saved on the client after the first successful run)"
     echo ""
     echo ">>> Whatever you expose keeps its OWN auth. The relay authenticates the"
@@ -3703,9 +3734,9 @@ PYEOF
   # to another machine, so when stdout is redirected it must come out as plain
   # text a script can read — wrapping a secret in escape codes makes
   # `ferry drop f | grep passphrase` return something subtly wrong rather than
-  # something that obviously failed.
-  local g="" y="" z=""
-  if [[ -t 1 ]]; then g=$'\033[1;32m'; y=$'\033[1;33m'; z=$'\033[0m'; fi
+  # something that obviously failed. The gate is the shared _ferry_colors.
+  _ferry_colors
+  local g="$C_GREEN" y="$C_YELLOW" z="$C_RESET"
 
   echo ""
   echo "  ${g}${out}${z}  (${size} bytes, aes-256-cbc + pbkdf2@${FERRYDROP_ITER}, hmac-sha256)"
@@ -3876,8 +3907,8 @@ PYEOF
   fi
   [[ -d "$dest" ]] && dest="$dest/$name"
   cp "$work/pt" "$dest"
-  local g="" z=""
-  if [[ -t 1 ]]; then g=$'\033[1;32m'; z=$'\033[0m'; fi
+  _ferry_colors
+  local g="$C_GREEN" z="$C_RESET"
   echo "  ${g}${dest}${z}  ($(wc -c < "$dest" | tr -d ' ') bytes, verified)"
 }
 cmd_serve_hf() {

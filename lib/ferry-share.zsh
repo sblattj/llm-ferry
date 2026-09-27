@@ -13,6 +13,9 @@ cmd_share() {
     target_port=$((target_port + 1))
   done
 
+  # The curl lines below are meant to be copied into another machine's shell,
+  # so they must reach a pipe or a log as plain text (see _ferry_colors).
+  _ferry_colors
   echo "================================================================="
   echo "                SHARING LLM-FERRY CLIENT BOOTSTRAPPER"
   echo "================================================================="
@@ -20,7 +23,7 @@ cmd_share() {
   echo "Port bound:        $target_port"
   echo "================================================================="
   echo ">>> FIRST-TIME SETUP on any client laptop on the same LAN:"
-  echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-bootstrap.sh | zsh\033[0m"
+  echo "    ${C_GREEN}curl -fsSL http://$MDNS_NAME:$target_port/client-bootstrap.sh | zsh${C_RESET}"
   echo "    (or: curl -fsSL http://$LAN_IP:$target_port/client-bootstrap.sh | zsh)"
   echo "    Narrow the opencode scope on a laptop that already has its own setup:"
   echo "      ... /client-bootstrap.sh | zsh -s -- --profiles-only   (ferry's own profiles only)"
@@ -28,12 +31,12 @@ cmd_share() {
   echo ""
   echo ">>> CATCH UP an already-bootstrapped client (re-pull the CLI, re-apply"
   echo "    the opencode takeover; leaves ~/.zshrc alone):"
-  echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-reset.sh | zsh\033[0m"
+  echo "    ${C_GREEN}curl -fsSL http://$MDNS_NAME:$target_port/client-reset.sh | zsh${C_RESET}"
   echo "    (or: curl -fsSL http://$LAN_IP:$target_port/client-reset.sh | zsh)"
   echo ""
   echo ">>> REMOVE ferry from a client (CLI, profile, wrappers, guardrails;"
   echo "    keeps opencode's own session history unless --full --yes):"
-  echo "    \033[1;32mcurl -fsSL http://$MDNS_NAME:$target_port/client-cleanup.sh | zsh -s -- --dry-run\033[0m"
+  echo "    ${C_GREEN}curl -fsSL http://$MDNS_NAME:$target_port/client-cleanup.sh | zsh -s -- --dry-run${C_RESET}"
   echo "    (drop --dry-run to apply)"
   echo "================================================================="
   echo ">>> Starting Dynamic Python HTTP share server in background..."

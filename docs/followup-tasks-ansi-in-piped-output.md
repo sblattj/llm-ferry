@@ -1,5 +1,14 @@
 # Follow-up: ANSI colour is still unconditional outside `ferry drop`
 
+> **Resolved (2026-09-27).** One helper, `_ferry_colors [fd]` in
+> `lib/ferry-core.zsh`, gates colour on `[[ -t <fd> ]]` and `NO_COLOR`; all 19
+> colour-emitting echo sites in `lib/` now use it (serve 15 — two more than the
+> 13 measured below — share 3, relay 1, plus drop's two inline gates). Regression
+> suite: `lib/ferry-ansi.test.py` (piped relay token scrapes to the real token,
+> piped client `status` is plain, tty controls still colour, `NO_COLOR` honoured,
+> no escape literal outside the helper). The rest of this file is the original
+> task record.
+
 ## Origin
 
 Produced by the `sharpen` retrospective on session

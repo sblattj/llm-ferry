@@ -1438,11 +1438,21 @@ def _account_tokens(scope, observed) -> None:
 
 async def _charge_tokens(scope, observed) -> None:
     """_account_tokens in a worker thread; a no-op (no thread hop) for a
-    request that was never admitted. Never raises."""
+    request that was never admitted. Never raises anything but a cancel.
+
+    Called ONLY from _inference's `finally`, never from inside the send
+    chain: behind uvicorn (ASGI spec 2.3) Starlette's StreamingResponse
+    cancels the task streaming the body as soon as the final body is sent,
+    and an executor job cancelled before a worker picks it up is dropped.
+    The job is submitted synchronously (before the first await) and awaited
+    through asyncio.shield, so cancelling this coroutine, or the whole
+    request task, never cancels the charge itself."""
     try:
         if observed is None or not scope.get(KEY_ADMITTED_SCOPE):
             return
-        await asyncio.to_thread(_account_tokens, scope, observed)
+        job = asyncio.get_running_loop().run_in_executor(
+            None, _account_tokens, scope, observed)
+        await asyncio.shield(job)
     except Exception as err:
         _key_warn(err)
 
@@ -1729,8 +1739,14 @@ class LaneCatalogueFilter:
                 module = _metrics_module()
                 collector = module.RequestMetrics(started_at=started_at, clock=time.monotonic)
                 token = module.CURRENT_METRICS.set(collector)
-            except Exception:
+            except Exception as err:
                 collector = None
+                if metered:
+                    # Known gap (parked): this request is admitted and its RPM
+                    # counted, but with no collector it is charged 0 tokens.
+                    _key_warn(RuntimeError(
+                        "token metering unavailable, device-key requests are "
+                        "not charged tokens: %s: %s" % (type(err).__name__, err)))
             tapped = self._tapped(scope, send, strip, collector, emit=emit)
             send = tapped
         elif strip:
@@ -1742,7 +1758,10 @@ class LaneCatalogueFilter:
         finally:
             try:
                 if tapped is not None:
-                    await _charge_tokens(scope, tapped.finish(False))
+                    tapped.finish(False)
+                    # The single charge, after self.app has returned and so
+                    # outside Starlette's stream cancel scope; shielded.
+                    await _charge_tokens(scope, tapped.take_observed())
             finally:
                 if token is not None:
                     module.CURRENT_METRICS.reset(token)
@@ -1847,9 +1866,33 @@ class LaneCatalogueFilter:
             resolved = doc.get("model") if isinstance(doc, dict) else None
             if not await self._key_admit(scope, send, entry, requested, resolved):
                 return None
-        if ((tap_enabled() or entry is not None) and isinstance(doc, dict)
+        metered = entry is not None and isinstance(doc, dict)
+        stream_paths = ("/v1/chat/completions", "/chat/completions")
+        if metered:
+            # A metered stream must carry a usage chunk or it is charged 0.
+            # litellm 1.99 (common_request_processing
+            # _stream_usage_tracking_updates) only adds include_usage for
+            # chat, and strips its own usage chunk back out when the client
+            # did not ask; legacy completions stream no usage unless asked.
+            # /v1/responses (response.completed) and /v1/messages
+            # (message_start/message_delta) always report usage in-stream.
+            stream_paths += ("/v1/completions", "/completions")
+            stream = doc.get("stream")
+            if (type(stream) in (int, float) and stream == 1
+                    and scope.get("path") in stream_paths):
+                # litellm's usage injection keys on `stream is True`, yet the
+                # proxy still streams whatever response comes back as an
+                # iterator (_is_streaming_response), so `1` could stream
+                # with no usage chunk. Normalise it to the real boolean.
+                doc["stream"] = True
+                changed = True
+            if (doc.get("stream") is True and scope.get("path") in stream_paths
+                    and not isinstance(doc.get("stream_options"), (dict, type(None)))):
+                doc.pop("stream_options")   # unusable; rebuilt just below
+                changed = True
+        if ((tap_enabled() or metered) and isinstance(doc, dict)
                 and doc.get("stream") is True
-                and scope.get("path") in ("/v1/chat/completions", "/chat/completions")):
+                and scope.get("path") in stream_paths):
             options = doc.get("stream_options")
             if options is None or isinstance(options, dict):
                 options = dict(options or {})
@@ -1994,16 +2037,17 @@ class LaneCatalogueFilter:
         hide application or downstream-send exceptions.
 
         `emit=False` meters without an event record (a device key with the
-        tap off). `finish` returns the observed numbers the first time it
-        runs (None after that); the async caller charges them to the key via
-        _charge_tokens, off the event loop.
+        tap off). `finish` runs once and only RECORDS the observed numbers;
+        `take_observed()` hands them to _inference's finally, which charges
+        them to the key via _charge_tokens, off the event loop.
         """
         rec = None
         nbytes = 0
         emitted = False
+        settled = None
 
         def finish(complete):
-            nonlocal rec, emitted
+            nonlocal rec, emitted, settled
             if emitted:
                 return None
             emitted = True
@@ -2013,6 +2057,7 @@ class LaneCatalogueFilter:
                     observed = collector.finish(complete=complete) or {}
                 except Exception:
                     observed = {}
+            settled = observed
             if not emit:
                 return observed
             try:
@@ -2067,11 +2112,20 @@ class LaneCatalogueFilter:
                         pass
             result = await send(message)
             if mtype == "http.response.body" and not message.get("more_body"):
-                # The client already has its last byte; the charge follows.
-                await _charge_tokens(scope, finish(True))
+                # Record only: nothing may be awaited here, because this task
+                # is cancelled at stream end (see _charge_tokens). The charge
+                # happens in _inference's finally.
+                finish(True)
             return result
 
+        def take_observed():
+            """The observed numbers from the one finish(), handed out once."""
+            nonlocal settled
+            out, settled = settled, None
+            return out
+
         tapped.finish = finish
+        tapped.take_observed = take_observed
         return tapped
 
     async def _flush(self, send, start_message, body: bytes, fleet=None) -> None:

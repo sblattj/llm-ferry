@@ -765,5 +765,195 @@ class TestUsageStoreResilience(KeyFrontCase):
             self.assertEqual(reply(self.chat(token)[1])[0], 503)
 
 
+SSE_CHUNKS = [b'data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}\n\n',
+              b'data: {"id":"x","choices":[],"usage":{"prompt_tokens":7,'
+              b'"completion_tokens":5}}\n\n',
+              b"data: [DONE]\n\n"]
+
+
+class DisconnectingStream:
+    """litellm behind uvicorn (ASGI spec 2.3) + Starlette's StreamingResponse:
+    the body streams in one task while a second task listens for
+    `http.disconnect`, and the stream task is CANCELLED as soon as the
+    listener returns. uvicorn's receive() returns http.disconnect the moment
+    the final body has been sent, so every streamed response ends with that
+    cancel landing on whatever the send chain is awaiting."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def __call__(self, scope, receive, send):
+        self.calls += 1
+        while True:
+            msg = await receive()
+            if not msg.get("more_body"):
+                break
+
+        async def stream():
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"text/event-stream")]})
+            for chunk in SSE_CHUNKS:
+                await send({"type": "http.response.body", "body": chunk,
+                            "more_body": True})
+            await send({"type": "http.response.body", "body": b"",
+                        "more_body": False})
+
+        async def listen():
+            while (await receive())["type"] != "http.disconnect":
+                pass
+
+        tasks = {asyncio.ensure_future(stream()), asyncio.ensure_future(listen())}
+        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def drive_disconnecting(mw, token, busy=0.3):
+    """uvicorn-faithful transport: after the final body, receive() returns
+    http.disconnect. The default executor has ONE worker, and it is kept busy
+    for `busy` seconds from the final body on (concurrent requests' DB hops),
+    so a charge queued at stream end is still waiting when the cancel lands."""
+    import concurrent.futures
+    import time as _time
+    body = json.dumps({"model": "flash", "messages": [], "stream": True}).encode()
+    scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST",
+             "client": ("100.64.0.9", 50000), "query_string": b"",
+             "asgi": {"version": "3.0", "spec_version": "2.3"},
+             "headers": [(b"authorization", ("Bearer " + token).encode())]}
+    sent = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(1))
+        done = asyncio.Event()
+        state = {"read": False}
+
+        async def receive():
+            if not state["read"]:
+                state["read"] = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await done.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                loop.run_in_executor(None, _time.sleep, busy)
+                done.set()
+
+        await mw(scope, receive, send)
+
+    asyncio.run(main())
+    return sent
+
+
+class TestStreamingChargeSurvivesDisconnect(KeyFrontCase):
+    """Fix round 1 (review Critical): a completed streamed response must be
+    charged even though the task that streamed it is cancelled at stream end."""
+
+    def test_streamed_response_is_charged_despite_the_disconnect_cancel(self):
+        token = self.mint()
+        app = DisconnectingStream()
+        mw = FF.LaneCatalogueFilter(app, frozenset())
+        sent = drive_disconnecting(mw, token)
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(app.calls, 1)
+        self.assertEqual(U.Usage(self.db).month_tokens("laptop"), 12)
+
+    def test_the_charge_is_shielded_from_a_cancelled_request_task(self):
+        # The whole request task is cancelled while the charge is queued behind
+        # a busy worker: the job still runs once the worker frees up.
+        import concurrent.futures
+        import time as _time
+        token = self.mint()
+        mw = self.mw()
+
+        async def main():
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(1))
+            scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST",
+                     "client": ("100.64.0.9", 1), "query_string": b"",
+                     "headers": [(b"authorization", ("Bearer " + token).encode())]}
+            finished = asyncio.Event()
+
+            async def receive():
+                return {"type": "http.request", "body": b'{"model":"flash"}',
+                        "more_body": False}
+
+            async def send(message):
+                if message["type"] == "http.response.body" and not message.get("more_body"):
+                    loop.run_in_executor(None, _time.sleep, 0.3)  # worker busy
+                    finished.set()
+
+            task = asyncio.ensure_future(mw(scope, receive, send))
+            await finished.wait()
+            task.cancel()   # lands on the first await after the final body
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(main())
+        self.assertEqual(U.Usage(self.db).month_tokens("laptop"), 12)
+
+
+class TestStreamUsageForMeteredRequests(KeyFrontCase):
+    """Fix round 1 (review Minor a): wherever litellm 1.99 would stream a
+    metered request WITHOUT a usage chunk, the front asks for one."""
+
+    def send_body(self, path, doc, token=None):
+        body = json.dumps(doc).encode()
+        drive(self.mw(), path, bearer(token or self.mint()), body=body)
+        return json.loads(self.app.body)
+
+    def test_legacy_completions_stream_gets_include_usage(self):
+        for name, path in (("v1", "/v1/completions"), ("bare", "/completions")):
+            with self.subTest(path=path):
+                out = self.send_body(path, {"model": "flash", "prompt": "x",
+                                            "stream": True}, self.mint(name))
+                self.assertEqual(out["stream_options"], {"include_usage": True})
+
+    def test_non_dict_stream_options_is_replaced(self):
+        out = self.send_body("/v1/chat/completions",
+                             {"model": "flash", "messages": [], "stream": True,
+                              "stream_options": "yes"})
+        self.assertEqual(out["stream_options"], {"include_usage": True})
+
+    def test_integer_stream_is_normalised_and_gets_include_usage(self):
+        out = self.send_body("/v1/chat/completions",
+                             {"model": "flash", "messages": [], "stream": 1})
+        self.assertIs(out["stream"], True)
+        self.assertEqual(out["stream_options"], {"include_usage": True})
+
+    def test_responses_and_messages_are_left_alone(self):
+        # Both report usage in-stream without being asked (response.completed,
+        # message_start/message_delta), so their bodies are forwarded as sent.
+        for name, path in (("resp", "/v1/responses"), ("msgs", "/v1/messages")):
+            with self.subTest(path=path):
+                doc = {"model": "flash", "input": "x", "stream": True}
+                body = json.dumps(doc).encode()
+                drive(self.mw(), path, bearer(self.mint(name)), body=body)
+                self.assertEqual(self.app.body, body)
+
+    def test_master_bodies_are_untouched(self):
+        for doc in ({"model": "flash", "prompt": "x", "stream": True},
+                    {"model": "flash", "messages": [], "stream": 1}):
+            with self.subTest(doc=doc):
+                body = json.dumps(doc).encode()
+                drive(self.mw(), "/v1/completions", bearer(MASTER), body=body)
+                self.assertEqual(self.app.body, body)
+
+
+class TestAnthropicLaneRefusal(KeyFrontCase):
+    def test_lane_refusal_on_messages_is_anthropic_shaped(self):
+        token = self.mint(lanes=["flash"])
+        _, sent, _ = drive(self.mw(), "/v1/messages", [("x-api-key", token)],
+                           body=b'{"model":"heavy","messages":[]}')
+        status, _, doc = reply(sent)
+        self.assertEqual(status, 403)
+        self.assertEqual(doc["type"], "error")
+        self.assertEqual(doc["error"]["type"], "permission_error")
+        self.assertIn("heavy", doc["error"]["message"])
+        self.assertEqual(self.app.calls, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

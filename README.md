@@ -385,11 +385,13 @@ Issues and PRs are welcome — [open an issue](https://github.com/sblattj/llm-fe
 
 ```bash
 ./build.zsh --check    # regenerate ./ferry from lib/ferry-*.zsh; fail on drift
-for suite in lib/*.test.py observ/*.test.py; do python3 "$suite" || exit 1; done
+for suite in lib/*.test.py observ/*.test.py scripts/*.test.py; do python3 "$suite" || exit 1; done
 node lib/ferry-dashui.test.mjs
 ```
 
 How the suites are designed — real embedded Python against a throwaway `$HOME`, the client-scope end-to-end runs — is in [Deep dives](docs/deep-dives.md#test-suite-detail).
+
+**Cutting a release.** Bump `VERSION`, commit (subject `release: vX.Y.Z — <headline>`, optionally with `docs/releases/vX.Y.Z.md` as the notes), then `git tag -a vX.Y.Z -m "llm-ferry vX.Y.Z — <headline>" && git push origin vX.Y.Z`. The push runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which creates the GitHub Release if it does not exist yet: the title comes from the annotated tag's message (else the commit subject, the notes file's heading, the bare tag), the notes from the tag message's body (else `docs/releases/<tag>.md`, the commit body, `git log` since the previous tag), and the Latest marker only moves when the tag is the highest version. Preview exactly what it will publish with `python3 scripts/release-notes.py title|notes|latest vX.Y.Z`.
 
 ## License
 

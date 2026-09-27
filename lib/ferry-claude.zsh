@@ -77,7 +77,8 @@ PYEOF
 # /v1 suffix: Claude Code appends /v1/messages itself, and LiteLLM already
 # serves that path for every lane. AUTH_TOKEN is 'local' unless the front door
 # runs litellm with a master_key (LITELLM_MASTER_KEY) — `ferry claude` bakes
-# the real key from ~/.config/ferry/client.json's master_key (or --key) when
+# the real key from ~/.config/ferry/client.json's api_key, else master_key
+# (or --key) when
 # one is configured, else the 'local' placeholder a keyless LAN setup expects.
 #
 # Host and port are baked in at install time: the wrapper must work with ferry
@@ -172,7 +173,8 @@ Usage:
   --host H     Endpoint host to bake into the wrappers.
   --port P     Endpoint port (default 8090).
   --key K      Bearer token baked into the wrappers and sent to the front door.
-               Default: client.json's master_key when set, else 'local'.
+               Default: client.json's api_key, falling back to master_key;
+               else 'local'.
 
 Lane map:  cloud  main=heavy   background=flash
            local  main=local-orch  background=local-sub
@@ -231,15 +233,16 @@ except Exception:
   fi
   cl_port="${cl_port:-8090}"
 
-  # Key precedence: --key, else the client profile's optional master_key, else
-  # empty (the installer then bakes the legacy 'local' token). Read fresh from
+  # Key precedence: --key, else the client profile's api_key (a v1.39.0 device
+  # key), else its optional master_key, else empty (the installer then bakes the legacy 'local' token). Read fresh from
   # client.json — same reason host/port are — because `ferry claude --wrappers`
   # runs from host-reset.sh, which may run before/outside a normal CLI boot.
   # The value only lands in files, never on stdout.
   if [[ -z "$cl_key" ]]; then
     cl_key=$(python3 -c "import json, os, sys
 try:
-    print(json.load(open(os.path.expanduser(sys.argv[1]))).get('master_key') or '')
+    c = json.load(open(os.path.expanduser(sys.argv[1])))
+    print(c.get('api_key') or c.get('master_key') or '')
 except Exception:
     pass" "$HOME/.config/ferry/client.json" 2>/dev/null)
   fi
@@ -281,7 +284,8 @@ cfg = {
 # default, and recording it would make the mirror claim an auth setup that
 # does not exist.
 if key and key != "local":
-    cfg["master_key"] = key
+    # A per-device key (v1.39.0) is not the master and must not be named as one.
+    cfg["api_key" if key.startswith("fk-") else "master_key"] = key
 os.makedirs(os.path.dirname(path), exist_ok=True)
 with open(path, "w") as f:
     json.dump(cfg, f, indent=2)

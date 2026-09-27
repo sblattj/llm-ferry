@@ -172,6 +172,7 @@ its monotonic clock. Token counts are provider-reported nonnegative numbers or n
 | `output_tokens` | Wire-API output count; reasoning is a subset when reported. |
 | `reasoning_tokens` | Reported reasoning subset of output, never an additional term; omitted provider detail means null, not zero. |
 | `cached_input_tokens` | Separately reported cached-input read count; do not blindly add it to input across APIs. |
+| `key` | Which credential made the call: a device key's name, `master`, or empty (no or foreign credential). Never the key itself. Absent on records before v1.39.0. |
 
 `duration_ms` remains a legacy LiteLLM response-header value. It is neither end-to-end
 stream duration nor first-text latency and must never fill missing new timing fields.

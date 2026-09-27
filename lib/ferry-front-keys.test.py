@@ -587,6 +587,95 @@ class TestEmptyCredentialHeaders(KeyFrontCase):
                                  b"".join(v for _, v in self.app.scope["headers"]))
 
 
+class TestDevicePathAllowlist(KeyFrontCase):
+    """Round 4: a valid device key is admitted only on client routes; the
+    credential swap must not hand it litellm's admin routes at master power."""
+
+    def test_admin_and_unlisted_routes_are_403_and_never_reach_litellm(self):
+        token = self.mint()
+        for path in ("/key/generate", "/config/update", "/v1/audio/transcriptions",
+                     "/model/new", "/user/new", "/health", "/v1/ferry/reorder",
+                     "/v1/chat/completionsX", "/v1/modelsX", "/v1beta/models/x:embedContent",
+                     "/v1/realtime/client_secrets"):
+            with self.subTest(path=path):
+                _, sent, _ = drive(self.mw(), path, bearer(token))
+                status, _, doc = reply(sent)
+                self.assertEqual(status, 403)
+                self.assertEqual(doc["error"]["type"], "invalid_request_error")
+                self.assertEqual(doc["error"]["code"], "route_not_allowed")
+                self.assertIn("device keys may not call this route", doc["error"]["message"])
+        self.assertEqual(self.app.calls, 0)
+
+    def test_anthropic_family_403_shape(self):
+        # Every Anthropic-family path is allowed, so no request can produce
+        # this today; the shape is still pinned for the family rule.
+        doc = FF.key_error_body("/v1/messages", 403, "device keys may not call this route")
+        self.assertEqual(doc, {"type": "error", "error": {
+            "type": "permission_error", "message": "device keys may not call this route"}})
+
+    def test_client_routes_are_admitted(self):
+        token = self.mint()
+        for path, method in (("/v1/chat/completions", "POST"), ("/chat/completions", "POST"),
+                             ("/v1/responses", "POST"), ("/v1/messages", "POST"),
+                             ("/v1/messages/count_tokens", "POST"), ("/v1/embeddings", "POST"),
+                             ("/v1/models", "GET"), ("/models", "GET"),
+                             ("/v1/models/flash", "GET"), ("/models/flash", "GET"),
+                             ("/v1beta/models/flash:generateContent", "POST"),
+                             ("/v1beta/models/flash:streamGenerateContent", "POST"),
+                             ("/v1beta/models/flash:countTokens", "POST"),
+                             ("/models/flash:generateContent", "POST"),
+                             ("/health/liveliness", "GET"), ("/health/liveness", "GET")):
+            with self.subTest(path=path):
+                scope, sent, _ = drive(self.mw(), path, bearer(token), method=method)
+                self.assertEqual(reply(sent)[0], 200)
+                self.assertEqual(scope["ferry.key"], "laptop")
+
+    def test_gemini_query_key_route_is_admitted(self):
+        token = self.mint()
+        _, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
+                           query=("key=" + token).encode())
+        self.assertEqual(reply(sent)[0], 200)
+
+    def test_fleet_route_is_admitted(self):
+        token = self.mint()
+        path = os.path.join(self.dir, "fleets.json")
+        with open(path, "w") as fh:
+            json.dump({"default": "domestic", "clients": {}}, fh)
+        state = FF.FleetState(path, FLEETS)
+        _, sent, _ = drive(self.mw(state, FLEETS), FF.FLEET_PATH, bearer(token), method="GET")
+        self.assertEqual(reply(sent)[0], 200)
+
+    def test_realtime_websocket_is_admitted_and_others_closed(self):
+        token = self.mint()
+        for path in ("/v1/realtime", "/realtime"):
+            with self.subTest(path=path):
+                _, sent, _ = drive(self.mw(), path, bearer(token), method="GET",
+                                   scope_type="websocket")
+                self.assertEqual(sent, [{"type": "websocket.accept"}])
+        _, sent, _ = drive(self.mw(), "/v1/admin-socket", bearer(token), method="GET",
+                           scope_type="websocket")
+        self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+
+    def test_master_and_bare_on_admin_routes_pass_untouched(self):
+        boom = mock.Mock(side_effect=AssertionError("key store touched"))
+        with mock.patch.object(FF, "_key_cache", boom):
+            for headers, label in ((bearer(MASTER), "master"), ((), "")):
+                with self.subTest(label=label):
+                    scope, sent, send = drive(self.mw(), "/key/generate", headers)
+                    self.assertEqual(reply(sent)[0], 200)
+                    self.assertIs(self.app.send, send)
+                    self.assertEqual(scope["ferry.key"], label)
+                    self.assertEqual([(k.decode(), v.decode())
+                                      for k, v in self.app.scope["headers"]], list(headers))
+        boom.assert_not_called()
+
+    def test_revoked_key_on_an_admin_route_is_still_401(self):
+        _, gone = K.add("gone")
+        K.revoke("gone")
+        _, sent, _ = drive(self.mw(), "/key/generate", bearer(gone))
+        self.assertEqual(reply(sent)[0], 401)
+
+
 class TestEntryIsolation(KeyFrontCase):
     def test_key_entry_is_safe_against_downstream_mutation(self):
         token = self.mint(lanes=["flash"])

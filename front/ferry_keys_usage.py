@@ -7,12 +7,14 @@ RPM. admit() does its read-check-increment inside BEGIN IMMEDIATE, which
 takes SQLite's write lock, so two workers cannot both see "one left".
 
 Windows: RPM is a fixed calendar minute (epoch // 60); budgets are calendar
-months in UTC. Tokens are added on completion, so a request admitted just
-under budget can overshoot by one request (documented, accepted).
+months in UTC. Tokens are added on completion, so every request already in
+flight when the budget is reached has passed admission: requests already in
+flight can overshoot the budget, bounded by the key's concurrency, not by one
+request (documented, accepted).
 
-Nothing secret lives here (names and counts), but the file is created 0600
-anyway. The WAL sidecars (-wal, -shm) are created by SQLite under the
-process umask.
+Nothing secret lives here (names and counts), but the file is kept 0600
+anyway: a Usage's first connection chmods the db and any existing -wal/-shm
+sidecars to 0600, and SQLite creates new sidecars with the db file's mode.
 """
 from __future__ import annotations
 
@@ -75,6 +77,17 @@ class Usage:
                 os.makedirs(directory, mode=0o700, exist_ok=True)
                 fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
                 os.close(fd)
+                # O_CREAT's mode only applies to a NEW file. A file that
+                # already exists (e.g. recreated under the umask by a stale
+                # connection after the DB was deleted at runtime) is tightened
+                # here; SQLite gives new -wal/-shm files the db file's mode,
+                # and any existing ones are tightened too.
+                os.chmod(self.path, 0o600)
+                for suffix in ("-wal", "-shm"):
+                    try:
+                        os.chmod(self.path + suffix, 0o600)
+                    except FileNotFoundError:
+                        pass
             conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)
             if not self._ready:
                 conn.execute("PRAGMA journal_mode=WAL")

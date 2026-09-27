@@ -33,9 +33,11 @@ class NeverApp:
         raise AssertionError("enroll must never reach litellm")
 
 
-def post(body, headers=(), method="POST", client=("100.64.0.9", 50000)):
+def post(body, headers=(), method="POST", client=("100.64.0.9", 50000),
+         query=b"", full=False):
     raw = body if isinstance(body, bytes) else json.dumps(body).encode()
     scope = {"type": "http", "path": PATH, "method": method, "client": client,
+             "query_string": query,
              "headers": [(k.encode(), v.encode()) for k, v in headers]}
     sent = []
 
@@ -48,6 +50,8 @@ def post(body, headers=(), method="POST", client=("100.64.0.9", 50000)):
     asyncio.run(FF.LaneCatalogueFilter(NeverApp(), frozenset())(scope, receive, send))
     start = next(m for m in sent if m["type"] == "http.response.start")
     payload = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    if full:
+        return start["status"], json.loads(payload), dict(start["headers"])
     return start["status"], json.loads(payload)
 
 
@@ -114,8 +118,38 @@ class EnrollCase(unittest.TestCase):
         with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": ""}):
             status, _ = post({"name": "evil"}, [("authorization", "Bearer " + token)],
                              client=("127.0.0.1", 1))
-        self.assertIn(status, (401, 403))
+        self.assertEqual(status, 403)
         self.assertEqual([e["name"] for e in K.load()["keys"]], ["laptop"])
+
+    def test_a_device_key_in_any_credential_source_cannot_enroll(self):
+        _, token = K.add("laptop")
+        cases = {"x-litellm-api-key": dict(headers=[("x-litellm-api-key", token)]),
+                 "?key=": dict(query=("key=" + token).encode())}
+        for label, kwargs in cases.items():
+            with self.subTest(source=label):
+                status, doc = post({"name": "evil"}, **kwargs)
+                self.assertEqual(status, 401)
+                self.assertIn("message", doc["error"])
+                self.assertEqual([e["name"] for e in K.load()["keys"]], ["laptop"])
+        self.assertEqual(NeverApp.calls, 0)
+
+    def test_success_is_never_cached(self):
+        status, _, headers = post({"name": "laptop"}, master(), full=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get(b"cache-control"), b"no-store")
+
+    def test_an_oversized_body_is_413_and_mints_nothing(self):
+        big = {"name": "laptop", "pad": "x" * (64 * 1024)}
+        status, doc = post(big, master())
+        self.assertEqual(status, 413)
+        self.assertIn("message", doc["error"])
+        self.assertFalse(os.path.exists(self.keys))
+
+    def test_a_body_just_under_the_cap_is_accepted(self):
+        raw = json.dumps({"name": "laptop"}).encode()
+        raw = raw[:-1] + b"," + b'"p":"' + b"x" * (64 * 1024 - len(raw) - 8) + b'"}'
+        self.assertLessEqual(len(raw), 64 * 1024)
+        self.assertEqual(post(raw, master())[0], 200)
 
     def test_a_scope_that_carries_a_key_entry_is_never_the_master(self):
         # Belt and braces: even a scope labelled "master" is refused when

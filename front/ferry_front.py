@@ -738,6 +738,7 @@ FLEET_HEADER = b"x-ferry-fleet"
 CLIENT_HEADER = b"x-ferry-client"
 FLEET_PATH = "/v1/ferry/fleet"
 KEYS_ENROLL_PATH = "/v1/ferry/keys/enroll"
+KEYS_ENROLL_MAX_BODY = 64 * 1024
 FLEET_STATE_ENV = "FERRY_FLEETS"
 HOST_IDENTITY = "host"
 
@@ -1703,9 +1704,22 @@ class LaneCatalogueFilter:
             return await fail(403, "no master key is configured; enroll from "
                                    "the host itself",
                               "invalid_request_error", "enroll_not_allowed")
-        raw = await self._read_body(receive, send)
-        if raw is None:
-            return
+        # Counted here, not in the shared _read_body: stop buffering the
+        # moment the body passes KEYS_ENROLL_MAX_BODY.
+        raw = b""
+        try:
+            while True:
+                msg = await receive()
+                raw += msg.get("body", b"")
+                if len(raw) > KEYS_ENROLL_MAX_BODY:
+                    return await fail(413, "enroll bodies are limited to %d bytes"
+                                           % KEYS_ENROLL_MAX_BODY,
+                                      "invalid_request_error", "body_too_large")
+                if not msg.get("more_body"):
+                    break
+        except Exception:
+            return await fail(400, "could not read request body",
+                              "invalid_request_error", "invalid_body")
         try:
             doc = json.loads(raw)
         except Exception:
@@ -1726,7 +1740,9 @@ class LaneCatalogueFilter:
             _key_warn(err)
             return await fail(503, "the ferry key store is unwritable: %s" % err,
                               "server_error", "key_store_unavailable")
-        return await self._reply(send, 200, {"name": name, "key": token})
+        # The only response that ever carries a plaintext key: never cache it.
+        return await self._reply(send, 200, {"name": name, "key": token},
+                                 headers=[(b"cache-control", b"no-store")])
 
     async def _fleet_rewrite(self, scope, receive, send, collector=None):
         """Resolve this request's fleet and return a one-shot replay `receive`.

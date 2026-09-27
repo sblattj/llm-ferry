@@ -1238,20 +1238,21 @@ def authenticate(scope):
     device key's name; a valid device key also gets scope["ferry.key_entry"]
     and has its credential rewritten. A refusal is (status, message).
 
-    Ambiguity is refused before any lookup: a repeated authorization or
-    x-api-key header, or an fk- key anywhere beside a different credential,
-    would let the front door validate one value while litellm reads another.
-    Master and bare requests never reach the key store."""
+    Ambiguity is refused before any lookup whenever an fk- word appears in
+    any credential header: a repeated authorization or x-api-key header, or
+    an fk- key beside a different credential, would let the front door
+    validate one value while litellm reads another. Without an fk- word the
+    request keeps today's behaviour exactly (duplicates included), and
+    master and bare requests never reach the key store."""
     scope[KEY_SCOPE] = ""
     creds = _credential_headers(scope)
     if not creds:
         return None
-    names = [name for name, _ in creds]
-    if len(names) != len(set(names)):
-        return 401, _KEY_AMBIGUOUS
     _, value = presented_credential(dict(creds))
     if any(_carries_device_key(text) for _, text in creds):
-        if (value is None or not value.startswith(KEY_PREFIX)
+        names = [name for name, _ in creds]
+        if (len(names) != len(set(names))
+                or value is None or not value.startswith(KEY_PREFIX)
                 or any(_header_token(n, t) != value for n, t in creds)):
             return 401, _KEY_AMBIGUOUS
     elif value is None:

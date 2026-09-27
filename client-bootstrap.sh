@@ -277,21 +277,25 @@ fi
 # master key (POST /v1/ferry/keys/enroll); only that device key is stored, so
 # the master never has to live on this laptop and the host can revoke this one
 # machine alone. A re-run rotates the key under the same name (the name is kept
-# in client.json as key_name). Any failure — an older host answers 404/501 —
-# falls back to storing the master key exactly as before. Keys never printed.
+# in client.json as key_name, and reused only when the saved profile names this
+# same host). Any failure — an older host's 404/501, a 401, a timeout, a reply
+# that is not a device key — falls back to storing the master key exactly as
+# before. Keys never printed.
 DEVICE_KEY=""
 DEVICE_KEY_NAME=""
 if [[ -n "$MASTER_KEY" ]]; then
   echo ">>> Enrolling this machine for its own device key..."
   enroll_out=$(FERRY_ENROLL_MASTER="$MASTER_KEY" python3 - \
       "http://$HOST_NAME:$HOST_PORT" "$CLIENT_NAME" "$HOME/.config/ferry/client.json" \
-      2>/dev/null <<'PYEOF'
+      "$HOST_NAME" 2>/dev/null <<'PYEOF'
 import json, os, sys, urllib.request
-base, name, profile = sys.argv[1], sys.argv[2], sys.argv[3]
+base, name, profile, host = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 replace = False
 try:
     prior = json.load(open(profile))
-    if isinstance(prior.get("key_name"), str) and prior["key_name"]:
+    # key_name belongs to the host that minted it: rotate it only on that host.
+    if (prior.get("host") == host
+            and isinstance(prior.get("key_name"), str) and prior["key_name"]):
         name, replace = prior["key_name"], True
 except Exception:
     pass
@@ -321,7 +325,7 @@ PYEOF
     APIKEY_HINT="your ferry device key (stored as api_key in ~/.config/ferry/client.json)"
     BEARER_HINT="your ferry device key"
   else
-    echo "    This host does not issue device keys (older than v1.39.0) — storing the master key."
+    echo "    Device-key enroll unavailable — storing the master key."
   fi
 fi
 

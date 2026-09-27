@@ -39,6 +39,7 @@ wrong fleet is worse than one that refuses to start.
 """
 from __future__ import annotations
 
+import asyncio
 import hmac
 import importlib.machinery
 import importlib.util
@@ -1364,6 +1365,100 @@ def key_error_body(path, status, message, code=None, openai_type=None) -> dict:
                       "param": None, "code": code or ocode}}
 
 
+# ── device-key limits and token accounting ──────────────────────────────────
+# A device key's lanes, RPM and monthly token budget are checked AFTER fleet
+# resolution (a lane limit must see both the requested and the resolved
+# `<fleet>.<lane>`), and only a request that passed is charged. Tokens are
+# input + output: reasoning is already inside output (lib/ferry_metrics.py).
+# Tokens are added on completion, so every request already in flight when a
+# budget is crossed has passed admission: requests already in flight can
+# overshoot the budget, bounded by the key's concurrency, not by one request.
+# The SQLite calls (5 s busy timeout) run in a worker thread so a stuck writer
+# never stalls the event loop. Master and bare requests never touch any of it.
+KEY_ADMITTED_SCOPE = "ferry.key_admitted"
+_USAGES: dict = {}
+
+
+def _usage_module():
+    return _front_sibling("ferry_keys_usage")
+
+
+def _usage():
+    """One Usage per DB path per process; the path is read per call."""
+    mod = _usage_module()
+    path = mod.usage_path()
+    usage = _USAGES.get(path)
+    if usage is None:
+        usage = _USAGES[path] = mod.Usage(path)
+    return usage
+
+
+def _usage_forget(usage) -> None:
+    """Drop a cached Usage after it failed, so the next request builds a fresh
+    one. A cached instance skips schema creation, so a DB file deleted while
+    the front runs would otherwise fail ("no such table") until a restart."""
+    for path, cached in list(_USAGES.items()):
+        if cached is usage:
+            _USAGES.pop(path, None)
+
+
+def _usage_admit(name, rpm, budget_tokens):
+    """Usage.admit on the current DB; a failed instance is forgotten. Raises."""
+    usage = _usage()
+    try:
+        return usage.admit(name, rpm, budget_tokens)
+    except Exception:
+        _usage_forget(usage)
+        raise
+
+
+def _account_tokens(scope, observed) -> None:
+    """Charge an admitted device-key request its tokens. Never raises.
+
+    input + output only: reasoning tokens are already inside output
+    (lib/ferry_metrics.py). A refused request was never admitted, so its
+    error body costs nothing. Synchronous: callers run it off the event loop
+    (_charge_tokens)."""
+    try:
+        if not scope.get(KEY_ADMITTED_SCOPE):
+            return
+        tokens = 0
+        for field in ("input_tokens", "output_tokens"):
+            value = (observed or {}).get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                tokens += int(value)
+        if tokens:
+            usage = _usage()
+            try:
+                usage.add_tokens(scope[KEY_SCOPE], tokens)
+            except Exception:
+                _usage_forget(usage)
+                raise
+    except Exception as err:
+        _key_warn(err)
+
+
+async def _charge_tokens(scope, observed) -> None:
+    """_account_tokens in a worker thread; a no-op (no thread hop) for a
+    request that was never admitted. Never raises anything but a cancel.
+
+    Called ONLY from _inference's `finally`, never from inside the send
+    chain: behind uvicorn (ASGI spec 2.3) Starlette's StreamingResponse
+    cancels the task streaming the body as soon as the final body is sent,
+    and an executor job cancelled before a worker picks it up is dropped.
+    The job is submitted synchronously (before the first await) and awaited
+    through asyncio.shield, so cancelling this coroutine, or the whole
+    request task, never cancels the charge itself."""
+    try:
+        if observed is None or not scope.get(KEY_ADMITTED_SCOPE):
+            return
+        job = asyncio.get_running_loop().run_in_executor(
+            None, _account_tokens, scope, observed)
+        await asyncio.shield(job)
+    except Exception as err:
+        _key_warn(err)
+
+
 _FLEET_WARNED: dict = {}
 FLEET_WARN_INTERVAL = 60.0
 
@@ -1638,15 +1733,25 @@ class LaneCatalogueFilter:
         strip = strip_headers_enabled() and not _is_loopback_client(scope)
         collector = module = token = None
         tapped = None
-        if tap_enabled():
+        emit = tap_enabled()
+        # A device-key request is metered whether or not the event tap is on:
+        # its token budget must not depend on FERRY_EVENTS.
+        metered = scope.get(KEY_ENTRY_SCOPE) is not None
+        if emit or metered:
             started_at = time.monotonic()
             try:
                 module = _metrics_module()
                 collector = module.RequestMetrics(started_at=started_at, clock=time.monotonic)
                 token = module.CURRENT_METRICS.set(collector)
-            except Exception:
+            except Exception as err:
                 collector = None
-            tapped = self._tapped(scope, send, strip, collector)
+                if metered:
+                    # Known gap (parked): this request is admitted and its RPM
+                    # counted, but with no collector it is charged 0 tokens.
+                    _key_warn(RuntimeError(
+                        "token metering unavailable, device-key requests are "
+                        "not charged tokens: %s: %s" % (type(err).__name__, err)))
+            tapped = self._tapped(scope, send, strip, collector, emit=emit)
             send = tapped
         elif strip:
             send = self._stripping(send)
@@ -1658,6 +1763,9 @@ class LaneCatalogueFilter:
             try:
                 if tapped is not None:
                     tapped.finish(False)
+                    # The single charge, after self.app has returned and so
+                    # outside Starlette's stream cancel scope; shielded.
+                    await _charge_tokens(scope, tapped.take_observed())
             finally:
                 if token is not None:
                     module.CURRENT_METRICS.reset(token)
@@ -1789,6 +1897,7 @@ class LaneCatalogueFilter:
                     doc = json.loads(body)
                 except Exception:
                     doc = None
+        requested = doc.get("model") if isinstance(doc, dict) else None
         if isinstance(doc, dict) and tap_enabled():
             # The record still NAMES what was found — now with `fixed` per
             # entry — so a lane that hangs for one client stays traceable to
@@ -1824,8 +1933,38 @@ class LaneCatalogueFilter:
             if resolved and resolved != doc["model"]:
                 doc["model"] = resolved
                 changed = True
-        if (tap_enabled() and isinstance(doc, dict) and doc.get("stream") is True
-                and scope.get("path") in ("/v1/chat/completions", "/chat/completions")):
+        entry = scope.get(KEY_ENTRY_SCOPE)
+        if entry is not None:
+            resolved = doc.get("model") if isinstance(doc, dict) else None
+            if not await self._key_admit(scope, send, entry, requested, resolved):
+                return None
+        metered = entry is not None and isinstance(doc, dict)
+        stream_paths = ("/v1/chat/completions", "/chat/completions")
+        if metered:
+            # A metered stream must carry a usage chunk or it is charged 0.
+            # litellm 1.99 (common_request_processing
+            # _stream_usage_tracking_updates) only adds include_usage for
+            # chat, and strips its own usage chunk back out when the client
+            # did not ask; legacy completions stream no usage unless asked.
+            # /v1/responses (response.completed) and /v1/messages
+            # (message_start/message_delta) always report usage in-stream.
+            stream_paths += ("/v1/completions", "/completions")
+            stream = doc.get("stream")
+            if (type(stream) in (int, float) and stream == 1
+                    and scope.get("path") in stream_paths):
+                # litellm's usage injection keys on `stream is True`, yet the
+                # proxy still streams whatever response comes back as an
+                # iterator (_is_streaming_response), so `1` could stream
+                # with no usage chunk. Normalise it to the real boolean.
+                doc["stream"] = True
+                changed = True
+            if (doc.get("stream") is True and scope.get("path") in stream_paths
+                    and not isinstance(doc.get("stream_options"), (dict, type(None)))):
+                doc.pop("stream_options")   # unusable; rebuilt just below
+                changed = True
+        if ((tap_enabled() or metered) and isinstance(doc, dict)
+                and doc.get("stream") is True
+                and scope.get("path") in stream_paths):
             options = doc.get("stream_options")
             if options is None or isinstance(options, dict):
                 options = dict(options or {})
@@ -1855,6 +1994,45 @@ class LaneCatalogueFilter:
             return await receive()
 
         return replay
+
+    async def _key_admit(self, scope, send, entry, requested, resolved) -> bool:
+        """Lane, RPM and budget gate for a device key. False = already replied.
+
+        An unparseable body has no model, so a lane-restricted key is refused
+        (fail-closed). The usage DB runs in a worker thread; any failure there
+        is a 503 for this key only."""
+        path = scope.get("path", "")
+        name = scope.get(KEY_SCOPE, "")
+        lanes = entry.get("lanes")
+        if not _keys_module().lane_allowed(lanes, requested, resolved):
+            await self._reply(send, 403, key_error_body(path, 403,
+                "ferry device key %r may not use model %r (allowed lanes: %s)"
+                % (name, requested, ", ".join(lanes or []))))
+            return False
+        try:
+            verdict = await asyncio.to_thread(
+                _usage_admit, name, entry.get("rpm"), entry.get("budget_tokens"))
+        except Exception as err:
+            _key_warn(err)
+            await self._reply(send, 503, key_error_body(path, 503,
+                "the ferry key usage store is unavailable, so device keys are "
+                "refused until it is fixed (see the host's front log)"))
+            return False
+        if not verdict.ok:
+            retry = [(b"retry-after", str(max(1, int(verdict.retry_after))).encode())]
+            if verdict.reason == "budget":
+                doc = key_error_body(path, 429,
+                    "ferry device key %r has used its monthly budget of %s tokens"
+                    % (name, entry.get("budget_tokens")),
+                    code="insufficient_quota", openai_type="insufficient_quota")
+            else:
+                doc = key_error_body(path, 429,
+                    "ferry device key %r is over its limit of %s requests per minute"
+                    % (name, entry.get("rpm")))
+            await self._reply(send, 429, doc, retry)
+            return False
+        scope[KEY_ADMITTED_SCOPE] = True
+        return True
 
     def _catalogue_fleet(self, scope):
         """The fleet whose lanes this caller's bare names should mean.
@@ -1923,32 +2101,41 @@ class LaneCatalogueFilter:
 
         return stripping
 
-    def _tapped(self, scope, send, strip=False, collector=None):
+    def _tapped(self, scope, send, strip=False, collector=None, emit=True):
         """Passively observe bounded response data; emit after final send.
 
         Original chunks and ordering survive unchanged. A failed/unfinished
         response still emits observed numeric data; observation failures never
         hide application or downstream-send exceptions.
+
+        `emit=False` meters without an event record (a device key with the
+        tap off). `finish` runs once and only RECORDS the observed numbers;
+        `take_observed()` hands them to _inference's finally, which charges
+        them to the key via _charge_tokens, off the event loop.
         """
         rec = None
         nbytes = 0
         emitted = False
+        settled = None
 
         def finish(complete):
-            nonlocal rec, emitted
+            nonlocal rec, emitted, settled
             if emitted:
-                return
+                return None
             emitted = True
             observed = {}
             if collector is not None:
                 try:
-                    observed = collector.finish(complete=complete)
+                    observed = collector.finish(complete=complete) or {}
                 except Exception:
-                    pass
+                    observed = {}
+            settled = observed
+            if not emit:
+                return observed
             try:
                 tap = _tap()
                 if tap is None:
-                    return
+                    return observed
                 if rec is None:
                     client = scope.get("client") or ("", 0)
                     rec = tap.record_from_headers([], client[0], scope.get("path", ""), 0)
@@ -1956,22 +2143,25 @@ class LaneCatalogueFilter:
                 rec["resp_bytes"] = nbytes
                 rec["response_complete"] = bool(complete)
                 rec.update(observed)
+                rec["key"] = scope.get(KEY_SCOPE, "")
                 tap.offer(rec)
             except Exception:
                 pass
+            return observed
 
         async def tapped(message):
             nonlocal rec, nbytes
             mtype = message.get("type")
             if mtype == "http.response.start":
-                try:
-                    tap = _tap()
-                    if tap is not None:
-                        client = scope.get("client") or ("", 0)
-                        rec = tap.record_from_headers(message.get("headers") or [],
-                            client[0], scope.get("path", ""), message.get("status", 0))
-                except Exception:
-                    pass
+                if emit:
+                    try:
+                        tap = _tap()
+                        if tap is not None:
+                            client = scope.get("client") or ("", 0)
+                            rec = tap.record_from_headers(message.get("headers") or [],
+                                client[0], scope.get("path", ""), message.get("status", 0))
+                    except Exception:
+                        pass
                 if collector is not None:
                     try:
                         collector.start_response(message.get("headers") or [], message.get("status", 0))
@@ -1994,10 +2184,20 @@ class LaneCatalogueFilter:
                         pass
             result = await send(message)
             if mtype == "http.response.body" and not message.get("more_body"):
+                # Record only: nothing may be awaited here, because this task
+                # is cancelled at stream end (see _charge_tokens). The charge
+                # happens in _inference's finally.
                 finish(True)
             return result
 
+        def take_observed():
+            """The observed numbers from the one finish(), handed out once."""
+            nonlocal settled
+            out, settled = settled, None
+            return out
+
         tapped.finish = finish
+        tapped.take_observed = take_observed
         return tapped
 
     async def _flush(self, send, start_message, body: bytes, fleet=None) -> None:

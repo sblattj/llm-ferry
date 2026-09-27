@@ -1,5 +1,7 @@
 # Follow-up: automate the tag → GitHub Release step
 
+> **RESOLVED 2026-09-27:** task 1 landed as `.github/workflows/release.yml` + `scripts/release-notes.py` (tests: `scripts/release-notes.test.py`). It diverges from the sketch below on purpose: tags are lightweight, so the title/notes come from the tagged commit and `docs/releases/<tag>.md`, not a tag message, and `--latest` is computed from semver so a re-run for an old tag cannot steal the marker. Tasks 2 (drift check) and 3 (worktree prune) remain open; the history below is kept as written.
+
 ## Origin
 
 Produced by the `sharpen` retrospective on session

@@ -500,7 +500,7 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 Run every Python suite, the dashboard JavaScript checks, and the generated CLI guard from the repository root. Python tests use stdlib `unittest`; integration cases can invoke the project's command-line dependencies such as zsh and OpenSSL. The UI checks use Node.js.
 
 ```bash
-for suite in lib/*.test.py observ/*.test.py; do
+for suite in lib/*.test.py observ/*.test.py scripts/*.test.py; do
   python3 "$suite" || exit 1
 done
 node lib/ferry-dashui.test.mjs

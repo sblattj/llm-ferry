@@ -439,20 +439,54 @@ class TestEveryLitellmCredentialSource(KeyFrontCase):
                          headers)
         boom.assert_not_called()
 
-    def test_query_key_device_key_is_presented_and_rewritten(self):
+    def test_query_key_device_key_is_stripped_and_moved_to_a_header(self):
+        # Fix round 3: uvicorn's access log prints the (outermost, shared)
+        # scope's query string, so the master must NEVER be written there.
+        # The master rides in x-litellm-api-key, which litellm 1.99's
+        # get_api_key reads first on every route, generateContent included.
         token = self.mint()
         query = ("alt=sse&key=%s&x=%%2F1" % token).encode()
         scope, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
                                query=query)
         self.assertEqual(reply(sent)[0], 200)
-        self.assertEqual(self.app.scope["query_string"],
-                         ("alt=sse&key=%s&x=%%2F1" % MASTER).encode())
+        for label, seen in (("downstream", self.app.scope), ("original", scope)):
+            with self.subTest(scope=label):
+                self.assertEqual(seen["query_string"], b"alt=sse&x=%2F1")
+                self.assertNotIn(MASTER.encode(), seen["query_string"])
+                self.assertNotIn(token.encode(), seen["query_string"])
+        self.assertEqual(self.app.headers()[b"x-litellm-api-key"], MASTER.encode())
         self.assertEqual(scope["ferry.key"], "laptop")
         # The same key in a header and in ?key= is one credential.
-        drive(self.mw(), "/v1/chat/completions", bearer(token),
-              query=("key=" + token).encode())
-        self.assertEqual(self.app.scope["query_string"], ("key=" + MASTER).encode())
+        scope, _, _ = drive(self.mw(), "/v1/chat/completions", bearer(token),
+                            query=("key=" + token).encode())
+        self.assertEqual(self.app.scope["query_string"], b"")
+        self.assertEqual(scope["query_string"], b"")
         self.assertEqual(self.app.headers()[b"authorization"], b"Bearer " + MASTER.encode())
+        self.assertEqual(self.app.headers()[b"x-litellm-api-key"], MASTER.encode())
+        # x-litellm-api-key already present is rewritten, never duplicated.
+        drive(self.mw(), "/v1/chat/completions", [("x-litellm-api-key", token)],
+              query=("key=" + token).encode())
+        names = [bytes(k).lower() for k, _ in self.app.scope["headers"]]
+        self.assertEqual(names.count(b"x-litellm-api-key"), 1)
+
+    def test_query_key_is_stripped_without_a_master(self):
+        token = self.mint()
+        with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": ""}):
+            scope, sent, _ = drive(self.mw(), "/v1beta/models/f:generateContent", (),
+                                   query=("key=%s&alt=sse" % token).encode())
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.scope["query_string"], b"alt=sse")
+        self.assertNotIn(b"x-litellm-api-key", self.app.headers())
+
+    def test_a_refused_query_key_is_stripped_from_the_logged_scope(self):
+        # A refused request never reaches litellm, but uvicorn still logs the
+        # scope's query string: the plaintext device key must not be in it.
+        _, gone = K.add("gone")
+        K.revoke("gone")
+        scope, sent, _ = drive(self.mw(), "/v1beta/models/f:generateContent", (),
+                               query=("alt=sse&key=" + gone).encode())
+        self.assertEqual(reply(sent)[0], 401)
+        self.assertEqual(scope["query_string"], b"alt=sse")
 
     def test_query_key_that_disagrees_or_is_revoked_is_refused(self):
         token = self.mint()
@@ -464,6 +498,38 @@ class TestEveryLitellmCredentialSource(KeyFrontCase):
         self.refused((), query=("key=%s&key=%s" % (token, other)).encode())
         self.refused((), query=("key=" + gone).encode())
         self.assertEqual(self.app.calls, 0)
+
+    def test_duplicate_query_key_with_an_fk_word_is_refused(self):
+        token = self.mint()
+        self.refused((), query=("key=%s&key=%s" % (token, token)).encode())
+        self.refused(bearer(token), query=("key=%s&key=%s" % (token, token)).encode())
+        self.assertEqual(self.app.calls, 0)
+        # Without an fk- word a duplicate ?key= is litellm's business, as today.
+        _, sent, _ = drive(self.mw(), "/v1/chat/completions", bearer(MASTER),
+                           query=b"key=sk-a&key=sk-a")
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.scope["query_string"], b"key=sk-a&key=sk-a")
+
+    def test_x_litellm_api_key_accepts_the_bearer_form(self):
+        # litellm strips "Bearer " from x-litellm-api-key, so this is one key.
+        token = self.mint()
+        scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                               [("x-litellm-api-key", "Bearer " + token)])
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(scope["ferry.key"], "laptop")
+        self.assertEqual(self.app.headers()[b"x-litellm-api-key"], MASTER.encode())
+        _, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                           [("x-litellm-api-key", "Bearer " + token)] + bearer(token))
+        self.assertEqual(reply(sent)[0], 200)
+        scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                               [("x-litellm-api-key", "Bearer " + MASTER)])
+        self.assertEqual(scope["ferry.key"], "master")
+
+    def test_credential_headers_follow_litellm_precedence(self):
+        self.assertEqual(FF.CREDENTIAL_HEADERS,
+                         (b"x-litellm-api-key", b"authorization", b"api-key",
+                          b"x-api-key", b"x-goog-api-key",
+                          b"ocp-apim-subscription-key"))
 
     def test_a_non_fk_query_key_is_untouched(self):
         scope, sent, send = drive(self.mw(), "/v1/chat/completions", bearer(MASTER),

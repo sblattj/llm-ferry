@@ -1167,11 +1167,17 @@ def _master_key() -> str:
     return (os.environ.get("LITELLM_MASTER_KEY") or "").strip()
 
 
-# Every header litellm 1.99 reads a client key from, in its precedence order
-# (x-litellm-api-key outranks Authorization). The `?key=` query parameter is
-# the one non-header source; QUERY_KEY handles it.
-CREDENTIAL_HEADERS = (b"x-litellm-api-key", b"authorization", b"x-api-key",
-                      b"api-key", b"x-goog-api-key", b"ocp-apim-subscription-key")
+# Every header litellm 1.99 reads a client key from, in its precedence order:
+# litellm/proxy/auth/user_api_key_auth.py `get_api_key` checks
+# x-litellm-api-key (Bearer/Basic stripped), Authorization, API-Key,
+# x-api-key, x-goog-api-key, Ocp-Apim-Subscription-Key, then `?key=` on
+# generateContent routes only. QUERY_KEY handles that last, non-header source.
+CREDENTIAL_HEADERS = (b"x-litellm-api-key", b"authorization", b"api-key",
+                      b"x-api-key", b"x-goog-api-key", b"ocp-apim-subscription-key")
+# Where an admitted `?key=` device key's master goes: litellm reads this
+# header first on every route, and a header, unlike the query string, is
+# never printed by uvicorn's access log.
+MASTER_KEY_HEADER = b"x-litellm-api-key"
 QUERY_KEY = "key"
 _KEY_AMBIGUOUS = ("ambiguous credentials: send exactly one credential, and when "
                   "it is a ferry device key, send only that key")
@@ -1198,6 +1204,12 @@ def _header_token(name: bytes, text: str):
     pasted without its scheme is still a presented device key). Every other
     credential header: the whole value. Surrounding quotes are stripped."""
     text = _unquote(text)
+    if name == MASTER_KEY_HEADER:
+        # litellm strips a "Bearer " scheme from this header, so do we.
+        parts = text.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return _unquote(parts[1]) or None
+        return text or None
     if name != b"authorization":
         return text or None
     parts = text.split(None, 1)
@@ -1249,17 +1261,15 @@ def _query_keys(parts) -> list:
             for p in parts if _is_query_key(p)]
 
 
-def _replace_query_key(scope, parts, master: str) -> None:
-    """Every `key=` parameter becomes the master (or goes); the rest of the
-    query string is kept byte for byte."""
-    out = []
-    for part in parts:
-        if _is_query_key(part):
-            if master:
-                out.append(b"key=" + urllib.parse.quote(master, safe="").encode())
-            continue
-        out.append(part)
-    scope["query_string"] = b"&".join(out)
+def _strip_query_key(scope, parts) -> None:
+    """Remove every `key=` parameter; the rest of the query string is kept
+    byte for byte.
+
+    Never REWRITE it to the master: this middleware is the outermost app, so
+    `scope` is uvicorn's own, and its access log prints this query string
+    (into ~/.config/ferry/litellm.log); litellm also stores the request URL
+    in its metadata. The master travels in MASTER_KEY_HEADER instead."""
+    scope["query_string"] = b"&".join(p for p in parts if not _is_query_key(p))
 
 
 def _credential_headers(scope):
@@ -1319,12 +1329,17 @@ def authenticate(scope):
                 and hmac.compare_digest(value.encode(), master.encode())):
             scope[KEY_SCOPE] = "master"
         return None
+    if fk_query:
+        # Admitted or refused, a device key never stays in the query string
+        # uvicorn logs.
+        _strip_query_key(scope, parts)
     present = [(n, t) for n, t in creds if _unquote(t)]
     names = [n for n, _ in present]
-    if len(names) != len(set(names)):
+    qvalues = [_unquote(v) for v in qkeys if _unquote(v)]
+    if len(names) != len(set(names)) or len(qvalues) > 1:
         return 401, _KEY_AMBIGUOUS
     tokens = [_canonical(_header_token(n, t)) for n, t in present]
-    tokens += [_canonical(_unquote(v)) for v in qkeys if _unquote(v)]
+    tokens += [_canonical(v) for v in qvalues]
     value = tokens[0] if tokens else None
     if not _is_device_key(value) or any(t != value for t in tokens):
         return 401, _KEY_AMBIGUOUS
@@ -1343,7 +1358,10 @@ def authenticate(scope):
     scope[KEY_ENTRY_SCOPE] = entry
     _replace_credential(scope, master)
     if qkeys:
-        _replace_query_key(scope, parts, master)
+        _strip_query_key(scope, parts)
+        if master and not any(bytes(k).lower() == MASTER_KEY_HEADER
+                              for k, _ in scope["headers"]):
+            scope["headers"].append((MASTER_KEY_HEADER, master.encode()))
     return None
 
 

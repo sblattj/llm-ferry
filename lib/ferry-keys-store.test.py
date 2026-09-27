@@ -217,7 +217,9 @@ class TestLoad(StoreCase):
 
     def test_a_reserved_name_in_the_store_fails_closed(self):
         _, token = K.add("laptop")
-        for reserved in ("master", "host", "Master", " HOST ", "master\n"):
+        for reserved in ("master", "host", "Master", " HOST ", "master\n",
+                         "master.", "-master", "master_", "MASTER!", "--host--",
+                         "Host "):
             with self.subTest(reserved=reserved):
                 doc = {"version": 1, "keys": [
                     {"name": "laptop", "sha256": K.hash_token(token)},
@@ -229,6 +231,15 @@ class TestLoad(StoreCase):
                     K.load()
                 with self.assertRaises(K.KeyStoreError):
                     K.KeyCache().lookup(token)
+
+
+    def test_names_that_only_resemble_a_reserved_one_still_load(self):
+        for name in ("master-laptop", "hosts", "my-host"):
+            with self.subTest(name=name):
+                doc = {"version": 1, "keys": [{"name": name, "sha256": "a" * 64}]}
+                with open(self.path, "w") as fh:
+                    json.dump(doc, fh)
+                self.assertEqual(K.load()["keys"][0]["name"], name)
 
 
 class TestLifecycle(StoreCase):

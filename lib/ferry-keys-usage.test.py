@@ -131,6 +131,54 @@ class TestFiles(UsageCase):
         finally:
             conn.close()
 
+    def permissive_umask(self):
+        old = os.umask(0o022)
+        self.addCleanup(os.umask, old)
+
+    def mode(self, path):
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_fresh_db_and_its_wal_sidecars_are_0600_under_a_loose_umask(self):
+        import sqlite3
+        self.permissive_umask()
+        self.u.admit("a", now=NOW)
+        # SQLite deletes -wal/-shm when the last connection closes; an open
+        # reader keeps them on disk so their modes can be observed.
+        hold = sqlite3.connect(self.path)
+        self.addCleanup(hold.close)
+        hold.execute("SELECT count(*) FROM minute").fetchone()
+        self.u.add_tokens("a", 3, now=NOW)
+        self.assertEqual(self.mode(self.path), 0o600)
+        for suffix in ("-wal", "-shm"):
+            self.assertTrue(os.path.exists(self.path + suffix), suffix)
+            self.assertEqual(self.mode(self.path + suffix), 0o600, suffix)
+
+    def test_a_db_recreated_after_a_heal_is_0600(self):
+        # A cached Usage whose file was deleted lets sqlite3.connect recreate
+        # it under the umask (0644 here); the fresh Usage the front builds
+        # after the failure must tighten it back to 0600.
+        self.permissive_umask()
+        self.u.admit("a", now=NOW)
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.path + suffix):
+                os.remove(self.path + suffix)
+        with self.assertRaises(U.UsageError):
+            self.u.admit("a", now=NOW)  # "no such table", file recreated
+        self.assertEqual(self.mode(self.path), 0o644)  # control: the stale mode
+        # A reader holding the file open leaves 0644 sidecars behind.
+        import sqlite3
+        hold = sqlite3.connect(self.path)
+        self.addCleanup(hold.close)
+        hold.execute("PRAGMA journal_mode=WAL").fetchone()
+        hold.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        self.assertEqual(self.mode(self.path + "-shm"), 0o644)  # control
+        fresh = U.Usage(self.path)
+        self.assertTrue(fresh.admit("a", now=NOW).ok)
+        self.assertEqual(self.mode(self.path), 0o600)
+        for suffix in ("-wal", "-shm"):
+            self.assertTrue(os.path.exists(self.path + suffix), suffix)
+            self.assertEqual(self.mode(self.path + suffix), 0o600, suffix)
+
     def test_unopenable_db_raises_usage_error(self):
         bad = U.Usage(self.dir)  # a directory is not a database
         with self.assertRaises(U.UsageError):

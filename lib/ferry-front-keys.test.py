@@ -576,5 +576,384 @@ class TestErrorBodies(unittest.TestCase):
                          "insufficient_quota")
 
 
+import ferry_keys_usage as U  # noqa: E402
+
+
+class TestLimits(KeyFrontCase):
+    def usage(self):
+        return U.Usage(self.db)
+
+    def chat(self, token, model="flash", mw=None, **extra):
+        body = json.dumps(dict({"model": model, "messages": []}, **extra)).encode()
+        return drive(mw or self.mw(), "/v1/chat/completions", bearer(token), body=body)
+
+    def test_lane_restricted_key_gets_403_for_another_lane(self):
+        token = self.mint(lanes=["flash"])
+        status, _, doc = reply(self.chat(token, "heavy")[1])
+        self.assertEqual(status, 403)
+        self.assertEqual(doc["error"]["code"], "model_not_allowed")
+        self.assertEqual(self.app.calls, 0)
+        self.assertEqual(reply(self.chat(token, "flash")[1])[0], 200)
+
+    def test_fleet_qualified_lane_limit_sees_the_resolved_lane(self):
+        state_path = os.path.join(self.dir, "fleets.json")
+        with open(state_path, "w") as fh:
+            json.dump({"default": "domestic", "clients": {}}, fh)
+        mw = self.mw(FF.FleetState(state_path, FLEETS), FLEETS)
+        token = self.mint(lanes=["international.flash"])
+        self.assertEqual(reply(self.chat(token, "flash", mw=mw)[1])[0], 403)
+        self.assertEqual(reply(self.chat(token, "international.flash", mw=mw)[1])[0], 200)
+
+    def test_unparseable_body_on_a_lane_restricted_key_is_403(self):
+        token = self.mint(lanes=["flash"])
+        _, sent, _ = drive(self.mw(), "/v1/chat/completions", bearer(token), body=b"{not json")
+        self.assertEqual(reply(sent)[0], 403)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_rpm_limit_is_429_with_retry_after_in_both_shapes(self):
+        token = self.mint(rpm=1)
+        self.assertEqual(reply(self.chat(token)[1])[0], 200)
+        status, headers, doc = reply(self.chat(token)[1])
+        self.assertEqual(status, 429)
+        self.assertTrue(1 <= int(headers[b"retry-after"]) <= 60)
+        self.assertEqual(doc["error"]["code"], "rate_limit_exceeded")
+        _, sent, _ = drive(self.mw(), "/v1/messages", [("x-api-key", token)],
+                           body=b'{"model":"flash","messages":[]}')
+        status, headers, doc = reply(sent)
+        self.assertEqual((status, doc["error"]["type"]), (429, "rate_limit_error"))
+        self.assertIn(b"retry-after", headers)
+        self.assertEqual(self.app.calls, 1)
+
+    def test_budget_is_429_insufficient_quota(self):
+        token = self.mint(budget_tokens=10)
+        self.assertEqual(reply(self.chat(token)[1])[0], 200)  # charges 12
+        status, headers, doc = reply(self.chat(token)[1])
+        self.assertEqual(status, 429)
+        self.assertEqual(doc["error"]["code"], "insufficient_quota")
+        self.assertEqual(doc["error"]["type"], "insufficient_quota")
+        self.assertGreater(int(headers[b"retry-after"]), 0)
+
+    def test_accounting_works_with_the_tap_off(self):
+        self.assertEqual(os.environ["FERRY_EVENTS"], "0")
+        token = self.mint()
+        self.chat(token)
+        self.assertEqual(self.usage().month_tokens("laptop"), 12)  # 7 in + 5 out
+        self.assertEqual(self.usage().minute_requests("laptop"), 1)
+
+    def test_reasoning_tokens_are_not_double_counted(self):
+        self.app.payload = json.dumps({"usage": {
+            "prompt_tokens": 7, "completion_tokens": 5,
+            "completion_tokens_details": {"reasoning_tokens": 4}}}).encode()
+        self.chat(self.mint())
+        self.assertEqual(self.usage().month_tokens("laptop"), 12)
+
+    def test_a_refused_request_is_not_counted(self):
+        token = self.mint(rpm=1)
+        self.chat(token)
+        self.chat(token)
+        self.assertEqual(self.usage().month_tokens("laptop"), 12)
+        self.assertEqual(self.usage().minute_requests("laptop"), 1)
+
+    def test_include_usage_is_injected_for_device_keys_only(self):
+        self.chat(self.mint(), stream=True)
+        self.assertEqual(json.loads(self.app.body)["stream_options"], {"include_usage": True})
+        body = json.dumps({"model": "flash", "messages": [], "stream": True}).encode()
+        drive(self.mw(), "/v1/chat/completions", bearer(MASTER), body=body)
+        self.assertEqual(self.app.body, body)
+
+    def test_master_request_still_gets_the_original_send(self):
+        _, _, send = drive(self.mw(), "/v1/chat/completions", bearer(MASTER))
+        self.assertIs(self.app.send, send)
+        # CONTROL: a device key does get the metering wrapper.
+        _, _, send = self.chat(self.mint())
+        self.assertIsNot(self.app.send, send)
+
+    def test_unusable_usage_db_is_503_for_keys_and_invisible_to_the_master(self):
+        token = self.mint()
+        with mock.patch.dict(os.environ, {"FERRY_KEYS_DB": self.dir}), \
+                mock.patch("sys.stderr"):
+            status, _, doc = reply(self.chat(token)[1])
+            self.assertEqual(status, 503)
+            self.assertEqual(doc["error"]["code"], "key_store_unavailable")
+            _, sent, _ = drive(self.mw(), "/v1/chat/completions", bearer(MASTER))
+            self.assertEqual(reply(sent)[0], 200)
+
+    def test_accounting_failure_never_breaks_the_response(self):
+        token = self.mint()
+        with mock.patch.object(U.Usage, "add_tokens",
+                               side_effect=U.UsageError("disk full")), \
+                mock.patch("sys.stderr") as err:
+            _, sent, _ = self.chat(token)
+        status, _, _ = reply(sent)
+        self.assertEqual(status, 200)
+        body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+        self.assertEqual(body, USAGE_BODY)
+        self.assertTrue(any("disk full" in str(c.args[0]) for c in err.write.call_args_list if c.args))
+
+
+class TestEventKeyField(KeyFrontCase):
+    def setUp(self):
+        super().setUp()
+        self.events = os.path.join(self.dir, "events.jsonl")
+        os.environ["FERRY_EVENTS"] = "1"   # restored by the patch.dict in the base
+        FF.reset_tap(self.events)
+        self.addCleanup(FF.reset_tap, None)
+
+    def test_record_names_the_key(self):
+        token = self.mint()
+        for headers in (bearer(token), bearer(MASTER), ()):
+            drive(self.mw(), "/v1/chat/completions", headers)
+        FF.tap_flush()
+        with open(self.events) as fh:
+            keys = [json.loads(line)["key"] for line in fh if line.strip()]
+        self.assertEqual(keys, ["laptop", "master", ""])
+
+
+class TestUsageStoreResilience(KeyFrontCase):
+    """Task 4 seat additions: the usage DB is touched off the event loop,
+    and a deleted DB heals on the next request instead of at restart."""
+
+    def chat(self, token):
+        return drive(self.mw(), "/v1/chat/completions", bearer(token),
+                     body=b'{"model":"flash","messages":[]}')
+
+    def test_admit_and_charge_run_off_the_event_loop(self):
+        seen = []
+        real_admit, real_add = U.Usage.admit, U.Usage.add_tokens
+
+        def probe(real):
+            def wrapped(*args, **kwargs):
+                try:
+                    asyncio.get_running_loop()
+                    seen.append("loop")
+                except RuntimeError:
+                    seen.append("thread")
+                return real(*args, **kwargs)
+            return wrapped
+
+        with mock.patch.object(U.Usage, "admit", probe(real_admit)), \
+                mock.patch.object(U.Usage, "add_tokens", probe(real_add)):
+            self.assertEqual(reply(self.chat(self.mint())[1])[0], 200)
+        self.assertEqual(seen, ["thread", "thread"])
+
+    def test_a_deleted_usage_db_heals_on_the_next_request(self):
+        token = self.mint()
+        self.assertEqual(reply(self.chat(token)[1])[0], 200)
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db + suffix):
+                os.remove(self.db + suffix)
+        with mock.patch("sys.stderr"):
+            # The cached Usage believed its schema existed ("no such table"):
+            # the first request after the deletion is refused, fail-closed...
+            self.assertEqual(reply(self.chat(token)[1])[0], 503)
+        # ...and the next one is served by a fresh Usage that rebuilt it.
+        self.assertEqual(reply(self.chat(token)[1])[0], 200)
+        self.assertEqual(U.Usage(self.db).minute_requests("laptop"), 1)
+        self.assertEqual(U.Usage(self.db).month_tokens("laptop"), 12)
+
+    def test_the_heal_probe_can_fail(self):
+        # Control for the test above: without dropping the cached instance
+        # the deleted DB keeps failing ("no such table").
+        token = self.mint()
+        self.assertEqual(reply(self.chat(token)[1])[0], 200)
+        for suffix in ("", "-wal", "-shm"):
+            if os.path.exists(self.db + suffix):
+                os.remove(self.db + suffix)
+        with mock.patch.object(FF, "_usage_forget", lambda usage: None), \
+                mock.patch("sys.stderr"):
+            self.assertEqual(reply(self.chat(token)[1])[0], 503)
+            self.assertEqual(reply(self.chat(token)[1])[0], 503)
+
+
+SSE_CHUNKS = [b'data: {"id":"x","choices":[{"delta":{"content":"hi"}}]}\n\n',
+              b'data: {"id":"x","choices":[],"usage":{"prompt_tokens":7,'
+              b'"completion_tokens":5}}\n\n',
+              b"data: [DONE]\n\n"]
+
+
+class DisconnectingStream:
+    """litellm behind uvicorn (ASGI spec 2.3) + Starlette's StreamingResponse:
+    the body streams in one task while a second task listens for
+    `http.disconnect`, and the stream task is CANCELLED as soon as the
+    listener returns. uvicorn's receive() returns http.disconnect the moment
+    the final body has been sent, so every streamed response ends with that
+    cancel landing on whatever the send chain is awaiting."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def __call__(self, scope, receive, send):
+        self.calls += 1
+        while True:
+            msg = await receive()
+            if not msg.get("more_body"):
+                break
+
+        async def stream():
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"text/event-stream")]})
+            for chunk in SSE_CHUNKS:
+                await send({"type": "http.response.body", "body": chunk,
+                            "more_body": True})
+            await send({"type": "http.response.body", "body": b"",
+                        "more_body": False})
+
+        async def listen():
+            while (await receive())["type"] != "http.disconnect":
+                pass
+
+        tasks = {asyncio.ensure_future(stream()), asyncio.ensure_future(listen())}
+        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+def drive_disconnecting(mw, token, busy=0.3):
+    """uvicorn-faithful transport: after the final body, receive() returns
+    http.disconnect. The default executor has ONE worker, and it is kept busy
+    for `busy` seconds from the final body on (concurrent requests' DB hops),
+    so a charge queued at stream end is still waiting when the cancel lands."""
+    import concurrent.futures
+    import time as _time
+    body = json.dumps({"model": "flash", "messages": [], "stream": True}).encode()
+    scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST",
+             "client": ("100.64.0.9", 50000), "query_string": b"",
+             "asgi": {"version": "3.0", "spec_version": "2.3"},
+             "headers": [(b"authorization", ("Bearer " + token).encode())]}
+    sent = []
+
+    async def main():
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(1))
+        done = asyncio.Event()
+        state = {"read": False}
+
+        async def receive():
+            if not state["read"]:
+                state["read"] = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            await done.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                loop.run_in_executor(None, _time.sleep, busy)
+                done.set()
+
+        await mw(scope, receive, send)
+
+    asyncio.run(main())
+    return sent
+
+
+class TestStreamingChargeSurvivesDisconnect(KeyFrontCase):
+    """Fix round 1 (review Critical): a completed streamed response must be
+    charged even though the task that streamed it is cancelled at stream end."""
+
+    def test_streamed_response_is_charged_despite_the_disconnect_cancel(self):
+        token = self.mint()
+        app = DisconnectingStream()
+        mw = FF.LaneCatalogueFilter(app, frozenset())
+        sent = drive_disconnecting(mw, token)
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(app.calls, 1)
+        self.assertEqual(U.Usage(self.db).month_tokens("laptop"), 12)
+
+    def test_the_charge_is_shielded_from_a_cancelled_request_task(self):
+        # The whole request task is cancelled while the charge is queued behind
+        # a busy worker: the job still runs once the worker frees up.
+        import concurrent.futures
+        import time as _time
+        token = self.mint()
+        mw = self.mw()
+
+        async def main():
+            loop = asyncio.get_running_loop()
+            loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(1))
+            scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST",
+                     "client": ("100.64.0.9", 1), "query_string": b"",
+                     "headers": [(b"authorization", ("Bearer " + token).encode())]}
+            finished = asyncio.Event()
+
+            async def receive():
+                return {"type": "http.request", "body": b'{"model":"flash"}',
+                        "more_body": False}
+
+            async def send(message):
+                if message["type"] == "http.response.body" and not message.get("more_body"):
+                    loop.run_in_executor(None, _time.sleep, 0.3)  # worker busy
+                    finished.set()
+
+            task = asyncio.ensure_future(mw(scope, receive, send))
+            await finished.wait()
+            task.cancel()   # lands on the first await after the final body
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(main())
+        self.assertEqual(U.Usage(self.db).month_tokens("laptop"), 12)
+
+
+class TestStreamUsageForMeteredRequests(KeyFrontCase):
+    """Fix round 1 (review Minor a): wherever litellm 1.99 would stream a
+    metered request WITHOUT a usage chunk, the front asks for one."""
+
+    def send_body(self, path, doc, token=None):
+        body = json.dumps(doc).encode()
+        drive(self.mw(), path, bearer(token or self.mint()), body=body)
+        return json.loads(self.app.body)
+
+    def test_legacy_completions_stream_gets_include_usage(self):
+        for name, path in (("v1", "/v1/completions"), ("bare", "/completions")):
+            with self.subTest(path=path):
+                out = self.send_body(path, {"model": "flash", "prompt": "x",
+                                            "stream": True}, self.mint(name))
+                self.assertEqual(out["stream_options"], {"include_usage": True})
+
+    def test_non_dict_stream_options_is_replaced(self):
+        out = self.send_body("/v1/chat/completions",
+                             {"model": "flash", "messages": [], "stream": True,
+                              "stream_options": "yes"})
+        self.assertEqual(out["stream_options"], {"include_usage": True})
+
+    def test_integer_stream_is_normalised_and_gets_include_usage(self):
+        out = self.send_body("/v1/chat/completions",
+                             {"model": "flash", "messages": [], "stream": 1})
+        self.assertIs(out["stream"], True)
+        self.assertEqual(out["stream_options"], {"include_usage": True})
+
+    def test_responses_and_messages_are_left_alone(self):
+        # Both report usage in-stream without being asked (response.completed,
+        # message_start/message_delta), so their bodies are forwarded as sent.
+        for name, path in (("resp", "/v1/responses"), ("msgs", "/v1/messages")):
+            with self.subTest(path=path):
+                doc = {"model": "flash", "input": "x", "stream": True}
+                body = json.dumps(doc).encode()
+                drive(self.mw(), path, bearer(self.mint(name)), body=body)
+                self.assertEqual(self.app.body, body)
+
+    def test_master_bodies_are_untouched(self):
+        for doc in ({"model": "flash", "prompt": "x", "stream": True},
+                    {"model": "flash", "messages": [], "stream": 1}):
+            with self.subTest(doc=doc):
+                body = json.dumps(doc).encode()
+                drive(self.mw(), "/v1/completions", bearer(MASTER), body=body)
+                self.assertEqual(self.app.body, body)
+
+
+class TestAnthropicLaneRefusal(KeyFrontCase):
+    def test_lane_refusal_on_messages_is_anthropic_shaped(self):
+        token = self.mint(lanes=["flash"])
+        _, sent, _ = drive(self.mw(), "/v1/messages", [("x-api-key", token)],
+                           body=b'{"model":"heavy","messages":[]}')
+        status, _, doc = reply(sent)
+        self.assertEqual(status, 403)
+        self.assertEqual(doc["type"], "error")
+        self.assertEqual(doc["error"]["type"], "permission_error")
+        self.assertIn("heavy", doc["error"]["message"])
+        self.assertEqual(self.app.calls, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

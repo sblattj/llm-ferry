@@ -161,6 +161,7 @@ That's it — every editor and CLI on the client now talks to one endpoint on th
 
 ## Recent releases
 
+- **[v1.38.0 — safe help, clean pipes, named offers](docs/releases/v1.38.0.md)** — `--help` never runs a subcommand, colour only on a terminal, `ferry offer --as NAME` with `.app` signatures intact, and releases cut automatically on tag push.
 - **[v1.37.0 — Claude subscription lanes](docs/releases/v1.37.0.md)** — `ferry auth-claude login` serves `claude-*` traffic from a Claude Pro/Max subscription over OAuth, with metered fallback hops.
 - **[v1.36.0 — the extraction lane comes home](docs/releases/v1.36.0.md)** — Schematron-8B HTML→JSON extraction now runs on the host GPU, on its own door (`ferry up --schematron`). [Full history →](docs/releases)
 

@@ -5,18 +5,24 @@ Re-ranking of the 37-issue queue in
 filtered by the positioning (LAN appliance, zero-infra, strict named chains)
 rather than by rival parity. Issue numbers refer to that queue.
 
-## Tier 0 — hygiene (in progress)
+## Tier 0 — hygiene (shipped in v1.38.0)
 
-- [ ] Release automation: tag push creates the GitHub Release; backfill the
-      missing Releases (v1.30.x–v1.34.0, v1.36.0). See
-      [followup-tasks-release-automation.md](followup-tasks-release-automation.md).
-- [ ] ANSI colour gated on a tty across all `lib/` modules. See
+- [x] Release automation: `.github/workflows/release.yml` creates the Release
+      on tag push; the 11 missing Releases (v1.29.4–v1.36.0) were backfilled.
+      See [followup-tasks-release-automation.md](followup-tasks-release-automation.md).
+- [x] ANSI colour gated on a tty (and `NO_COLOR`) across all `lib/` modules. See
       [followup-tasks-ansi-in-piped-output.md](followup-tasks-ansi-in-piped-output.md).
 - [x] `ferry offer` naming and `.app` payload integrity. See
       [followup-tasks-offer-and-app-payloads.md](followup-tasks-offer-and-app-payloads.md).
-- [ ] Subcommand `--help` safety: `ferry reload --help` currently reloads the
-      live front door because `reload`/`install`/`status`/`share`/`log` drop
-      their arguments in `lib/ferry-main.zsh`.
+- [x] Subcommand `--help` safety: `-h`/`--help` never runs a subcommand;
+      arg-less commands reject stray arguments.
+
+Still open from the follow-up docs:
+
+- [ ] `Range` requests on the share server's `/file/` (offer doc, item 4).
+- [ ] ANSI escapes outside `lib/` (`client-*.sh`, `host-*.sh`, `status.sh`,
+      `observ/*`) are not tty-gated.
+- [ ] Release follow-up tasks 2–3 (drift check, worktree prune).
 
 ## Tier 1 — strengthen the differentiators
 

@@ -335,6 +335,20 @@ class MasterKeyTest(ClaudeHarness):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn(f"TOKEN={self.PROFILE_KEY}", r.stdout)
 
+    DEVICE_KEY = "fk-mbp-" + "c" * 32
+
+    def test_a_device_key_is_baked_and_mirrored_as_api_key(self):
+        fdir = os.path.join(self.home, ".config", "ferry")
+        os.makedirs(fdir, exist_ok=True)
+        with open(os.path.join(fdir, "client.json"), "w") as f:
+            json.dump({"host": INSTALL_HOST, "port": INSTALL_PORT,
+                       "api_key": self.DEVICE_KEY, "key_name": "mbp"}, f)
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.rc_text().count(f"ANTHROPIC_AUTH_TOKEN={self.DEVICE_KEY}"), 3)
+        mirror = self.claude_json()
+        self.assertEqual(mirror["api_key"], self.DEVICE_KEY)
+        self.assertNotIn("master_key", mirror)
+
 
 class ClaudeJsonTest(ClaudeHarness):
     """The default action records the endpoint; --wrappers must not touch it."""

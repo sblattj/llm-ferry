@@ -616,7 +616,8 @@ cmd_opencode() {
   local oc_host="${CLIENT_HOST:-}" oc_port="${CLIENT_PORT:-8090}"
   # v1.22.0: the front door can run litellm behind a master_key. The bearer
   # baked into the generated configs (and sent on the catalogue check) resolves
-  # --key > client.json's master_key (boot-loaded as CLIENT_MASTER_KEY) > unset
+  # --key > client.json's api_key, else its master_key (boot-loaded as
+  # CLIENT_MASTER_KEY, which may hold a v1.39.0 device key) > unset
   # (the legacy 'local' token, so keyless LAN setups are unchanged). The key is
   # only written into files / request headers, never printed.
   local oc_key=""

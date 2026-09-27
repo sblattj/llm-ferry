@@ -552,6 +552,159 @@ class MasterKeyTest(ClientHarness):
         # Nothing was configured against a host that refuses every request.
         self.assertFalse(os.path.exists(self.path(".config", "ferry", "client.json")))
 
+    def test_an_old_host_without_enroll_keeps_the_master_key(self):
+        self.run_script(BOOTSTRAP, "--no-opencode",
+                        env=self.env(master_key=KeyedStubHost.REQUIRED_KEY,
+                                     port=self.keyed_port))
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["master_key"], KeyedStubHost.REQUIRED_KEY)
+        self.assertNotIn("api_key", prof)
+        self.assertNotIn("key_name", prof)
+
+
+class EnrollingStubHost(KeyedStubHost):
+    """A v1.39.0 host: POST /v1/ferry/keys/enroll mints a device key for the
+    master, and /v1/models accepts either credential afterwards."""
+
+    DEVICE_KEY = "fk-laptop-" + "a" * 32
+    ENROLLS = []
+    # "ok" mints DEVICE_KEY; "malformed" answers 200 with a key that is not a
+    # device key; "unauthorized" answers 401 to every enroll.
+    MODE = "ok"
+
+    def do_GET(self):  # noqa: N802
+        if (self.path.startswith("/v1/models")
+                and self.headers.get("Authorization", "") == f"Bearer {self.DEVICE_KEY}"):
+            return StubHost.do_GET(self)
+        KeyedStubHost.do_GET(self)
+
+    def do_POST(self):  # noqa: N802
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        if (self.path != "/v1/ferry/keys/enroll"
+                or self.headers.get("Authorization", "") != f"Bearer {self.REQUIRED_KEY}"
+                or EnrollingStubHost.MODE == "unauthorized"):
+            if self.path == "/v1/ferry/keys/enroll":
+                EnrollingStubHost.ENROLLS.append(json.loads(raw or b"{}"))
+            self.send_response(401)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        doc = json.loads(raw)
+        EnrollingStubHost.ENROLLS.append(doc)
+        key = self.DEVICE_KEY if EnrollingStubHost.MODE == "ok" else "sk-Not_A_Device_Key"
+        body = json.dumps({"name": doc["name"], "key": key}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class DeviceKeyTest(ClientHarness):
+    """v1.39.0 — a bootstrap given the master key trades it for a per-device
+    key and stores only that; an older host keeps the master key path."""
+
+    @classmethod
+    def setUpClass(cls):
+        ClientHarness.setUpClass()
+        cls.enrolling = ThreadingHTTPServer(("127.0.0.1", 0), EnrollingStubHost)
+        cls.enrolling_port = cls.enrolling.server_address[1]
+        threading.Thread(target=cls.enrolling.serve_forever, daemon=True).start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.enrolling.shutdown()
+        cls.enrolling.server_close()
+        ClientHarness.tearDownClass()
+
+    # The script derives the enroll name from `hostname -s`, lower-cased. A
+    # stub `hostname` on PATH pins it, so a real host name carrying `_` (which
+    # a device-key name may not) cannot break these tests.
+    STUB_HOSTNAME = "Test-Laptop"
+
+    def setUp(self):
+        super().setUp()
+        EnrollingStubHost.ENROLLS.clear()
+        EnrollingStubHost.MODE = "ok"
+        self.addCleanup(setattr, EnrollingStubHost, "MODE", "ok")
+        stub = os.path.join(self.bin, "hostname")
+        with open(stub, "w") as f:
+            f.write(f"#!/bin/sh\necho {self.STUB_HOSTNAME}\n")
+        os.chmod(stub, 0o755)
+
+    def keyed_env(self):
+        return self.env(master_key=KeyedStubHost.REQUIRED_KEY, port=self.enrolling_port)
+
+    def expected_name(self):
+        return self.STUB_HOSTNAME.lower()
+
+    def write_prior_profile(self, host, key_name):
+        os.makedirs(self.path(".config", "ferry"), exist_ok=True)
+        with open(self.path(".config", "ferry", "client.json"), "w") as f:
+            json.dump({"host": host, "port": str(self.enrolling_port),
+                       "api_key": "fk-old-" + "b" * 32, "key_name": key_name}, f)
+
+    def assert_master_key_fallback(self, p):
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["master_key"], KeyedStubHost.REQUIRED_KEY)
+        self.assertNotIn("api_key", prof)
+        self.assertNotIn("key_name", prof)
+        self.assertIn("Device-key enroll unavailable", p.stdout)
+        self.assertNotIn(KeyedStubHost.REQUIRED_KEY, p.stdout + p.stderr)
+
+    def test_a_prior_profile_for_another_host_does_not_replace(self):
+        # key_name belongs to the host that minted it; asking THIS host to
+        # replace that name could rotate some other machine's key.
+        self.write_prior_profile("other-host.local", "someone-else")
+        self.run_script(BOOTSTRAP, "--no-opencode", env=self.keyed_env())
+        self.assertEqual(EnrollingStubHost.ENROLLS, [{"name": self.expected_name()}])
+
+    def test_a_malformed_enroll_reply_falls_back_to_the_master_key(self):
+        EnrollingStubHost.MODE = "malformed"
+        p = self.run_script(BOOTSTRAP, "--no-opencode", env=self.keyed_env())
+        self.assertEqual(len(EnrollingStubHost.ENROLLS), 1)
+        self.assert_master_key_fallback(p)
+        self.assertNotIn("sk-Not_A_Device_Key",
+                         open(self.path(".config", "ferry", "client.json")).read())
+
+    def test_an_unauthorized_enroll_falls_back_to_the_master_key(self):
+        EnrollingStubHost.MODE = "unauthorized"
+        p = self.run_script(BOOTSTRAP, "--no-opencode", env=self.keyed_env())
+        self.assertEqual(len(EnrollingStubHost.ENROLLS), 1)
+        self.assert_master_key_fallback(p)
+
+    def test_bootstrap_trades_the_master_for_a_device_key(self):
+        p = self.run_script(BOOTSTRAP, "--no-opencode", env=self.keyed_env())
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["api_key"], EnrollingStubHost.DEVICE_KEY)
+        self.assertEqual(prof["key_name"], self.expected_name())
+        self.assertNotIn("master_key", prof)
+        self.assertEqual(EnrollingStubHost.ENROLLS, [{"name": self.expected_name()}])
+        for secret in (KeyedStubHost.REQUIRED_KEY, EnrollingStubHost.DEVICE_KEY):
+            self.assertNotIn(secret, p.stdout + p.stderr)
+        self.assertIn("device key", p.stdout)
+
+    def test_a_rerun_rotates_the_same_name(self):
+        self.run_script(BOOTSTRAP, "--no-opencode", env=self.keyed_env())
+        self.run_script(BOOTSTRAP, "--no-opencode", env=self.keyed_env())
+        self.assertEqual(EnrollingStubHost.ENROLLS[-1],
+                         {"name": self.expected_name(), "replace": True})
+
+    def test_the_generated_configs_carry_the_device_key(self):
+        self.run_script(BOOTSTRAP, "--profiles-only", env=self.keyed_env())
+        with open(self.path(".config", "ferry", "opencode-cloud.json")) as f:
+            text = f.read()
+        self.assertIn(EnrollingStubHost.DEVICE_KEY, text)
+        self.assertNotIn(KeyedStubHost.REQUIRED_KEY, text)
+
+    def test_reset_threads_the_device_key_through(self):
+        self.run_script(BOOTSTRAP, "--profiles-only", env=self.keyed_env())
+        os.remove(self.path(".config", "ferry", "opencode-cloud.json"))
+        out = self.run_script(RESET, env=self.env(port=self.enrolling_port)).stdout
+        with open(self.path(".config", "ferry", "opencode-cloud.json")) as f:
+            self.assertIn(EnrollingStubHost.DEVICE_KEY, f.read())
+        self.assertNotIn(EnrollingStubHost.DEVICE_KEY, out)
+
 
 class ClientCleanupTest(ClientHarness):
     """What client-cleanup.sh takes away — and, more importantly, what it leaves."""
@@ -1226,6 +1379,15 @@ class ScriptContractTest(unittest.TestCase):
         self.assertIn('key_args=(--key "$saved_key")', reset)
         # Both ferry calls ride the array; empty when no key was stored.
         self.assertEqual(reset.count('"${key_args[@]}"'), 2)
+        self.assertIn("c.get('api_key') or c.get('master_key'", reset)
+
+    def test_client_to_host_never_promotes_a_device_key_to_master(self):
+        """A device key authenticates one laptop to one host; client-to-host.sh
+        must carry only a real master_key into the new host's secrets."""
+        line = next(l for l in self.read(os.path.join(REPO, "client-to-host.sh")).splitlines()
+                    if l.startswith('CLIENT_KEY="$(python3'))
+        self.assertIn("get('master_key')", line)
+        self.assertNotIn("api_key", line)
 
 
 class ClientNameTest(ClientHarness):

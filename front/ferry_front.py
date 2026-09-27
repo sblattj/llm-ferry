@@ -39,6 +39,7 @@ wrong fleet is worse than one that refuses to start.
 """
 from __future__ import annotations
 
+import hmac
 import importlib.machinery
 import importlib.util
 import json
@@ -46,6 +47,7 @@ import os
 import sys
 import tempfile
 import time
+import urllib.parse
 
 MODEL_LIST_PATHS = frozenset({"/v1/models", "/models"})
 
@@ -164,9 +166,11 @@ def strip_headers_enabled() -> bool:
 #
 # Control surface: GET /v1/ferry/chains reads the live chains, POST
 # /v1/ferry/reorder writes them. Loopback-only (same rule as the dash's header
-# exemption): these mutate routing, so the LAN never reaches them. litellm's
-# own auth still applies first — litellm resolves auth before this middleware
-# ever runs, so without the bearer the request is a 401 from litellm itself.
+# exemption): these mutate routing, so the LAN never reaches them. This
+# middleware WRAPS litellm, so it runs first and answers these paths itself:
+# litellm's auth never sees them. The only gates are the front door's own —
+# the credential check at the top of LaneCatalogueFilter.__call__ (which
+# refuses a bad fk- key) and the loopback test; no bearer is required.
 # Paths are /v1/ferry/* on purpose: is_inference_path has no /v1/ferry prefix,
 # so the event tap never records a reorder as a served request.
 REORDER_CHAINS_PATH = "/v1/ferry/chains"
@@ -954,7 +958,12 @@ def caller_identity(scope, headers: dict) -> str:
 
     A headerless client reaching the host through `tailscale serve` arrives
     from loopback and is therefore 'host'. That is documented, not worked
-    around: regenerated client configs carry the header."""
+    around: regenerated client configs carry the header. A valid device key
+    outranks all three: the key's name is the identity."""
+    # A device key IS the identity: it outranks X-Ferry-Client, so a device
+    # cannot read or move another client's sticky fleet by claiming its name.
+    if (scope or {}).get(KEY_ENTRY_SCOPE):
+        return str(scope.get(KEY_SCOPE) or "")
     named = _header_text(headers, CLIENT_HEADER)
     if named:
         return named
@@ -1080,6 +1089,279 @@ def _bearer_ok(headers: dict) -> bool:
     return len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == key
 
 
+# ── per-device client keys ───────────────────────────────────────────────────
+# A client may present `fk-<name>-<random>` instead of the master key. The
+# front door checks it against ~/.config/ferry/keys.json (front/ferry_keys.py),
+# then REWRITES the credential to the master before litellm sees the request,
+# so litellm's own auth is unchanged. The master key keeps working untouched.
+# Only an `fk-` credential ever reads the key store: master and bare requests
+# stay one header compare. Fail-closed: a corrupt store refuses fk- keys (and
+# says so on stderr, rate-limited); it never lets them through.
+KEY_PREFIX = "fk-"
+KEY_SCOPE = "ferry.key"
+KEY_ENTRY_SCOPE = "ferry.key_entry"
+KEY_WARN_INTERVAL = 60.0
+_KEY_CACHE = None
+_KEY_WARNED: dict = {}
+_KEY_REASONS = {
+    "unknown": "unknown ferry device key",
+    "revoked": "this ferry device key has been revoked",
+    "expired": "this ferry device key has expired",
+}
+ANTHROPIC_PATHS = ("/v1/messages", "/messages")
+_OPENAI_ERRORS = {401: ("invalid_request_error", "invalid_api_key"),
+                  403: ("invalid_request_error", "model_not_allowed"),
+                  429: ("requests", "rate_limit_exceeded"),
+                  503: ("server_error", "key_store_unavailable")}
+_ANTHROPIC_ERRORS = {401: "authentication_error", 403: "permission_error",
+                     429: "rate_limit_error", 503: "api_error"}
+
+
+def _front_sibling(name: str):
+    """Import front/<name>.py whether or not front/ is on sys.path.
+
+    Shares the sys.modules entry, so a test that did `import ferry_keys`
+    and this loader hand out the same module (and the same exception
+    classes)."""
+    if name in sys.modules:
+        return sys.modules[name]
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), name + ".py")
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def _keys_module():
+    return _front_sibling("ferry_keys")
+
+
+def _key_cache():
+    global _KEY_CACHE
+    if _KEY_CACHE is None:
+        _KEY_CACHE = _keys_module().KeyCache()
+    return _KEY_CACHE
+
+
+def _key_warn(err, stream=None, clock=None) -> bool:
+    """One stderr line per distinct key-store error per KEY_WARN_INTERVAL."""
+    try:
+        key = (type(err).__name__, str(err))
+        now = (clock or time.monotonic)()
+        last = _KEY_WARNED.get(key)
+        if last is not None and now - last < KEY_WARN_INTERVAL:
+            return False
+        _KEY_WARNED[key] = now
+        print("ferry-front: client keys: %s: %s" % key, file=stream or sys.stderr)
+        return True
+    except Exception:
+        return False
+
+
+def _master_key() -> str:
+    return (os.environ.get("LITELLM_MASTER_KEY") or "").strip()
+
+
+# Every header litellm 1.99 reads a client key from, in its precedence order
+# (x-litellm-api-key outranks Authorization). The `?key=` query parameter is
+# the one non-header source; QUERY_KEY handles it.
+CREDENTIAL_HEADERS = (b"x-litellm-api-key", b"authorization", b"x-api-key",
+                      b"api-key", b"x-goog-api-key", b"ocp-apim-subscription-key")
+QUERY_KEY = "key"
+_KEY_AMBIGUOUS = ("ambiguous credentials: send exactly one credential, and when "
+                  "it is a ferry device key, send only that key")
+
+
+def _unquote(text) -> str:
+    """Strip whitespace and any matching surrounding quotes."""
+    text = (text or "").strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text
+
+
+def _is_device_key(token) -> bool:
+    """`fk-…`, case-insensitively (tokens are minted lower-case base32)."""
+    return (isinstance(token, str)
+            and token[:len(KEY_PREFIX)].lower() == KEY_PREFIX)
+
+
+def _header_token(name: bytes, text: str):
+    """The credential one header carries, or None.
+
+    Authorization: `Bearer <token>`, or a scheme-less `fk-…` (a device key
+    pasted without its scheme is still a presented device key). Every other
+    credential header: the whole value. Surrounding quotes are stripped."""
+    text = _unquote(text)
+    if name != b"authorization":
+        return text or None
+    parts = text.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return _unquote(parts[1]) or None
+    if len(parts) == 1 and _is_device_key(_unquote(parts[0])):
+        return _unquote(parts[0])
+    return None
+
+
+def _carries_device_key(text: str) -> bool:
+    """Whether a raw credential value mentions an fk- key anywhere as a word
+    (after a scheme, a comma, inside quotes, in any case), not merely as a
+    substring of some other token."""
+    for sep in (",", ";", "="):
+        text = text.replace(sep, " ")
+    return any(_is_device_key(_unquote(word)) for word in text.split())
+
+
+def _canonical(token):
+    """A device key compares and hashes lower-case; anything else as sent."""
+    return token.lower() if _is_device_key(token) else token
+
+
+def presented_credential(headers: dict):
+    """(header name, credential) — the first CREDENTIAL_HEADERS entry set."""
+    for name in CREDENTIAL_HEADERS:
+        token = _header_token(name, _header_text(headers, name))
+        if token:
+            return name, token
+    return None, None
+
+
+def _query_parts(scope) -> list:
+    raw = scope.get("query_string") or b""
+    if isinstance(raw, str):
+        raw = raw.encode("latin-1", "replace")
+    return bytes(raw).split(b"&") if raw else []
+
+
+def _is_query_key(part: bytes) -> bool:
+    name = part.partition(b"=")[0].decode("latin-1")
+    return urllib.parse.unquote_plus(name) == QUERY_KEY
+
+
+def _query_keys(parts) -> list:
+    """Every `?key=` value, URL-decoded, in order."""
+    return [urllib.parse.unquote_plus(p.partition(b"=")[2].decode("utf-8", "replace"))
+            for p in parts if _is_query_key(p)]
+
+
+def _replace_query_key(scope, parts, master: str) -> None:
+    """Every `key=` parameter becomes the master (or goes); the rest of the
+    query string is kept byte for byte."""
+    out = []
+    for part in parts:
+        if _is_query_key(part):
+            if master:
+                out.append(b"key=" + urllib.parse.quote(master, safe="").encode())
+            continue
+        out.append(part)
+    scope["query_string"] = b"&".join(out)
+
+
+def _credential_headers(scope):
+    """[(lowercased name, text)] of every credential header, in order."""
+    out = []
+    for key, value in scope.get("headers") or []:
+        name = bytes(key).lower()
+        if name in CREDENTIAL_HEADERS:
+            out.append((name, bytes(value).decode("utf-8", "replace").strip()))
+    return out
+
+
+def _replace_credential(scope, master: str) -> None:
+    """Swap every non-empty credential header for the master (or drop it);
+    empty ones are dropped.
+
+    Only called once authenticate() has proven every non-empty credential
+    header carries the validated key, so no other credential survives."""
+    out = []
+    for key, value in scope.get("headers") or []:
+        name = bytes(key).lower()
+        if name in CREDENTIAL_HEADERS:
+            if master and _unquote(bytes(value).decode("utf-8", "replace")):
+                out.append((name, b"Bearer " + master.encode()
+                            if name == b"authorization" else master.encode()))
+            continue
+        out.append((key, value))
+    scope["headers"] = out
+
+
+def authenticate(scope):
+    """Admit or refuse this request's credential. None = proceed.
+
+    Sets scope["ferry.key"] to "master", "" (no or foreign credential) or the
+    device key's name; a valid device key also gets scope["ferry.key_entry"]
+    and has its credential rewritten. A refusal is (status, message).
+
+    The sources are every CREDENTIAL_HEADERS header plus `?key=`. Ambiguity
+    is refused before any lookup whenever an fk- word appears in any of
+    them: a repeated credential header, or any different non-empty
+    credential beside the device key, would let the front door validate one
+    value while litellm reads another. Empty credential headers are ignored.
+    Without an fk- word the request keeps today's behaviour exactly
+    (duplicates included), and master and bare requests never reach the key
+    store."""
+    scope[KEY_SCOPE] = ""
+    creds = _credential_headers(scope)
+    parts = _query_parts(scope)
+    qkeys = _query_keys(parts) if parts else []
+    fk_query = any(_carries_device_key(v) for v in qkeys)
+    if not creds and not fk_query:
+        return None
+    master = _master_key()
+    if not fk_query and not any(_carries_device_key(t) for _, t in creds):
+        _, value = presented_credential(dict(creds))
+        if (value is not None and master
+                and hmac.compare_digest(value.encode(), master.encode())):
+            scope[KEY_SCOPE] = "master"
+        return None
+    present = [(n, t) for n, t in creds if _unquote(t)]
+    names = [n for n, _ in present]
+    if len(names) != len(set(names)):
+        return 401, _KEY_AMBIGUOUS
+    tokens = [_canonical(_header_token(n, t)) for n, t in present]
+    tokens += [_canonical(_unquote(v)) for v in qkeys if _unquote(v)]
+    value = tokens[0] if tokens else None
+    if not _is_device_key(value) or any(t != value for t in tokens):
+        return 401, _KEY_AMBIGUOUS
+    try:
+        entry, reason = _key_cache().lookup(value)
+    except Exception as err:
+        _key_warn(err)
+        return 401, ("the ferry key store is unreadable, so device keys are "
+                     "refused until it is fixed (see the host's front log)")
+    if entry is None:
+        return 401, _KEY_REASONS.get(reason, _KEY_REASONS["unknown"])
+    # A private copy: downstream steps may not mutate the cache's entry.
+    entry = dict(entry, lanes=list(entry["lanes"])
+                 if isinstance(entry.get("lanes"), list) else entry.get("lanes"))
+    scope[KEY_SCOPE] = entry["name"]
+    scope[KEY_ENTRY_SCOPE] = entry
+    _replace_credential(scope, master)
+    if qkeys:
+        _replace_query_key(scope, parts, master)
+    return None
+
+
+def is_anthropic_path(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in ANTHROPIC_PATHS)
+
+
+def key_error_body(path, status, message, code=None, openai_type=None) -> dict:
+    """An error body the calling SDK can parse: Anthropic shape on /v1/messages,
+    OpenAI shape everywhere else."""
+    if is_anthropic_path(path or ""):
+        return {"type": "error", "error": {
+            "type": _ANTHROPIC_ERRORS.get(status, "api_error"), "message": message}}
+    otype, ocode = _OPENAI_ERRORS.get(status, ("server_error", None))
+    return {"error": {"message": message, "type": openai_type or otype,
+                      "param": None, "code": code or ocode}}
+
+
 _FLEET_WARNED: dict = {}
 FLEET_WARN_INTERVAL = 60.0
 
@@ -1154,6 +1436,17 @@ class LaneCatalogueFilter:
         self.state = state
 
     async def __call__(self, scope, receive, send):
+        # Credentials before anything else, control plane included: a revoked
+        # device key must not reach /v1/ferry/fleet either.
+        if scope.get("type") in ("http", "websocket"):
+            refused = authenticate(scope)
+            if refused is not None:
+                status, message = refused
+                if scope.get("type") == "websocket":
+                    # Close before accept: the server answers the upgrade 403.
+                    return await send({"type": "websocket.close", "code": 1008})
+                return await self._reply(send, status, key_error_body(
+                    scope.get("path", ""), status, message))
         # The control plane first: GET /v1/ferry/chains, POST /v1/ferry/reorder,
         # and POST /v1/ferry/promote are answered HERE, before litellm ever sees
         # the request — litellm has no such routes and would 404 them, and more
@@ -1528,13 +1821,14 @@ class LaneCatalogueFilter:
             _fleet_warn(err)
             return None
 
-    async def _reply(self, send, status, doc):
+    async def _reply(self, send, status, doc, headers=None):
         body = json.dumps(doc).encode()
         await send({
             "type": "http.response.start",
             "status": status,
             "headers": [(b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode())],
+                        (b"content-length", str(len(body)).encode())]
+                       + list(headers or []),
         })
         await send({"type": "http.response.body", "body": body,
                     "more_body": False})

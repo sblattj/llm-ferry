@@ -69,15 +69,43 @@ OFFERED = os.path.expanduser("~/.config/ferry/offered.json")
 CLIENT_LOG = os.path.expanduser("~/.config/ferry/client_logs.txt")
 
 class DynamicHandler(SimpleHTTPRequestHandler):
-    def _tar_stream(self, root, arcname):
-        # Stream a tar of `root` back to the client. dereference=True resolves the
-        # HuggingFace cache's snapshot symlinks (which point into ../../blobs) into
-        # real file content, so the pulled model is self-contained on the client.
+    def _tar_stream(self, root, arcname, deref=None):
+        # Stream a tar of `root` back to the client.
+        #
+        # Dereferencing is per payload, not per server. deref=None (auto) resolves
+        # symlinks into real content — the HuggingFace cache's snapshots/ links
+        # point into ../../blobs, and a pulled model must be self-contained — EXCEPT
+        # inside a *.app bundle: its code signature seals the symlink layout
+        # (Versions/Current, sealed resources), and replacing a link with a copy
+        # fails `codesign --verify` with "a sealed resource is missing or invalid".
+        # deref=True/False (from offered.json) forces one behavior everywhere.
+        # The root itself is always resolved, so a payload offered through a
+        # symlink ships its target rather than a dangling link.
         self.send_response(200)
         self.send_header("Content-Type", "application/x-tar")
         self.end_headers()
-        with tarfile.open(fileobj=self.wfile, mode="w|", dereference=True) as tar:
-            tar.add(root, arcname=arcname)
+        with tarfile.open(fileobj=self.wfile, mode="w|") as tar:
+            self._tar_add(tar, root, arcname, deref, in_app=False, is_root=True)
+
+    @classmethod
+    def _tar_add(cls, tar, path, arc, deref, in_app, is_root=False):
+        # TarFile.add reads tar.dereference when it builds each member's TarInfo,
+        # so flipping it per entry and adding non-recursively gives per-subtree
+        # behavior inside one stream.
+        # The bundle boundary itself is followed (a symlink to an .app, e.g.
+        # offer-links/ghostty -> Ghostty.app, ships the bundle, not a dangling
+        # link, and is judged by its target's name); only what is INSIDE the
+        # bundle keeps its symlinks.
+        entering = not in_app and (path.rstrip("/").endswith(".app")
+                                   or os.path.realpath(path).endswith(".app"))
+        follow = is_root or (deref if deref is not None else (entering or not in_app))
+        in_app = in_app or entering
+        tar.dereference = follow
+        tar.add(path, arcname=arc, recursive=False)
+        if os.path.isdir(path) and (follow or not os.path.islink(path)):
+            for child in sorted(os.listdir(path)):
+                cls._tar_add(tar, os.path.join(path, child), arc + "/" + child,
+                             deref, in_app)
 
     def do_GET(self):
         # Client-facing scripts get the host's live identity injected. Add a name
@@ -127,11 +155,19 @@ class DynamicHandler(SimpleHTTPRequestHandler):
         if self.path.startswith("/file/"):
             name = self.path[len("/file/"):].strip("/")
             offered = json.load(open(OFFERED)) if os.path.exists(OFFERED) else {}
-            p = offered.get(name)
-            if not p or not os.path.exists(p):
+            entry = offered.get(name)
+            # An entry is a plain path, or {"path": ..., "deref": bool} when
+            # `ferry offer --deref/--no-deref` pinned the tar behavior.
+            if isinstance(entry, dict):
+                p, deref = entry.get("path"), entry.get("deref")
+            else:
+                p, deref = entry, None
+            if not isinstance(p, str) or not os.path.exists(p):
                 self.send_response(404); self.end_headers()
                 self.wfile.write(b"not offered\n"); return
-            self._tar_stream(p, os.path.basename(p.rstrip("/"))); return
+            # The archive member keeps the path's own basename; the manifest key
+            # (`ferry offer --as NAME`) is only the lookup name.
+            self._tar_stream(p, os.path.basename(p.rstrip("/")), deref); return
 
         # /manifest — list the models in the host cache and the offered files.
         if self.path == "/manifest" or self.path.endswith("/manifest"):

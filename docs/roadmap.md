@@ -12,7 +12,7 @@ rather than by rival parity. Issue numbers refer to that queue.
       [followup-tasks-release-automation.md](followup-tasks-release-automation.md).
 - [ ] ANSI colour gated on a tty across all `lib/` modules. See
       [followup-tasks-ansi-in-piped-output.md](followup-tasks-ansi-in-piped-output.md).
-- [ ] `ferry offer` naming and `.app` payload integrity. See
+- [x] `ferry offer` naming and `.app` payload integrity. See
       [followup-tasks-offer-and-app-payloads.md](followup-tasks-offer-and-app-payloads.md).
 - [ ] Subcommand `--help` safety: `ferry reload --help` currently reloads the
       live front door because `reload`/`install`/`status`/`share`/`log` drop

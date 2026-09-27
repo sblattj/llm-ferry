@@ -60,6 +60,11 @@ Commands:
 
 Ferrying models & files across the LAN:
   offer <path>...    [Host] Record files/dirs in ~/.config/ferry/offered.json for clients to fetch
+                       [--as NAME] names the next path (default: its basename); a name
+                       already offered for a different path is refused unless --replace
+                       [--deref|--no-deref] pins symlink handling (default: follow, except
+                       inside a .app, whose signature seals its symlinks)
+                       --selftest offers a tiny fixture (file, symlink tree, signed .app)
   pull <model-id>    [Client] Pull a model from the host's local HF cache
                        [--host H] [--port P] [--transport http|hf|nc] [--to DIR]
                        http (default): stream+untar from the share server

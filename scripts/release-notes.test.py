@@ -41,6 +41,53 @@ class TitleTests(unittest.TestCase):
         self.assertEqual(rn.derive_title('v1.36.0', '', '# Unrelated heading\n'), 'v1.36.0')
 
 
+class AnnotatedTagTests(unittest.TestCase):
+    """The annotated tag's message is the FIRST source for title and notes."""
+
+    def test_llm_ferry_prefix_em_dash(self):
+        self.assertEqual(rn.derive_title('v1.33.0', 'Release v1.33.0: ferry migrate promotes a client into a host',
+                                         '', 'llm-ferry v1.33.0 — Promote a client into a host'),
+                         'v1.33.0 — Promote a client into a host')
+
+    def test_llm_ferry_prefix_colon(self):
+        self.assertEqual(rn.derive_title('v1.32.0', 'feat: x', '',
+                                         'llm-ferry v1.32.0: OpenCode learns how to use the goal plugin'),
+                         'v1.32.0 — OpenCode learns how to use the goal plugin')
+
+    def test_bare_tag_colon(self):
+        self.assertEqual(rn.derive_title('v1.36.0', 'feat(schematron): run the lane', '',
+                                         'v1.36.0: the schematron extraction lane runs on the host GPU'),
+                         'v1.36.0 — the schematron extraction lane runs on the host GPU')
+
+    def test_bare_tag_em_dash(self):
+        self.assertEqual(rn.derive_title('v1.9.0', 'x', '', 'v1.9.0 — /v1/models advertises lanes only'),
+                         'v1.9.0 — /v1/models advertises lanes only')
+
+    def test_tag_message_beats_commit_subject_and_doc(self):
+        self.assertEqual(rn.derive_title('v1.0.0', 'release: v1.0.0 — from commit', '# v1.0.0 — from doc\n',
+                                         'v1.0.0: from tag'),
+                         'v1.0.0 — from tag')
+
+    def test_tag_message_not_naming_the_tag_falls_through(self):
+        # v1.35.0's real tag message; the notes-file H1 supplies the title.
+        self.assertEqual(rn.derive_title('v1.35.0', 'feat(up): --schematron', '# llm-ferry v1.35.0 — a dedicated schematron door\n',
+                                         'ferry up --schematron: the extraction lane on its own door (:8094)'),
+                         'v1.35.0 — a dedicated schematron door')
+
+    def test_subject_only_tag_message_falls_through(self):
+        # "v1.8.0" alone carries no title text.
+        self.assertEqual(rn.derive_title('v1.8.0', 'release: v1.8.0 — commit title', '', 'v1.8.0'),
+                         'v1.8.0 — commit title')
+
+    def test_tag_body_is_first_notes_source(self):
+        tag_body = 'What shipped.\n\nClaude-Session-Id: bcc93dc5-e7b5\n'
+        self.assertEqual(rn.derive_notes('v1.32.0', '# doc\n', 'commit body', ['s'], None, tag_body),
+                         'What shipped.\n')
+
+    def test_empty_tag_body_falls_through_to_doc(self):
+        self.assertEqual(rn.derive_notes('v1.33.0', '# doc\n', 'commit body', ['s'], None, '\n'), '# doc\n')
+
+
 class NotesTests(unittest.TestCase):
     def test_release_doc_wins(self):
         self.assertEqual(rn.derive_notes('v1.37.0', '# heading\n\ntext\n\n', 'body', ['s']), '# heading\n\ntext\n')
@@ -93,9 +140,21 @@ class RealRepoTests(unittest.TestCase):
             self.skipTest('tag v1.37.0 not in this checkout')
 
     def test_known_titles(self):
+        # v1.37.0 is lightweight in origin; the commit subject supplies it.
         self.assertEqual(self.run_cli('title', 'v1.37.0').stdout.strip(), 'v1.37.0 — Claude subscription lanes')
-        self.assertEqual(self.run_cli('title', 'v1.33.0').stdout.strip(),
-                         'v1.33.0 — ferry migrate promotes a client into a host')
+
+    def test_annotated_tag_title_when_annotated_locally(self):
+        kind = subprocess.run(['git', 'cat-file', '-t', 'v1.33.0'], cwd=HERE, capture_output=True, text=True)
+        if kind.stdout.strip() != 'tag':
+            self.skipTest('v1.33.0 is not annotated here; run `git fetch --tags --force origin`')
+        self.assertEqual(self.run_cli('title', 'v1.33.0').stdout.strip(), 'v1.33.0 — Promote a client into a host')
+
+    def test_lightweight_tag_has_no_tag_message(self):
+        kind = subprocess.run(['git', 'cat-file', '-t', 'v1.37.0'], cwd=HERE, capture_output=True, text=True)
+        if kind.stdout.strip() != 'commit':
+            self.skipTest('v1.37.0 is not lightweight here')
+        # Must NOT fall back to the commit message that %(contents) would return.
+        self.assertEqual(rn.read_tag_message('v1.37.0', HERE.parent), ('', ''))
 
     def test_usage_error(self):
         self.assertEqual(self.run_cli('bogus').returncode, 2)

@@ -5,8 +5,8 @@ name: release
 # Release object, so the Releases page drifted behind the tags twice.
 #
 # Title, notes and the Latest flag come from scripts/release-notes.py (run it
-# locally to preview). Tags here are lightweight, so the source is the tagged
-# commit plus docs/releases/<tag>.md, never a tag message.
+# locally to preview). The annotated tag's message is the first source; a
+# lightweight tag falls through to the tagged commit and docs/releases/<tag>.md.
 on:
   push:
     tags: ["v*"]
@@ -28,6 +28,12 @@ jobs:
           # Full history and all tags: the notes fallback walks `git log`
           # back to the previous tag, and Latest compares against every tag.
           fetch-depth: 0
+
+      # On a tag-push event checkout can leave the triggering tag as a
+      # lightweight ref pointing at the commit, which hides the annotated
+      # message the title and notes are read from. Re-fetch the real objects.
+      - name: Fetch annotated tag objects
+        run: git fetch --tags --force origin
 
       - name: Create the GitHub Release if it is missing
         env:

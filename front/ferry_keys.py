@@ -135,7 +135,7 @@ def _validate(doc, path) -> None:
                 or not isinstance(entry.get("sha256"), str)
                 or not _SHA_RE.match(entry["sha256"])):
             raise KeyStoreError("%s: malformed key entry %r" % (path, entry))
-        if entry["name"] in RESERVED_NAMES:
+        if entry["name"].strip().lower() in RESERVED_NAMES:
             raise KeyStoreError("%s: key name %r is reserved" % (path, entry["name"]))
         if entry["name"] in seen:
             raise KeyStoreError("%s: duplicate key name %r" % (path, entry["name"]))

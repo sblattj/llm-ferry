@@ -47,6 +47,7 @@ import os
 import sys
 import tempfile
 import time
+import urllib.parse
 
 MODEL_LIST_PATHS = frozenset({"/v1/models", "/models"})
 
@@ -165,9 +166,11 @@ def strip_headers_enabled() -> bool:
 #
 # Control surface: GET /v1/ferry/chains reads the live chains, POST
 # /v1/ferry/reorder writes them. Loopback-only (same rule as the dash's header
-# exemption): these mutate routing, so the LAN never reaches them. litellm's
-# own auth still applies first — litellm resolves auth before this middleware
-# ever runs, so without the bearer the request is a 401 from litellm itself.
+# exemption): these mutate routing, so the LAN never reaches them. This
+# middleware WRAPS litellm, so it runs first and answers these paths itself:
+# litellm's auth never sees them. The only gates are the front door's own —
+# the credential check at the top of LaneCatalogueFilter.__call__ (which
+# refuses a bad fk- key) and the loopback test; no bearer is required.
 # Paths are /v1/ferry/* on purpose: is_inference_path has no /v1/ferry prefix,
 # so the event tap never records a reorder as a served request.
 REORDER_CHAINS_PATH = "/v1/ferry/chains"
@@ -1164,44 +1167,99 @@ def _master_key() -> str:
     return (os.environ.get("LITELLM_MASTER_KEY") or "").strip()
 
 
-CREDENTIAL_HEADERS = (b"authorization", b"x-api-key")
+# Every header litellm 1.99 reads a client key from, in its precedence order
+# (x-litellm-api-key outranks Authorization). The `?key=` query parameter is
+# the one non-header source; QUERY_KEY handles it.
+CREDENTIAL_HEADERS = (b"x-litellm-api-key", b"authorization", b"x-api-key",
+                      b"api-key", b"x-goog-api-key", b"ocp-apim-subscription-key")
+QUERY_KEY = "key"
 _KEY_AMBIGUOUS = ("ambiguous credentials: send exactly one credential, and when "
                   "it is a ferry device key, send only that key")
+
+
+def _unquote(text) -> str:
+    """Strip whitespace and any matching surrounding quotes."""
+    text = (text or "").strip()
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    return text
+
+
+def _is_device_key(token) -> bool:
+    """`fk-…`, case-insensitively (tokens are minted lower-case base32)."""
+    return (isinstance(token, str)
+            and token[:len(KEY_PREFIX)].lower() == KEY_PREFIX)
 
 
 def _header_token(name: bytes, text: str):
     """The credential one header carries, or None.
 
     Authorization: `Bearer <token>`, or a scheme-less `fk-…` (a device key
-    pasted without its scheme is still a presented device key). x-api-key:
-    the whole value."""
-    text = (text or "").strip()
+    pasted without its scheme is still a presented device key). Every other
+    credential header: the whole value. Surrounding quotes are stripped."""
+    text = _unquote(text)
     if name != b"authorization":
         return text or None
     parts = text.split(None, 1)
-    if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
-        return parts[1].strip()
-    if len(parts) == 1 and parts[0].startswith(KEY_PREFIX):
-        return parts[0]
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return _unquote(parts[1]) or None
+    if len(parts) == 1 and _is_device_key(_unquote(parts[0])):
+        return _unquote(parts[0])
     return None
 
 
 def _carries_device_key(text: str) -> bool:
-    """Whether a raw credential header value mentions an fk- key anywhere as
-    a word (after a scheme, a comma, …), not merely as a substring of some
-    other token."""
+    """Whether a raw credential value mentions an fk- key anywhere as a word
+    (after a scheme, a comma, inside quotes, in any case), not merely as a
+    substring of some other token."""
     for sep in (",", ";", "="):
         text = text.replace(sep, " ")
-    return any(word.startswith(KEY_PREFIX) for word in text.split())
+    return any(_is_device_key(_unquote(word)) for word in text.split())
+
+
+def _canonical(token):
+    """A device key compares and hashes lower-case; anything else as sent."""
+    return token.lower() if _is_device_key(token) else token
 
 
 def presented_credential(headers: dict):
-    """(header name, credential) — Authorization first, then x-api-key."""
+    """(header name, credential) — the first CREDENTIAL_HEADERS entry set."""
     for name in CREDENTIAL_HEADERS:
         token = _header_token(name, _header_text(headers, name))
         if token:
             return name, token
     return None, None
+
+
+def _query_parts(scope) -> list:
+    raw = scope.get("query_string") or b""
+    if isinstance(raw, str):
+        raw = raw.encode("latin-1", "replace")
+    return bytes(raw).split(b"&") if raw else []
+
+
+def _is_query_key(part: bytes) -> bool:
+    name = part.partition(b"=")[0].decode("latin-1")
+    return urllib.parse.unquote_plus(name) == QUERY_KEY
+
+
+def _query_keys(parts) -> list:
+    """Every `?key=` value, URL-decoded, in order."""
+    return [urllib.parse.unquote_plus(p.partition(b"=")[2].decode("utf-8", "replace"))
+            for p in parts if _is_query_key(p)]
+
+
+def _replace_query_key(scope, parts, master: str) -> None:
+    """Every `key=` parameter becomes the master (or goes); the rest of the
+    query string is kept byte for byte."""
+    out = []
+    for part in parts:
+        if _is_query_key(part):
+            if master:
+                out.append(b"key=" + urllib.parse.quote(master, safe="").encode())
+            continue
+        out.append(part)
+    scope["query_string"] = b"&".join(out)
 
 
 def _credential_headers(scope):
@@ -1214,16 +1272,17 @@ def _credential_headers(scope):
     return out
 
 
-def _replace_credential(scope, token: str, master: str) -> None:
-    """Swap every credential header for the master (or drop it).
+def _replace_credential(scope, master: str) -> None:
+    """Swap every non-empty credential header for the master (or drop it);
+    empty ones are dropped.
 
-    Only called once authenticate() has proven every credential header
-    resolves to `token`, so no other credential can survive beside it."""
+    Only called once authenticate() has proven every non-empty credential
+    header carries the validated key, so no other credential survives."""
     out = []
     for key, value in scope.get("headers") or []:
         name = bytes(key).lower()
         if name in CREDENTIAL_HEADERS:
-            if master:
+            if master and _unquote(bytes(value).decode("utf-8", "replace")):
                 out.append((name, b"Bearer " + master.encode()
                             if name == b"authorization" else master.encode()))
             continue
@@ -1238,30 +1297,37 @@ def authenticate(scope):
     device key's name; a valid device key also gets scope["ferry.key_entry"]
     and has its credential rewritten. A refusal is (status, message).
 
-    Ambiguity is refused before any lookup whenever an fk- word appears in
-    any credential header: a repeated authorization or x-api-key header, or
-    an fk- key beside a different credential, would let the front door
-    validate one value while litellm reads another. Without an fk- word the
-    request keeps today's behaviour exactly (duplicates included), and
-    master and bare requests never reach the key store."""
+    The sources are every CREDENTIAL_HEADERS header plus `?key=`. Ambiguity
+    is refused before any lookup whenever an fk- word appears in any of
+    them: a repeated credential header, or any different non-empty
+    credential beside the device key, would let the front door validate one
+    value while litellm reads another. Empty credential headers are ignored.
+    Without an fk- word the request keeps today's behaviour exactly
+    (duplicates included), and master and bare requests never reach the key
+    store."""
     scope[KEY_SCOPE] = ""
     creds = _credential_headers(scope)
-    if not creds:
-        return None
-    _, value = presented_credential(dict(creds))
-    if any(_carries_device_key(text) for _, text in creds):
-        names = [name for name, _ in creds]
-        if (len(names) != len(set(names))
-                or value is None or not value.startswith(KEY_PREFIX)
-                or any(_header_token(n, t) != value for n, t in creds)):
-            return 401, _KEY_AMBIGUOUS
-    elif value is None:
+    parts = _query_parts(scope)
+    qkeys = _query_keys(parts) if parts else []
+    fk_query = any(_carries_device_key(v) for v in qkeys)
+    if not creds and not fk_query:
         return None
     master = _master_key()
-    if not value.startswith(KEY_PREFIX):
-        if master and hmac.compare_digest(value.encode(), master.encode()):
+    if not fk_query and not any(_carries_device_key(t) for _, t in creds):
+        _, value = presented_credential(dict(creds))
+        if (value is not None and master
+                and hmac.compare_digest(value.encode(), master.encode())):
             scope[KEY_SCOPE] = "master"
         return None
+    present = [(n, t) for n, t in creds if _unquote(t)]
+    names = [n for n, _ in present]
+    if len(names) != len(set(names)):
+        return 401, _KEY_AMBIGUOUS
+    tokens = [_canonical(_header_token(n, t)) for n, t in present]
+    tokens += [_canonical(_unquote(v)) for v in qkeys if _unquote(v)]
+    value = tokens[0] if tokens else None
+    if not _is_device_key(value) or any(t != value for t in tokens):
+        return 401, _KEY_AMBIGUOUS
     try:
         entry, reason = _key_cache().lookup(value)
     except Exception as err:
@@ -1275,7 +1341,9 @@ def authenticate(scope):
                  if isinstance(entry.get("lanes"), list) else entry.get("lanes"))
     scope[KEY_SCOPE] = entry["name"]
     scope[KEY_ENTRY_SCOPE] = entry
-    _replace_credential(scope, value, master)
+    _replace_credential(scope, master)
+    if qkeys:
+        _replace_query_key(scope, parts, master)
     return None
 
 

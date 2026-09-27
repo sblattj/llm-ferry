@@ -77,9 +77,10 @@ class Upstream:
 
 
 def drive(mw, path, headers=(), body=b"{}", method="POST",
-          client=("100.64.0.9", 50000), scope_type="http"):
+          client=("100.64.0.9", 50000), scope_type="http", query=b""):
     scope = {"type": scope_type, "path": path, "method": method, "client": client,
-             "headers": [(k.encode(), v.encode()) for k, v in headers]}
+             "headers": [(k.encode(), v.encode()) for k, v in headers],
+             "query_string": query}
     sent = []
 
     async def receive():
@@ -369,6 +370,155 @@ class TestAmbiguousCredentials(KeyFrontCase):
         self.assertEqual(reply(sent)[0], 200)
         self.assertEqual(self.app.headers()[b"authorization"], b"Bearer sk-abcfk-xyz")
         self.assertEqual(scope["ferry.key"], "")
+
+
+EXTRA_HEADERS = ("x-litellm-api-key", "api-key", "x-goog-api-key",
+                 "ocp-apim-subscription-key")
+
+
+class TestEveryLitellmCredentialSource(KeyFrontCase):
+    """Fix round 2: every header litellm 1.99 reads a key from, plus ?key=."""
+
+    def refused(self, headers, query=b"", path="/v1/chat/completions"):
+        _, sent, _ = drive(self.mw(), path, headers, query=query)
+        status, _, doc = reply(sent)
+        self.assertEqual(status, 401, (headers, query))
+        return doc
+
+    def test_a_device_key_in_any_litellm_header_is_rewritten(self):
+        token = self.mint()
+        for name in EXTRA_HEADERS:
+            with self.subTest(header=name):
+                scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                                       [(name, token)])
+                self.assertEqual(reply(sent)[0], 200)
+                self.assertEqual(self.app.headers()[name.encode()], MASTER.encode())
+                self.assertEqual(scope["ferry.key"], "laptop")
+
+    def test_a_revoked_key_in_any_litellm_header_is_refused(self):
+        _, token = K.add("gone")
+        K.revoke("gone")
+        for name in EXTRA_HEADERS:
+            with self.subTest(header=name):
+                self.assertIn("revoked", self.refused([(name, token)])["error"]["message"])
+        self.assertEqual(self.app.calls, 0)
+
+    def test_a_different_credential_in_any_header_beside_a_device_key_is_refused(self):
+        token = self.mint()
+        for name in EXTRA_HEADERS:
+            for other in ("sk-other", MASTER):
+                with self.subTest(header=name, other=other):
+                    self.refused(bearer(token) + [(name, other)])
+                    self.refused([(name, token), ("authorization", "Bearer " + other)])
+        self.assertEqual(self.app.calls, 0)
+
+    def test_duplicate_extra_header_with_a_device_key_is_refused(self):
+        token = self.mint()
+        for name in EXTRA_HEADERS:
+            with self.subTest(header=name):
+                self.refused([(name, token), (name, token)])
+
+    def test_the_same_key_everywhere_is_admitted_and_every_copy_rewritten(self):
+        token = self.mint()
+        headers = bearer(token) + [(name, token) for name in EXTRA_HEADERS]
+        drive(self.mw(), "/v1/chat/completions", headers)
+        seen = self.app.headers()
+        self.assertEqual(seen[b"authorization"], b"Bearer " + MASTER.encode())
+        for name in EXTRA_HEADERS:
+            self.assertEqual(seen[name.encode()], MASTER.encode())
+
+    def test_master_in_x_litellm_api_key_is_untouched(self):
+        boom = mock.Mock(side_effect=AssertionError("key store touched"))
+        with mock.patch.object(FF, "_key_cache", boom):
+            headers = [("x-litellm-api-key", MASTER), ("x-litellm-api-key", MASTER)]
+            scope, sent, send = drive(self.mw(), "/v1/chat/completions", headers)
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertIs(self.app.send, send)
+        self.assertEqual(scope["ferry.key"], "master")
+        self.assertEqual([(k.decode(), v.decode()) for k, v in self.app.scope["headers"]],
+                         headers)
+        boom.assert_not_called()
+
+    def test_query_key_device_key_is_presented_and_rewritten(self):
+        token = self.mint()
+        query = ("alt=sse&key=%s&x=%%2F1" % token).encode()
+        scope, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
+                               query=query)
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.scope["query_string"],
+                         ("alt=sse&key=%s&x=%%2F1" % MASTER).encode())
+        self.assertEqual(scope["ferry.key"], "laptop")
+        # The same key in a header and in ?key= is one credential.
+        drive(self.mw(), "/v1/chat/completions", bearer(token),
+              query=("key=" + token).encode())
+        self.assertEqual(self.app.scope["query_string"], ("key=" + MASTER).encode())
+        self.assertEqual(self.app.headers()[b"authorization"], b"Bearer " + MASTER.encode())
+
+    def test_query_key_that_disagrees_or_is_revoked_is_refused(self):
+        token = self.mint()
+        _, other = K.add("other")
+        _, gone = K.add("gone")
+        K.revoke("gone")
+        self.refused(bearer(token), query=("key=" + other).encode())
+        self.refused(bearer(MASTER), query=("key=" + token).encode())
+        self.refused((), query=("key=%s&key=%s" % (token, other)).encode())
+        self.refused((), query=("key=" + gone).encode())
+        self.assertEqual(self.app.calls, 0)
+
+    def test_a_non_fk_query_key_is_untouched(self):
+        scope, sent, send = drive(self.mw(), "/v1/chat/completions", bearer(MASTER),
+                                  query=b"key=sk-foo")
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.scope["query_string"], b"key=sk-foo")
+        self.assertIs(self.app.send, send)
+        self.assertEqual(scope["ferry.key"], "master")
+
+
+class TestDeviceKeySpelling(KeyFrontCase):
+    """Fix round 2: quotes and case do not hide a device key."""
+
+    def test_quoted_and_upper_case_keys_are_presented(self):
+        token = self.mint()
+        for label, headers in {
+                "quoted bearer": [("authorization", 'Bearer "%s"' % token)],
+                "quoted x-api-key": [("x-api-key", "'%s'" % token)],
+                "upper case": bearer(token.upper()),
+                "quoted scheme-less": [("authorization", '"%s"' % token)]}.items():
+            with self.subTest(label=label):
+                scope, sent, _ = drive(self.mw(), "/v1/chat/completions", headers)
+                self.assertEqual(reply(sent)[0], 200)
+                self.assertEqual(scope["ferry.key"], "laptop")
+                self.assertNotIn(token.lower().encode(),
+                                 b"".join(v for _, v in self.app.scope["headers"]).lower())
+
+    def test_quoted_or_upper_case_revoked_key_is_refused(self):
+        _, token = K.add("gone")
+        K.revoke("gone")
+        for headers in (bearer('"%s"' % token), bearer(token.upper()),
+                        [("x-api-key", token.upper())]):
+            with self.subTest(headers=headers):
+                _, sent, _ = drive(self.mw(), "/v1/chat/completions", headers)
+                self.assertEqual(reply(sent)[0], 401)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_upper_case_fk_beside_another_credential_is_ambiguous(self):
+        token = self.mint()
+        _, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                           bearer(MASTER) + [("x-api-key", token.upper())])
+        self.assertEqual(reply(sent)[0], 401)
+
+
+class TestEmptyCredentialHeaders(KeyFrontCase):
+    def test_an_empty_credential_header_beside_a_device_key_is_ignored(self):
+        token = self.mint()
+        for name in ("x-api-key", "x-litellm-api-key", "api-key"):
+            with self.subTest(header=name):
+                scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                                       bearer(token) + [(name, "")])
+                self.assertEqual(reply(sent)[0], 200)
+                self.assertEqual(scope["ferry.key"], "laptop")
+                self.assertNotIn(token.encode(),
+                                 b"".join(v for _, v in self.app.scope["headers"]))
 
 
 class TestEntryIsolation(KeyFrontCase):

@@ -217,7 +217,7 @@ class TestLoad(StoreCase):
 
     def test_a_reserved_name_in_the_store_fails_closed(self):
         _, token = K.add("laptop")
-        for reserved in ("master", "host"):
+        for reserved in ("master", "host", "Master", " HOST ", "master\n"):
             with self.subTest(reserved=reserved):
                 doc = {"version": 1, "keys": [
                     {"name": "laptop", "sha256": K.hash_token(token)},

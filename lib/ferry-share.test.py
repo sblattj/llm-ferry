@@ -18,12 +18,15 @@ These tests run the REAL embedded server — extracted from the built `ferry`, n
 a reimplementation — against a temp directory, so a change to the handler that
 breaks injection fails here rather than on someone's laptop.
 """
+import io
+import json
 import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -312,6 +315,257 @@ class TestClientTelemetryLogPath(unittest.TestCase):
             body = f.read()
         self.assertIn("before", body)
         self.assertIn("after the checkout vanished", body)
+
+
+class TestOfferedPayloads(unittest.TestCase):
+    """`ferry offer` naming and `/file/<name>` payload integrity.
+
+    Runs the REAL built `ferry offer` and the REAL embedded share server, both
+    against a temp HOME, so the live ~/.config/ferry/offered.json is never read
+    or written. Two defects are guarded here:
+
+    - the manifest key was always the path's basename: no way to name a
+      payload, and a second path with the same basename silently replaced the
+      first;
+    - `_tar_stream` dereferenced every symlink, which is right for the HF cache
+      and voids the code signature of a macOS .app (its seal covers symlinks).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.home = tempfile.mkdtemp(prefix="ferry-offerhome-")
+        cls.work = tempfile.mkdtemp(prefix="ferry-offerwork-")
+        server_py = os.path.join(cls.work, "_server.py")
+        with open(server_py, "w") as f:
+            f.write(extract_embedded_server())
+        cls.port = free_port()
+        cls.proc = subprocess.Popen(
+            [sys.executable, server_py, str(cls.port), cls.work, "ferry-share-marker"],
+            env=dict(os.environ, HOME=cls.home),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{cls.port}/manifest", timeout=1).read()
+                break
+            except Exception:
+                if cls.proc.poll() is not None:
+                    raise AssertionError(f"share server died:\n{cls.proc.stdout.read()}")
+                time.sleep(0.15)
+        else:
+            raise AssertionError("share server never came up")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        try:
+            cls.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            cls.proc.kill()
+            cls.proc.wait(timeout=10)
+        if cls.proc.stdout and not cls.proc.stdout.closed:
+            cls.proc.stdout.close()
+        shutil.rmtree(cls.home, ignore_errors=True)
+        shutil.rmtree(cls.work, ignore_errors=True)
+
+    # -- helpers -----------------------------------------------------------
+    @property
+    def manifest_path(self):
+        return os.path.join(self.home, ".config", "ferry", "offered.json")
+
+    def offer(self, *args):
+        return subprocess.run(["zsh", FERRY, "offer", *args],
+                              env=dict(os.environ, HOME=self.home),
+                              capture_output=True, text=True, timeout=120)
+
+    def mkfile(self, rel, text="x\n"):
+        p = os.path.join(self.work, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    def fetch(self, name):
+        """GET /file/<name>; return (status, raw tar bytes)."""
+        try:
+            with urllib.request.urlopen(
+                    f"http://127.0.0.1:{self.port}/file/{name}", timeout=30) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.read()
+
+    def members(self, body):
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as t:
+            return {m.name: m for m in t.getmembers()}
+
+    def extract(self, body):
+        """Unpack with the system tar, exactly as `ferry get` does."""
+        dest = tempfile.mkdtemp(prefix="ferry-offerdest-", dir=self.work)
+        subprocess.run(["tar", "-x", "-C", dest], input=body, check=True)
+        return dest
+
+    def set_entry(self, name, value):
+        with open(self.manifest_path) as f:
+            data = json.load(f)
+        data[name] = value
+        with open(self.manifest_path, "w") as f:
+            json.dump(data, f)
+
+    # -- item 1: naming ----------------------------------------------------
+    def test_as_names_the_payload_and_the_basename_is_not_a_key(self):
+        src = self.mkfile("naming/toolsdir/readme.txt", "tools\n")
+        r = self.offer("--as", "tools", os.path.dirname(src))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("/file/tools", r.stdout, "offer must print the fetch URL")
+        status, body = self.fetch("tools")
+        self.assertEqual(status, 200)
+        self.assertIn("toolsdir/readme.txt", self.members(body))
+        self.assertEqual(self.fetch("toolsdir")[0], 404)
+
+    def test_default_name_is_still_the_basename(self):
+        src = self.mkfile("legacy/eval.jsonl", "{}\n")
+        r = self.offer(src)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(self.manifest_path) as f:
+            # The historical plain-string shape, so older readers keep working.
+            self.assertEqual(json.load(f)["eval.jsonl"], src)
+        status, body = self.fetch("eval.jsonl")
+        self.assertEqual(status, 200)
+        self.assertIn("eval.jsonl", self.members(body))
+
+    def test_a_basename_collision_is_refused_and_writes_nothing(self):
+        first = self.mkfile("coll/one/payload.bin", "one\n")
+        second = self.mkfile("coll/two/payload.bin", "two\n")
+        self.assertEqual(self.offer(first).returncode, 0)
+        with open(self.manifest_path, "rb") as f:
+            before = f.read()
+        # A second, valid path in the same call must not be written either.
+        other = self.mkfile("coll/other.txt")
+        r = self.offer(other, second)
+        self.assertNotEqual(r.returncode, 0, "a collision must fail the command")
+        self.assertIn("already offered", r.stderr)
+        with open(self.manifest_path, "rb") as f:
+            self.assertEqual(f.read(), before, "a refused offer changed the manifest")
+        # Re-offering the SAME path is not a collision.
+        self.assertEqual(self.offer(first).returncode, 0)
+        # --replace is the explicit override.
+        r = self.offer("--replace", second)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, body = self.fetch("payload.bin")
+        dest = self.extract(body)
+        with open(os.path.join(dest, "payload.bin")) as f:
+            self.assertEqual(f.read(), "two\n")
+
+    def test_a_name_with_a_slash_is_refused(self):
+        src = self.mkfile("slash/a.txt")
+        r = self.offer("--as", "a/b", src)
+        self.assertNotEqual(r.returncode, 0)
+
+    # -- item 2: dereferencing ----------------------------------------------
+    def _selftest_app(self):
+        r = self.offer("--selftest")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(self.manifest_path) as f:
+            data = json.load(f)
+        return data["ferry-selftest-app"]
+
+    def test_symlinks_inside_an_app_stay_symlinks(self):
+        self._selftest_app()
+        status, body = self.fetch("ferry-selftest-app")
+        self.assertEqual(status, 200)
+        m = self.members(body)
+        link = m["FerrySelftest.app/Contents/Resources/current"]
+        self.assertTrue(link.issym(), "a symlink inside a .app was dereferenced")
+        self.assertEqual(link.linkname, "data.txt")
+
+    def test_symlinks_outside_an_app_are_still_dereferenced(self):
+        self._selftest_app()
+        status, body = self.fetch("ferry-selftest-tree")
+        self.assertEqual(status, 200)
+        link = self.members(body)["tree/link.txt"]
+        self.assertTrue(link.isfile(), "default dereferencing regressed")
+
+    @unittest.skipUnless(shutil.which("codesign"), "codesign is macOS-only")
+    def test_a_ferried_app_keeps_a_valid_signature_and_deref_breaks_it(self):
+        app = self._selftest_app()
+        src = subprocess.run(["codesign", "--verify", "--deep", "--strict", app],
+                             capture_output=True, text=True)
+        self.assertEqual(src.returncode, 0, f"fixture is not validly signed: {src.stderr}")
+
+        _, body = self.fetch("ferry-selftest-app")
+        ok = subprocess.run(["codesign", "--verify", "--deep", "--strict",
+                             os.path.join(self.extract(body), "FerrySelftest.app")],
+                            capture_output=True, text=True)
+        self.assertEqual(ok.returncode, 0, f"ferried .app fails verification: {ok.stderr}")
+
+        # The control: force the old unconditional dereference for this entry.
+        # Without a failing case, the passing one proves nothing.
+        self.set_entry("ferry-selftest-app", {"path": app, "deref": True})
+        try:
+            _, body = self.fetch("ferry-selftest-app")
+            bad = subprocess.run(["codesign", "--verify", "--deep", "--strict",
+                                  os.path.join(self.extract(body), "FerrySelftest.app")],
+                                 capture_output=True, text=True)
+            self.assertNotEqual(bad.returncode, 0,
+                                "dereferencing did not break the signature; the check cannot fail")
+        finally:
+            self.set_entry("ferry-selftest-app", app)
+
+    def test_a_symlink_to_an_app_inside_a_tree_ships_the_bundle(self):
+        # The provisioning pattern one level down: a plain directory of links,
+        # one of which points at an .app. The link must become the bundle (not
+        # a dangling absolute symlink), and the bundle's own links must survive.
+        app = self._selftest_app()
+        links = os.path.join(self.work, "applinks")
+        os.makedirs(links)
+        os.symlink(app, os.path.join(links, "Linked.app"))
+        self.assertEqual(self.offer("--as", "applinks", links).returncode, 0)
+        _, body = self.fetch("applinks")
+        m = self.members(body)
+        self.assertTrue(m["applinks/Linked.app"].isdir(), "the .app link shipped as a symlink")
+        self.assertTrue(m["applinks/Linked.app/Contents/Resources/current"].issym())
+
+    def test_a_no_deref_entry_still_resolves_a_symlinked_root(self):
+        target = os.path.dirname(self.mkfile("rootlink/real/inner.txt", "inner\n"))
+        os.symlink("inner.txt", os.path.join(target, "inner-link"))
+        link = os.path.join(self.work, "rootlink", "via-link")
+        os.symlink(target, link)
+        r = self.offer("--no-deref", "--as", "vialink", link)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        _, body = self.fetch("vialink")
+        m = self.members(body)
+        self.assertTrue(m["via-link"].isdir(), "a symlinked root shipped as a dangling link")
+        self.assertTrue(m["via-link/inner.txt"].isfile())
+        self.assertTrue(m["via-link/inner-link"].issym(), "--no-deref was ignored")
+
+    def test_pull_still_dereferences_the_hf_cache(self):
+        base = os.path.join(self.home, ".cache", "huggingface", "hub",
+                            "models--org--tiny")
+        os.makedirs(os.path.join(base, "blobs"))
+        os.makedirs(os.path.join(base, "snapshots", "abc"))
+        with open(os.path.join(base, "blobs", "deadbeef"), "w") as f:
+            f.write("weights\n")
+        os.symlink("../../blobs/deadbeef",
+                   os.path.join(base, "snapshots", "abc", "model.safetensors"))
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/pull/org/tiny", timeout=30) as r:
+            body = r.read()
+        member = self.members(body)["tiny/model.safetensors"]
+        self.assertTrue(member.isfile(), "a pulled model shipped a symlink into blobs/")
+        with tarfile.open(fileobj=io.BytesIO(body), mode="r:") as t:
+            self.assertEqual(t.extractfile("tiny/model.safetensors").read(), b"weights\n")
+
+    # -- item 3: the fixture -------------------------------------------------
+    def test_selftest_offers_a_fetchable_fixture(self):
+        self._selftest_app()
+        with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/manifest", timeout=10) as r:
+            files = json.load(r)["files"]
+        for name in ("ferry-selftest-file", "ferry-selftest-tree", "ferry-selftest-app"):
+            self.assertIn(name, files)
+        status, body = self.fetch("ferry-selftest-file")
+        self.assertEqual(status, 200)
+        self.assertIn("hello.txt", self.members(body))
 
 
 if __name__ == "__main__":

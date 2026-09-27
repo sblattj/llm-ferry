@@ -1,5 +1,21 @@
 # Follow-up tasks — `ferry offer` naming and `.app` payload integrity
 
+> **Resolved (items 1-3), 2026-09-27.** `ferry offer --as NAME` names a payload
+> (default is still the basename), refuses a name already offered for a different
+> path unless `--replace` (nothing is written on refusal), and prints each
+> `GET /file/<name>` URL. `_tar_stream` now dereferences per payload: symlinks are
+> followed except inside a `*.app` bundle, the root is always resolved, and
+> `--deref`/`--no-deref` records an explicit override as
+> `{"path": ..., "deref": bool}` (plain-string entries still work). `ferry offer
+> --selftest` offers a file, a symlink tree, and an ad-hoc-signed `.app`.
+> Regression tests: `TestOfferedPayloads` in `lib/ferry-share.test.py`, including
+> `codesign --verify --deep --strict` passing on a ferried `.app` and failing with
+> `deref: true` (the control). Corrections to the claims below: `offered.json` is a
+> flat `{name: path}` map, so `"files": []` was the `/manifest` response, not the
+> file; and the host's manifest was no longer empty (its `offer-links/` symlinks and
+> zipped `app-wrap/` entries are workarounds for items 1 and 2). Item 4 (`Range`)
+> is still open. `VERSION` was not bumped in this change.
+
 Staged by the `sharpen` retro of session `858e1614-9a00-4eff-be5a-f86b47f37aba`
 (2026-08-30). No code in this repo was changed by that retro. Both items were
 found by an implementer seat (`a81fd7ae4099fab80`) that built a stand-in server

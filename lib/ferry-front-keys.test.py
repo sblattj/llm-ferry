@@ -607,11 +607,14 @@ class TestDevicePathAllowlist(KeyFrontCase):
         self.assertEqual(self.app.calls, 0)
 
     def test_anthropic_family_403_shape(self):
-        # Every Anthropic-family path is allowed, so no request can produce
-        # this today; the shape is still pinned for the family rule.
-        doc = FF.key_error_body("/v1/messages", 403, "device keys may not call this route")
+        # GET /v1/messages is not a client route (only POST is).
+        token = self.mint()
+        _, sent, _ = drive(self.mw(), "/v1/messages", bearer(token), method="GET")
+        status, _, doc = reply(sent)
+        self.assertEqual(status, 403)
         self.assertEqual(doc, {"type": "error", "error": {
             "type": "permission_error", "message": "device keys may not call this route"}})
+        self.assertEqual(self.app.calls, 0)
 
     def test_client_routes_are_admitted(self):
         token = self.mint()
@@ -619,16 +622,120 @@ class TestDevicePathAllowlist(KeyFrontCase):
                              ("/v1/responses", "POST"), ("/v1/messages", "POST"),
                              ("/v1/messages/count_tokens", "POST"), ("/v1/embeddings", "POST"),
                              ("/v1/models", "GET"), ("/models", "GET"),
-                             ("/v1/models/flash", "GET"), ("/models/flash", "GET"),
+                             ("/v1/models/flash", "GET"),
                              ("/v1beta/models/flash:generateContent", "POST"),
                              ("/v1beta/models/flash:streamGenerateContent", "POST"),
                              ("/v1beta/models/flash:countTokens", "POST"),
-                             ("/models/flash:generateContent", "POST"),
+                             ("/v1/responses/resp_1", "GET"), ("/v1/responses/resp_1", "DELETE"),
+                             ("/v1/responses/resp_1/input_items", "GET"),
+                             ("/v1/responses/resp_1/cancel", "POST"),
+                             ("/v1/responses/compact", "POST"),
                              ("/health/liveliness", "GET"), ("/health/liveness", "GET")):
             with self.subTest(path=path):
                 scope, sent, _ = drive(self.mw(), path, bearer(token), method=method)
                 self.assertEqual(reply(sent)[0], 200)
                 self.assertEqual(scope["ferry.key"], "laptop")
+
+    def assert_route_refused(self, token, path, method, scope_type="http"):
+        _, sent, _ = drive(self.mw(), path, bearer(token), method=method,
+                           scope_type=scope_type)
+        if scope_type == "websocket":
+            self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+        else:
+            status, _, doc = reply(sent)
+            self.assertEqual(status, 403)
+            self.assertEqual(doc["error"]["message"], FF.KEY_ROUTE_REFUSED)
+            if FF.is_anthropic_path(path):
+                self.assertEqual(doc["error"]["type"], "permission_error")
+            else:
+                self.assertEqual(doc["error"]["code"], "route_not_allowed")
+
+    def test_param_first_litellm_routes_are_403(self):
+        # Round-5 repros: litellm routes whose FIRST segment is a path param
+        # (/{provider}/v1/files*, /{provider}/v1/batches*, /{mcp_server_name}/…)
+        # took a client-looking first segment and reached files, batches and
+        # MCP OAuth at master power.
+        token = self.mint()
+        for path, method in (
+                ("/models/v1/files", "GET"), ("/models/v1/files", "POST"),
+                ("/models/v1/files/x/content", "GET"), ("/models/v1/files/x", "DELETE"),
+                ("/models/v1/batches", "GET"), ("/models/v1/batches", "POST"),
+                ("/models/v1/batches/x/cancel", "POST"),
+                ("/messages/v1/files", "GET"), ("/responses/v1/files", "GET"),
+                ("/embeddings/v1/files", "GET"), ("/completions/v1/batches", "GET"),
+                ("/chat/completions/v1/files", "GET"), ("/v1/models/v1/files", "GET"),
+                ("/messages/v1/batches", "POST"),
+                ("/models/mcp", "POST"), ("/messages/mcp", "POST"),
+                ("/models/token", "POST"), ("/responses/token", "POST"),
+                ("/models/register", "POST"), ("/responses/register", "POST"),
+                ("/messages/authorize", "GET"), ("/models/token", "GET"),
+                ("/models/v1/files/x:generateContent", "GET"),
+                ("/models/v1/files/x:generateContent", "DELETE"),
+                ("/models/v1/files/x:generateContent", "POST"),
+                ("/models/v1/batches/x:countTokens", "GET")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_bare_forms_that_collide_with_param_routes_are_403(self):
+        # Only the /v1 (/v1beta) form is admitted where the bare form shares a
+        # shape with /{mcp_server_name}/{authorize,token,…}.
+        token = self.mint()
+        for path, method in (("/models/flash", "GET"),
+                             ("/models/flash:generateContent", "POST"),
+                             ("/responses/resp_1", "GET"), ("/responses/resp_1", "DELETE"),
+                             ("/responses/resp_1/cancel", "POST"),
+                             ("/responses/resp_1/input_items", "GET")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_unused_bare_forms_are_403(self):
+        # These do not collide, but no client calls them: bare /messages has
+        # no litellm route at all, and /responses/compact has a /v1 twin.
+        token = self.mint()
+        for path in ("/responses/compact", "/messages", "/messages/count_tokens"):
+            with self.subTest(path=path):
+                self.assert_route_refused(token, path, "POST")
+        self.assertEqual(self.app.calls, 0)
+
+    def test_the_method_is_part_of_the_rule(self):
+        token = self.mint()
+        for path, method in (("/v1/chat/completions", "GET"), ("/v1/chat/completions", "DELETE"),
+                             ("/v1/models", "POST"), ("/v1/models/flash", "DELETE"),
+                             ("/v1beta/models/flash:generateContent", "GET"),
+                             ("/v1beta/models/flash:generateContent", "DELETE"),
+                             ("/v1/responses", "GET"), ("/v1/responses/resp_1", "PUT"),
+                             ("/v1/messages", "GET"), ("/health/liveliness", "POST"),
+                             ("/v1/chat/completions", "HEAD"), ("/v1/models", "OPTIONS"),
+                             ("/v1/ferry/fleet", "DELETE")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_rules_are_anchored_to_the_whole_path(self):
+        token = self.mint()
+        for path, method in (("/v1/chat/completions/x", "POST"),
+                             ("/v1/messages/x", "POST"), ("/v1/models/a/b", "GET"),
+                             ("/v1/responses/a/b", "GET"),
+                             ("/v1beta/models/a/b:generateContent", "POST"),
+                             ("/v1beta/models/:generateContent", "POST"),
+                             ("/v1/models/", "GET"), ("/v1/responses/", "GET")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_websocket_rules_are_exact(self):
+        token = self.mint()
+        for path in ("/v1/responses", "/responses"):
+            with self.subTest(path=path):
+                _, sent, _ = drive(self.mw(), path, bearer(token), method="GET",
+                                   scope_type="websocket")
+                self.assertEqual(sent, [{"type": "websocket.accept"}])
+        for path in ("/models/v1/files", "/v1/chat/completions", "/openai/v1/realtime",
+                     "/v1/realtime/x"):
+            with self.subTest(path=path):
+                self.assert_route_refused(token, path, "GET", scope_type="websocket")
 
     def test_gemini_query_key_route_is_admitted(self):
         token = self.mint()

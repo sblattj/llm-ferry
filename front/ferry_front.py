@@ -44,6 +44,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -1111,33 +1112,50 @@ _KEY_REASONS = {
 ANTHROPIC_PATHS = ("/v1/messages", "/messages")
 # A valid device key is swapped for the master, so it may only reach the
 # routes a client actually calls — never litellm's admin surface (/key/*,
-# /config/*, /model/new, …) at master power. Verified against litellm
-# 1.99.0's route table (proxy_server.py `/v1/models/{model_id}`,
-# google_endpoints/endpoints.py generate routes, _types.py public_routes).
+# /config/*, /model/new, …) at master power. Every rule is a (method, WHOLE
+# path) pair: litellm 1.99.0 also has routes whose FIRST segment is a param
+# (/{provider}/v1/files*, /{provider}/v1/batches*,
+# /{mcp_server_name}/{mcp,token,register,authorize}), so any prefix rule — or
+# any bare two-segment form like /models/<x> or /responses/<x> — lands a
+# client-looking path on a file, batch or MCP OAuth handler. Where the bare
+# form collides that way, only the /v1 (/v1beta) form is admitted.
+# lib/ferry-front-routes.test.py proves this against litellm's real, complete
+# route table; update both together.
 KEY_ROUTE_REFUSED = "device keys may not call this route"
-DEVICE_KEY_EXACT_PATHS = frozenset({
-    "/v1/realtime", "/realtime",                  # the realtime websocket
-    "/health/liveliness", "/health/liveness",     # litellm public; ferry-dash probes it
-})
-DEVICE_KEY_MODEL_PREFIXES = ("/v1/models/", "/models/")   # retrieve (+ the /models/… Gemini alias)
-GEMINI_MODEL_PREFIXES = ("/v1beta/models/", "/models/")
-GEMINI_ACTIONS = (":generateContent", ":streamGenerateContent", ":countTokens")
+WEBSOCKET_METHOD = "WEBSOCKET"   # the method slot for a websocket upgrade
+DEVICE_KEY_EXACT_ROUTES = {
+    "GET": frozenset({"/v1/models", "/models",
+                      "/health/liveliness", "/health/liveness",  # ferry-dash probe
+                      FLEET_PATH}),
+    "POST": frozenset({"/v1/chat/completions", "/chat/completions",
+                       "/v1/completions", "/completions",
+                       "/v1/embeddings", "/embeddings",
+                       "/v1/messages", "/v1/messages/count_tokens",
+                       "/v1/responses", "/responses", "/v1/responses/compact",
+                       FLEET_PATH}),
+    WEBSOCKET_METHOD: frozenset({"/v1/realtime", "/realtime",
+                                 "/v1/responses", "/responses"}),
+}
+_SEGMENT = r"[^/]+"
+DEVICE_KEY_PATTERN_ROUTES = {
+    "GET": (re.compile(r"/v1/models/" + _SEGMENT),
+            re.compile(r"/v1/responses/" + _SEGMENT),
+            re.compile(r"/v1/responses/" + _SEGMENT + r"/input_items")),
+    "DELETE": (re.compile(r"/v1/responses/" + _SEGMENT),),
+    "POST": (re.compile(r"/v1/responses/" + _SEGMENT + r"/cancel"),
+             re.compile(r"/v1beta/models/[^/:]+:"
+                        r"(?:generateContent|streamGenerateContent|countTokens)")),
+}
 
 
-def device_key_route_allowed(path: str) -> bool:
-    """Whether a valid device key may call `path` (segment-aware prefixes)."""
-    if not path:
+def device_key_route_allowed(method: str, path: str) -> bool:
+    """Whether a valid device key may call (method, path); every rule is
+    anchored to the whole path. `method` is WEBSOCKET_METHOD for an upgrade."""
+    if not path or not method:
         return False
-    if (path in MODEL_LIST_PATHS or path in DEVICE_KEY_EXACT_PATHS
-            or path == FLEET_PATH):
+    if path in DEVICE_KEY_EXACT_ROUTES.get(method, ()):
         return True
-    if any(path == p or path.startswith(p + "/") for p in INFERENCE_PATH_PREFIXES):
-        return True
-    if any(path.startswith(p) and len(path) > len(p)
-           for p in DEVICE_KEY_MODEL_PREFIXES):
-        return True
-    return (any(path.startswith(p) for p in GEMINI_MODEL_PREFIXES)
-            and path.endswith(GEMINI_ACTIONS))
+    return any(rx.fullmatch(path) for rx in DEVICE_KEY_PATTERN_ROUTES.get(method, ()))
 
 
 _OPENAI_ERRORS = {401: ("invalid_request_error", "invalid_api_key"),
@@ -1382,7 +1400,9 @@ def authenticate(scope):
                      "refused until it is fixed (see the host's front log)")
     if entry is None:
         return 401, _KEY_REASONS.get(reason, _KEY_REASONS["unknown"])
-    if not device_key_route_allowed(scope.get("path", "")):
+    method = (WEBSOCKET_METHOD if scope.get("type") == "websocket"
+              else scope.get("method", ""))
+    if not device_key_route_allowed(method, scope.get("path", "")):
         # A real key on the wrong route: 403, and nothing is rewritten.
         return 403, KEY_ROUTE_REFUSED
     # A private copy: downstream steps may not mutate the cache's entry.

@@ -391,7 +391,7 @@ node lib/ferry-dashui.test.mjs
 
 How the suites are designed — real embedded Python against a throwaway `$HOME`, the client-scope end-to-end runs — is in [Deep dives](docs/deep-dives.md#test-suite-detail).
 
-**Cutting a release.** Bump `VERSION`, commit (subject `release: vX.Y.Z — <headline>`, optionally with `docs/releases/vX.Y.Z.md` as the notes), then `git tag vX.Y.Z && git push origin vX.Y.Z`. The push runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which creates the GitHub Release if it does not exist yet: the title comes from the commit subject (or the notes file's heading, else the bare tag), the notes from `docs/releases/<tag>.md` (else the commit body, else `git log` since the previous tag), and the Latest marker only moves when the tag is the highest version. Preview exactly what it will publish with `python3 scripts/release-notes.py title|notes|latest vX.Y.Z`.
+**Cutting a release.** Bump `VERSION`, commit (subject `release: vX.Y.Z — <headline>`, optionally with `docs/releases/vX.Y.Z.md` as the notes), then `git tag -a vX.Y.Z -m "llm-ferry vX.Y.Z — <headline>" && git push origin vX.Y.Z`. The push runs [`.github/workflows/release.yml`](.github/workflows/release.yml), which creates the GitHub Release if it does not exist yet: the title comes from the annotated tag's message (else the commit subject, the notes file's heading, the bare tag), the notes from the tag message's body (else `docs/releases/<tag>.md`, the commit body, `git log` since the previous tag), and the Latest marker only moves when the tag is the highest version. Preview exactly what it will publish with `python3 scripts/release-notes.py title|notes|latest vX.Y.Z`.
 
 ## License
 

@@ -1109,6 +1109,37 @@ _KEY_REASONS = {
     "expired": "this ferry device key has expired",
 }
 ANTHROPIC_PATHS = ("/v1/messages", "/messages")
+# A valid device key is swapped for the master, so it may only reach the
+# routes a client actually calls — never litellm's admin surface (/key/*,
+# /config/*, /model/new, …) at master power. Verified against litellm
+# 1.99.0's route table (proxy_server.py `/v1/models/{model_id}`,
+# google_endpoints/endpoints.py generate routes, _types.py public_routes).
+KEY_ROUTE_REFUSED = "device keys may not call this route"
+DEVICE_KEY_EXACT_PATHS = frozenset({
+    "/v1/realtime", "/realtime",                  # the realtime websocket
+    "/health/liveliness", "/health/liveness",     # litellm public; ferry-dash probes it
+})
+DEVICE_KEY_MODEL_PREFIXES = ("/v1/models/", "/models/")   # retrieve (+ the /models/… Gemini alias)
+GEMINI_MODEL_PREFIXES = ("/v1beta/models/", "/models/")
+GEMINI_ACTIONS = (":generateContent", ":streamGenerateContent", ":countTokens")
+
+
+def device_key_route_allowed(path: str) -> bool:
+    """Whether a valid device key may call `path` (segment-aware prefixes)."""
+    if not path:
+        return False
+    if (path in MODEL_LIST_PATHS or path in DEVICE_KEY_EXACT_PATHS
+            or path == FLEET_PATH):
+        return True
+    if any(path == p or path.startswith(p + "/") for p in INFERENCE_PATH_PREFIXES):
+        return True
+    if any(path.startswith(p) and len(path) > len(p)
+           for p in DEVICE_KEY_MODEL_PREFIXES):
+        return True
+    return (any(path.startswith(p) for p in GEMINI_MODEL_PREFIXES)
+            and path.endswith(GEMINI_ACTIONS))
+
+
 _OPENAI_ERRORS = {401: ("invalid_request_error", "invalid_api_key"),
                   403: ("invalid_request_error", "model_not_allowed"),
                   429: ("requests", "rate_limit_exceeded"),
@@ -1351,6 +1382,9 @@ def authenticate(scope):
                      "refused until it is fixed (see the host's front log)")
     if entry is None:
         return 401, _KEY_REASONS.get(reason, _KEY_REASONS["unknown"])
+    if not device_key_route_allowed(scope.get("path", "")):
+        # A real key on the wrong route: 403, and nothing is rewritten.
+        return 403, KEY_ROUTE_REFUSED
     # A private copy: downstream steps may not mutate the cache's entry.
     entry = dict(entry, lanes=list(entry["lanes"])
                  if isinstance(entry.get("lanes"), list) else entry.get("lanes"))
@@ -1463,8 +1497,9 @@ class LaneCatalogueFilter:
                 if scope.get("type") == "websocket":
                     # Close before accept: the server answers the upgrade 403.
                     return await send({"type": "websocket.close", "code": 1008})
+                code = "route_not_allowed" if message == KEY_ROUTE_REFUSED else None
                 return await self._reply(send, status, key_error_body(
-                    scope.get("path", ""), status, message))
+                    scope.get("path", ""), status, message, code=code))
         # The control plane first: GET /v1/ferry/chains, POST /v1/ferry/reorder,
         # and POST /v1/ferry/promote are answered HERE, before litellm ever sees
         # the request — litellm has no such routes and would 404 them, and more

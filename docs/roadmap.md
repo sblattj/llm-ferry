@@ -39,6 +39,16 @@ rather than by rival parity. Issue numbers refer to that queue.
 04 retry/timeout knobs, 07 credentials at rest, 29 continuous probes,
 27 headless/Linux, 37 per-lane reasoning policy, 12 cache-token pricing.
 
+- [ ] **Jev failure-classifier audit** (branch `jev-audit-tier`, `f39a5ec`,
+      based on pre-rewrite `db4ebad` — rebase onto `origin/main` first).
+      Merge the shadow tier after launch, not before: it adds third-party
+      egress, which cuts against "keys never leave the host". Higher-value use:
+      run Jev offline over logged `unknown` failures to mine new keyword rules
+      for `lib/ferry_live.py` `classify()` (eval: 105/105 unknown-gap fill), so
+      the deterministic table stays in charge. Add a pluggable local-lane
+      backend (host flash/schematron) and eval it on the same 340-call set.
+      Stays shadow-only: adversarial steer breached 21.4% against a 5% bar.
+
 ## Deliberately skipped
 
 - 02 auto tier routing — contradicts strict named chains; silent quality risk.

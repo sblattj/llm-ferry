@@ -137,16 +137,36 @@ class KeyFrontCase(unittest.TestCase):
 
 class TestPassThrough(KeyFrontCase):
     def test_master_and_bare_requests_touch_no_key_state(self):
-        for headers, label in ((bearer(MASTER), "master"), ((), "")):
-            with self.subTest(label=label):
-                scope, _, send = drive(self.mw(), "/v1/chat/completions", headers)
-                self.assertEqual(self.app.headers().get(b"authorization"),
-                                 dict(headers).get("authorization", "").encode() or None)
+        # The key-store accessor raises: a master or bare request that reached
+        # it would 401 (fail-closed) instead of passing through.
+        boom = mock.Mock(side_effect=AssertionError("key store touched"))
+        patcher = mock.patch.object(FF, "_key_cache", boom)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for headers, label in ((bearer(MASTER), "master"), ((), ""),
+                               ([("x-api-key", MASTER)], "master")):
+            with self.subTest(label=label, headers=headers):
+                scope, sent, send = drive(self.mw(), "/v1/chat/completions", headers)
+                self.assertEqual(reply(sent)[0], 200)
+                seen = self.app.headers()
+                for name in (b"authorization", b"x-api-key"):
+                    want = dict(headers).get(name.decode())
+                    self.assertEqual(seen.get(name), want.encode() if want else None)
                 self.assertEqual(scope["ferry.key"], label)
                 self.assertNotIn("ferry.key_entry", scope)
                 self.assertIs(self.app.send, send)
+        boom.assert_not_called()
         self.assertFalse(os.path.exists(self.keys))
         self.assertFalse(os.path.exists(self.db))
+
+    def test_the_no_touch_probe_can_fail(self):
+        # Control for the test above: the same patch DOES fire for an fk- key.
+        boom = mock.Mock(side_effect=AssertionError("key store touched"))
+        with mock.patch.object(FF, "_key_cache", boom):
+            _, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                               bearer("fk-nobody-" + "a" * 32))
+        self.assertEqual(reply(sent)[0], 401)
+        self.assertEqual(boom.call_count, 1)
 
     def test_a_non_ferry_credential_is_litellms_business(self):
         scope, _, _ = drive(self.mw(), "/v1/chat/completions", bearer("sk-something-else"))
@@ -196,8 +216,7 @@ class TestDeviceKeys(KeyFrontCase):
                     self.assertEqual(status, 401)
                     self.assertEqual(doc["error"]["code"], "invalid_api_key")
                     self.assertEqual(doc["error"]["type"], "invalid_request_error")
-                    self.assertIn(reason if reason != "unknown" else "unknown",
-                                  doc["error"]["message"])
+                    self.assertIn(reason, doc["error"]["message"])
         self.assertEqual(self.app.calls, 0)
 
     def test_anthropic_path_gets_the_anthropic_error_shape(self):
@@ -245,6 +264,102 @@ class TestDeviceKeys(KeyFrontCase):
         drive(self.mw(), "/v1/realtime", bearer(token), method="GET",
               scope_type="websocket")
         self.assertEqual(self.app.headers()[b"authorization"], b"Bearer " + MASTER.encode())
+
+
+class TestAmbiguousCredentials(KeyFrontCase):
+    """Fix round 1: a request must present exactly one credential, and when
+    any credential header carries an fk- key, every credential header must
+    be that same validated key."""
+
+    def refused(self, headers, path="/v1/chat/completions"):
+        _, sent, _ = drive(self.mw(), path, headers)
+        status, _, doc = reply(sent)
+        self.assertEqual(status, 401, headers)
+        self.assertEqual(doc["error"]["code"], "invalid_api_key")
+        return doc
+
+    def test_duplicate_credential_headers_are_refused(self):
+        token = self.mint()
+        cases = {
+            "two fk bearers": bearer(token) + bearer(token),
+            "fk then master": bearer(token) + bearer(MASTER),
+            "master then master": bearer(MASTER) + bearer(MASTER),
+            "two x-api-keys": [("x-api-key", token), ("x-api-key", token)],
+            "x-api-key master twice": [("x-api-key", MASTER), ("x-api-key", MASTER)],
+        }
+        for label, headers in cases.items():
+            with self.subTest(label=label):
+                self.refused(headers)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_mixed_credentials_with_an_fk_key_are_refused(self):
+        token = self.mint()
+        _, other = K.add("other")
+        cases = {
+            "two different fk keys": bearer(token) + [("x-api-key", other)],
+            "foreign bearer + fk x-api-key": bearer("sk-something-else")
+                                             + [("x-api-key", token)],
+            "master bearer + fk x-api-key": bearer(MASTER) + [("x-api-key", token)],
+            "fk bearer + master x-api-key": bearer(token) + [("x-api-key", MASTER)],
+            "fk under another scheme": [("authorization", "Token " + token)],
+            "fk after a comma": [("authorization", "Bearer sk-x, " + token)],
+        }
+        for label, headers in cases.items():
+            with self.subTest(label=label):
+                self.refused(headers)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_the_same_fk_key_in_both_headers_is_admitted_and_both_rewritten(self):
+        token = self.mint()
+        scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                               bearer(token) + [("x-api-key", token)])
+        self.assertEqual(reply(sent)[0], 200)
+        headers = self.app.headers()
+        self.assertEqual(headers[b"authorization"], b"Bearer " + MASTER.encode())
+        self.assertEqual(headers[b"x-api-key"], MASTER.encode())
+        self.assertEqual(scope["ferry.key"], "laptop")
+
+    def test_scheme_less_authorization_fk_is_a_presented_key(self):
+        token = self.mint()
+        scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                               [("authorization", token)])
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.headers()[b"authorization"], b"Bearer " + MASTER.encode())
+        self.assertEqual(scope["ferry.key"], "laptop")
+        K.revoke("laptop")
+        self.bump()
+        doc = self.refused([("authorization", token)])
+        self.assertIn("revoked", doc["error"]["message"])
+
+    def test_websocket_with_ambiguous_credentials_is_closed(self):
+        token = self.mint()
+        _, sent, _ = drive(self.mw(), "/v1/realtime", bearer(token) + bearer(token),
+                           method="GET", scope_type="websocket")
+        self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+        _, sent, _ = drive(self.mw(), "/v1/realtime",
+                           bearer(MASTER) + [("x-api-key", token)],
+                           method="GET", scope_type="websocket")
+        self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+        self.assertEqual(self.app.calls, 0)
+
+    def test_a_foreign_key_that_merely_contains_fk_dash_is_not_a_device_key(self):
+        scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                               bearer("sk-abcfk-xyz"))
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.headers()[b"authorization"], b"Bearer sk-abcfk-xyz")
+        self.assertEqual(scope["ferry.key"], "")
+
+
+class TestEntryIsolation(KeyFrontCase):
+    def test_key_entry_is_safe_against_downstream_mutation(self):
+        token = self.mint(lanes=["flash"])
+        mw = self.mw()
+        scope, _, _ = drive(mw, "/v1/models", bearer(token), method="GET")
+        scope["ferry.key_entry"]["lanes"].append("heavy")
+        scope["ferry.key_entry"]["rpm"] = 999
+        scope, _, _ = drive(mw, "/v1/models", bearer(token), method="GET")
+        self.assertEqual(scope["ferry.key_entry"]["lanes"], ["flash"])
+        self.assertIsNone(scope["ferry.key_entry"]["rpm"])
 
 
 class TestIdentity(KeyFrontCase):

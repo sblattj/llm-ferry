@@ -64,6 +64,21 @@ class TestNamesAndTokens(StoreCase):
                 with self.assertRaises(K.KeyNameError):
                     K.normalize_name(bad)
 
+    def test_reserved_names_are_refused(self):
+        # "master" would erase the credential class in scope["ferry.key"];
+        # "host" would impersonate the host's sticky fleet identity.
+        for bad in ("master", "Master", " HOST ", "host"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(K.KeyNameError):
+                    K.normalize_name(bad)
+                with self.assertRaises(K.KeyNameError):
+                    K.add(bad)
+                with self.assertRaises(K.KeyNameError):
+                    K.add(bad, unique=True)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual(K.normalize_name("master-laptop"), "master-laptop")
+        self.assertEqual(K.normalize_name("hosts"), "hosts")
+
     def test_expires_from_date(self):
         self.assertEqual(K.expires_from_date("2026-10-01"), "2026-10-01T00:00:00Z")
         with self.assertRaises(K.KeyNameError):
@@ -199,6 +214,21 @@ class TestLoad(StoreCase):
                     json.dump(doc, fh)
                 with self.assertRaises(K.KeyStoreError):
                     K.load()
+
+    def test_a_reserved_name_in_the_store_fails_closed(self):
+        _, token = K.add("laptop")
+        for reserved in ("master", "host"):
+            with self.subTest(reserved=reserved):
+                doc = {"version": 1, "keys": [
+                    {"name": "laptop", "sha256": K.hash_token(token)},
+                    {"name": reserved, "sha256": "a" * 64}]}
+                with open(self.path, "w") as fh:
+                    json.dump(doc, fh)
+                self.bump_mtime()
+                with self.assertRaises(K.KeyStoreError):
+                    K.load()
+                with self.assertRaises(K.KeyStoreError):
+                    K.KeyCache().lookup(token)
 
 
 class TestLifecycle(StoreCase):

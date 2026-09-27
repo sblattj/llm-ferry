@@ -278,19 +278,40 @@ class TestAmbiguousCredentials(KeyFrontCase):
         self.assertEqual(doc["error"]["code"], "invalid_api_key")
         return doc
 
-    def test_duplicate_credential_headers_are_refused(self):
+    def test_duplicate_credential_headers_with_an_fk_word_are_refused(self):
         token = self.mint()
         cases = {
             "two fk bearers": bearer(token) + bearer(token),
             "fk then master": bearer(token) + bearer(MASTER),
-            "master then master": bearer(MASTER) + bearer(MASTER),
+            "master then fk": bearer(MASTER) + bearer(token),
             "two x-api-keys": [("x-api-key", token), ("x-api-key", token)],
-            "x-api-key master twice": [("x-api-key", MASTER), ("x-api-key", MASTER)],
+            "foreign then fk x-api-key": [("x-api-key", "sk-x"), ("x-api-key", token)],
         }
         for label, headers in cases.items():
             with self.subTest(label=label):
                 self.refused(headers)
         self.assertEqual(self.app.calls, 0)
+
+    def test_duplicate_headers_without_an_fk_word_pass_through_untouched(self):
+        # Global constraint: master and non-fk requests keep today's behaviour
+        # exactly, so a duplicate without any fk- word is litellm's business.
+        boom = mock.Mock(side_effect=AssertionError("key store touched"))
+        cases = {
+            "master bearer twice": (bearer(MASTER) + bearer(MASTER), "master"),
+            "master x-api-key twice": ([("x-api-key", MASTER), ("x-api-key", MASTER)],
+                                       "master"),
+            "foreign bearer twice": (bearer("sk-a") + bearer("sk-b"), ""),
+        }
+        with mock.patch.object(FF, "_key_cache", boom):
+            for label, (headers, key) in cases.items():
+                with self.subTest(label=label):
+                    scope, sent, send = drive(self.mw(), "/v1/chat/completions", headers)
+                    self.assertEqual(reply(sent)[0], 200)
+                    self.assertIs(self.app.send, send)
+                    self.assertEqual(scope["ferry.key"], key)
+                    self.assertEqual([(k.decode(), v.decode())
+                                      for k, v in self.app.scope["headers"]], headers)
+        boom.assert_not_called()
 
     def test_mixed_credentials_with_an_fk_key_are_refused(self):
         token = self.mint()

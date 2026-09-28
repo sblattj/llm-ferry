@@ -83,10 +83,15 @@ CLIENT_ENDPOINTS = {
     "get_response_input_items": [("GET", "/v1/responses/resp_1/input_items")],
     "compact_response": [("POST", "/v1/responses/compact")],
     "cancel_response": [("POST", "/v1/responses/resp_1/cancel")],
+    "health_liveliness": [("GET", "/health/liveliness"), ("GET", "/health/liveness")],
+}
+# Client-shaped endpoints a device key must NOT reach yet: the front cannot
+# limit or meter them (Gemini-native is not an inference path to the front;
+# websockets never reach _key_admit). The master still reaches them.
+UNMETERED_ENDPOINTS = {
     "google_generate_content": [("POST", "/v1beta/models/flash:generateContent")],
     "google_stream_generate_content": [("POST", "/v1beta/models/flash:streamGenerateContent")],
     "google_count_tokens": [("POST", "/v1beta/models/flash:countTokens")],
-    "health_liveliness": [("GET", "/health/liveliness"), ("GET", "/health/liveness")],
     "realtime_websocket_endpoint": [("WEBSOCKET", "/v1/realtime"), ("WEBSOCKET", "/realtime")],
     "responses_websocket_endpoint": [("WEBSOCKET", "/v1/responses"), ("WEBSOCKET", "/responses")],
 }
@@ -237,7 +242,7 @@ class TestDeviceKeyRoutesAgainstLitellm(unittest.TestCase):
                     path = path.replace(prm, val, 1)
                 seen.add(path)
         # The client shapes themselves, with the same adversarial ids.
-        for reqs in CLIENT_ENDPOINTS.values():
+        for reqs in list(CLIENT_ENDPOINTS.values()) + list(UNMETERED_ENDPOINTS.values()):
             for _, path in reqs:
                 seen.add(path)
                 for val in FILLS:
@@ -282,6 +287,13 @@ class TestDeviceKeyRoutesAgainstLitellm(unittest.TestCase):
                 with self.subTest(endpoint=name, method=method, path=path):
                     self.assertEqual(_resolve(self.app, method, path), name)
                     self.assertEqual(self.admitted([(method, path)]), [(method, path)])
+
+    def test_unmetered_endpoints_exist_and_are_refused(self):
+        for name, reqs in UNMETERED_ENDPOINTS.items():
+            for method, path in reqs:
+                with self.subTest(endpoint=name, method=method, path=path):
+                    self.assertEqual(_resolve(self.app, method, path), name)
+                    self.assertEqual(self.admitted([(method, path)]), [])
 
     def test_front_owned_routes_are_admitted_and_unknown_to_litellm(self):
         for method, path in FRONT_OWNED:

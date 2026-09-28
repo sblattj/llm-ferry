@@ -301,7 +301,16 @@ if [[ $SUPPLIED_DEVICE_KEY -eq 1 ]]; then
   # The key rides in the environment, never argv (argv is world-readable in ps).
   DEVICE_KEY_NAME=$(FERRY_SUPPLIED_KEY="$DEVICE_KEY" python3 -c 'import os, re
 m = re.fullmatch(r"fk-([a-z0-9-]+)-[a-z2-7]{32}", os.environ["FERRY_SUPPLIED_KEY"].lower())
-print(m.group(1) if m else "")' 2>/dev/null || true)
+slug = m.group(1) if m else ""
+# mint_token() in front/ferry_keys.py builds this slug as
+# normalize_name(name)[:24].rstrip("-") (SLUG_MAX=24): normalize_name never
+# leaves a repeated dash, so a slug produced by truncation is always exactly
+# 24 or 23 characters long. A slug of 22 characters or fewer therefore cannot
+# have been truncated and safely equals the real stored key name; anything
+# 23+ is ambiguous (could be a genuine name that length, or a longer real
+# name cut down to it) and must be omitted so a later master bootstrap never
+# rotates the wrong (truncated) name and orphans this key.
+print(slug if len(slug) <= 22 else "")' 2>/dev/null || true)
   echo ">>> Using the supplied device key."
 elif [[ -n "$MASTER_KEY" ]]; then
   echo ">>> Enrolling this machine for its own device key..."

@@ -134,11 +134,14 @@ def _validate(doc, path) -> None:
             or not isinstance(doc.get("keys"), list)):
         raise KeyStoreError('%s: expected {"version": 1, "keys": [...]}' % path)
     seen = set()
-    for entry in doc["keys"]:
+    for index, entry in enumerate(doc["keys"]):
         if (not isinstance(entry, dict) or not isinstance(entry.get("name"), str)
                 or not isinstance(entry.get("sha256"), str)
                 or not _SHA_RE.match(entry["sha256"])):
-            raise KeyStoreError("%s: malformed key entry %r" % (path, entry))
+            # Position only, never a repr: this text reaches the dash card and
+            # the front log, and an entry carries its sha256.
+            raise KeyStoreError("%s: key entry #%d is malformed (it needs a string "
+                                "name and a sha256 hex digest)" % (path, index + 1))
         # Same rule as normalize_name, so "master.", "-master", "MASTER!"
         # cannot be hand-edited in past the reserved check.
         if _normalize(entry["name"]) in RESERVED_NAMES:

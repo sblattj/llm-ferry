@@ -1568,6 +1568,34 @@ class TestSnapshots(FerryOpencodeCase):
             self.run_ferry("--keep", "2")
         self.assertEqual(len(self.snapshots()), 2)
 
+    def test_a_device_key_replacing_the_master_redacts_it_in_every_snapshot(self):
+        # v1.39.0 migration: the master must not survive in a snapshot — the
+        # one written now or an older one — but the snapshots stay (redacted).
+        master, device = "sk-snap-master", "fk-mbp-" + "d" * 32
+        with open(self.cfg, "w") as f:
+            json.dump({}, f)
+        self.run_ferry("--key", master)
+        self.run_ferry("--key", master)          # an older snapshot holding it
+        out = self.run_ferry("--key", device)
+        snaps = self.snapshots()
+        self.assertEqual(len(snaps), 3)
+        texts = [open(os.path.join(self.dir, s)).read() for s in snaps]
+        self.assertFalse(any(master in t for t in texts), "master survived in a snapshot")
+        self.assertEqual(sum("<redacted: replaced by ferry device key>" in t
+                             for t in texts), 2)
+        self.assertIn(device, open(self.cfg).read())
+        self.assertNotIn(master, out)
+
+    def test_a_master_rewrite_does_not_redact(self):
+        # Control: without a device key replacing it, the master stays.
+        with open(self.cfg, "w") as f:
+            json.dump({}, f)
+        self.run_ferry("--key", "sk-snap-master")
+        self.run_ferry("--key", "sk-snap-master")
+        texts = [open(os.path.join(self.dir, s)).read() for s in self.snapshots()]
+        self.assertTrue(any("sk-snap-master" in t for t in texts))
+        self.assertFalse(any("redacted" in t for t in texts))
+
     def test_a_users_own_jsonc_file_is_not_pruned(self):
         # Retention matches the timestamp SHAPE, not a "opencode.*.jsonc" glob,
         # which would delete a user's notes file sitting in the same directory.

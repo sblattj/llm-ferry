@@ -88,13 +88,17 @@ PYEOF
 # tool, and wrapping it would hijack sessions they never asked to route
 # anywhere. Env is scoped with `env`, so it reaches the claude child process
 # only and never leaks into the interactive shell.
+#
+# `env -u ANTHROPIC_API_KEY`: with both set, Claude Code sends the token as
+# Authorization AND the shell's API key as x-api-key, and the front door
+# refuses a device key beside a different credential as ambiguous (401).
 unalias claude-ferry claude-ferry-local claude-ferry-super 2>/dev/null
 
 # claude-ferry: the CLOUD pair — heavy drives, flash runs subagents and the
 # haiku-slot background calls.
 claude-ferry() {
   local nl=$'\n'
-  env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
+  env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
       ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
       ANTHROPIC_CUSTOM_HEADERS="X-Ferry-Client: __FERRY_CL_NAME__${FERRY_FLEET:+${nl}X-Ferry-Fleet: $FERRY_FLEET}" \
       ANTHROPIC_MODEL=heavy \
@@ -112,7 +116,7 @@ claude-ferry() {
 # reason `ferry opencode` caps local-lane output at 8k.
 claude-ferry-local() {
   local nl=$'\n'
-  env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
+  env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
       ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
       ANTHROPIC_CUSTOM_HEADERS="X-Ferry-Client: __FERRY_CL_NAME__${FERRY_FLEET:+${nl}X-Ferry-Fleet: $FERRY_FLEET}" \
       ANTHROPIC_MODEL=local-orch \
@@ -129,7 +133,7 @@ claude-ferry-local() {
 # subagents. The cheapest cloud profile.
 claude-ferry-super() {
   local nl=$'\n'
-  env ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
+  env -u ANTHROPIC_API_KEY ANTHROPIC_BASE_URL="http://__FERRY_CL_HOST__:__FERRY_CL_PORT__" \
       ANTHROPIC_AUTH_TOKEN=__FERRY_CL_KEY__ \
       ANTHROPIC_CUSTOM_HEADERS="X-Ferry-Client: __FERRY_CL_NAME__${FERRY_FLEET:+${nl}X-Ferry-Fleet: $FERRY_FLEET}" \
       ANTHROPIC_MODEL=heavy \
@@ -258,10 +262,36 @@ except Exception:
   # Snapshot any existing claude.json before overwrite, so a lane re-mapping is
   # always reversible (same convention as `ferry opencode`'s config snapshots).
   python3 - "$cl_host" "$cl_port" "$cl_key" "$HOME/.config/ferry/claude.json" <<'PYEOF'
-import datetime, json, os, shutil, sys
+import datetime, json, os, re, shutil, sys
 
 host, port, path = sys.argv[1], sys.argv[2], os.path.expanduser(sys.argv[4])
 key = sys.argv[3]
+
+# v1.39.0 migration: when a device key replaces a master key, the master must
+# not survive in the backups. It is REDACTED in place — in the backup written
+# now and in every earlier claude.json.<UTC>.bak — never deleted, so the
+# backups stay useful for everything else.
+REDACTED = "<redacted: replaced by ferry device key>"
+replaced = ""
+if key.lower().startswith("fk-") and os.path.exists(path):
+    try:
+        old = json.load(open(path)).get("master_key")
+    except Exception:
+        old = None
+    if (isinstance(old, str) and old and old != "local"
+            and not old.lower().startswith("fk-") and old != key):
+        replaced = old
+
+def redact(p):
+    try:
+        with open(p, "rb") as f:
+            data = f.read()
+        if replaced.encode() in data:
+            with open(p, "wb") as f:
+                f.write(data.replace(replaced.encode(), REDACTED.encode()))
+    except OSError:
+        pass
+
 if os.path.exists(path):
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     snap = f"{path}.{ts}.bak"
@@ -271,6 +301,13 @@ if os.path.exists(path):
         n += 1
     shutil.copy2(path, snap)
     print(f"    Snapshot:       {snap}")
+    if replaced:
+        d, base = os.path.split(path)
+        pat = re.compile(re.escape(base) + r"\.\d{8}T\d{6}Z(-\d+)?\.bak$")
+        for f in os.listdir(d or "."):
+            if pat.match(f):
+                redact(os.path.join(d, f))
+        print("    The replaced master key is redacted in claude.json's backups.")
 
 cfg = {
     "host": host,

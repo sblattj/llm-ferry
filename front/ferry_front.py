@@ -1145,13 +1145,13 @@ DEVICE_KEY_EXACT_ROUTES = {
                        FLEET_PATH}),
     WEBSOCKET_METHOD: frozenset(),   # no websocket is metered yet
 }
+# Stored responses (GET/DELETE /v1/responses/<id>, its input_items and
+# cancel) are NOT client routes: no ferry client polls them, and a GET would
+# re-meter the stored response's usage on every poll. Only creating a
+# response (POST /v1/responses, and its /compact) is admitted.
 _SEGMENT = r"[^/]+"
 DEVICE_KEY_PATTERN_ROUTES = {
-    "GET": (re.compile(r"/v1/models/" + _SEGMENT),
-            re.compile(r"/v1/responses/" + _SEGMENT),
-            re.compile(r"/v1/responses/" + _SEGMENT + r"/input_items")),
-    "DELETE": (re.compile(r"/v1/responses/" + _SEGMENT),),
-    "POST": (re.compile(r"/v1/responses/" + _SEGMENT + r"/cancel"),),
+    "GET": (re.compile(r"/v1/models/" + _SEGMENT),),
 }
 
 
@@ -1636,7 +1636,12 @@ class LaneCatalogueFilter:
             # write the caller's own entry — and `default: true`, the one
             # host-wide write, is still loopback-only.
             headers = _header_map(scope)
-            if not _bearer_ok(headers):
+            # A device key authenticate() admitted counts from whichever
+            # source it came in (x-api-key, ?key=, …); _bearer_ok alone reads
+            # Authorization only, which is unchanged for master and bare.
+            key_admitted = (scope.get(KEY_ENTRY_SCOPE) is not None
+                            and scope.get(KEY_SCOPE) not in ("", "master", None))
+            if not key_admitted and not _bearer_ok(headers):
                 return await self._reply(
                     send, 401, {"errors": ["bearer required"]})
             if self.state is None:

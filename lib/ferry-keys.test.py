@@ -72,9 +72,26 @@ class TestAdd(CliCase):
         self.assertIn("ferry keys:", p.stderr)
         self.assertIn("already exists", p.stderr)
         self.assertNotIn("Traceback", p.stderr)
-        second = self.cli("add", "laptop", "--replace").stdout.strip()
+        p = self.cli("add", "laptop", "--replace")
+        second = p.stdout.strip()
         self.assertNotEqual(first, second)
         self.assertEqual(len(self.doc()["keys"]), 1)
+        self.assertIn("rotated 'laptop'", p.stderr)
+        self.assertNotIn("created", p.stderr)
+
+    def test_replace_of_a_new_name_says_created(self):
+        p = self.cli("add", "fresh", "--replace")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("created 'fresh'", p.stderr)
+        self.assertNotIn("rotated", p.stderr)
+
+    def test_replace_reactivates_a_revoked_name(self):
+        self.cli("add", "laptop")
+        self.cli("revoke", "laptop")
+        p = self.cli("add", "laptop", "--replace")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("rotated 'laptop'", p.stderr)
+        self.assertIsNone(self.doc()["keys"][0]["revoked"])
 
     def test_bad_limits_are_usage_errors(self):
         for args in (("--rpm", "0"), ("--rpm", "x"), ("--budget-tokens", "-5"),

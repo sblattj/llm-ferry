@@ -1,6 +1,7 @@
 # Per-device client keys — design
 
-Status: DRAFT for review (2026-09-27). Roadmap item: Tier 1, issue 06 of
+Status: APPROVED 2026-09-27; implemented in v1.39.0 (plan: `docs/superpowers/plans/2026-09-27-client-keys.md`).
+Roadmap item: Tier 1, issue 06 of
 [the gap sweep](../../competitive-gap-sweep-2026-09-27.md).
 
 ## Intent (agreed)
@@ -165,3 +166,9 @@ README security section: device keys vs the shared master key, how to migrate
 2. **Should the master key stop being stored on existing clients** when they
    next run `ferry update`, or only when they re-run bootstrap? (Draft: only
    bootstrap; `update` never touches credentials.)
+
+**Resolved 2026-09-27:** (1) v1 is token-only (`budget_tokens`); USD is
+deferred. (2) Only re-running bootstrap migrates a client; `ferry update`
+never touches credentials. The plan also records eight corrections to this
+draft — notably budgets count input + output only, since reasoning is a
+subset of output.

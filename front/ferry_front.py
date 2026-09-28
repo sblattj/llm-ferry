@@ -1124,6 +1124,13 @@ ANTHROPIC_PATHS = ("/v1/messages", "/messages")
 # form collides that way, only the /v1 (/v1beta) form is admitted.
 # lib/ferry-front-routes.test.py proves this against litellm's real, complete
 # route table; update both together.
+#
+# A route is also admitted only if the front can LIMIT and METER it there:
+# Gemini-native generate (/v1beta/models/…:generateContent) is not an
+# is_inference_path, and websockets (realtime, the responses socket) never
+# reach _key_admit, so a key there would skip its lane check, RPM, budget
+# and metering. They stay refused for device keys (the master still reaches
+# them) until metering is added for them.
 KEY_ROUTE_REFUSED = "device keys may not call this route"
 WEBSOCKET_METHOD = "WEBSOCKET"   # the method slot for a websocket upgrade
 DEVICE_KEY_EXACT_ROUTES = {
@@ -1136,8 +1143,7 @@ DEVICE_KEY_EXACT_ROUTES = {
                        "/v1/messages", "/v1/messages/count_tokens",
                        "/v1/responses", "/responses", "/v1/responses/compact",
                        FLEET_PATH}),
-    WEBSOCKET_METHOD: frozenset({"/v1/realtime", "/realtime",
-                                 "/v1/responses", "/responses"}),
+    WEBSOCKET_METHOD: frozenset(),   # no websocket is metered yet
 }
 _SEGMENT = r"[^/]+"
 DEVICE_KEY_PATTERN_ROUTES = {
@@ -1145,9 +1151,7 @@ DEVICE_KEY_PATTERN_ROUTES = {
             re.compile(r"/v1/responses/" + _SEGMENT),
             re.compile(r"/v1/responses/" + _SEGMENT + r"/input_items")),
     "DELETE": (re.compile(r"/v1/responses/" + _SEGMENT),),
-    "POST": (re.compile(r"/v1/responses/" + _SEGMENT + r"/cancel"),
-             re.compile(r"/v1beta/models/[^/:]+:"
-                        r"(?:generateContent|streamGenerateContent|countTokens)")),
+    "POST": (re.compile(r"/v1/responses/" + _SEGMENT + r"/cancel"),),
 }
 
 

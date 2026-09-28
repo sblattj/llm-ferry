@@ -260,11 +260,14 @@ class TestDeviceKeys(KeyFrontCase):
         self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
         self.assertEqual(self.app.calls, 0)
 
-    def test_websocket_with_a_valid_key_is_rewritten(self):
+    def test_websocket_with_a_valid_key_is_closed_unrewritten(self):
+        # Round 6: no websocket is metered, so even a valid key is refused.
         token = self.mint()
-        drive(self.mw(), "/v1/realtime", bearer(token), method="GET",
-              scope_type="websocket")
-        self.assertEqual(self.app.headers()[b"authorization"], b"Bearer " + MASTER.encode())
+        scope, sent, _ = drive(self.mw(), "/v1/realtime", bearer(token), method="GET",
+                               scope_type="websocket")
+        self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+        self.assertEqual(self.app.calls, 0)
+        self.assertEqual(scope["headers"], [(b"authorization", ("Bearer " + token).encode())])
 
 
 class TestAmbiguousCredentials(KeyFrontCase):
@@ -446,8 +449,7 @@ class TestEveryLitellmCredentialSource(KeyFrontCase):
         # get_api_key reads first on every route, generateContent included.
         token = self.mint()
         query = ("alt=sse&key=%s&x=%%2F1" % token).encode()
-        scope, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
-                               query=query)
+        scope, sent, _ = drive(self.mw(), "/v1/chat/completions", (), query=query)
         self.assertEqual(reply(sent)[0], 200)
         for label, seen in (("downstream", self.app.scope), ("original", scope)):
             with self.subTest(scope=label):
@@ -472,7 +474,7 @@ class TestEveryLitellmCredentialSource(KeyFrontCase):
     def test_query_key_is_stripped_without_a_master(self):
         token = self.mint()
         with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": ""}):
-            scope, sent, _ = drive(self.mw(), "/v1beta/models/f:generateContent", (),
+            scope, sent, _ = drive(self.mw(), "/v1/chat/completions", (),
                                    query=("key=%s&alt=sse" % token).encode())
         self.assertEqual(reply(sent)[0], 200)
         self.assertEqual(self.app.scope["query_string"], b"alt=sse")
@@ -623,9 +625,6 @@ class TestDevicePathAllowlist(KeyFrontCase):
                              ("/v1/messages/count_tokens", "POST"), ("/v1/embeddings", "POST"),
                              ("/v1/models", "GET"), ("/models", "GET"),
                              ("/v1/models/flash", "GET"),
-                             ("/v1beta/models/flash:generateContent", "POST"),
-                             ("/v1beta/models/flash:streamGenerateContent", "POST"),
-                             ("/v1beta/models/flash:countTokens", "POST"),
                              ("/v1/responses/resp_1", "GET"), ("/v1/responses/resp_1", "DELETE"),
                              ("/v1/responses/resp_1/input_items", "GET"),
                              ("/v1/responses/resp_1/cancel", "POST"),
@@ -725,23 +724,54 @@ class TestDevicePathAllowlist(KeyFrontCase):
                 self.assert_route_refused(token, path, method)
         self.assertEqual(self.app.calls, 0)
 
-    def test_websocket_rules_are_exact(self):
+    def test_every_websocket_is_refused(self):
         token = self.mint()
-        for path in ("/v1/responses", "/responses"):
-            with self.subTest(path=path):
-                _, sent, _ = drive(self.mw(), path, bearer(token), method="GET",
-                                   scope_type="websocket")
-                self.assertEqual(sent, [{"type": "websocket.accept"}])
         for path in ("/models/v1/files", "/v1/chat/completions", "/openai/v1/realtime",
                      "/v1/realtime/x"):
             with self.subTest(path=path):
                 self.assert_route_refused(token, path, "GET", scope_type="websocket")
 
-    def test_gemini_query_key_route_is_admitted(self):
+    def test_unmetered_routes_refuse_device_keys(self):
+        # Round 6: Gemini-native generate and every websocket skip _key_admit
+        # (no lane check, RPM, budget or metering), so a device key there
+        # would bypass its limits. Refused until metering exists.
         token = self.mint()
-        _, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
-                           query=("key=" + token).encode())
-        self.assertEqual(reply(sent)[0], 200)
+        for action in ("generateContent", "streamGenerateContent", "countTokens"):
+            with self.subTest(action=action):
+                self.assert_route_refused(token, "/v1beta/models/flash:" + action, "POST")
+        for path in ("/v1/realtime", "/realtime", "/v1/responses", "/responses"):
+            with self.subTest(websocket=path):
+                self.assert_route_refused(token, path, "GET", scope_type="websocket")
+        self.assertEqual(self.app.calls, 0)
+
+    def test_limited_key_cannot_bypass_limits_on_gemini_native(self):
+        # The Task 10 probe: lanes=[heavy], rpm=1, model flash. Chat was
+        # 403/403/403 and generateContent was 200/200/200.
+        _, token = K.add("probe", lanes=["heavy"], rpm=1)
+        body = json.dumps({"model": "flash", "messages": []}).encode()
+        statuses = [reply(drive(self.mw(), "/v1beta/models/flash:generateContent",
+                                bearer(token), body=body)[1])[0] for _ in range(3)]
+        self.assertEqual(statuses, [403, 403, 403])
+        self.assertEqual(self.app.calls, 0)
+
+    def test_master_still_reaches_gemini_native_and_realtime(self):
+        for path, typ in (("/v1beta/models/flash:generateContent", "http"),
+                          ("/v1/realtime", "websocket")):
+            with self.subTest(path=path):
+                scope, sent, send = drive(self.mw(), path, bearer(MASTER),
+                                          method="POST" if typ == "http" else "GET",
+                                          scope_type=typ)
+                self.assertIs(self.app.send, send)
+                self.assertEqual(scope["ferry.key"], "master")
+
+    def test_gemini_query_key_is_refused_and_stripped(self):
+        # The ?key= stripping stays: a refused key is never logged.
+        token = self.mint()
+        scope, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
+                               query=("alt=sse&key=" + token).encode())
+        self.assertEqual(reply(sent)[0], 403)
+        self.assertEqual(scope["query_string"], b"alt=sse")
+        self.assertEqual(self.app.calls, 0)
 
     def test_fleet_route_is_admitted(self):
         token = self.mint()
@@ -752,13 +782,8 @@ class TestDevicePathAllowlist(KeyFrontCase):
         _, sent, _ = drive(self.mw(state, FLEETS), FF.FLEET_PATH, bearer(token), method="GET")
         self.assertEqual(reply(sent)[0], 200)
 
-    def test_realtime_websocket_is_admitted_and_others_closed(self):
+    def test_unknown_websocket_is_closed(self):
         token = self.mint()
-        for path in ("/v1/realtime", "/realtime"):
-            with self.subTest(path=path):
-                _, sent, _ = drive(self.mw(), path, bearer(token), method="GET",
-                                   scope_type="websocket")
-                self.assertEqual(sent, [{"type": "websocket.accept"}])
         _, sent, _ = drive(self.mw(), "/v1/admin-socket", bearer(token), method="GET",
                            scope_type="websocket")
         self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])

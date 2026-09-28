@@ -4,8 +4,8 @@
 relay), in the same style/richness as the g0vs1g desk stack, launched from the ferry CLI
 via **`ferry dash --grafana`**. Local (localhost), on-demand (up/down), $0 (all OSS).
 
-**Reference implementation — READ IT, adapt from it:** the g0vs1g stack lives on disk at
-`/Users/sblatt/fin/g0vs1g-desk/deploy/observ/`. Its `grafana/grafana.ini`,
+**Reference implementation — READ IT, adapt from it:** the g0vs1g stack lives in
+the deploying repo's `deploy/observ/` directory. Its `grafana/grafana.ini`,
 `grafana/provisioning/**`, `mac/bringup.sh`, and dashboard JSONs are the proven template —
 mirror their structure and the validated dataviz palette. Adapt names/ports/metrics for ferry.
 

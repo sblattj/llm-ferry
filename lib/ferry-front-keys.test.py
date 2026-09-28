@@ -625,9 +625,6 @@ class TestDevicePathAllowlist(KeyFrontCase):
                              ("/v1/messages/count_tokens", "POST"), ("/v1/embeddings", "POST"),
                              ("/v1/models", "GET"), ("/models", "GET"),
                              ("/v1/models/flash", "GET"),
-                             ("/v1/responses/resp_1", "GET"), ("/v1/responses/resp_1", "DELETE"),
-                             ("/v1/responses/resp_1/input_items", "GET"),
-                             ("/v1/responses/resp_1/cancel", "POST"),
                              ("/v1/responses/compact", "POST"),
                              ("/health/liveliness", "GET"), ("/health/liveness", "GET")):
             with self.subTest(path=path):
@@ -696,6 +693,19 @@ class TestDevicePathAllowlist(KeyFrontCase):
         for path in ("/responses/compact", "/messages", "/messages/count_tokens"):
             with self.subTest(path=path):
                 self.assert_route_refused(token, path, "POST")
+        self.assertEqual(self.app.calls, 0)
+
+    def test_stored_response_routes_are_403(self):
+        # No ferry client polls stored responses, and a GET would re-meter the
+        # stored response's usage on every poll (and refuse a lane-restricted
+        # key for model None). Only creating a response is a client route.
+        token = self.mint()
+        for path, method in (("/v1/responses/resp_1", "GET"),
+                             ("/v1/responses/resp_1", "DELETE"),
+                             ("/v1/responses/resp_1/input_items", "GET"),
+                             ("/v1/responses/resp_1/cancel", "POST")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
         self.assertEqual(self.app.calls, 0)
 
     def test_the_method_is_part_of_the_rule(self):
@@ -843,6 +853,31 @@ class TestIdentity(KeyFrontCase):
         self.assertEqual(reply(sent)[0], 200)
         with open(self.state_path) as fh:
             self.assertEqual(json.load(fh)["clients"], {"mbp": "international"})
+
+    def test_fleet_accepts_a_device_key_from_any_admitted_source(self):
+        # authenticate admits x-api-key and ?key= as well as Authorization, and
+        # rewrites the header the key actually came in; the fleet route must
+        # honour the admission, not re-read Authorization alone.
+        token = self.mint("mbp")
+        for label, headers, query in (("x-api-key", [("x-api-key", token)], b""),
+                                      ("?key=", [], ("key=" + token).encode())):
+            with self.subTest(source=label):
+                _, sent, _ = drive(self.mw(self.state, FLEETS), FF.FLEET_PATH, headers,
+                                   method="GET", query=query)
+                status, _, doc = reply(sent)
+                self.assertEqual(status, 200, doc)
+                self.assertEqual(doc["you"], "mbp")
+
+    def test_fleet_master_and_bare_behaviour_is_unchanged(self):
+        # _bearer_ok still reads Authorization only: a bare request and the
+        # master in x-api-key stay 401, the master bearer stays 200.
+        for label, headers, want in (("bare", [], 401),
+                                     ("master x-api-key", [("x-api-key", MASTER)], 401),
+                                     ("master bearer", bearer(MASTER), 200)):
+            with self.subTest(case=label):
+                _, sent, _ = drive(self.mw(self.state, FLEETS), FF.FLEET_PATH, headers,
+                                   method="GET")
+                self.assertEqual(reply(sent)[0], want)
 
     def test_caller_identity_without_a_key_is_unchanged(self):
         scope = {"client": ("100.64.0.9", 1)}

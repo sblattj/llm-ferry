@@ -109,9 +109,18 @@ if [[ -n "$MASTER_KEY" ]] && printf '%s' "$MASTER_KEY" | grep -q '[[:cntrl:]"\\]
   exit 1
 fi
 
+# A key that starts with fk- (any case) is a DEVICE key someone already minted
+# with `ferry keys add`, not the master: there is nothing to trade at enroll,
+# and it is stored as api_key, never labelled master_key.
+SUPPLIED_DEVICE_KEY=0
+[[ "${MASTER_KEY:l}" == fk-* ]] && SUPPLIED_DEVICE_KEY=1
+
 # Hand-config hint phrasing. Once a key is in play, the hand-written configs
 # need it as their apiKey / bearer — but the VALUE is never printed.
-if [[ -n "$MASTER_KEY" ]]; then
+if [[ $SUPPLIED_DEVICE_KEY -eq 1 ]]; then
+  APIKEY_HINT="your ferry device key (stored as api_key in ~/.config/ferry/client.json)"
+  BEARER_HINT="your ferry device key"
+elif [[ -n "$MASTER_KEY" ]]; then
   APIKEY_HINT="your ferry master key (stored as master_key in ~/.config/ferry/client.json)"
   BEARER_HINT="your ferry master key"
 else
@@ -283,7 +292,18 @@ fi
 # before. Keys never printed.
 DEVICE_KEY=""
 DEVICE_KEY_NAME=""
-if [[ -n "$MASTER_KEY" ]]; then
+ENROLLED=0
+if [[ $SUPPLIED_DEVICE_KEY -eq 1 ]]; then
+  # --key fk-…: already a device key. No enroll (there is no master to trade),
+  # and its name is read back from the minted shape fk-<name>-<32 base32> so a
+  # later bootstrap with the master can rotate it under the same name.
+  DEVICE_KEY="$MASTER_KEY"
+  # The key rides in the environment, never argv (argv is world-readable in ps).
+  DEVICE_KEY_NAME=$(FERRY_SUPPLIED_KEY="$DEVICE_KEY" python3 -c 'import os, re
+m = re.fullmatch(r"fk-([a-z0-9-]+)-[a-z2-7]{32}", os.environ["FERRY_SUPPLIED_KEY"].lower())
+print(m.group(1) if m else "")' 2>/dev/null || true)
+  echo ">>> Using the supplied device key."
+elif [[ -n "$MASTER_KEY" ]]; then
   echo ">>> Enrolling this machine for its own device key..."
   enroll_out=$(FERRY_ENROLL_MASTER="$MASTER_KEY" python3 - \
       "http://$HOST_NAME:$HOST_PORT" "$CLIENT_NAME" "$HOME/.config/ferry/client.json" \
@@ -321,6 +341,7 @@ PYEOF
   if [[ "$enroll_out" == *$'\t'fk-* ]]; then
     DEVICE_KEY_NAME="${enroll_out%%$'\t'*}"
     DEVICE_KEY="${enroll_out#*$'\t'}"
+    ENROLLED=1
     echo "    Enrolled device key '$DEVICE_KEY_NAME' (the master key is NOT stored on this machine)."
     APIKEY_HINT="your ferry device key (stored as api_key in ~/.config/ferry/client.json)"
     BEARER_HINT="your ferry device key"
@@ -341,14 +362,21 @@ mkdir -p "$HOME/.config/ferry"
 # master_key rides in the profile ONLY when a key was supplied. Its absence is
 # how every reader (client-reset.sh, the ferry CLI) knows this host takes no
 # key — so the JSON shape below is byte-stable when MASTER_KEY is empty.
-# api_key/key_name replace master_key when the host issued a device key.
+# api_key/key_name replace master_key when the host issued a device key (or
+# one was supplied; key_name is then omitted when it cannot be read back).
 MASTER_KEY_JSON=""
-if [[ -n "$DEVICE_KEY" ]]; then
+if [[ -n "$DEVICE_KEY" && -n "$DEVICE_KEY_NAME" ]]; then
   MASTER_KEY_JSON=$(printf ',\n  "api_key": "%s",\n  "key_name": "%s"' "$DEVICE_KEY" "$DEVICE_KEY_NAME")
+elif [[ -n "$DEVICE_KEY" ]]; then
+  MASTER_KEY_JSON=$(printf ',\n  "api_key": "%s"' "$DEVICE_KEY")
 elif [[ -n "$MASTER_KEY" ]]; then
   MASTER_KEY_JSON=$(printf ',\n  "master_key": "%s"' "$MASTER_KEY")
 fi
-cat <<EOF > "$HOME/.config/ferry/client.json"
+# The profile holds a credential: written 0600 (umask for a new file, chmod
+# for a profile an older bootstrap left 0644).
+(
+  umask 077
+  cat <<EOF > "$HOME/.config/ferry/client.json"
 {
   "host": "$HOST_NAME",
   "port": "$HOST_PORT",
@@ -358,6 +386,8 @@ cat <<EOF > "$HOME/.config/ferry/client.json"
   "claude_mode": "$CLAUDE_MODE"${MASTER_KEY_JSON}
 }
 EOF
+)
+chmod 600 "$HOME/.config/ferry/client.json"
 echo "    Successfully saved profile: ~/.config/ferry/client.json"
 
 # 3. Automatic opencode configuration (the one supported integration; everything
@@ -1092,6 +1122,51 @@ if [[ $CLAUDE_FAILED -eq 1 ]]; then
   echo "    WARNING: 'ferry claude' failed. By hand: point Claude Code's"
   echo "    ANTHROPIC_BASE_URL at http://$HOST_NAME:$HOST_PORT ($BEARER_HINT),"
   echo "    or re-run this script / client-reset.sh."
+fi
+
+# 4b. Migration hygiene (v1.39.0). A client first bootstrapped before v1.39.0
+# had the master key baked into every ferry-written config, and `ferry
+# opencode` / `ferry claude` back each one up before rewriting it. Those
+# writers redact the master they replace; this pass also catches every older
+# ferry-made backup of the same targets (and anything the writers could not
+# parse). Backups are REDACTED in place, never deleted. Only ferry's own
+# backup names are touched, and only after a successful enroll: a supplied
+# --key fk-… has no master to redact. The key rides in the environment.
+if [[ $ENROLLED -eq 1 ]]; then
+  FERRY_REDACT_MASTER="$MASTER_KEY" python3 - "$HOME" <<'PYEOF' || true
+import os, re, sys
+home, secret = sys.argv[1], os.environ["FERRY_REDACT_MASTER"].encode()
+REDACTED = b"<redacted: replaced by ferry device key>"
+TS = r"\.\d{8}T\d{6}Z(-\d+)?"
+SHAPES = {
+    os.path.join(home, ".config", "ferry"): re.compile(
+        r"^(opencode-cloud|opencode-local|opencode-super)" + TS + r"\.jsonc$"
+        r"|^claude\.json" + TS + r"\.bak$"),
+    os.path.join(home, ".config", "opencode"): re.compile(
+        r"^(opencode|tui)" + TS + r"\.jsonc$"),
+}
+n = 0
+for d, pat in SHAPES.items():
+    try:
+        names = os.listdir(d)
+    except OSError:
+        continue
+    for name in names:
+        p = os.path.join(d, name)
+        if not pat.match(name) or not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "rb") as f:
+                data = f.read()
+            if secret in data:
+                with open(p, "wb") as f:
+                    f.write(data.replace(secret, REDACTED))
+                n += 1
+        except OSError:
+            pass
+if n:
+    print(f"    Redacted the master key from {n} older ferry config backup(s).")
+PYEOF
 fi
 
 # 5. Wrap up

@@ -697,6 +697,66 @@ class DeviceKeyTest(ClientHarness):
         self.assertIn(EnrollingStubHost.DEVICE_KEY, text)
         self.assertNotIn(KeyedStubHost.REQUIRED_KEY, text)
 
+    def test_migration_leaves_no_master_key_anywhere_under_home(self):
+        """A pre-1.39 client (master baked into every config) re-runs the
+        bootstrap and gets a device key. `ferry opencode` / `ferry claude`
+        back up each file before rewriting it; those backups must not keep the
+        master. They are redacted, not deleted: the backups stay useful."""
+        stub = os.path.join(self.bin, "claude")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(stub, 0o755)
+        master = KeyedStubHost.REQUIRED_KEY
+        # Run 1: a host without enroll, so the master is stored and baked in.
+        EnrollingStubHost.MODE = "unauthorized"
+        self.run_script(BOOTSTRAP, env=self.keyed_env())
+        self.assertEqual(self.read_json(".config", "ferry", "client.json")["master_key"],
+                         master)
+        # Run 2: the host now enrolls.
+        EnrollingStubHost.MODE = "ok"
+        p = self.run_script(BOOTSTRAP, env=self.keyed_env())
+        self.assertEqual(self.read_json(".config", "ferry", "client.json")["api_key"],
+                         EnrollingStubHost.DEVICE_KEY)
+        holders, redacted = [], []
+        for root, _dirs, files in os.walk(self.home):
+            for name in files:
+                full = os.path.join(root, name)
+                with open(full, "rb") as fh:
+                    data = fh.read()
+                if master.encode() in data:
+                    holders.append(os.path.relpath(full, self.home))
+                if b"<redacted: replaced by ferry device key>" in data:
+                    redacted.append(os.path.relpath(full, self.home))
+        self.assertEqual(holders, [], "the master key survived the migration in these files")
+        # The backups were redacted, not removed.
+        self.assertTrue(any(r.endswith(".jsonc") for r in redacted), redacted)
+        self.assertTrue(any(r.endswith(".bak") for r in redacted), redacted)
+        self.assertNotIn(master, p.stdout + p.stderr)
+
+    def test_a_supplied_device_key_is_stored_as_api_key_without_enrolling(self):
+        # --key fk-… is a device key someone minted with `ferry keys add`:
+        # there is no master to trade, so no enroll, and it is never labelled
+        # a master key.
+        p = self.run_script(BOOTSTRAP, "--no-opencode", "--key", EnrollingStubHost.DEVICE_KEY,
+                            env=self.env(port=self.enrolling_port))
+        self.assertEqual(EnrollingStubHost.ENROLLS, [])
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["api_key"], EnrollingStubHost.DEVICE_KEY)
+        self.assertNotIn("master_key", prof)
+        self.assertEqual(prof["key_name"], "laptop")
+        self.assertIn("Using the supplied device key.", p.stdout)
+        self.assertNotIn("enroll unavailable", p.stdout)
+        self.assertNotIn("storing the master key", p.stdout)
+
+    def test_client_json_is_private(self):
+        for env in (self.keyed_env(), self.env()):
+            with self.subTest(keyed=env.get("FERRY_MASTER_KEY") is not None):
+                path = self.path(".config", "ferry", "client.json")
+                if os.path.exists(path):
+                    os.chmod(path, 0o644)   # a profile from an older bootstrap
+                self.run_script(BOOTSTRAP, "--no-opencode", env=env)
+                self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
     def test_reset_threads_the_device_key_through(self):
         self.run_script(BOOTSTRAP, "--profiles-only", env=self.keyed_env())
         os.remove(self.path(".config", "ferry", "opencode-cloud.json"))

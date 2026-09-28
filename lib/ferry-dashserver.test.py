@@ -717,6 +717,22 @@ class KeysSummaryTests(unittest.TestCase):
         self.assertEqual(s["keys"], [])
         self.assertTrue(s["error"].startswith("keys.json unreadable"), s["error"])
 
+    def test_a_malformed_entry_error_names_the_path_not_the_entry(self):
+        # The card shows the store path and a short reason — never a repr of
+        # the entry, which would put its sha256 (and anything else in it) on
+        # the dash page.
+        sha = "ab" * 32
+        with open(self.keys, "w") as fh:
+            json.dump({"version": 1, "keys": [
+                {"name": 7, "sha256": sha, "note": "private-note"}]}, fh)
+        s = dash.keys_summary()
+        self.assertEqual(s["keys"], [])
+        self.assertIn(self.keys, s["error"])
+        self.assertIn("malformed", s["error"])
+        self.assertNotIn(sha, s["error"])
+        self.assertNotIn("private-note", s["error"])
+        self.assertNotIn("{", s["error"])
+
     def test_key_store_module_unavailable_is_reported_not_raised(self):
         with unittest.mock.patch.object(dash, "_keys_mods", return_value=None):
             s = dash.keys_summary()

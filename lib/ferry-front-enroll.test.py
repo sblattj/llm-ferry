@@ -108,8 +108,9 @@ class EnrollCase(unittest.TestCase):
     def test_a_device_key_cannot_enroll(self):
         _, token = K.add("laptop")
         status, doc = post({"name": "evil"}, [("authorization", "Bearer " + token)])
-        self.assertEqual(status, 401)
-        self.assertIn("message", doc["error"])
+        # The route allowlist refuses a device key before the enroll gate runs.
+        self.assertEqual(status, 403)
+        self.assertEqual(doc["error"]["code"], "route_not_allowed")
         self.assertEqual([e["name"] for e in K.load()["keys"]], ["laptop"])
         self.assertEqual(NeverApp.calls, 0)
 
@@ -128,8 +129,8 @@ class EnrollCase(unittest.TestCase):
         for label, kwargs in cases.items():
             with self.subTest(source=label):
                 status, doc = post({"name": "evil"}, **kwargs)
-                self.assertEqual(status, 401)
-                self.assertIn("message", doc["error"])
+                self.assertEqual(status, 403)
+                self.assertEqual(doc["error"]["code"], "route_not_allowed")
                 self.assertEqual([e["name"] for e in K.load()["keys"]], ["laptop"])
         self.assertEqual(NeverApp.calls, 0)
 

@@ -45,6 +45,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -1112,6 +1113,54 @@ _KEY_REASONS = {
     "expired": "this ferry device key has expired",
 }
 ANTHROPIC_PATHS = ("/v1/messages", "/messages")
+# A valid device key is swapped for the master, so it may only reach the
+# routes a client actually calls — never litellm's admin surface (/key/*,
+# /config/*, /model/new, …) at master power. Every rule is a (method, WHOLE
+# path) pair: litellm 1.99.0 also has routes whose FIRST segment is a param
+# (/{provider}/v1/files*, /{provider}/v1/batches*,
+# /{mcp_server_name}/{mcp,token,register,authorize}), so any prefix rule — or
+# any bare two-segment form like /models/<x> or /responses/<x> — lands a
+# client-looking path on a file, batch or MCP OAuth handler. Where the bare
+# form collides that way, only the /v1 (/v1beta) form is admitted.
+# lib/ferry-front-routes.test.py proves this against litellm's real, complete
+# route table; update both together.
+KEY_ROUTE_REFUSED = "device keys may not call this route"
+WEBSOCKET_METHOD = "WEBSOCKET"   # the method slot for a websocket upgrade
+DEVICE_KEY_EXACT_ROUTES = {
+    "GET": frozenset({"/v1/models", "/models",
+                      "/health/liveliness", "/health/liveness",  # ferry-dash probe
+                      FLEET_PATH}),
+    "POST": frozenset({"/v1/chat/completions", "/chat/completions",
+                       "/v1/completions", "/completions",
+                       "/v1/embeddings", "/embeddings",
+                       "/v1/messages", "/v1/messages/count_tokens",
+                       "/v1/responses", "/responses", "/v1/responses/compact",
+                       FLEET_PATH}),
+    WEBSOCKET_METHOD: frozenset({"/v1/realtime", "/realtime",
+                                 "/v1/responses", "/responses"}),
+}
+_SEGMENT = r"[^/]+"
+DEVICE_KEY_PATTERN_ROUTES = {
+    "GET": (re.compile(r"/v1/models/" + _SEGMENT),
+            re.compile(r"/v1/responses/" + _SEGMENT),
+            re.compile(r"/v1/responses/" + _SEGMENT + r"/input_items")),
+    "DELETE": (re.compile(r"/v1/responses/" + _SEGMENT),),
+    "POST": (re.compile(r"/v1/responses/" + _SEGMENT + r"/cancel"),
+             re.compile(r"/v1beta/models/[^/:]+:"
+                        r"(?:generateContent|streamGenerateContent|countTokens)")),
+}
+
+
+def device_key_route_allowed(method: str, path: str) -> bool:
+    """Whether a valid device key may call (method, path); every rule is
+    anchored to the whole path. `method` is WEBSOCKET_METHOD for an upgrade."""
+    if not path or not method:
+        return False
+    if path in DEVICE_KEY_EXACT_ROUTES.get(method, ()):
+        return True
+    return any(rx.fullmatch(path) for rx in DEVICE_KEY_PATTERN_ROUTES.get(method, ()))
+
+
 _OPENAI_ERRORS = {401: ("invalid_request_error", "invalid_api_key"),
                   403: ("invalid_request_error", "model_not_allowed"),
                   429: ("requests", "rate_limit_exceeded"),
@@ -1170,11 +1219,17 @@ def _master_key() -> str:
     return (os.environ.get("LITELLM_MASTER_KEY") or "").strip()
 
 
-# Every header litellm 1.99 reads a client key from, in its precedence order
-# (x-litellm-api-key outranks Authorization). The `?key=` query parameter is
-# the one non-header source; QUERY_KEY handles it.
-CREDENTIAL_HEADERS = (b"x-litellm-api-key", b"authorization", b"x-api-key",
-                      b"api-key", b"x-goog-api-key", b"ocp-apim-subscription-key")
+# Every header litellm 1.99 reads a client key from, in its precedence order:
+# litellm/proxy/auth/user_api_key_auth.py `get_api_key` checks
+# x-litellm-api-key (Bearer/Basic stripped), Authorization, API-Key,
+# x-api-key, x-goog-api-key, Ocp-Apim-Subscription-Key, then `?key=` on
+# generateContent routes only. QUERY_KEY handles that last, non-header source.
+CREDENTIAL_HEADERS = (b"x-litellm-api-key", b"authorization", b"api-key",
+                      b"x-api-key", b"x-goog-api-key", b"ocp-apim-subscription-key")
+# Where an admitted `?key=` device key's master goes: litellm reads this
+# header first on every route, and a header, unlike the query string, is
+# never printed by uvicorn's access log.
+MASTER_KEY_HEADER = b"x-litellm-api-key"
 QUERY_KEY = "key"
 _KEY_AMBIGUOUS = ("ambiguous credentials: send exactly one credential, and when "
                   "it is a ferry device key, send only that key")
@@ -1201,6 +1256,12 @@ def _header_token(name: bytes, text: str):
     pasted without its scheme is still a presented device key). Every other
     credential header: the whole value. Surrounding quotes are stripped."""
     text = _unquote(text)
+    if name == MASTER_KEY_HEADER:
+        # litellm strips a "Bearer " scheme from this header, so do we.
+        parts = text.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return _unquote(parts[1]) or None
+        return text or None
     if name != b"authorization":
         return text or None
     parts = text.split(None, 1)
@@ -1252,17 +1313,15 @@ def _query_keys(parts) -> list:
             for p in parts if _is_query_key(p)]
 
 
-def _replace_query_key(scope, parts, master: str) -> None:
-    """Every `key=` parameter becomes the master (or goes); the rest of the
-    query string is kept byte for byte."""
-    out = []
-    for part in parts:
-        if _is_query_key(part):
-            if master:
-                out.append(b"key=" + urllib.parse.quote(master, safe="").encode())
-            continue
-        out.append(part)
-    scope["query_string"] = b"&".join(out)
+def _strip_query_key(scope, parts) -> None:
+    """Remove every `key=` parameter; the rest of the query string is kept
+    byte for byte.
+
+    Never REWRITE it to the master: this middleware is the outermost app, so
+    `scope` is uvicorn's own, and its access log prints this query string
+    (into ~/.config/ferry/litellm.log); litellm also stores the request URL
+    in its metadata. The master travels in MASTER_KEY_HEADER instead."""
+    scope["query_string"] = b"&".join(p for p in parts if not _is_query_key(p))
 
 
 def _credential_headers(scope):
@@ -1322,12 +1381,17 @@ def authenticate(scope):
                 and hmac.compare_digest(value.encode(), master.encode())):
             scope[KEY_SCOPE] = "master"
         return None
+    if fk_query:
+        # Admitted or refused, a device key never stays in the query string
+        # uvicorn logs.
+        _strip_query_key(scope, parts)
     present = [(n, t) for n, t in creds if _unquote(t)]
     names = [n for n, _ in present]
-    if len(names) != len(set(names)):
+    qvalues = [_unquote(v) for v in qkeys if _unquote(v)]
+    if len(names) != len(set(names)) or len(qvalues) > 1:
         return 401, _KEY_AMBIGUOUS
     tokens = [_canonical(_header_token(n, t)) for n, t in present]
-    tokens += [_canonical(_unquote(v)) for v in qkeys if _unquote(v)]
+    tokens += [_canonical(v) for v in qvalues]
     value = tokens[0] if tokens else None
     if not _is_device_key(value) or any(t != value for t in tokens):
         return 401, _KEY_AMBIGUOUS
@@ -1339,6 +1403,11 @@ def authenticate(scope):
                      "refused until it is fixed (see the host's front log)")
     if entry is None:
         return 401, _KEY_REASONS.get(reason, _KEY_REASONS["unknown"])
+    method = (WEBSOCKET_METHOD if scope.get("type") == "websocket"
+              else scope.get("method", ""))
+    if not device_key_route_allowed(method, scope.get("path", "")):
+        # A real key on the wrong route: 403, and nothing is rewritten.
+        return 403, KEY_ROUTE_REFUSED
     # A private copy: downstream steps may not mutate the cache's entry.
     entry = dict(entry, lanes=list(entry["lanes"])
                  if isinstance(entry.get("lanes"), list) else entry.get("lanes"))
@@ -1346,7 +1415,10 @@ def authenticate(scope):
     scope[KEY_ENTRY_SCOPE] = entry
     _replace_credential(scope, master)
     if qkeys:
-        _replace_query_key(scope, parts, master)
+        _strip_query_key(scope, parts)
+        if master and not any(bytes(k).lower() == MASTER_KEY_HEADER
+                              for k, _ in scope["headers"]):
+            scope["headers"].append((MASTER_KEY_HEADER, master.encode()))
     return None
 
 
@@ -1542,8 +1614,9 @@ class LaneCatalogueFilter:
                 if scope.get("type") == "websocket":
                     # Close before accept: the server answers the upgrade 403.
                     return await send({"type": "websocket.close", "code": 1008})
+                code = "route_not_allowed" if message == KEY_ROUTE_REFUSED else None
                 return await self._reply(send, status, key_error_body(
-                    scope.get("path", ""), status, message))
+                    scope.get("path", ""), status, message, code=code))
         if scope.get("type") == "http" and scope.get("path") == KEYS_ENROLL_PATH:
             return await self._enroll(scope, receive, send)
         # The control plane first: GET /v1/ferry/chains, POST /v1/ferry/reorder,

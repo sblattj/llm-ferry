@@ -439,20 +439,54 @@ class TestEveryLitellmCredentialSource(KeyFrontCase):
                          headers)
         boom.assert_not_called()
 
-    def test_query_key_device_key_is_presented_and_rewritten(self):
+    def test_query_key_device_key_is_stripped_and_moved_to_a_header(self):
+        # Fix round 3: uvicorn's access log prints the (outermost, shared)
+        # scope's query string, so the master must NEVER be written there.
+        # The master rides in x-litellm-api-key, which litellm 1.99's
+        # get_api_key reads first on every route, generateContent included.
         token = self.mint()
         query = ("alt=sse&key=%s&x=%%2F1" % token).encode()
         scope, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
                                query=query)
         self.assertEqual(reply(sent)[0], 200)
-        self.assertEqual(self.app.scope["query_string"],
-                         ("alt=sse&key=%s&x=%%2F1" % MASTER).encode())
+        for label, seen in (("downstream", self.app.scope), ("original", scope)):
+            with self.subTest(scope=label):
+                self.assertEqual(seen["query_string"], b"alt=sse&x=%2F1")
+                self.assertNotIn(MASTER.encode(), seen["query_string"])
+                self.assertNotIn(token.encode(), seen["query_string"])
+        self.assertEqual(self.app.headers()[b"x-litellm-api-key"], MASTER.encode())
         self.assertEqual(scope["ferry.key"], "laptop")
         # The same key in a header and in ?key= is one credential.
-        drive(self.mw(), "/v1/chat/completions", bearer(token),
-              query=("key=" + token).encode())
-        self.assertEqual(self.app.scope["query_string"], ("key=" + MASTER).encode())
+        scope, _, _ = drive(self.mw(), "/v1/chat/completions", bearer(token),
+                            query=("key=" + token).encode())
+        self.assertEqual(self.app.scope["query_string"], b"")
+        self.assertEqual(scope["query_string"], b"")
         self.assertEqual(self.app.headers()[b"authorization"], b"Bearer " + MASTER.encode())
+        self.assertEqual(self.app.headers()[b"x-litellm-api-key"], MASTER.encode())
+        # x-litellm-api-key already present is rewritten, never duplicated.
+        drive(self.mw(), "/v1/chat/completions", [("x-litellm-api-key", token)],
+              query=("key=" + token).encode())
+        names = [bytes(k).lower() for k, _ in self.app.scope["headers"]]
+        self.assertEqual(names.count(b"x-litellm-api-key"), 1)
+
+    def test_query_key_is_stripped_without_a_master(self):
+        token = self.mint()
+        with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": ""}):
+            scope, sent, _ = drive(self.mw(), "/v1beta/models/f:generateContent", (),
+                                   query=("key=%s&alt=sse" % token).encode())
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.scope["query_string"], b"alt=sse")
+        self.assertNotIn(b"x-litellm-api-key", self.app.headers())
+
+    def test_a_refused_query_key_is_stripped_from_the_logged_scope(self):
+        # A refused request never reaches litellm, but uvicorn still logs the
+        # scope's query string: the plaintext device key must not be in it.
+        _, gone = K.add("gone")
+        K.revoke("gone")
+        scope, sent, _ = drive(self.mw(), "/v1beta/models/f:generateContent", (),
+                               query=("alt=sse&key=" + gone).encode())
+        self.assertEqual(reply(sent)[0], 401)
+        self.assertEqual(scope["query_string"], b"alt=sse")
 
     def test_query_key_that_disagrees_or_is_revoked_is_refused(self):
         token = self.mint()
@@ -464,6 +498,38 @@ class TestEveryLitellmCredentialSource(KeyFrontCase):
         self.refused((), query=("key=%s&key=%s" % (token, other)).encode())
         self.refused((), query=("key=" + gone).encode())
         self.assertEqual(self.app.calls, 0)
+
+    def test_duplicate_query_key_with_an_fk_word_is_refused(self):
+        token = self.mint()
+        self.refused((), query=("key=%s&key=%s" % (token, token)).encode())
+        self.refused(bearer(token), query=("key=%s&key=%s" % (token, token)).encode())
+        self.assertEqual(self.app.calls, 0)
+        # Without an fk- word a duplicate ?key= is litellm's business, as today.
+        _, sent, _ = drive(self.mw(), "/v1/chat/completions", bearer(MASTER),
+                           query=b"key=sk-a&key=sk-a")
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.scope["query_string"], b"key=sk-a&key=sk-a")
+
+    def test_x_litellm_api_key_accepts_the_bearer_form(self):
+        # litellm strips "Bearer " from x-litellm-api-key, so this is one key.
+        token = self.mint()
+        scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                               [("x-litellm-api-key", "Bearer " + token)])
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(scope["ferry.key"], "laptop")
+        self.assertEqual(self.app.headers()[b"x-litellm-api-key"], MASTER.encode())
+        _, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                           [("x-litellm-api-key", "Bearer " + token)] + bearer(token))
+        self.assertEqual(reply(sent)[0], 200)
+        scope, sent, _ = drive(self.mw(), "/v1/chat/completions",
+                               [("x-litellm-api-key", "Bearer " + MASTER)])
+        self.assertEqual(scope["ferry.key"], "master")
+
+    def test_credential_headers_follow_litellm_precedence(self):
+        self.assertEqual(FF.CREDENTIAL_HEADERS,
+                         (b"x-litellm-api-key", b"authorization", b"api-key",
+                          b"x-api-key", b"x-goog-api-key",
+                          b"ocp-apim-subscription-key"))
 
     def test_a_non_fk_query_key_is_untouched(self):
         scope, sent, send = drive(self.mw(), "/v1/chat/completions", bearer(MASTER),
@@ -519,6 +585,202 @@ class TestEmptyCredentialHeaders(KeyFrontCase):
                 self.assertEqual(scope["ferry.key"], "laptop")
                 self.assertNotIn(token.encode(),
                                  b"".join(v for _, v in self.app.scope["headers"]))
+
+
+class TestDevicePathAllowlist(KeyFrontCase):
+    """Round 4: a valid device key is admitted only on client routes; the
+    credential swap must not hand it litellm's admin routes at master power."""
+
+    def test_admin_and_unlisted_routes_are_403_and_never_reach_litellm(self):
+        token = self.mint()
+        for path in ("/key/generate", "/config/update", "/v1/audio/transcriptions",
+                     "/model/new", "/user/new", "/health", "/v1/ferry/reorder",
+                     "/v1/chat/completionsX", "/v1/modelsX", "/v1beta/models/x:embedContent",
+                     "/v1/realtime/client_secrets"):
+            with self.subTest(path=path):
+                _, sent, _ = drive(self.mw(), path, bearer(token))
+                status, _, doc = reply(sent)
+                self.assertEqual(status, 403)
+                self.assertEqual(doc["error"]["type"], "invalid_request_error")
+                self.assertEqual(doc["error"]["code"], "route_not_allowed")
+                self.assertIn("device keys may not call this route", doc["error"]["message"])
+        self.assertEqual(self.app.calls, 0)
+
+    def test_anthropic_family_403_shape(self):
+        # GET /v1/messages is not a client route (only POST is).
+        token = self.mint()
+        _, sent, _ = drive(self.mw(), "/v1/messages", bearer(token), method="GET")
+        status, _, doc = reply(sent)
+        self.assertEqual(status, 403)
+        self.assertEqual(doc, {"type": "error", "error": {
+            "type": "permission_error", "message": "device keys may not call this route"}})
+        self.assertEqual(self.app.calls, 0)
+
+    def test_client_routes_are_admitted(self):
+        token = self.mint()
+        for path, method in (("/v1/chat/completions", "POST"), ("/chat/completions", "POST"),
+                             ("/v1/responses", "POST"), ("/v1/messages", "POST"),
+                             ("/v1/messages/count_tokens", "POST"), ("/v1/embeddings", "POST"),
+                             ("/v1/models", "GET"), ("/models", "GET"),
+                             ("/v1/models/flash", "GET"),
+                             ("/v1beta/models/flash:generateContent", "POST"),
+                             ("/v1beta/models/flash:streamGenerateContent", "POST"),
+                             ("/v1beta/models/flash:countTokens", "POST"),
+                             ("/v1/responses/resp_1", "GET"), ("/v1/responses/resp_1", "DELETE"),
+                             ("/v1/responses/resp_1/input_items", "GET"),
+                             ("/v1/responses/resp_1/cancel", "POST"),
+                             ("/v1/responses/compact", "POST"),
+                             ("/health/liveliness", "GET"), ("/health/liveness", "GET")):
+            with self.subTest(path=path):
+                scope, sent, _ = drive(self.mw(), path, bearer(token), method=method)
+                self.assertEqual(reply(sent)[0], 200)
+                self.assertEqual(scope["ferry.key"], "laptop")
+
+    def assert_route_refused(self, token, path, method, scope_type="http"):
+        _, sent, _ = drive(self.mw(), path, bearer(token), method=method,
+                           scope_type=scope_type)
+        if scope_type == "websocket":
+            self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+        else:
+            status, _, doc = reply(sent)
+            self.assertEqual(status, 403)
+            self.assertEqual(doc["error"]["message"], FF.KEY_ROUTE_REFUSED)
+            if FF.is_anthropic_path(path):
+                self.assertEqual(doc["error"]["type"], "permission_error")
+            else:
+                self.assertEqual(doc["error"]["code"], "route_not_allowed")
+
+    def test_param_first_litellm_routes_are_403(self):
+        # Round-5 repros: litellm routes whose FIRST segment is a path param
+        # (/{provider}/v1/files*, /{provider}/v1/batches*, /{mcp_server_name}/…)
+        # took a client-looking first segment and reached files, batches and
+        # MCP OAuth at master power.
+        token = self.mint()
+        for path, method in (
+                ("/models/v1/files", "GET"), ("/models/v1/files", "POST"),
+                ("/models/v1/files/x/content", "GET"), ("/models/v1/files/x", "DELETE"),
+                ("/models/v1/batches", "GET"), ("/models/v1/batches", "POST"),
+                ("/models/v1/batches/x/cancel", "POST"),
+                ("/messages/v1/files", "GET"), ("/responses/v1/files", "GET"),
+                ("/embeddings/v1/files", "GET"), ("/completions/v1/batches", "GET"),
+                ("/chat/completions/v1/files", "GET"), ("/v1/models/v1/files", "GET"),
+                ("/messages/v1/batches", "POST"),
+                ("/models/mcp", "POST"), ("/messages/mcp", "POST"),
+                ("/models/token", "POST"), ("/responses/token", "POST"),
+                ("/models/register", "POST"), ("/responses/register", "POST"),
+                ("/messages/authorize", "GET"), ("/models/token", "GET"),
+                ("/models/v1/files/x:generateContent", "GET"),
+                ("/models/v1/files/x:generateContent", "DELETE"),
+                ("/models/v1/files/x:generateContent", "POST"),
+                ("/models/v1/batches/x:countTokens", "GET")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_bare_forms_that_collide_with_param_routes_are_403(self):
+        # Only the /v1 (/v1beta) form is admitted where the bare form shares a
+        # shape with /{mcp_server_name}/{authorize,token,…}.
+        token = self.mint()
+        for path, method in (("/models/flash", "GET"),
+                             ("/models/flash:generateContent", "POST"),
+                             ("/responses/resp_1", "GET"), ("/responses/resp_1", "DELETE"),
+                             ("/responses/resp_1/cancel", "POST"),
+                             ("/responses/resp_1/input_items", "GET")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_unused_bare_forms_are_403(self):
+        # These do not collide, but no client calls them: bare /messages has
+        # no litellm route at all, and /responses/compact has a /v1 twin.
+        token = self.mint()
+        for path in ("/responses/compact", "/messages", "/messages/count_tokens"):
+            with self.subTest(path=path):
+                self.assert_route_refused(token, path, "POST")
+        self.assertEqual(self.app.calls, 0)
+
+    def test_the_method_is_part_of_the_rule(self):
+        token = self.mint()
+        for path, method in (("/v1/chat/completions", "GET"), ("/v1/chat/completions", "DELETE"),
+                             ("/v1/models", "POST"), ("/v1/models/flash", "DELETE"),
+                             ("/v1beta/models/flash:generateContent", "GET"),
+                             ("/v1beta/models/flash:generateContent", "DELETE"),
+                             ("/v1/responses", "GET"), ("/v1/responses/resp_1", "PUT"),
+                             ("/v1/messages", "GET"), ("/health/liveliness", "POST"),
+                             ("/v1/chat/completions", "HEAD"), ("/v1/models", "OPTIONS"),
+                             ("/v1/ferry/fleet", "DELETE")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_rules_are_anchored_to_the_whole_path(self):
+        token = self.mint()
+        for path, method in (("/v1/chat/completions/x", "POST"),
+                             ("/v1/messages/x", "POST"), ("/v1/models/a/b", "GET"),
+                             ("/v1/responses/a/b", "GET"),
+                             ("/v1beta/models/a/b:generateContent", "POST"),
+                             ("/v1beta/models/:generateContent", "POST"),
+                             ("/v1/models/", "GET"), ("/v1/responses/", "GET")):
+            with self.subTest(method=method, path=path):
+                self.assert_route_refused(token, path, method)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_websocket_rules_are_exact(self):
+        token = self.mint()
+        for path in ("/v1/responses", "/responses"):
+            with self.subTest(path=path):
+                _, sent, _ = drive(self.mw(), path, bearer(token), method="GET",
+                                   scope_type="websocket")
+                self.assertEqual(sent, [{"type": "websocket.accept"}])
+        for path in ("/models/v1/files", "/v1/chat/completions", "/openai/v1/realtime",
+                     "/v1/realtime/x"):
+            with self.subTest(path=path):
+                self.assert_route_refused(token, path, "GET", scope_type="websocket")
+
+    def test_gemini_query_key_route_is_admitted(self):
+        token = self.mint()
+        _, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
+                           query=("key=" + token).encode())
+        self.assertEqual(reply(sent)[0], 200)
+
+    def test_fleet_route_is_admitted(self):
+        token = self.mint()
+        path = os.path.join(self.dir, "fleets.json")
+        with open(path, "w") as fh:
+            json.dump({"default": "domestic", "clients": {}}, fh)
+        state = FF.FleetState(path, FLEETS)
+        _, sent, _ = drive(self.mw(state, FLEETS), FF.FLEET_PATH, bearer(token), method="GET")
+        self.assertEqual(reply(sent)[0], 200)
+
+    def test_realtime_websocket_is_admitted_and_others_closed(self):
+        token = self.mint()
+        for path in ("/v1/realtime", "/realtime"):
+            with self.subTest(path=path):
+                _, sent, _ = drive(self.mw(), path, bearer(token), method="GET",
+                                   scope_type="websocket")
+                self.assertEqual(sent, [{"type": "websocket.accept"}])
+        _, sent, _ = drive(self.mw(), "/v1/admin-socket", bearer(token), method="GET",
+                           scope_type="websocket")
+        self.assertEqual(sent, [{"type": "websocket.close", "code": 1008}])
+
+    def test_master_and_bare_on_admin_routes_pass_untouched(self):
+        boom = mock.Mock(side_effect=AssertionError("key store touched"))
+        with mock.patch.object(FF, "_key_cache", boom):
+            for headers, label in ((bearer(MASTER), "master"), ((), "")):
+                with self.subTest(label=label):
+                    scope, sent, send = drive(self.mw(), "/key/generate", headers)
+                    self.assertEqual(reply(sent)[0], 200)
+                    self.assertIs(self.app.send, send)
+                    self.assertEqual(scope["ferry.key"], label)
+                    self.assertEqual([(k.decode(), v.decode())
+                                      for k, v in self.app.scope["headers"]], list(headers))
+        boom.assert_not_called()
+
+    def test_revoked_key_on_an_admin_route_is_still_401(self):
+        _, gone = K.add("gone")
+        K.revoke("gone")
+        _, sent, _ = drive(self.mw(), "/key/generate", bearer(gone))
+        self.assertEqual(reply(sent)[0], 401)
 
 
 class TestEntryIsolation(KeyFrontCase):

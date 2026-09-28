@@ -573,8 +573,12 @@ class EnrollingStubHost(KeyedStubHost):
     MODE = "ok"
 
     def do_GET(self):  # noqa: N802
-        if (self.path.startswith("/v1/models")
-                and self.headers.get("Authorization", "") == f"Bearer {self.DEVICE_KEY}"):
+        # Any well-formed fk- credential is accepted, not just DEVICE_KEY: the
+        # supplied-device-key tests probe with their own fk-<slug>-<body>
+        # tokens (never minted by this stub) to exercise client-bootstrap.sh's
+        # read-back logic, not this host's auth.
+        auth = self.headers.get("Authorization", "")
+        if self.path.startswith("/v1/models") and auth.startswith("Bearer fk-"):
             return StubHost.do_GET(self)
         KeyedStubHost.do_GET(self)
 
@@ -747,6 +751,34 @@ class DeviceKeyTest(ClientHarness):
         self.assertIn("Using the supplied device key.", p.stdout)
         self.assertNotIn("enroll unavailable", p.stdout)
         self.assertNotIn("storing the master key", p.stdout)
+
+    def test_a_supplied_long_name_key_stores_no_key_name(self):
+        # mint_token() truncates normalize_name(name) to SLUG_MAX=24 chars
+        # then rstrips a trailing dash, so a read-back slug of 23 or 24 chars
+        # is ambiguous: it may be the WHOLE stored name, or it may be a
+        # longer name cut down to that length. Storing it as key_name risks a
+        # later master bootstrap rotating the wrong (truncated) name and
+        # orphaning this key, so it must be omitted whenever the slug could
+        # have been truncated.
+        long_key = "fk-" + ("x" * 24) + "-" + ("a" * 32)
+        p = self.run_script(BOOTSTRAP, "--no-opencode", "--key", long_key,
+                            env=self.env(port=self.enrolling_port))
+        self.assertEqual(EnrollingStubHost.ENROLLS, [])
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["api_key"], long_key)
+        self.assertNotIn("key_name", prof)
+        self.assertIn("Using the supplied device key.", p.stdout)
+
+    def test_a_supplied_short_name_key_still_stores_key_name(self):
+        # A slug well under the truncation boundary (22 chars or fewer)
+        # cannot have been produced by truncation, so it safely equals the
+        # real stored key name and is kept.
+        short_key = "fk-" + ("x" * 20) + "-" + ("a" * 32)
+        self.run_script(BOOTSTRAP, "--no-opencode", "--key", short_key,
+                        env=self.env(port=self.enrolling_port))
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof["api_key"], short_key)
+        self.assertEqual(prof["key_name"], "x" * 20)
 
     def test_client_json_is_private(self):
         for env in (self.keyed_env(), self.env()):

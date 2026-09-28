@@ -337,6 +337,44 @@ class MasterKeyTest(ClaudeHarness):
 
     DEVICE_KEY = "fk-mbp-" + "c" * 32
 
+    def test_the_wrappers_drop_an_inherited_anthropic_api_key(self):
+        """Claude Code sends BOTH `Authorization: Bearer <AUTH_TOKEN>` and
+        `x-api-key: <ANTHROPIC_API_KEY>` when both are set, and the front door
+        refuses a device key beside a different credential as ambiguous. So
+        every wrapper must hand claude an env WITHOUT ANTHROPIC_API_KEY, while
+        still exporting the rest of what it sets."""
+        fdir = os.path.join(self.home, ".config", "ferry")
+        os.makedirs(fdir, exist_ok=True)
+        with open(os.path.join(fdir, "client.json"), "w") as f:
+            json.dump({"host": INSTALL_HOST, "port": INSTALL_PORT,
+                       "api_key": self.DEVICE_KEY, "key_name": "mbp"}, f)
+        self.assertEqual(self.run_install().returncode, 0)
+        bindir = os.path.join(self.home, "bin")
+        os.makedirs(bindir)
+        stub = os.path.join(bindir, "claude")
+        with open(stub, "w") as f:
+            f.write('#!/bin/sh\necho "API=${ANTHROPIC_API_KEY:-unset} '
+                    'TOKEN=$ANTHROPIC_AUTH_TOKEN BASE=$ANTHROPIC_BASE_URL '
+                    'MODEL=$ANTHROPIC_MODEL ARGS=$*"\n')
+        os.chmod(stub, 0o755)
+        env = self.env(path_prefix=bindir)
+        env["ANTHROPIC_API_KEY"] = "sk-ant-shell-exported"
+        for fn, model in (("claude-ferry", "heavy"), ("claude-ferry-local", "local-orch"),
+                          ("claude-ferry-super", "heavy")):
+            with self.subTest(wrapper=fn):
+                r = subprocess.run(["zsh", "-c", f"source {self.rc}; {fn} -p hi"],
+                                   capture_output=True, text=True, env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("API=unset", r.stdout)
+                self.assertIn(f"TOKEN={self.DEVICE_KEY}", r.stdout)
+                self.assertIn("BASE=http://testhost:8090", r.stdout)
+                self.assertIn(f"MODEL={model}", r.stdout)
+                self.assertIn("ARGS=-p hi", r.stdout)
+        # Control: the unwrapped stub does see the exported key, so API=unset
+        # above is the wrappers' doing, not an absent variable.
+        r = subprocess.run(["zsh", "-c", "claude"], capture_output=True, text=True, env=env)
+        self.assertIn("API=sk-ant-shell-exported", r.stdout)
+
     def test_a_device_key_is_baked_and_mirrored_as_api_key(self):
         fdir = os.path.join(self.home, ".config", "ferry")
         os.makedirs(fdir, exist_ok=True)
@@ -381,6 +419,30 @@ class ClaudeJsonTest(ClaudeHarness):
                              "the .bak does not hold the PREVIOUS config")
         self.assertEqual(self.read_json(self.json_path())["host"], "twohost",
                          "the live config does not hold the latest host")
+
+    def test_a_device_key_replacing_the_master_redacts_it_in_every_backup(self):
+        master, device = "sk-bak-master", "fk-mbp-" + "e" * 32
+        self.assertEqual(self.run_install("--key", master).returncode, 0)
+        self.assertEqual(self.run_install("--key", master).returncode, 0)
+        r = self.run_install("--key", device)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        baks = sorted(glob.glob(self.json_path() + ".*.bak"))
+        self.assertEqual(len(baks), 2)
+        for bak in baks:
+            with open(bak) as f:
+                text = f.read()
+            self.assertNotIn(master, text)
+            self.assertIn("<redacted: replaced by ferry device key>", text)
+        self.assertEqual(self.read_json(self.json_path())["api_key"], device)
+        self.assertNotIn(master, r.stdout + r.stderr)
+
+    def test_a_master_rewrite_keeps_the_backup_verbatim(self):
+        # Control: no device key replaces it, so nothing is redacted.
+        self.assertEqual(self.run_install("--key", "sk-bak-master").returncode, 0)
+        self.assertEqual(self.run_install("--key", "sk-bak-master").returncode, 0)
+        (bak,) = glob.glob(self.json_path() + ".*.bak")
+        with open(bak) as f:
+            self.assertIn("sk-bak-master", f.read())
 
     def test_wrappers_flag_installs_but_leaves_claude_json_alone(self):
         self.assertEqual(self.run_install().returncode, 0)

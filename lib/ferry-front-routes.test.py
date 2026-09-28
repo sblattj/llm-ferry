@@ -78,12 +78,17 @@ CLIENT_ENDPOINTS = {
     "anthropic_response": [("POST", "/v1/messages")],
     "count_tokens": [("POST", "/v1/messages/count_tokens")],
     "responses_api": [("POST", "/v1/responses"), ("POST", "/responses")],
+    "compact_response": [("POST", "/v1/responses/compact")],
+    "health_liveliness": [("GET", "/health/liveliness"), ("GET", "/health/liveness")],
+}
+# Stored-response endpoints: no ferry client polls them, and a GET would
+# re-meter the stored response's usage on every poll. Refused for device keys
+# (the master still reaches them).
+STORED_RESPONSE_ENDPOINTS = {
     "get_response": [("GET", "/v1/responses/resp_1")],
     "delete_response": [("DELETE", "/v1/responses/resp_1")],
     "get_response_input_items": [("GET", "/v1/responses/resp_1/input_items")],
-    "compact_response": [("POST", "/v1/responses/compact")],
     "cancel_response": [("POST", "/v1/responses/resp_1/cancel")],
-    "health_liveliness": [("GET", "/health/liveliness"), ("GET", "/health/liveness")],
 }
 # Client-shaped endpoints a device key must NOT reach yet: the front cannot
 # limit or meter them (Gemini-native is not an inference path to the front;
@@ -242,7 +247,8 @@ class TestDeviceKeyRoutesAgainstLitellm(unittest.TestCase):
                     path = path.replace(prm, val, 1)
                 seen.add(path)
         # The client shapes themselves, with the same adversarial ids.
-        for reqs in list(CLIENT_ENDPOINTS.values()) + list(UNMETERED_ENDPOINTS.values()):
+        for reqs in (list(CLIENT_ENDPOINTS.values()) + list(UNMETERED_ENDPOINTS.values())
+                     + list(STORED_RESPONSE_ENDPOINTS.values())):
             for _, path in reqs:
                 seen.add(path)
                 for val in FILLS:
@@ -290,6 +296,13 @@ class TestDeviceKeyRoutesAgainstLitellm(unittest.TestCase):
 
     def test_unmetered_endpoints_exist_and_are_refused(self):
         for name, reqs in UNMETERED_ENDPOINTS.items():
+            for method, path in reqs:
+                with self.subTest(endpoint=name, method=method, path=path):
+                    self.assertEqual(_resolve(self.app, method, path), name)
+                    self.assertEqual(self.admitted([(method, path)]), [])
+
+    def test_stored_response_endpoints_exist_and_are_refused(self):
+        for name, reqs in STORED_RESPONSE_ENDPOINTS.items():
             for method, path in reqs:
                 with self.subTest(endpoint=name, method=method, path=path):
                     self.assertEqual(_resolve(self.app, method, path), name)

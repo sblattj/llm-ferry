@@ -58,7 +58,8 @@ def _parser():
     add.add_argument("--rpm", type=_positive, default=None, metavar="N")
     add.add_argument("--budget-tokens", type=_positive, default=None, metavar="N")
     add.add_argument("--replace", action="store_true",
-                     help="rotate an existing key of this name in place")
+                     help="rotate an existing key of this name in place "
+                          "(a revoked name is reactivated)")
 
     verbs.add_parser("list", help="every key with its status, limits and usage")
 
@@ -111,14 +112,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.verb == "add":
+            # Only for the wording: --replace on an existing name rotates it
+            # (and reactivates it if it was revoked); otherwise it creates.
+            rotated = (args.replace
+                       and K.find(K.load(), K.normalize_name(args.name)) is not None)
             name, token = K.add(args.name, expires=args.expires, lanes=args.lanes,
                                 rpm=args.rpm, budget_tokens=args.budget_tokens,
                                 replace=args.replace)
             print(token)
-            print("ferry keys: created %r. The key above is shown ONCE; put it in "
+            print("ferry keys: %s %r. The key above is shown ONCE; put it in "
                   "the device's client.json as api_key (or re-run client-bootstrap.sh "
-                  "there with the master key to enroll automatically)." % name,
-                  file=sys.stderr)
+                  "there with the master key to enroll automatically)."
+                  % ("rotated" if rotated else "created", name), file=sys.stderr)
             return 0
         if args.verb == "list":
             return _list()

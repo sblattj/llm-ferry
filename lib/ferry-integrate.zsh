@@ -1303,8 +1303,37 @@ if served:
 # hand-maintained config legitimately carries comments that json.dump cannot
 # round-trip. The snapshot is where they survive.
 SNAP_RE_TPL = r"^{stem}\.\d{{8}}T\d{{6}}Z(-\d+)?\.jsonc$"
+# v1.39.0 migration: when a device key (fk-…) replaces a master key, the master
+# must not survive in the snapshots. It is REDACTED — in the snapshot written
+# now and in every earlier snapshot of the same target — never deleted, so the
+# snapshots stay useful for everything else.
+REDACTED = "<redacted: replaced by ferry device key>"
 
-def snapshot(path, keep):
+def replaced_master(old_cfg):
+    """The ferry apiKey this run replaces, when that is a master being traded
+    for a device key; else ''."""
+    if not oc_key.lower().startswith("fk-") or not isinstance(old_cfg, dict):
+        return ""
+    try:
+        old = old_cfg["provider"]["ferry"]["options"]["apiKey"]
+    except (KeyError, TypeError):
+        return ""
+    if (isinstance(old, str) and old and old != "local"
+            and not old.lower().startswith("fk-") and old != oc_key):
+        return old
+    return ""
+
+def redact_file(p, secret):
+    try:
+        with open(p, "rb") as f:
+            data = f.read()
+        if secret.encode() in data:
+            with open(p, "wb") as f:
+                f.write(data.replace(secret.encode(), REDACTED.encode()))
+    except OSError:
+        pass
+
+def snapshot(path, keep, redact=""):
     if not os.path.exists(path):
         return None
     d = os.path.dirname(path) or "."
@@ -1316,14 +1345,19 @@ def snapshot(path, keep):
         snap = os.path.join(d, f"{stem}.{ts}-{n}.jsonc")
         n += 1
     shutil.copy2(path, snap)
+    # Match only OUR snapshots: the timestamp shape, anchored to this stem.
+    # A plain "{stem}.*.jsonc" glob would happily delete a user's own
+    # opencode.notes.jsonc sitting in the same directory.
+    pat = re.compile(SNAP_RE_TPL.format(stem=re.escape(stem)))
     if keep > 0:
-        # Match only OUR snapshots: the timestamp shape, anchored to this stem.
-        # A plain "{stem}.*.jsonc" glob would happily delete a user's own
-        # opencode.notes.jsonc sitting in the same directory.
-        pat = re.compile(SNAP_RE_TPL.format(stem=re.escape(stem)))
         olds = sorted(f for f in os.listdir(d) if pat.match(f))
         for old in olds[:-keep]:
             os.remove(os.path.join(d, old))
+    if redact:
+        for f in os.listdir(d):
+            if pat.match(f):
+                redact_file(os.path.join(d, f), redact)
+        print("    The replaced master key is redacted in this config's snapshots.")
     return snap
 
 # --- Load whatever is there (JSONC-tolerant). ---
@@ -1344,7 +1378,7 @@ if os.path.exists(cfg_path):
             print("    The original is preserved verbatim in the snapshot below.")
             cfg = None
 
-snap = snapshot(cfg_path, keep_snaps)
+snap = snapshot(cfg_path, keep_snaps, replaced_master(cfg))
 if cfg is None:
     cfg = {}
 cfg.setdefault("$schema", SCHEMA)

@@ -6,7 +6,7 @@
       "ferry": {
         "npm": "@ai-sdk/openai-compatible",
         "name": "Ferry (host)",
-        "options": { "baseURL": "http://your-mac.local:8090/v1", "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>", "headers": {"X-Ferry-Client": "your-laptop", "X-Ferry-Fleet": "{env:FERRY_FLEET}"} },
+        "options": { "baseURL": "http://your-mac.local:8090/v1", "apiKey": "<your device key (api_key in ~/.config/ferry/client.json), the master key, or \"local\" on a keyless LAN>", "headers": {"X-Ferry-Client": "your-laptop", "X-Ferry-Fleet": "{env:FERRY_FLEET}"} },
         "models": {
           "heavy": {},
           "medium": {},
@@ -40,7 +40,7 @@
         "provider": "openai",
         "model": "heavy",
         "apiBase": "http://your-mac.local:8090/v1",
-        "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
+        "apiKey": "<your device key (api_key in ~/.config/ferry/client.json), the master key, or \"local\" on a keyless LAN>",
         "_note": "The domestic template serves six lanes at once: heavy + medium + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Select medium explicitly for substantive coding or review work."
       }
     ]
@@ -49,7 +49,7 @@
   "cursor_ide": {
     "section": "Settings -> Models -> OpenAI-Compatible",
     "override_baseURL": "http://your-mac.local:8090/v1",
-    "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
+    "apiKey": "<your device key (api_key in ~/.config/ferry/client.json), the master key, or \"local\" on a keyless LAN>",
     "model_name_to_add": "heavy",
     "_note": "The domestic template serves six lanes at once: heavy + medium + flash + super-flash (cloud) and local-orch + local-sub (host GPU). Select medium explicitly for substantive coding or review work."
   },

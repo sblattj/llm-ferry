@@ -70,6 +70,7 @@ It goes further than serving inference: it can **ferry whole models and files** 
 - [Remote access (Tailscale)](#remote-access-tailscale)
 - [Local models — operating notes](#local-models--operating-notes)
 - [Platform support](#platform-support)
+- [Device keys](#device-keys)
 - [Privacy](#privacy)
 - [Command reference](#command-reference)
 - [FAQ](#faq)
@@ -85,7 +86,7 @@ It goes further than serving inference: it can **ferry whole models and files** 
 - 🏠 **You run a home lab.** One box becomes the inference appliance; everything else is a thin client.
 - 👥 **A small team wants to share one set of API keys.** Centralize billing and secrets on a host; clients never see a key.
 - 🤖 **You do agentic coding and want cheap + smart on tap.** Serve a big **orchestrator** model and a pool of cheap **workers** on the same endpoint, and let your agent fan out across both.
-- 🔒 **Mac/Linux host, LAN-only, your hardware.** Client↔host traffic is plain HTTP on your private network behind one shared master key; cloud calls go host→provider over HTTPS with the host's keys. This is not a public gateway or a hosted service — and that's the point.
+- 🔒 **Mac/Linux host, LAN-only, your hardware.** Client↔host traffic is plain HTTP on your private network behind a ferry key (the master key or a per-device key); cloud calls go host→provider over HTTPS with the host's keys. This is not a public gateway or a hosted service — and that's the point.
 
 ## Why not just…?
 
@@ -109,7 +110,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 
 - 🧾 **Run on your subscriptions, not just API keys** — ChatGPT- and Claude Pro/Max-subscription lanes log in once over OAuth (`ferry auth-claude login`); each carries metered fallback hops so an exhausted subscription degrades to pay-per-token instead of erroring the client. [[releases]](docs/releases/v1.37.0.md)
 - 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too, so **Claude Code runs on the ferry backend** (`claude-ferry` wrappers). [[The stack →]](#the-stack--eight-lanes-on-one-endpoint)
-- 🔑 **Keys stay on the host** — provider keys never leave the host; clients hold one shared master key. [[Privacy →]](#privacy)
+- 🔑 **Keys stay on the host** — provider keys never leave the host; each client holds one ferry key — its own revocable [device key](#device-keys), or the shared master key on older setups. [[Privacy →]](#privacy)
 - ⚡ **Local GPU + cloud, same endpoint** — Apple MLX inference on the Mac, or a cloud proxy, or both in one route config. [[Local GPU lanes →]](#the-local-gpu-lanes)
 - 🧠 **Named lanes with explicit fallback hops** — clients pick a role (`heavy`, `flash`, …); you swap the backends without editing a single client. [[The stack →]](#the-stack--eight-lanes-on-one-endpoint)
 - 🗺️ **Fleets** — switch every cloud lane between routing sets (e.g. `domestic` ↔ `international`) per caller, mid-session, no restart. [[Fleets →]](#fleets)
@@ -161,9 +162,9 @@ That's it — every editor and CLI on the client now talks to one endpoint on th
 
 ## Recent releases
 
+- **[v1.39.0 — per-device keys](docs/releases/v1.39.0.md)** — every client gets its own revocable key at bootstrap, with optional lane, requests-per-minute and monthly token limits; `ferry keys` manages them and the dash shows who spent what.
 - **[v1.38.0 — safe help, clean pipes, named offers](docs/releases/v1.38.0.md)** — `--help` never runs a subcommand, colour only on a terminal, `ferry offer --as NAME` with `.app` signatures intact, and releases cut automatically on tag push.
-- **[v1.37.0 — Claude subscription lanes](docs/releases/v1.37.0.md)** — `ferry auth-claude login` serves `claude-*` traffic from a Claude Pro/Max subscription over OAuth, with metered fallback hops.
-- **[v1.36.0 — the extraction lane comes home](docs/releases/v1.36.0.md)** — Schematron-8B HTML→JSON extraction now runs on the host GPU, on its own door (`ferry up --schematron`). [Full history →](docs/releases)
+- **[v1.37.0 — Claude subscription lanes](docs/releases/v1.37.0.md)** — `ferry auth-claude login` serves `claude-*` traffic from a Claude Pro/Max subscription over OAuth, with metered fallback hops. [Full history →](docs/releases)
 
 ## The stack — eight lanes on one endpoint
 
@@ -334,9 +335,31 @@ Measured known issues — the `local-orch` deep-prefill streaming crash (self-re
 
 **Local GPU serving uses Apple MLX and is macOS / Apple Silicon only.** On Linux, plain `ferry up` automatically degrades to the cloud lanes; serve models with `--route`, `--cloud`, or `--model <id>` against a cloud / OpenAI-compatible endpoint instead. `ferry install` on Ubuntu skips MLX and the model downloads, and may prompt you to `apt install zsh` (ferry is a zsh script); `avahi-daemon` (so `.local` mDNS names resolve) and `iproute2` are recommended.
 
+## Device keys
+
+Every client can hold **its own key** instead of the shared master key, so you can see which device spent what, cut off one lost laptop without re-keying the rest, and optionally cap a device.
+
+- **Getting one is automatic.** Run the client bootstrap with the master key (`FERRY_MASTER_KEY=… curl …/client-bootstrap.sh | zsh`). A v1.39.0 host mints a device key named after the machine and the client stores only that (`api_key` in `~/.config/ferry/client.json`), never the master. Re-running the bootstrap against the same host rotates the key under the same name. An older host just keeps the master-key setup. Existing clients keep working on the master key until they re-run the bootstrap; `ferry update` never touches credentials.
+- **Managing them (host only):**
+
+  ```bash
+  ferry keys add ci-box --lanes flash --rpm 30 --budget-tokens 2000000 --expires 2027-01-01   # prints the key once
+  ferry keys list                  # status, limits, tokens this month, requests this minute
+  ferry keys revoke old-laptop     # refused from the next request on, no restart
+  ferry keys set ci-box --rpm none # 'none' clears a limit
+  ```
+
+  Names are lower-cased to `[a-z0-9-]`; `master` and `host` are reserved.
+- **Client routes only.** A device key works on inference (`/v1/chat/completions`, `/v1/completions`, `/v1/messages` and its `count_tokens`, `/v1/responses`, `/v1/embeddings`), the model lists, `/v1/ferry/fleet` and the health probe. Any other route — litellm's admin API and UI, audio, images, files, batches — answers 403 `route_not_allowed`. Device keys do not work on the Gemini-native (`/v1beta/models/…:generateContent`) or websocket routes (realtime, the responses socket), which get 403 or a 1008 close, because the front cannot limit or meter them yet: use the master key there. The master key is unaffected and still reaches everything.
+- **Limits are optional.** `--lanes` accepts bare lanes (`flash`, which means any fleet's flash) or fleet lanes (`international.flash`); `orch` counts as `heavy`. A disallowed lane is a 403. `--rpm` caps one key's requests per minute across all front-door workers (429 with `Retry-After`). `--budget-tokens` caps **input + output tokens per calendar month (UTC)**, answered 429 `insufficient_quota` once spent. Tokens are charged once per request when its response completes (streams included, even if the client disconnects), so every request already in flight when the budget runs out may still finish: the overshoot can be more than one request. Limits and metering apply on every route a device key can reach that serves a model: the OpenAI- and Anthropic-style inference routes above. There are no USD budgets in v1.
+- **Credentials.** A device key is accepted from any credential header litellm reads or from `?key=`; a `?key=` device key is removed from the URL before forwarding, so it never reaches the access log, and sending two different credentials alongside an `fk-` key is a 401.
+- **Where it shows.** `ferry dash` has a *Device keys* card, and each live-feed row from a keyed request is prefixed with the calling key's name (or `master`). Every event record carries a `key` field holding the key's name, `master`, or empty.
+- **Failure modes.** A corrupt `keys.json` refuses every device key (401) and a broken usage DB refuses them with a 503. Each problem gets one rate-limited line in the front log. The master key keeps working through both.
+- **Files:** `~/.config/ferry/keys.json` (0600; hashes only, and a key is never stored or logged) and `~/.config/ferry/keys-usage.sqlite` (counters).
+
 ## Privacy
 
-Everything runs on your own hardware and network. The front door answers only requests carrying the **master key** — one shared secret you set in `LITELLM_MASTER_KEY` and every client holds a copy of (a keyless request gets a 401). The LAN transport is still **plain HTTP**, so that key travels in a header anyone sharing the wire can read: it is an auth layer, not encryption — enough to keep a neighbor's laptop or a misaddressed `curl` out, not enough for a hostile network. The hostile-network answer is [Tailscale Serve](#remote-access-tailscale). The MLX servers bind `127.0.0.1`, so the GPU lanes are reachable only through the front door. Cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the provider keys** — the master key is the one credential a client holds. The one transport built for an untrusted channel is `ferry drop` / `ferry pickup`, which encrypts before the data leaves the machine. Client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host, outside any checkout. The observability stack binds to `127.0.0.1` only. A port published with `ferry relay` is reachable by anything that can reach the host on that port — whatever you `ferry expose` must carry its own authentication.
+Everything runs on your own hardware and network. The front door answers only requests carrying the **master key** (`LITELLM_MASTER_KEY`) or a **[device key](#device-keys)** minted from it (a keyless request gets a 401); a bootstrapped v1.39.0 client holds only its own revocable device key. The LAN transport is still **plain HTTP**, so that key travels in a header anyone sharing the wire can read: it is an auth layer, not encryption — enough to keep a neighbor's laptop or a misaddressed `curl` out, not enough for a hostile network. The hostile-network answer is [Tailscale Serve](#remote-access-tailscale). The MLX servers bind `127.0.0.1`, so the GPU lanes are reachable only through the front door. Cloud calls go host→provider over HTTPS using the host's keys, so **client devices never see the provider keys** — its ferry key is the one credential a client holds. The one transport built for an untrusted channel is `ferry drop` / `ferry pickup`, which encrypts before the data leaves the machine. Client telemetry (`ferry msg` / `ferry log`) is appended to `~/.config/ferry/client_logs.txt` on the host, outside any checkout. The observability stack binds to `127.0.0.1` only. A port published with `ferry relay` is reachable by anything that can reach the host on that port — whatever you `ferry expose` must carry its own authentication.
 
 ## Command reference
 
@@ -351,6 +374,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `auth-claude login\|status\|refresh\|logout` | host | Manage the Claude Pro/Max subscription OAuth credential |
 | `msg <text>` / `log` / `inbox` | client / host | Send a note or pipe stdin to the host's log; read it back dated and attributed |
 | `fleet ls\|show\|use <name>` | both | List fleets, show resolved selections, set a caller's sticky fleet |
+| `keys add\|list\|revoke\|set` | host | Per-device client keys: mint (shown once), list with usage, revoke, and set lane / RPM / monthly token limits |
 | `relay` / `expose <port>` / `expose-vnc` | host / client | Reverse expose: client dials out, host publishes its port (RFB preflight for VNC) |
 | `serve-vnc [--bind ADDR] [--fetch]` | host | Browser VNC viewer + WebSocket bridge (default `8099`) |
 | `offer [--as NAME] <path>...` / `get <name>` | host / client | Record files for clients (a name collision is refused; `.app` bundles keep their signature; `--selftest` offers a fixture); fetch an offered file/dir by name |
@@ -366,11 +390,11 @@ Everything runs on your own hardware and network. The front door answers only re
 
 ## FAQ
 
-**Does any of my data leave the LAN?** Local-lane inference never leaves the host; cloud lanes call the provider from the host over HTTPS with the host's keys. Client↔host traffic is plain HTTP on your private network behind one shared master key — for hostile networks, front the endpoint with [Tailscale](#remote-access-tailscale). See [Privacy](#privacy).
+**Does any of my data leave the LAN?** Local-lane inference never leaves the host; cloud lanes call the provider from the host over HTTPS with the host's keys. Client↔host traffic is plain HTTP on your private network behind a ferry key (the master key or a per-device key) — for hostile networks, front the endpoint with [Tailscale](#remote-access-tailscale). See [Privacy](#privacy).
 
 **Does it run on Linux?** The CLI, cloud proxy, dashboards, and LAN share/transfer run on macOS and Linux/Ubuntu. Local MLX GPU serving is macOS / Apple Silicon only — on Linux, `ferry up` degrades to the cloud lanes automatically. See [Platform support](#platform-support).
 
-**Do clients need API keys?** No. Clients hold exactly one shared master key for the front door; provider keys and OAuth subscription logins exist only on the host.
+**Do clients need API keys?** No provider keys. A client holds one ferry key for the front door — its own [device key](#device-keys) from v1.39.0, or the shared master key on older setups; provider keys and OAuth subscription logins exist only on the host.
 
 ## Contributing
 
@@ -383,7 +407,7 @@ Issues and PRs are welcome — [open an issue](https://github.com/sblattj/llm-fe
 
 ## Development
 
-`ferry` is assembled from 18 per-domain modules in [`lib/`](lib/). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules, regenerate, and commit both (`build.zsh --check` flags drift; don't hand-edit `ferry`):
+`ferry` is assembled from 20 per-domain modules in [`lib/`](lib/). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules, regenerate, and commit both (`build.zsh --check` flags drift; don't hand-edit `ferry`):
 
 ```bash
 ./build.zsh --check    # regenerate ./ferry from lib/ferry-*.zsh; fail on drift

@@ -26,10 +26,24 @@ Still open from the follow-up docs:
 
 ## Tier 1 — strengthen the differentiators
 
-- [ ] **06 Per-client virtual keys with budgets.** Every multi-user LAN claim
-      depends on it, and it is the prerequisite for 13 (spend rollups),
-      25 (transcripts) and 08 (key rotation). Build first. Design draft
-      awaiting review: [client-keys spec](superpowers/specs/2026-09-27-client-keys-design.md).
+- [x] **06 Per-client virtual keys with budgets.** Shipped in v1.39.0 as
+      per-device keys with token budgets ([spec](superpowers/specs/2026-09-27-client-keys-design.md),
+      [release](releases/v1.39.0.md)). USD budgets are deferred (spec open
+      question 1). Unblocks 13 (spend rollups), 25 (transcripts) and 08 (key rotation).
+
+Still open from 06:
+
+- [ ] Pre-existing: the loopback-only gate on `/v1/ferry/reorder`, `/promote`
+      and `/chains` treats `tailscale serve` clients as loopback (the enroll
+      endpoint on a host with no master key has the same caveat).
+- [ ] The device-key route allowlist (`device_key_route_allowed`) may need
+      widening if a client uses a route outside it — watch the front log for
+      `route_not_allowed`.
+- [ ] Meter Gemini-native + realtime for device keys, then allow them.
+      Gemini-native generate (`/v1beta/models/…:generateContent`) and the
+      websocket routes (realtime, the responses socket) refuse device keys
+      today because `_key_admit` runs only on `INFERENCE_PATH_PREFIXES` over
+      HTTP; the master key still reaches them.
 - [ ] **34 Ollama-native API** (`/api/tags`, `/api/chat`). Many tools speak
       only Ollama; also answers the "ollama converging from below" threat.
 - [ ] **01 Session affinity.** Pin a conversation to one deployment — matters

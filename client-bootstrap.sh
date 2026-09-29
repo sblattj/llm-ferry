@@ -15,7 +15,7 @@
 # without auth never see one. When given (env FERRY_MASTER_KEY, or --key which
 # wins), it is stored as "master_key" in ~/.config/ferry/client.json, carried
 # on every connectivity probe, and picked up from the profile by the ferry CLI
-# when it wires the opencode/claude configs. The key is never echoed.
+# when it wires the opencode/claude/cline configs. The key is never echoed.
 # From v1.39.0 a host that issues per-device keys trades the master key for one
 # at bootstrap: client.json then holds "api_key" + "key_name" and NO master_key.
 # Only re-running this script migrates an existing client; `ferry update` never
@@ -46,6 +46,13 @@
 # guardrails apply to `opencode`); --no-claude skips the step entirely. The
 # choice is recorded in client.json as "claude_mode" (full / none), the same
 # way, for client-reset.sh to re-apply.
+#
+# CLINE (VS Code) is a third integration with its own single switch. By default
+# `ferry cline` pre-seeds the ~/.cline provider files with this host as an
+# openai-compatible provider — with or without VS Code installed, since seeding
+# before first launch is a supported flow (there is no cline CLI to detect).
+# --no-cline skips the step entirely. The choice is recorded in client.json as
+# "cline_mode" (full / none), the same way, for client-reset.sh to re-apply.
 
 set -eu
 
@@ -60,6 +67,7 @@ SELF="$0"
 OC_MODE="full"
 GUARDRAILS=""   # empty = follow the mode; 1/0 = explicit --with/--no-guardrails
 NO_CLAUDE=0
+NO_CLINE=0
 # The shared master key (v1.22.0): optional. Env first; an explicit --key wins.
 MASTER_KEY="${FERRY_MASTER_KEY:-}"
 
@@ -77,6 +85,8 @@ usage() {
   echo "         on by default in full mode, off in the other two)"
   echo "       --no-claude   (skip the Claude Code wrappers; by default they are"
   echo "         installed when a 'claude' CLI is on PATH)"
+  echo "       --no-cline   (skip the Cline (VS Code) provider files; by default"
+  echo "         ~/.cline is pre-seeded even when VS Code isn't installed yet)"
   echo "       -h | --help"
 }
 
@@ -88,6 +98,7 @@ while [[ $# -gt 0 ]]; do
     --with-guardrails) GUARDRAILS=1; shift ;;
     --no-guardrails)   GUARDRAILS=0; shift ;;
     --no-claude)       NO_CLAUDE=1; shift ;;
+    --no-cline)        NO_CLINE=1; shift ;;
     --key)
       if [[ $# -lt 2 || -z "$2" ]]; then
         echo "Error: --key needs a value"; exit 1
@@ -96,7 +107,7 @@ while [[ $# -gt 0 ]]; do
     --key=*)
       MASTER_KEY="${1#--key=}"; shift ;;
     -h|--help)         usage; exit 0 ;;
-    *) echo "Unknown flag: $1"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --key KEY, --with-guardrails, --no-guardrails, --no-claude, --help"; exit 1 ;;
+    *) echo "Unknown flag: $1"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --key KEY, --with-guardrails, --no-guardrails, --no-claude, --no-cline, --help"; exit 1 ;;
   esac
 done
 
@@ -282,6 +293,7 @@ else
   CLAUDE_MODE="none"
 fi
 
+
 # Per-device keys (v1.39.0). A host from v1.39.0 on mints a device key for the
 # master key (POST /v1/ferry/keys/enroll); only that device key is stored, so
 # the master never has to live on this laptop and the host can revoke this one
@@ -359,6 +371,17 @@ PYEOF
   fi
 fi
 
+# Cline scope is decided here too, for the same reason: it must land in
+# client.json before the write below. Unlike claude there is no CLI/VS Code
+# detection — pre-seeding ~/.cline before VS Code is ever installed is a
+# supported flow — so full is the plain default and --no-cline is the only
+# way it narrows.
+if [[ $NO_CLINE -eq 1 ]]; then
+  CLINE_MODE="none"
+else
+  CLINE_MODE="full"
+fi
+
 # Write local client JSON config profile
 echo ">>> Creating client configuration profile..."
 mkdir -p "$HOME/.config/ferry"
@@ -368,6 +391,9 @@ mkdir -p "$HOME/.config/ferry"
 # claude_mode is the same idea for the Claude Code wrappers: full when they
 # were installed, none when --no-claude was passed or no `claude` CLI exists.
 # Absent on a pre-claude profile reads as "none" — a reset never widens.
+# cline_mode is the same idea again for the Cline (VS Code) provider files:
+# full when they were written, none when --no-cline was passed. Absent on a
+# pre-cline profile reads as "none" — a reset never widens.
 # master_key rides in the profile ONLY when a key was supplied. Its absence is
 # how every reader (client-reset.sh, the ferry CLI) knows this host takes no
 # key — so the JSON shape below is byte-stable when MASTER_KEY is empty.
@@ -392,7 +418,8 @@ fi
   "share_port": "$SHARE_PORT",
   "name": "$CLIENT_NAME",
   "opencode_mode": "$OC_MODE",
-  "claude_mode": "$CLAUDE_MODE"${MASTER_KEY_JSON}
+  "claude_mode": "$CLAUDE_MODE",
+  "cline_mode": "$CLINE_MODE"${MASTER_KEY_JSON}
 }
 EOF
 )
@@ -1133,13 +1160,14 @@ if [[ $CLAUDE_FAILED -eq 1 ]]; then
   echo "    or re-run this script / client-reset.sh."
 fi
 
+
 # 4b. Migration hygiene (v1.39.0). A client first bootstrapped before v1.39.0
 # had the master key baked into every ferry-written config, and `ferry
-# opencode` / `ferry claude` back each one up before rewriting it. Those
-# writers redact the master they replace; this pass also catches every older
-# ferry-made backup of the same targets (and anything the writers could not
-# parse). Backups are REDACTED in place, never deleted. Only ferry's own
-# backup names are touched, and only after a successful enroll: a supplied
+# opencode` / `ferry claude` / `ferry cline` back each one up before rewriting
+# it. Those writers redact the master they replace; this pass also catches
+# every older ferry-made backup of the same targets (and anything the writers
+# could not parse). Backups are REDACTED in place, never deleted. Only ferry's
+# own backup names are touched, and only after a successful enroll: a supplied
 # --key fk-… has no master to redact. The key rides in the environment.
 if [[ $ENROLLED -eq 1 ]]; then
   FERRY_REDACT_MASTER="$MASTER_KEY" python3 - "$HOME" <<'PYEOF' || true
@@ -1150,9 +1178,14 @@ TS = r"\.\d{8}T\d{6}Z(-\d+)?"
 SHAPES = {
     os.path.join(home, ".config", "ferry"): re.compile(
         r"^(opencode-cloud|opencode-local|opencode-super)" + TS + r"\.jsonc$"
-        r"|^claude\.json" + TS + r"\.bak$"),
+        r"|^claude\.json" + TS + r"\.bak$"
+        r"|^cline\.json" + TS + r"\.bak$"),
     os.path.join(home, ".config", "opencode"): re.compile(
         r"^(opencode|tui)" + TS + r"\.jsonc$"),
+    os.path.join(home, ".cline", "data"): re.compile(
+        r"^(globalState|secrets)\.json" + TS + r"\.ferry\.bak$"),
+    os.path.join(home, ".cline", "data", "settings"): re.compile(
+        r"^providers\.json" + TS + r"\.ferry\.bak$"),
 }
 n = 0
 for d, pat in SHAPES.items():
@@ -1176,6 +1209,34 @@ for d, pat in SHAPES.items():
 if n:
     print(f"    Redacted the master key from {n} older ferry config backup(s).")
 PYEOF
+fi
+
+# 4c. Cline (VS Code) integration. Cline speaks OpenAI-compatible, so `ferry
+# cline` writes the provider straight into the ~/.cline data files
+# (data/globalState.json, data/secrets.json, data/settings/providers.json).
+# Writing them is safe with VS Code closed; pre-seeding a machine that has no
+# VS Code yet is the supported first-run flow. Independent of the opencode and
+# claude modes; scope was recorded in client.json above.
+echo ""
+CLINE_FAILED=0
+if [[ "$CLINE_MODE" == "full" ]]; then
+  echo ">>> Wiring Cline (VS Code) to the host..."
+  # env -u OPENCODE_CONFIG: same hygiene as the `ferry opencode` / `ferry
+  # claude` calls — the shell's own pointer must not leak into ferry's writer.
+  # No --key here, exactly like the claude step: ferry reads api_key (a device
+  # key), else master_key, from the client.json profile this script just wrote.
+  if ! env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" cline \
+        --host "$HOST_NAME" --port "$HOST_PORT"; then
+    CLINE_FAILED=1
+  fi
+else
+  echo ">>> Skipping Cline wiring (--no-cline)."
+fi
+if [[ $CLINE_FAILED -eq 1 ]]; then
+  echo "    WARNING: 'ferry cline' failed. By hand: in Cline's provider settings"
+  echo "    set baseURL http://$HOST_NAME:$HOST_PORT/v1, apiKey $APIKEY_HINT,"
+  echo "    model = a LANE NAME — or edit the ~/.cline/data files directly"
+  echo "    (with VS Code closed), or re-run this script / client-reset.sh."
 fi
 
 # 5. Wrap up
@@ -1245,6 +1306,22 @@ case "$CLAUDE_MODE" in
     fi
     echo "    By hand: ANTHROPIC_BASE_URL=http://$HOST_NAME:$HOST_PORT ($BEARER_HINT),"
     echo "    model = a LANE NAME (heavy/flash cloud, local-orch/local-sub GPU)."
+    ;;
+esac
+
+case "$CLINE_MODE" in
+  full)
+    echo ">>> CLINE (VS CODE) ON THE FERRY BACKEND:"
+    echo "    Cline's provider config now points at this host (openai-compatible lane)."
+    echo "    VS Code/Cline not installed yet? The config is pre-seeded — install it with:"
+    echo "      code --install-extension saoudrizwan.claude-dev"
+    echo "    then start VS Code and pick the 'openai-compatible' provider."
+    if [[ $CLINE_FAILED -eq 1 ]]; then
+      echo "    (WARNING: the wiring step FAILED above — ~/.cline may not be written yet.)"
+    fi
+    ;;
+  none)
+    echo ">>> CLINE (VS CODE) WAS NOT CONFIGURED (--no-cline)."
     ;;
 esac
 echo ""

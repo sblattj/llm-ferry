@@ -13,6 +13,7 @@ Forensic internals moved out of the [README](../README.md) so it stays scannable
 - [Promoting a client into a host](#promoting-a-client-into-a-host)
 - [Route config forensics](#route-config-forensics)
 - [The opencode goal-plugin install internals](#the-opencode-goal-plugin-install-internals)
+- [The cline takeover internals](#the-cline-takeover-internals)
 - [Fleets — configuration detail](#fleets--configuration-detail)
 - [Event tap, schema repair & attribution](#event-tap-schema-repair--attribution)
 - [Encrypted drop — crypto detail](#encrypted-drop--crypto-detail)
@@ -324,6 +325,22 @@ python3 -c 'import json;print([s["location"] for s in json.load(open("/tmp/oc-sk
 prints the installed path; before v1.32.0 it prints `[]`.
 
 Then, in a terminal wider than 120 columns, `ctrl+p` → **Plugins** lists an *External* entry for `opencode-goal-plugin` at that path, and `/goal <objective>` puts a **Goal** panel in the sidebar under LSP.
+
+## The cline takeover internals
+
+**Cline is wired through its files, not VS Code settings.** As of v4.1.21 the Cline extension (`saoudrizwan.claude-dev`) keeps *all* provider config in plain JSON under `~/.cline/` — `data/globalState.json` for extension state, `data/secrets.json` (mode 0600) for credentials, and `data/settings/providers.json` as the SDK-shared mirror. There is no settings import/export (that is Roo Code) and no `cline.*` VS Code settings; the only environment variables relocate the data directory (`CLINE_DATA_DIR` and friends), which `ferry cline --data-dir` follows. That file-backed surface is exactly why ferry can wire Cline the way it wires opencode: `ferry cline` merges ferry's keys into all three files around everything Cline already wrote, snapshots each to `<file>.<UTCtimestamp>.ferry.bak` before the first modify of a run (pruned to the last 10), and records `~/.config/ferry/cline.json` so reset and cleanup can find their way back.
+
+**The provider id duality is the #1 trap.** The same setting is spelled two ways in Cline's own stores: extension state (`globalState.json`) uses `"openai"` for what the UI calls OpenAI Compatible, while `providers.json` uses `"openai-compatible"`. Write only one spelling and the other store still points wherever it pointed before. `ferry cline` writes both, every time.
+
+**Writing `providers.json` alone is silently ignored.** On a fresh install `actModeApiProvider` defaults to `"openrouter"` when absent from `globalState.json`, and Cline consults that key *before* it ever looks at the SDK-shared mirror — so a hand-rolled recipe that only fills in `providers.json` produces a Cline that keeps talking to OpenRouter while looking, in one of its two stores, perfectly ferry-configured. Hence the otherwise-redundant-looking `actModeApiProvider`/`planModeApiProvider` lines in the [example config](../client-config-example.json): `globalState.json` is not optional, it is the file that selects the provider.
+
+**The key is written even when ferry ignores it.** Cline only sends an `Authorization` header when a key exists — older builds sent a literal `Bearer noop`, current builds send nothing — and ferry's front door is happy either way, but the cleanest contract is a real non-empty key in `secrets.json` under `openAiApiKey`, mode 0600 on that file (created 0600; an already-stricter mode is preserved). A keyless LAN writes the same `"local"` placeholder every other client holds. The key resolves exactly like `ferry claude`'s: `--key`, else the client profile's `api_key` (the v1.39.0 per-device key an enrolled bootstrap minted), else its `master_key` — and `~/.config/ferry/cline.json` records a device key as `api_key`, never mislabeled as the master.
+
+**Cleanup restores or strips, never deletes.** `client-cleanup.sh` works per file: if `.ferry.bak` snapshots exist, the newest snapshot's content is restored and the rest deleted; if none survive, the ferry-written keys are stripped surgically — the act/plan/model/base URL/header keys (and `welcomeViewCompleted`) only while `openAiBaseUrl` still points at the recorded host, the `openAiApiKey` only when it matches the recorded key, the `openai-compatible` provider entry only when its base URL matches. `~/.cline` itself is never removed: your chat history and checkpoints live there and are not ferry's to delete.
+
+**The fleet header is baked, not templated.** opencode's config is evaluated by opencode, so ferry can write a live placeholder — `X-Ferry-Fleet: {env:FERRY_FLEET}` — that resolves per launch. Cline's config is a static JSON file read by a VS Code extension that never expands it, so `ferry cline` writes `X-Ferry-Fleet` into `openAiHeaders` **only when `$FERRY_FLEET` is set at the moment it runs**, baking the value in. Changing fleets means re-running `ferry cline` (or editing the header by hand) — `ferry fleet use` on the host does not reach into a client's static file.
+
+**Close VS Code first.** The extension caches its config in memory and writes it back out, so files edited under a running VS Code can be silently overwritten from memory the moment it exits or saves settings. `ferry cline` detects a running VS Code (`pgrep -f "Visual Studio Code"`), warns, and continues — the files are still correct if nothing in the extension rewrites them, but the warning is the contract. Relatedly, a machine with no VS Code yet is a supported target, not an error: pre-seeding `~/.cline` before the first launch means Cline comes up already pointed at ferry, and the one-time marketplace hint (`code --install-extension saoudrizwan.claude-dev`) is printed as a note.
 
 ## Fleets — configuration detail
 

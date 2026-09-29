@@ -110,12 +110,13 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 
 - 🧾 **Run on your subscriptions, not just API keys** — ChatGPT- and Claude Pro/Max-subscription lanes log in once over OAuth (`ferry auth-claude login`); each carries metered fallback hops so an exhausted subscription degrades to pay-per-token instead of erroring the client. [[releases]](docs/releases/v1.37.0.md)
 - 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too, so **Claude Code runs on the ferry backend** (`claude-ferry` wrappers). [[The stack →]](#the-stack--eight-lanes-on-one-endpoint)
+- 🧩 **Cline (VS Code) wired too** — `ferry cline` (or a plain bootstrap) points the Cline extension at the ferry endpoint by lane name, writing its file-backed provider config with snapshots first. [[Release →]](docs/releases/v1.40.0.md)
 - 🔑 **Keys stay on the host** — provider keys never leave the host; each client holds one ferry key — its own revocable [device key](#device-keys), or the shared master key on older setups. [[Privacy →]](#privacy)
 - ⚡ **Local GPU + cloud, same endpoint** — Apple MLX inference on the Mac, or a cloud proxy, or both in one route config. [[Local GPU lanes →]](#the-local-gpu-lanes)
 - 🧠 **Named lanes with explicit fallback hops** — clients pick a role (`heavy`, `flash`, …); you swap the backends without editing a single client. [[The stack →]](#the-stack--eight-lanes-on-one-endpoint)
 - 🗺️ **Fleets** — switch every cloud lane between routing sets (e.g. `domestic` ↔ `international`) per caller, mid-session, no restart. [[Fleets →]](#fleets)
 - 🎛️ **Multi-key worker pool** — pooled deployments with least-used spread and automatic 429 cooldown/failover.
-- 🚀 **One-curl client onboarding** — installs the CLI, writes the client profile, and auto-wires the editor (opencode / Continue / Cursor). [[Quickstart →]](#quickstart)
+- 🚀 **One-curl client onboarding** — installs the CLI, writes the client profile, and auto-wires the editor (opencode / Claude Code / Cline in VS Code). [[Quickstart →]](#quickstart)
 - 🎨 **Signal Studio route editor** — search your model library *and* the live public OpenRouter catalog, add/reorder/copy fallback hops, undo, preview the exact YAML diff, apply. Desktop, tablet, and phone layouts. [[Tour →]](docs/signal-studio.md)
 - 📊 **See each request clearly** — first-text latency, duration, and reported tokens in the live dashboard; optional Grafana + VictoriaMetrics + VictoriaLogs for persistent observability. [[Dashboards →]](#dashboards--observability)
 - 📦 **Ferry models & files across the LAN** — stream whole models from the host's HuggingFace cache, offer/fetch arbitrary files, or push over netcat. [[→]](#ferrying-models--files-across-the-lan)
@@ -148,7 +149,7 @@ ferry share                          # print the one-liner clients run (LAN shar
 curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 ```
 
-The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint, and adds `opencode-cloud` / `opencode-local` / `opencode-super` shell shortcuts — and, when `claude` is installed, `claude-ferry` / `claude-ferry-local` / `claude-ferry-super`. Bare `opencode` and `claude` are deliberately untouched. Then check in:
+The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint, and adds `opencode-cloud` / `opencode-local` / `opencode-super` shell shortcuts — and, when `claude` is installed, `claude-ferry` / `claude-ferry-local` / `claude-ferry-super`. Cline in VS Code is auto-wired the same way (`ferry cline`'s takeover; skip with `--no-cline`, and close VS Code for the run). Bare `opencode` and `claude` are deliberately untouched. Then check in:
 
 ```bash
 ferry status                     # connection health + the lanes the host serves
@@ -385,6 +386,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `drop <path>\|--msg <text>` / `pickup <blob>` | any | Encrypted off-LAN transfer (AES-256-CBC + HMAC, openssl) |
 | `opencode [--local\|--cloud] [--key KEY] [--model M] [--small-model SM] [--housekeeper HK] [--super] [--keep N] [--no-default]` | dual | Take the opencode config over: agents pinned to lane names, `general` disabled, `light`/`standard` subagents added, snapshots first. `--key` writes the master key into the configs |
 | `claude [--key KEY] [--wrappers]` | dual | Install the `claude-ferry*` wrappers pointing Claude Code at the ferry endpoint by lane name |
+| `cline [--host H] [--port P] [--key KEY] [--model M] [--data-dir D] [--keep N]` | dual | Point Cline (VS Code) at the ferry endpoint: writes the `~/.cline` provider files (snapshot first, merged, `heavy` lane by default), records `~/.config/ferry/cline.json` for reset/cleanup |
 | `migrate [--dry-run] [--full] [--dir D]` | client | Promote this client into a host of its own ([how](docs/deep-dives.md#promoting-a-client-into-a-host)) |
 
 `ferry --help` prints the built-in usage banner.

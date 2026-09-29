@@ -103,6 +103,9 @@ Commands:
                         ferry claude [--host H] [--port P] [--wrappers]
   auth-claude        [Dual] Claude Pro/Max subscription OAuth (browser PKCE)
                         ferry auth-claude login | status | refresh | logout [--force]
+  cline              [Dual] Point Cline (VS Code) at this ferry host: writes
+                       the ~/.cline provider config (openai-compatible lane)
+                        ferry cline [--host H] [--port P] [--key K] [--model LANE] [--data-dir DIR] [--keep N]
   fleet              [Dual] Read or switch which fleet (routing set) bare lane
                        names resolve to
                         ferry fleet ls | show | use <fleet> [--default] | use --clear

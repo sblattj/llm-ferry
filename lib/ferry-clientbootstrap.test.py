@@ -1469,8 +1469,10 @@ class ScriptContractTest(unittest.TestCase):
         reset = self.read(RESET)
         self.assertIn("master_key", reset)
         self.assertIn('key_args=(--key "$saved_key")', reset)
-        # Both ferry calls ride the array; empty when no key was stored.
-        self.assertEqual(reset.count('"${key_args[@]}"'), 2)
+        # Every ferry re-apply call rides the array — opencode's per-config
+        # loop, the claude wrappers, and (v1.40.0) the cline pre-seed; empty
+        # when no key was stored.
+        self.assertEqual(reset.count('"${key_args[@]}"'), 3)
         self.assertIn("c.get('api_key') or c.get('master_key'", reset)
 
     def test_client_to_host_never_promotes_a_device_key_to_master(self):
@@ -1510,6 +1512,53 @@ class ClientNameTest(ClientHarness):
         prof = self.read_json(".config", "ferry", "client.json")
         self.assertEqual(prof["master_key"], "sk-test-name-and-key")
         self.assertEqual(prof["name"], self.expected_name())
+
+
+class ClineTestCase(ClientHarness):
+    """v1.40.0 — the Cline (VS Code) pre-seed rides the same bootstrap.
+
+    client.json records a cline_mode exactly like opencode_mode/claude_mode:
+    the default is "full" (seat-01: the target Macs have no VS Code yet, so
+    pre-seeding a machine before first launch IS the supported flow — there is
+    no CLI detection to fail), and --no-cline records "none" and must leave
+    ~/.cline entirely alone. The full run's observable is the file the
+    extension would otherwise have nothing pointing at: ~/.cline/data/
+    globalState.json with act mode on the "openai" (OpenAI Compatible)
+    provider and the base URL at the stub host.
+    """
+
+    def test_full_bootstrap_seeds_the_cline_provider(self):
+        self.run_script(BOOTSTRAP)
+
+        self.assertEqual(
+            self.read_json(".config", "ferry", "client.json").get("cline_mode"),
+            "full")
+        gs_path = self.path(".cline", "data", "globalState.json")
+        if not os.path.exists(gs_path):
+            # The bootstrap's cline step drives the ferry monolith it just
+            # DOWNLOADED from the host, so before the checkout's ./build.zsh
+            # regenerates it with the cline module, the step warn-fails with
+            # "Unknown command: cline" and nothing is pre-seeded.
+            self.fail("~/.cline/data/globalState.json was not written — the "
+                      "bootstrap's `ferry cline` step failed (expected until "
+                      "the post-wave ./build.zsh puts cline in the monolith)")
+        with open(gs_path) as f:
+            gs = json.load(f)
+        self.assertEqual(gs["actModeApiProvider"], "openai")
+        self.assertEqual(gs["openAiBaseUrl"],
+                         f"http://127.0.0.1:{self.port}/v1")
+
+    def test_no_cline_records_none_and_never_creates_the_cline_dir(self):
+        self.run_script(BOOTSTRAP, "--no-cline")
+
+        self.assertEqual(
+            self.read_json(".config", "ferry", "client.json").get("cline_mode"),
+            "none")
+        # The whole tree stays untouched — a user's chat history and
+        # checkpoints live under ~/.cline, so "no cline scope" means the
+        # directory is not even created.
+        self.assertFalse(os.path.exists(self.path(".cline")),
+                         "--no-cline created ~/.cline anyway")
 
 
 if __name__ == "__main__":

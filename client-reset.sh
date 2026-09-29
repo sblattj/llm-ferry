@@ -43,6 +43,11 @@
 # absent on a pre-claude profile — means the machine never opted in, and the
 # step is skipped. A reset re-applies scope, it never widens it.
 #
+# Cline (VS Code) is read the same way again: "cline_mode" out of client.json.
+# "full" re-runs `ferry cline --host/--port` so the provider files under
+# ~/.cline catch up with the host; anything else — "none", or the key absent —
+# means the machine never opted in, and the step is skipped.
+#
 # The MASTER KEY (v1.22.0) is threaded the same way: read out of client.json
 # and passed to the CLI as --key ONLY when the bootstrap stored one — never
 # printed, and never invented for a profile that has none.
@@ -88,7 +93,7 @@ echo "================================================================="
 # Injected value wins; otherwise the last bootstrap's profile. We never prompt:
 # a reset is a catch-up on a machine that has already been set up, so if there
 # is no profile the right answer is the bootstrap, not an interactive guess.
-saved_host=""; saved_share=""; saved_port=""; saved_mode=""; saved_key=""
+saved_host=""; saved_share=""; saved_port=""; saved_mode=""; saved_cline=""; saved_key=""
 if [[ -f "$CLIENT_JSON" ]]; then
   saved=$(python3 - "$CLIENT_JSON" <<'PYEOF'
 import json, sys
@@ -96,7 +101,7 @@ try:
     c = json.load(open(sys.argv[1]))
 except Exception:
     c = {}
-print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}\t{c.get('api_key') or c.get('master_key','')}")
+print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}\t{c.get('cline_mode','')}\t{c.get('api_key') or c.get('master_key','')}")
 PYEOF
 )
   # Peel the fields off one at a time. A `##*\t` shortcut for the last field
@@ -106,6 +111,7 @@ PYEOF
   saved_port="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
   saved_mode="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
   saved_claude="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
+  saved_cline="${rest%%$'\t'*}";  rest="${rest#*$'\t'}"
   saved_key="$rest"
 fi
 
@@ -132,6 +138,17 @@ case "$CLAUDE_MODE" in
      CLAUDE_MODE="none" ;;
 esac
 
+# Cline scope: read the same way as Claude Code, with the same semantics —
+# absent key on a pre-cline profile reads as "none", and an unrecognised value
+# is treated as none with a warning, not an error (no flag to override it
+# with, and skipping is the safe direction).
+CLINE_MODE="${saved_cline:-none}"
+case "$CLINE_MODE" in
+  full|none) ;;
+  *) echo "Warning: unrecognised cline_mode '$CLINE_MODE' in $CLIENT_JSON — skipping Cline."
+     CLINE_MODE="none" ;;
+esac
+
 [[ "$HOST_NAME"  == "HOST_MDNS_PLACEHOLDER"  ]] && HOST_NAME="$saved_host"
 [[ "$SHARE_PORT" == "SHARE_PORT_PLACEHOLDER" ]] && SHARE_PORT="${saved_share:-8095}"
 HOST_PORT="${HOST_PORT:-${saved_port:-8090}}"
@@ -151,6 +168,10 @@ esac
 case "$CLAUDE_MODE" in
   full) echo "claude scope:   FULL (claude-ferry / claude-ferry-local re-applied)" ;;
   none) echo "claude scope:   NONE (skipped)" ;;
+esac
+case "$CLINE_MODE" in
+  full) echo "cline scope:    FULL (~/.cline provider files re-applied)" ;;
+  none) echo "cline scope:    NONE (skipped)" ;;
 esac
 [[ -n "$OC_MODE_OVERRIDE" ]] && echo "                (flag override for this run; client.json is not rewritten)"
 echo "================================================================="
@@ -210,6 +231,7 @@ echo "    \033[1;32mCLI updated: $FERRY_BIN\033[0m"
 echo ""
 RESET_FAILED=0
 CLAUDE_APPLIED=0
+CLINE_APPLIED=0
 if [[ "$OC_MODE" == "none" ]]; then
   echo ">>> opencode scope is 'none' — no config written."
   echo "    The CLI above is up to date, which is the whole reset for this machine."
@@ -285,6 +307,31 @@ if [[ "$CLAUDE_MODE" != "none" ]]; then
   fi
 fi
 
+# --- 4. Re-apply the Cline (VS Code) wiring -----------------------------------
+# Same delivery mechanism as the claude step above, so a plain `ferry update`
+# + reset delivers cline support to an already-bootstrapped machine without a
+# re-bootstrap: `ferry cline` rewrites the three provider files under ~/.cline
+# (and its own ~/.config/ferry/cline.json record) whenever client.json records
+# "cline_mode" != "none". client.json is never rewritten here, so the recorded
+# scope cannot drift.
+if [[ "$CLINE_MODE" != "none" ]]; then
+  echo ""
+  echo ">>> Re-applying the Cline (VS Code) wiring..."
+  # Same explicit --host/--port as the calls above: without them a CLI that
+  # cannot find a client profile decides it is ON the host and wires
+  # everything to 127.0.0.1. env -u OPENCODE_CONFIG for the same reason.
+  if ! env -u OPENCODE_CONFIG "$FERRY_BIN" cline \
+        --host "$HOST_NAME" --port "$HOST_PORT" "${key_args[@]}"; then
+    # Warning, not fatal, for the same reason as the claude step: the re-pull
+    # and opencode takeover — a reset's core contract — already succeeded.
+    echo "    WARNING: 'ferry cline' failed. The provider files under ~/.cline"
+    echo "    may be missing or stale (an older host CLI has no 'cline' step)."
+    echo "    Check the host serves a current CLI, then re-run this script."
+  else
+    CLINE_APPLIED=1
+  fi
+fi
+
 echo ""
 echo "================================================================="
 if [[ $RESET_FAILED -eq 1 ]]; then
@@ -305,5 +352,9 @@ echo "by a reset — re-run client-bootstrap.sh if those need refreshing."
 if [[ $CLAUDE_APPLIED -eq 1 ]]; then
   echo "Claude Code wiring re-applied: claude-ferry / claude-ferry-local in ~/.zshrc"
   echo "(claude_mode scope from client.json; its block is the one ~/.zshrc write a reset makes)."
+fi
+if [[ $CLINE_APPLIED -eq 1 ]]; then
+  echo "Cline (VS Code) wiring re-applied: provider files under ~/.cline"
+  echo "(cline_mode scope from client.json)."
 fi
 echo "================================================================="

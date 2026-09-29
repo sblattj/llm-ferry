@@ -46,6 +46,52 @@
     ]
   },
 
+  "cline_vscode": {
+    "extension": "Cline — saoudrizwan.claude-dev",
+    "marketplace_install": "code --install-extension saoudrizwan.claude-dev",
+    "_warning": "Close VS Code before writing these files: the Cline extension caches its config in memory and can overwrite your edits when it exits. Easiest of all: run `ferry cline` on the client — it writes exactly this, snapshots first.",
+    "files": {
+      "~/.cline/data/globalState.json": {
+        "actModeApiProvider": "openai",
+        "planModeApiProvider": "openai",
+        "openAiBaseUrl": "http://your-mac.local:8090/v1",
+        "actModeOpenAiModelId": "heavy",
+        "planModeOpenAiModelId": "heavy",
+        "openAiHeaders": { "X-Ferry-Client": "your-laptop" },
+        "welcomeViewCompleted": true
+      },
+      "~/.cline/data/secrets.json": {
+        "openAiApiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>"
+      },
+      "~/.cline/data/settings/providers.json": {
+        "version": 1,
+        "lastUsedProvider": "openai-compatible",
+        "modes": {},
+        "providers": {
+          "openai-compatible": {
+            "settings": {
+              "provider": "openai-compatible",
+              "baseUrl": "http://your-mac.local:8090/v1",
+              "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
+              "model": "heavy",
+              "headers": { "X-Ferry-Client": "your-laptop" }
+            },
+            "updatedAt": "<ISO8601 UTC timestamp>",
+            "tokenSource": "manual"
+          }
+        }
+      }
+    },
+    "_notes": [
+      "chmod 600 ~/.cline/data/secrets.json — it holds the key in plain JSON.",
+      "The key must be non-empty even on a keyless LAN: Cline only sends an Authorization header when a key exists.",
+      "actModeApiProvider must be written as \"openai\" — a fresh install defaults it to \"openrouter\", and then Cline silently ignores providers.json entirely.",
+      "The provider id duality is Cline's own: extension state spells it \"openai\" (meaning OpenAI-Compatible), providers.json spells it \"openai-compatible\". Both files are required.",
+      "To pin a fleet, add \"X-Ferry-Fleet\": \"<fleet>\" to openAiHeaders and to the providers.json headers — a static file can't read $FERRY_FLEET, so the value is baked in by hand (or by `ferry cline` when the variable is set).",
+      "Merge into existing files: keep every key Cline already wrote that isn't shown here."
+    ]
+  },
+
   "cursor_ide": {
     "section": "Settings -> Models -> OpenAI-Compatible",
     "override_baseURL": "http://your-mac.local:8090/v1",

@@ -86,6 +86,7 @@ case "$COMMAND" in
   opencode)      cmd_opencode "$@" ;;
   claude)        cmd_claude "$@" ;;
   auth-claude)   cmd_auth_claude "$@" ;;
+  cline)         cmd_cline "$@" ;;
   fleet)         cmd_fleet "$@" ;;
   keys)          cmd_keys "$@" ;;
   update)        cmd_update "$@" ;;

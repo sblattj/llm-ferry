@@ -1,9 +1,9 @@
 #!/bin/zsh
 # client-cleanup.sh — remove every trace of llm-ferry from a CLIENT laptop.
 # The inverse of client-bootstrap.sh: uninstall the ferry CLI, delete the
-# client profile and ferry-written opencode + claude configs, strip the shell
-# wrappers (opencode and claude) and the host-code alias from ~/.zshrc, and
-# remove the guardrail files bootstrap installed.
+# client profile and ferry-written opencode + claude + cline configs, strip
+# the shell wrappers (opencode and claude) and the host-code alias from
+# ~/.zshrc, and remove the guardrail files bootstrap installed.
 #
 #   curl -fsSL http://<host>:<share-port>/client-cleanup.sh | zsh
 #   curl -fsSL http://<host>:<share-port>/client-cleanup.sh | zsh -s -- --full
@@ -90,12 +90,48 @@ else
 fi
 echo ""
 
+# --- 2b. Capture the Cline record BEFORE ~/.config/ferry goes ----------------
+# Section 3 deletes ~/.config/ferry wholesale, which takes ferry's own cline
+# record (~/.config/ferry/cline.json) with it — but the Cline unwire in
+# section 5b needs the host/port/key `ferry cline` wrote WITH, to prove a
+# base URL or API key is ferry's before taking it out. Both records are read
+# here, cline.json first (it is what `ferry cline` actually recorded);
+# client.json is the fallback for host/port and for the key cline.json
+# omits when it is "local" (v1.39.0 device keys are stored as api_key in
+# either file; both spellings are read). When neither file exists (never
+# opted in, or a half-cleaned machine) everything stays empty and section 5b
+# stays best-effort: only the "local" key spelling remains provable.
+CLINE_HOST=""; CLINE_PORT=""; CLINE_KEY=""
+cline_rec=$(python3 - "$HOME/.config/ferry/cline.json" "$HOME/.config/ferry/client.json" <<'PYEOF'
+import json, sys
+rec = {}
+for p in sys.argv[1:]:          # first record that carries a key wins
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        continue
+    if not isinstance(d, dict):
+        continue
+    for k in ("host", "port", "api_key", "master_key"):
+        if k not in rec and d.get(k) is not None:
+            rec[k] = str(d.get(k))
+key = rec.get("api_key") or rec.get("master_key") or ""
+print(f"{rec.get('host','')}\t{rec.get('port','')}\t{key}")
+PYEOF
+)
+CLINE_HOST="${cline_rec%%$'\t'*}"; cline_rest="${cline_rec#*$'\t'}"
+CLINE_PORT="${cline_rest%%$'\t'*}"
+CLINE_KEY="${cline_rest#*$'\t'}"
+
 # --- 3. Remove the client profile + ferry-written opencode profiles ---------
 # The whole directory goes, which also takes the claude profile
-# (~/.config/ferry/claude.json) and the client.json "claude_mode" key with it —
-# there is no scenario where client.json survives this script.
+# (~/.config/ferry/claude.json), the cline record (~/.config/ferry/cline.json)
+# and the client.json "claude_mode"/"cline_mode" keys with it — there is no
+# scenario where client.json survives this script. Section 2b already read out
+# what the cline unwire needs; nothing else looks back.
 echo ">>> Removing ~/.config/ferry (client profile, opencode lane profiles,"
-echo "    claude profile, last-lane marker, takeover snapshots)..."
+echo "    claude + cline records, last-lane marker, takeover snapshots)..."
 if [[ -d "$HOME/.config/ferry" ]]; then
   run rm -rf "$HOME/.config/ferry"
   echo "    Removed ~/.config/ferry"
@@ -518,6 +554,146 @@ else
 fi
 echo ""
 
+# --- 5b. Unwire Cline (VS Code) ----------------------------------------------
+# `ferry cline` writes three provider files under ~/.cline —
+# data/globalState.json, data/secrets.json and data/settings/providers.json —
+# and keeps a <file>.<UTC>.ferry.bak snapshot beside each before the first
+# modify per run. NEVER rm -rf ~/.cline: the user's chat history and
+# checkpoints live there and are not ferry's to delete. Per file:
+#   - snapshots present -> restore the NEWEST one's content into the live
+#     file and delete every snapshot: the recorded pre-ferry state beats any
+#     strip we could compute, and the restore makes the newest one redundant.
+#   - no snapshots      -> strip only the keys ferry wrote, and only while
+#     they still prove out as ferry's (the guards in the python below): the
+#     base URL must still point at the host:port captured in section 2b, the
+#     API key must equal the recorded master_key or "local", and
+#     lastUsedProvider goes only while it still names openai-compatible.
+CLINE_DATA="$HOME/.cline/data"
+# The base the guards compare against; empty when section 2b found no record
+# at all, which is the "cannot prove ownership" case, not a URL of ":".
+CLINE_BASE=""
+[[ -n "$CLINE_HOST" && -n "$CLINE_PORT" ]] && CLINE_BASE="$CLINE_HOST:$CLINE_PORT"
+unwire_cline_file() {   # <path> <globalstate|secrets|providers> <host:port> <key>
+  python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import json, sys
+
+path, kind, base, key = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+ferry_url = f"http://{base}/v1" if base else ""
+
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    print("    Could not parse as JSON — leaving it untouched.")
+    sys.exit(0)
+if not isinstance(cfg, dict):
+    print("    Could not parse as JSON — leaving it untouched.")
+    sys.exit(0)
+
+# Decide everything BEFORE touching the file (same rule as the opencode
+# unwire above): nothing provably ferry's means a byte-for-byte no-op.
+removed, note = [], ""
+if kind == "globalstate":
+    if not base:
+        note = "no recorded host:port to prove the base URL is ferry's"
+    elif cfg.get("openAiBaseUrl") == ferry_url:
+        # The exact key set `ferry cline` writes (DESIGN §2), no more.
+        for k in ("actModeApiProvider", "planModeApiProvider", "openAiBaseUrl",
+                  "actModeOpenAiModelId", "planModeOpenAiModelId",
+                  "openAiHeaders", "welcomeViewCompleted"):
+            if k in cfg:
+                del cfg[k]
+                removed.append(k)
+elif kind == "secrets":
+    v = cfg.get("openAiApiKey")
+    # "local" is always provably ferry's spelling; anything else must equal
+    # the master_key a record actually holds. A user's own OpenAI key never
+    # matches either and survives.
+    if isinstance(v, str) and (v == "local" or (key and v == key)):
+        del cfg["openAiApiKey"]
+        removed.append("openAiApiKey")
+elif kind == "providers":
+    provs = cfg.get("providers")
+    entry_url = None
+    if isinstance(provs, dict):
+        entry = provs.get("openai-compatible")
+        if isinstance(entry, dict) and isinstance(entry.get("settings"), dict):
+            entry_url = entry["settings"].get("baseUrl")
+    if not base:
+        note = "no recorded host:port to prove the entry is ferry's"
+    elif entry_url == ferry_url and isinstance(provs, dict):
+        del provs["openai-compatible"]
+        removed.append("providers.openai-compatible")
+    # Independent guard by design: lastUsedProvider goes only while it still
+    # names the openai-compatible entry ferry selected.
+    if cfg.get("lastUsedProvider") == "openai-compatible":
+        del cfg["lastUsedProvider"]
+        removed.append("lastUsedProvider")
+
+if not removed:
+    if note:
+        print(f"    {note[0].upper()}{note[1:]} — file left unchanged.")
+    else:
+        print("    Nothing provably ferry's — file left unchanged.")
+    sys.exit(0)
+
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+for k in removed:
+    print(f"    Removed '{k}'")
+PYEOF
+}
+
+if [[ -d "$CLINE_DATA" ]]; then
+  echo ">>> Unwiring the Cline (VS Code) provider files under $HOME/.cline ..."
+  for spec in \
+    "$CLINE_DATA/globalState.json|globalstate" \
+    "$CLINE_DATA/secrets.json|secrets" \
+    "$CLINE_DATA/settings/providers.json|providers"
+  do
+    c_path="${spec%%|*}"; c_kind="${spec#*|}"
+    echo "    -> $c_path"
+    if [[ ! -f "$c_path" ]]; then
+      echo "       Not present — skipping."
+      continue
+    fi
+    # Snapshots first: restoring the pre-ferry state beats any strip. The Om
+    # glob flag sorts by mtime ascending, so the LAST entry is the newest.
+    c_baks=("$c_path".*.ferry.bak(NOm))
+    if [[ ${#c_baks} -gt 0 ]]; then
+      c_newest="${c_baks[-1]}"
+      if [[ $DRY_RUN -eq 1 ]]; then
+        echo "       [dry-run] would restore ${c_newest##*/} into $c_path"
+        echo "       [dry-run] would delete ${#c_baks} ferry snapshot(s)"
+      else
+        run cp "$c_newest" "$c_path"
+        for c_b in "${c_baks[@]}"; do run rm -f "$c_b"; done
+        echo "       Restored ${c_newest##*/} (newest pre-ferry snapshot)"
+        echo "       Removed ${#c_baks} ferry snapshot(s)"
+      fi
+      continue
+    fi
+    if [[ $DRY_RUN -eq 1 ]]; then
+      case "$c_kind" in
+        globalstate) c_probe='"openAiBaseUrl"' ;;
+        secrets)     c_probe='"openAiApiKey"' ;;
+        providers)   c_probe='"openai-compatible"' ;;
+      esac
+      if grep -q "$c_probe" "$c_path" 2>/dev/null; then
+        echo "       [dry-run] would strip the ferry keys from $c_path (ownership-guarded)"
+      else
+        echo "       Nothing ferry-shaped found — file would be left alone."
+      fi
+      continue
+    fi
+    unwire_cline_file "$c_path" "$c_kind" "$CLINE_BASE" "$CLINE_KEY"
+  done
+else
+  echo ">>> Cline (VS Code): $HOME/.cline not present — skipping."
+fi
+echo ""
+
 # --- 6. Remove the skill/command files installed into opencode's global dirs
 echo ">>> Removing the bundled opencode skills and commands"
 echo "    (/fan-out + spawning-subagents + using-the-goal-plugin)..."
@@ -563,5 +739,7 @@ fi
 echo "Left in place on purpose:"
 echo "  - the opencode binary itself (it is not ferry's)"
 [[ $FULL -eq 0 ]] && echo "  - $OC_DATA (your session history; --full --yes removes it)"
+echo "  - ~/.cline itself (Cline chat history/checkpoints are not ferry's;"
+echo "    only the ferry provider wiring was unwired above)"
 echo "Open a NEW terminal so the stripped wrappers/aliases unload."
 echo "================================================================="

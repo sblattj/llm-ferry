@@ -324,6 +324,11 @@ class TestLaneAllowed(unittest.TestCase):
         self.assertFalse(K.lane_allowed(["domestic.flash"], "flash", "international.flash"))
         self.assertFalse(K.lane_allowed(["flash"], "heavy", "domestic.heavy"))
         self.assertTrue(K.lane_allowed(["heavy"], "orch", "orch"))
+        self.assertTrue(K.lane_allowed(["flash"], "light", "light"))
+        self.assertTrue(K.lane_allowed(["flash"], "light", "domestic.flash"))
+        self.assertTrue(K.lane_allowed(["super-flash"], "super-light", "super-light"))
+        self.assertFalse(K.lane_allowed(["flash"], "super-light", "super-light"))
+        self.assertFalse(K.lane_allowed(["heavy"], "light", "light"))
         self.assertFalse(K.lane_allowed(["flash"], None, None))
 
 

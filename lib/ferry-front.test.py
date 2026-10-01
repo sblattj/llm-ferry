@@ -1623,6 +1623,27 @@ class TestResolveModel(unittest.TestCase):
             self.assertEqual(FF.resolve_model(legacy, "domestic", "host", self.state),
                              "domestic.heavy")
 
+    def test_generic_light_tiers_resolve_as_flash_lanes(self):
+        for alias, lane in (("light", "flash"), ("super-light", "super-flash")):
+            self.assertEqual(FF.resolve_model(alias, "domestic", "host", self.state),
+                             "domestic." + lane)
+            self.assertEqual(FF.resolve_model(alias, "international", "host", self.state),
+                             "international." + lane)
+            # no header: the host's sticky selection ("international") wins
+            self.assertEqual(FF.resolve_model(alias, "", "host", self.state),
+                             "international." + lane)
+            # no selection: the host-wide default
+            self.assertEqual(FF.resolve_model(alias, "", "stephens-laptop", self.state),
+                             "domestic." + lane)
+
+    def test_a_fleet_qualified_alias_passes_through_like_qualified_orch(self):
+        for name in ("domestic.light", "domestic.super-light", "domestic.orch"):
+            self.assertEqual(FF.resolve_model(name, "international", "host", self.state), name)
+
+    def test_near_miss_alias_names_are_untouched(self):
+        for name in ("lights", "super_light", "Light", "medium-light"):
+            self.assertEqual(FF.resolve_model(name, "domestic", "host", self.state), name)
+
     # pass-through
     def test_an_unknown_name_is_untouched(self):
         # litellm 404s it exactly as it does today: the resolver never invents
@@ -1636,7 +1657,7 @@ class TestResolveModel(unittest.TestCase):
         # Pre-fleets config: no dotted names, nothing is rewritten and
         # nothing raises, whatever the header or sticky selection says.
         state = FF.FleetState(self.path, {})
-        for name in ("heavy", "orch", "flash", "local-orch", "anything"):
+        for name in ("heavy", "orch", "flash", "light", "super-light", "local-orch", "anything"):
             self.assertEqual(FF.resolve_model(name, "domestic", "host", state), name)
 
     # errors
@@ -2098,6 +2119,14 @@ class TestFleetMiddleware(FleetHarness):
             self.drive_body(self.mw(app), "/v1/chat/completions",
                             json.dumps({"model": name}).encode())
             self.assertEqual(json.loads(app.body)["model"], "domestic.heavy", name)
+
+    def test_generic_light_tiers_resolve_to_flash_lanes(self):
+        for name, want in (("light", "domestic.flash"),
+                           ("super-light", "domestic.super-flash")):
+            app = BodyApp()
+            self.drive_body(self.mw(app), "/v1/chat/completions",
+                            json.dumps({"model": name}).encode())
+            self.assertEqual(json.loads(app.body)["model"], want, name)
 
     def test_messages_and_responses_paths_are_rewritten_too(self):
         for path in ("/v1/messages", "/v1/responses", "/chat/completions"):

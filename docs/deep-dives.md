@@ -364,7 +364,7 @@ Then, in a terminal wider than 120 columns, `ctrl+p` → **Plugins** lists an *E
 
 **Never touched:** the rest of `~/.prime` (sessions, login) and `settings.json` (ferry does not set a default provider; it prints `prime-agent --provider ferry --model heavy` instead). Cleanup restores the newest `.ferry.bak` snapshot and deletes the rest, then runs a guarded text-surgical strip of `providers.ferry` (only while its `baseUrl` is the recorded ferry host, or, with no record, while it carries the `X-Ferry-Client` header); `models.json` itself is never deleted.
 
-**Unverified.** Config shape and the URL join were read from the prime-agent source, but ferry has not been exercised against a live `prime-agent` binary, and whether a running prime-agent daemon re-reads `models.json` without a restart is unknown.
+**Verified end to end against prime-agent 0.9.8.** `ferry prime` on a host, then `prime-agent --provider ferry --model heavy -p ...`, answered a plain prompt and completed a tool-using task (a Python call that wrote a file); `--model flash` answered too, and every request reached the front door as `POST /v1/chat/completions` with a 200. Still unknown: whether a running prime-agent daemon re-reads `models.json` without a restart, so restart it after re-running `ferry prime`.
 
 ## Fleets — configuration detail
 

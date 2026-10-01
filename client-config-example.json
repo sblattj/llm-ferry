@@ -111,7 +111,7 @@
 
   "prime_agent": {
     "tool": "Prime Agent — curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
-    "_warning": "Easiest of all: run `ferry prime` on the client — it edits models.json surgically (other providers and comments kept) and snapshots first. Not yet end-to-end tested against a live prime-agent.",
+    "_warning": "Easiest of all: run `ferry prime` on the client — it edits models.json surgically (other providers and comments kept) and snapshots first. Verified end to end against prime-agent 0.9.8.",
     "file": "~/.prime/agent/models.json   (or $PRIME_AGENT_CODING_AGENT_DIR/models.json)",
     "content": {
       "providers": {

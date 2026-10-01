@@ -316,13 +316,19 @@ def status(entry, now=None) -> str:
     return "active"
 
 
+# Mirrors ferry_front.LANE_ALIASES: an aliased bare name counts as its target.
+LANE_ALIASES = {"orch": "heavy", "orchestrator": "heavy",
+                "light": "flash", "super-light": "super-flash"}
+
+
 def lane_allowed(lanes, requested, resolved) -> bool:
     """Whether a key restricted to `lanes` may use this request's model.
 
     `lanes` may name bare lanes ("flash": any fleet's flash) or fleet lanes
     ("domestic.flash": only that one). Both the model the client sent and
     the one fleet resolution produced are checked, and orch/orchestrator
-    count as heavy, mirroring ferry_front.LEGACY_HEAVY."""
+    count as heavy and light/super-light as flash/super-flash, mirroring
+    ferry_front.LANE_ALIASES."""
     if lanes is None:
         return True
     candidates = set()
@@ -331,8 +337,8 @@ def lane_allowed(lanes, requested, resolved) -> bool:
             candidates.add(model)
             if "." in model:
                 candidates.add(model.split(".", 1)[1])
-            if model in ("orch", "orchestrator"):
-                candidates.add("heavy")
+            if model in LANE_ALIASES:
+                candidates.add(LANE_ALIASES[model])
     return bool(candidates & set(lanes))
 
 

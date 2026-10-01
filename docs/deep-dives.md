@@ -208,7 +208,7 @@ The lower-level and recovery forms remain available when needed:
 curl -fsSL http://your-mac.local:8095/client-reset.sh | zsh  # lower-level client reset
 ```
 
-By default the MLX lanes are **left running** — `ferry up --route` re-reads the same `litellm.yaml` the stack uses, and litellm reaches the GPU lanes over HTTP on loopback, so a lane does not care that its front door restarted. Only `--full` reloads ~33GB of weights.
+The local GPU lanes are **opt-in** (`FERRY_LOCAL=1` or `ferry up --with-local`); `--full` relaunches them only if you opted in or they were running when the reset began, otherwise it is a clean cloud-only restart. By default the MLX lanes are **left running** — `ferry up --route` re-reads the same `litellm.yaml` the stack uses, and litellm reaches the GPU lanes over HTTP on loopback, so a lane does not care that its front door restarted. Only `--full` reloads ~33GB of weights.
 
 **The route config is validated before anything live is touched.** litellm does not check its config beyond parsing it, so a duplicate key, a dangling `model_group_alias`, a fallback naming a lane that does not exist, or an unset `os.environ/…` reference all start cleanly and then fail at request time, on one lane, looking exactly like a provider outage. `host-reset.sh` checks all four while the old proxy is still serving and aborts without restarting anything, so a bad edit costs a failed reset rather than an endpoint.
 
@@ -515,7 +515,7 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 
 **Known issues on the `local-sub` (Nemotron) lane (measured 2026-08-25):**
 
-- **`nemotron_h` continuous-batching crash (mlx-vlm) — patched automatically.** The batching engine passes both `input_ids` and `inputs_embeds`; the `nemotron_h` `LanguageModel.__call__` forwards both to a backbone that requires exactly one → `ValueError: Provide exactly one of inputs or inputs_embeds` on **every** request. `ferry install` and `host-bootstrap.sh` now apply the two-line fix to `.../site-packages/mlx_vlm/models/nemotron_h/language.py` after installing mlx-vlm. The patch is idempotent and no-ops once upstream fixes the call site — but note that **any manual `uv tool install mlx-vlm --force` wipes it**, so re-run `ferry install` after upgrading mlx-vlm yourself.
+- **`nemotron_h` continuous-batching crash (mlx-vlm) — patched automatically.** The batching engine passes both `input_ids` and `inputs_embeds`; the `nemotron_h` `LanguageModel.__call__` forwards both to a backbone that requires exactly one → `ValueError: Provide exactly one of inputs or inputs_embeds` on **every** request. `ferry install --with-local` and `host-bootstrap.sh --with-local` (the local models are opt-in) apply the two-line fix to `.../site-packages/mlx_vlm/models/nemotron_h/language.py` after installing mlx-vlm. The patch is idempotent and no-ops once upstream fixes the call site — but note that **any manual `uv tool install mlx-vlm --force` wipes it**, so re-run `ferry install` after upgrading mlx-vlm yourself.
 - **Flaky `task`-tool calls.** Nemotron frequently emits malformed task calls (hallucinated `task_id`, missing `description`) that opencode rejects *before the tool runs* — the model then silently retries the identical broken call (measured: 444 consecutive errors; also 22 identical 38-token retries). Fix shipped: `client-bootstrap.sh` installs a `/fan-out` command and a `spawning-subagents` skill into `~/.config/opencode/` (in the default scope; a `--profiles-only` / `--no-opencode` client opts in with `--with-guardrails`). The recipe must sit in the **user message** (`/fan-out` does this); placing it in system instructions made failures worse. With it: 3/3 valid parallel task calls, zero schema errors. This matters less now that Nemotron is the *subagent* lane rather than the driver — but it still applies to whatever small local model is driving.
 - **Residual model limits.** Bare tool calls (read/write/bash) are reliable; single delegation works. Complex multi-brief orchestration exceeds the 30B model — it duplicates briefs or stops to ask clarifying questions instead of integrating. This is exactly why it sits on `local-sub` and `local-orch` (Qwen) drives.
 - **Headless-run doom signature.** Watch the *server* log (opencode's `--format json` stream lags and misses in-flight loops): 3+ consecutive requests with identical generated-token counts and `finish_reason=tool_calls` = kill it.
@@ -524,17 +524,17 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 
 | Port | Purpose | Started by |
 |---|---|---|
-| **8090** | The endpoint — every lane, for every client | `ferry up` |
+| **8090** | The endpoint — every lane, for every client | `ferry up` (cloud lanes; `--with-local` adds the GPU lanes) |
 | **8091** | Live route-proxy dashboard (localhost only) | `ferry dash` |
-| **8092** | `local-orch` MLX backend (**internal** — clients use 8090) | `ferry up` |
-| **8093** | `local-sub` MLX backend (**internal** — clients use 8090) | `ferry up` |
+| **8092** | `local-orch` MLX backend (**internal** — clients use 8090) | `ferry up --with-local` |
+| **8093** | `local-sub` MLX backend (**internal** — clients use 8090) | `ferry up --with-local` |
 | **8094** | Dedicated `schematron` extraction door — ONLY that lane, served beside the main endpoint | `ferry up --schematron` |
 | **8095** | LAN share server — client bootstrap, model/file ferry routes, client telemetry | `ferry share` |
 | **8096** | HuggingFace pass-through proxy (experimental) | `ferry serve-hf` |
 | **8097** | General HTTP(S) download forward proxy | `ferry serve-proxy` |
 | **8098** | Reverse-relay control port — a client dials this to register, then publishes one of its own local ports through the host | `ferry relay` |
 | **8099** | Browser VNC viewer + WebSocket bridge onto ports published with `ferry expose-vnc` | `ferry serve-vnc` |
-| **8100** | `local-schematron` MLX backend (**internal** — clients use 8090, or the 8094 door). 8100 and not a gap in 8090-8099 because that block is full | `ferry up`, `ferry up --schematron` |
+| **8100** | `local-schematron` MLX backend (**internal** — clients use 8090, or the 8094 door). 8100 and not a gap in 8090-8099 because that block is full | `ferry up --with-local`, `ferry up --schematron` |
 | **9099** | Default netcat port for direct `ferry send` / `ferry receive` | `ferry send` / `ferry receive` |
 | **3001 / 8429 / 9428 / 9092** | Grafana / VictoriaMetrics / VictoriaLogs / metrics exporter (localhost only) | `ferry dash --grafana` |
 

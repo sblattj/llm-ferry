@@ -22,7 +22,7 @@ _FERRY_PASSTHROUGH_CMDS=(dash)
 
 # Commands that take NO arguments. Anything after them is an error (exit 2)
 # rather than being silently ignored while the command runs.
-_FERRY_NOARG_CMDS=(install reload status share log)
+_FERRY_NOARG_CMDS=(reload status share log)
 
 if [[ $# -lt 1 ]]; then
   usage
@@ -60,7 +60,7 @@ if (( ${_FERRY_NOARG_CMDS[(Ie)$COMMAND]} )) && [[ $# -gt 0 ]]; then
 fi
 
 case "$COMMAND" in
-  install)       cmd_install ;;
+  install)       cmd_install "$@" ;;
   up)            cmd_up "$@" ;;
   down)          cmd_down "$@" ;;
   reload)        cmd_reload ;;

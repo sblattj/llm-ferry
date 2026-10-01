@@ -106,6 +106,9 @@ Commands:
   cline              [Dual] Point Cline (VS Code) at this ferry host: writes
                        the ~/.cline provider config (openai-compatible lane)
                         ferry cline [--host H] [--port P] [--key K] [--model LANE] [--data-dir DIR] [--keep N]
+  prime              [Dual] Point Prime Agent at this ferry host: adds a 'ferry'
+                       provider to its models.json (openai-completions lanes)
+                        ferry prime [--host H] [--port P] [--key K] [--model LANE] [--agent-dir DIR] [--keep N]
   fleet              [Dual] Read or switch which fleet (routing set) bare lane
                        names resolve to
                         ferry fleet ls | show | use <fleet> [--default] | use --clear

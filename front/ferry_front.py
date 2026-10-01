@@ -736,6 +736,14 @@ def filter_catalogue(payload: bytes, public: frozenset[str]) -> bytes | None:
 CLOUD_LANES = ("heavy", "medium", "flash", "super-flash")
 LOCAL_LANES = frozenset({"local-orch", "local-sub"})
 LEGACY_HEAVY = frozenset({"orch", "orchestrator"})
+# Bare aliases folded onto a cloud lane BEFORE fleet resolution. `orch` is the
+# legacy driver name; `light`/`super-light` are the generic tier names a
+# client may send instead of the flash lanes. Bare names only: a fleet-
+# qualified alias (`domestic.light`) passes through untouched, exactly like
+# `domestic.orch`. Aliases are NOT advertised in /v1/models (neither is
+# `orch`). ferry_keys.LANE_ALIASES mirrors this map.
+LANE_ALIASES = {"orch": "heavy", "orchestrator": "heavy",
+                "light": "flash", "super-light": "super-flash"}
 FLEET_HEADER = b"x-ferry-fleet"
 CLIENT_HEADER = b"x-ferry-client"
 FLEET_PATH = "/v1/ferry/fleet"
@@ -984,7 +992,8 @@ def resolve_model(model: str, header_fleet: str, identity: str,
 
     Precedence, first match wins (spec §4): an explicit fleet prefix, a local
     lane, the X-Ferry-Fleet header, the caller's sticky selection, the
-    host-wide default. `orch`/`orchestrator` are folded into `heavy` first.
+    host-wide default. `orch`/`orchestrator` fold into `heavy` and `light`/`super-light`
+    into `flash`/`super-flash` first (LANE_ALIASES).
     Anything that is not a cloud lane after that fold passes through untouched
     so litellm answers it exactly as it does today."""
     if not isinstance(model, str) or not model:
@@ -999,7 +1008,7 @@ def resolve_model(model: str, header_fleet: str, identity: str,
         return model
     if model in LOCAL_LANES:
         return model
-    lane = "heavy" if model in LEGACY_HEAVY else model
+    lane = LANE_ALIASES.get(model, model)
     if lane not in CLOUD_LANES:
         return model
     fleet = (header_fleet or "").strip()

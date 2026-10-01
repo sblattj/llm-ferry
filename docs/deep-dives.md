@@ -254,7 +254,7 @@ router.py:6357   fallback_model_group is None -> raise original_exception
 
 Alias → target resolution lives at `router.py:9278`, on the deployment-selection path that lookup never reaches. So an aliased lane matches no `fallbacks:` entry, its primary's error goes straight to the client, and the entire chain is skipped — silently, because the config and `/v1/models` both look correct. Verified 2026-08-28 against a live stack whose primary was quota-blocked: the alias returned `500`; the real `model_name` returned `200` from the second hop.
 
-**Duplicate the deployment instead.** To keep a legacy name alive, give it a real `model_name` of its own rather than an alias — one extra block. (`heavy`'s own legacy names, `orch`/`orchestrator`, are the one case that needs no block at all: the front door's `LEGACY_HEAVY` map resolves them to `heavy` since fleets, 2026-09-04 — see [Fleets](../README.md#fleets).) A worker lane like `flash` still needs its **own** `fallbacks:` entry — not an alias of it — to keep failing over to its hop; here's the pattern for a hypothetical `flash-v1` rename:
+**Duplicate the deployment instead.** To keep a legacy name alive, give it a real `model_name` of its own rather than an alias — one extra block. (`heavy`'s own legacy names, `orch`/`orchestrator`, are the one case that needs no block at all: the front door's `LANE_ALIASES` map resolves them to `heavy` since fleets, 2026-09-04; the same map folds the generic `light`/`super-light` onto `flash`/`super-flash` — see [Fleets](../README.md#fleets).) A worker lane like `flash` still needs its **own** `fallbacks:` entry — not an alias of it — to keep failing over to its hop; here's the pattern for a hypothetical `flash-v1` rename:
 
 ```yaml
 model_list:

@@ -384,12 +384,13 @@ class VerifierCase(unittest.TestCase):
                           "title": {"model": f"ferry/{house}"}},
             }))
 
-    def verify(self, port, opencode_config=_UNSET, master_key=_UNSET, secrets=None):
+    def verify(self, port, opencode_config=_UNSET, master_key=_UNSET, secrets=None,
+               local_wanted="1"):
         # 5th argv: the secrets.env path, which the verifier reads (never
         # sources) to find LITELLM_MASTER_KEY when the shell has none.
         if secrets is None:
             secrets = os.path.join(self.home, ".config", "ferry", "secrets.env")
-        return run_python(self.src, [port, self.cfg, 9992, 9993, secrets],
+        return run_python(self.src, [port, self.cfg, 9992, 9993, secrets, local_wanted],
                           home=self.home, opencode_config=opencode_config,
                           master_key=master_key)
 
@@ -442,6 +443,18 @@ class VerifierCase(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("DOWN", r.stdout)
         self.assertIn("--full", r.stdout)
+
+    def test_a_dead_local_backend_is_not_a_fault_when_local_is_opt_out(self):
+        # v1.42.0: the local GPU lanes are opt-in. With them off by design, a
+        # closed MLX port is the expected state, not "DOWN ... --full".
+        for n in ("default", "cloud", "local"):
+            self.write_oc(n, ("orch", "flash", "super-flash"))
+        r = self.verify(self.serve(["orch", "flash", "flash-gem", "local-orch"]),
+                        local_wanted="0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("DOWN", r.stdout)
+        self.assertIn("opt-in", r.stdout)
+        self.assertIn("--with-local", r.stdout)
 
     # --- v1.22.0: master_key gating on the catalogue route --------------------
     def test_verifier_sends_the_bearer_when_the_key_is_available(self):
@@ -617,7 +630,7 @@ class ScriptShapeCase(unittest.TestCase):
         self.assertIn('Authorization", f"Bearer', verifier)
         self.assertIn("secrets_path", verifier)
         # ...and the shell side must hand the secrets path to the verifier.
-        self.assertIn('"$LOCAL_SUB_PORT" "$SECRETS" <<\'PYEOF\'', self.text)
+        self.assertIn('"$LOCAL_SUB_PORT" "$SECRETS" "$LOCAL_WANTED" <<\'PYEOF\'', self.text)
 
     def test_frees_the_share_port_before_restarting_it(self):
         # `ferry share` scans UPWARD for a free port, so starting a second server
@@ -755,6 +768,89 @@ class ScriptShapeCase(unittest.TestCase):
         self.assertLess(full_branch, down_line)
         self.assertLess(down_line, else_branch,
                         "`ferry down` must live inside the --full branch")
+
+    # --- v1.42.0: --full relaunches the local lanes only on an opt-in ---------
+    def _full_branch(self):
+        start = self.text.index("if (( FULL )); then")
+        return self.text[start:self.text.index("\nelse\n", start)]
+
+    def test_full_never_launches_the_local_lanes_unconditionally(self):
+        branch = self._full_branch()
+        # No bare `ferry up` (which a FERRY_LOCAL=1 shell would turn into the
+        # stack, but which must not be the unconditional --full path either).
+        self.assertNotRegex(branch, r'"\$FERRY_BIN" up\s*\n')
+        self.assertIn('"$FERRY_BIN" up --with-local', branch)
+        self.assertIn('"$FERRY_BIN" up --route', branch)
+
+    def test_full_decides_before_ferry_down(self):
+        branch = self._full_branch()
+        decide = branch.index("local_opted_in")
+        probe = branch.index("local_lanes_running")
+        first_down = branch.index('"$FERRY_BIN" down')
+        self.assertLess(decide, first_down)
+        self.assertLess(probe, first_down)
+
+    def test_with_local_launch_is_gated_on_the_decision(self):
+        branch = self._full_branch()
+        gate = branch.index("if (( RELAUNCH_LOCAL )); then")
+        self.assertLess(gate, branch.index('up --with-local'))
+        self.assertLess(branch.index('up --with-local'), branch.index("else", gate))
+        self.assertGreater(branch.index('up --route'), branch.index("else", gate))
+
+    def _run_helper(self, name, env_local=None, secrets_text=None, listening=False):
+        """Run the REAL helper function extracted from host-reset.sh."""
+        home = tempfile.mkdtemp(prefix="ferry-hostreset-opt-")
+        try:
+            secrets = os.path.join(home, "secrets.env")
+            if secrets_text is not None:
+                with open(secrets, "w") as f:
+                    f.write(secrets_text)
+            sock = None
+            if listening:
+                import socket
+                sock = socket.socket()
+                sock.bind(("127.0.0.1", 0))
+                sock.listen(1)
+                port = sock.getsockname()[1]
+            else:
+                port = 9  # discard port, never listening here
+            script = (f"SECRETS={secrets!r}\n"
+                      f"LOCAL_ORCH_PORT={port}\nLOCAL_SUB_PORT={port}\n"
+                      f"LOCAL_SCHEMATRON_PORT={port}\n"
+                      + script_function(name) + f"\n{name} && echo YES || echo NO\n")
+            env = dict(os.environ)
+            env.pop("FERRY_LOCAL", None)
+            if env_local is not None:
+                env["FERRY_LOCAL"] = env_local
+            r = subprocess.run(["zsh", "-c", script], capture_output=True,
+                               text=True, env=env, timeout=30)
+            if sock:
+                sock.close()
+            return r.stdout.strip()
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_opted_in_reads_env_and_secrets_like_ferry_does(self):
+        cases = [
+            (None, None, "NO"),
+            ("1", None, "YES"),
+            ("0", None, "NO"),
+            ("true", None, "NO"),
+            (None, "FERRY_LOCAL=1\n", "YES"),
+            (None, 'export FERRY_LOCAL="1"\n', "YES"),
+            # ferry sources secrets.env AFTER the shell, so the file wins.
+            ("1", "FERRY_LOCAL=0\n", "NO"),
+            ("0", "FERRY_LOCAL=1\n", "YES"),
+            (None, "# FERRY_LOCAL=1\n", "NO"),
+        ]
+        for env_local, secrets_text, want in cases:
+            with self.subTest(env=env_local, secrets=secrets_text):
+                self.assertEqual(
+                    self._run_helper("local_opted_in", env_local, secrets_text), want)
+
+    def test_running_probe_sees_a_listening_lane(self):
+        self.assertEqual(self._run_helper("local_lanes_running", listening=True), "YES")
+        self.assertEqual(self._run_helper("local_lanes_running", listening=False), "NO")
 
     def test_documents_the_full_flag(self):
         self.assertIn("--full", self.text)

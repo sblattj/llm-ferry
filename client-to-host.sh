@@ -23,8 +23,8 @@
 #   3. Seed ~/.config/ferry/litellm.yaml from litellm-route-example.yaml if it is
 #      not there yet (host-reset.sh requires the route config to exist).
 #   4. Provision host dependencies via 'ferry install' from the checkout, which
-#      is OS-aware (uv + litellm everywhere; on macOS also mlx-vlm and the
-#      ~16.6GB default models, skipped on Linux), installs the host's own shell
+#      is OS-aware (uv + litellm everywhere; on macOS also mlx-vlm; the ~42GB
+#      local models are opt-in via --with-local / FERRY_LOCAL=1), installs the host's own shell
 #      wrappers pointed at 127.0.0.1, and symlinks ferry into this checkout.
 #   5. Archive ~/.config/ferry/client.json to client.json.pre-migrate.<UTC>. This
 #      single move is what flips ferry out of CLIENT_MODE (see lib/ferry-core.zsh),
@@ -151,8 +151,8 @@ if [[ $DRY_RUN -eq 0 && $ASSUME_YES -eq 0 ]]; then
   echo "  - carry the client's master key (if any) into $SECRETS"
   echo "  - seed $ROUTE_CONFIG from the template if absent"
   if [[ $IS_MAC -eq 1 ]]; then
-    echo "  - run 'ferry install': install uv + litellm + mlx-vlm, and DOWNLOAD"
-    echo "    the ~16.6GB default local models (this is the slow part)"
+    echo "  - run 'ferry install': install uv + litellm + mlx-vlm (the ~42GB local"
+    echo "    models are OPT-IN and are NOT downloaded: 'ferry install --with-local')"
   else
     echo "  - run 'ferry install': install uv + litellm (Linux: no local GPU models)"
   fi
@@ -225,7 +225,7 @@ say ">>> Provisioning host dependencies ('ferry install')..."
 if [[ $DRY_RUN -eq 1 ]]; then
   if [[ $IS_MAC -eq 1 ]]; then
     echo "    [dry-run] zsh $APP_DIR/ferry install"
-    echo "              (installs uv + litellm + mlx-vlm, downloads ~16.6GB models,"
+    echo "              (installs uv + litellm + mlx-vlm, NO model downloads (opt-in),"
     echo "               installs host wrappers at 127.0.0.1, symlinks ~/.local/bin/ferry here)"
   else
     echo "    [dry-run] zsh $APP_DIR/ferry install"
@@ -328,7 +328,7 @@ echo "  Master key (if the route config gates it): read it from $SECRETS"
 echo ""
 echo "Next:"
 echo "    ferry status                 # per-lane health and served lane names"
-echo "    ferry up                     # serve the stack on :8090 (edit litellm.yaml first)"
+echo "    ferry up                     # serve the cloud lanes on :8090 (edit litellm.yaml first; --with-local adds the GPU lanes)"
 echo "    ferry share                  # advertise client-bootstrap.sh over the LAN (:8095)"
 echo "Open a NEW terminal so the host shell wrappers load."
 echo "To go back to being a client:  mv '$ARCHIVE' '$CLIENT_JSON'"

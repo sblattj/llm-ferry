@@ -62,6 +62,20 @@ PYEOF
 }
 
 cmd_install() {
+  # Local models (~42 GB of MLX weights) are OPT-IN: they download only with
+  # `ferry install --with-local` or FERRY_LOCAL=1 (env or secrets.env).
+  local with_local=0
+  _ferry_local_enabled && with_local=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --with-local) with_local=1; shift ;;
+      *)
+        echo "ferry install: unexpected argument '$1' (see: ferry help install)" >&2
+        exit 2
+        ;;
+    esac
+  done
+
   echo "================================================================="
   echo "               PROVISIONING LLM-FERRY SYSTEM HOST"
   echo "================================================================="
@@ -98,8 +112,14 @@ cmd_install() {
   echo ">>> Installing 'litellm' via uv..."
   uv tool install 'litellm[proxy]==1.99.0' --with 'prisma' --with 'prometheus_client' --force
 
-  # Download default local models (macOS only — Linux has no local MLX serving).
-  if (( IS_MAC )); then
+  # Download default local models (macOS only — Linux has no local MLX serving)
+  # — and only on an explicit opt-in. mlx-vlm itself (a small tool install,
+  # above) stays unconditional so `ferry up --with-local` works the moment the
+  # operator opts in; the ~42 GB of weights and the nemotron patch do not.
+  if (( IS_MAC && ! with_local )); then
+    echo ">>> Skipping local model downloads (local GPU lanes are opt-in)."
+    echo "    To fetch them: ferry install --with-local   (or set FERRY_LOCAL=1)"
+  elif (( IS_MAC )); then
     echo ">>> Downloading default local models..."
     download_model() {
       local model_id=$1

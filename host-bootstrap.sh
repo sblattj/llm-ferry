@@ -1,8 +1,23 @@
 #!/bin/zsh
 # host-bootstrap.sh — Bootstraps a new Mac to become a high-performance LAN inference host.
-# Sets up uv, installs mlx-vlm, downloads default models, and prepares the workspace.
+# Sets up uv, installs mlx-vlm, and prepares the workspace. The ~42 GB of local
+# MLX models are OPT-IN: pass --with-local (or set FERRY_LOCAL=1, in the shell or in
+# ~/.config/ferry/secrets.env) to download them; otherwise none is fetched.
 
 set -eu
+
+with_local=0
+[[ "${FERRY_LOCAL:-}" == "1" ]] && with_local=1
+if [[ -f "$HOME/.config/ferry/secrets.env" ]] \
+   && grep -qE '^[[:space:]]*(export[[:space:]]+)?FERRY_LOCAL=["'"'"']?1["'"'"']?[[:space:]]*$' "$HOME/.config/ferry/secrets.env" 2>/dev/null; then
+  with_local=1
+fi
+for arg in "$@"; do
+  case "$arg" in
+    --with-local) with_local=1 ;;
+    *) echo "host-bootstrap.sh: unexpected argument '$arg' (only --with-local is accepted)" >&2; exit 2 ;;
+  esac
+done
 
 echo "================================================================="
 echo "            BOOTSTRAPPING LLM-FERRY HOST MAC"
@@ -52,7 +67,11 @@ uv tool install 'litellm[proxy]==1.99.0' --with 'prisma' --with 'prometheus_clie
 # they use python3 stdlib, curl, tar, and nc, all present on macOS. Only the EXPERIMENTAL
 # `ferry pull --transport hf` (fetch through `ferry serve-hf`) uses the `hf`/`huggingface-cli`
 # tool, which uv installs alongside mlx-vlm above.
-echo ">>> Downloading default high-performance models (~16.6GB total)..."
+if (( ! with_local )); then
+echo ">>> Skipping local model downloads (local GPU lanes are opt-in)."
+echo "    To fetch them: re-run with --with-local, or 'ferry install --with-local' (or set FERRY_LOCAL=1)."
+else
+echo ">>> Downloading default high-performance models (~42GB total)..."
 
 download_model() {
   local model_id=$1
@@ -105,6 +124,7 @@ open(path, "w").write(src.replace(ANCHOR,
     "        # the backbone requires exactly one, so defer to inputs_embeds.\n" + GUARD + ANCHOR, 1))
 print(f"    Patched: {path}")
 PYEOF
+fi
 
 # 6. Check and recommend VRAM adjustments
 TOTAL_MEM_GB=$(sysctl -n hw.memsize 2>/dev/null | awk '{print int($1/1024/1024/1024)}')

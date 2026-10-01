@@ -10,8 +10,8 @@
 # Supports both Host Mode and Client Mode (on connecting laptops).
 #
 # Usage:
-#   ferry install                # Provision dependencies, models, and global link
-#   ferry up [options]           # [Host] Start local GPU server or cloud proxy (Gemini)
+#   ferry install [--with-local] # Provision dependencies and global link (+ local models on opt-in)
+#   ferry up [options]           # [Host] Start the cloud lanes (local GPU lanes only on --with-local / FERRY_LOCAL=1)
 #   ferry down                   # [Host] Stop all relay servers, proxies, and shares
 #   ferry status                 # [Dual] View active status, LAN IPs, and test connections
 #   ferry share                  # [Host] Expose client-bootstrap.sh over LAN
@@ -119,7 +119,7 @@ detect_mdns_name() {
 }
 
 # ---- Ports ----
-# In STACK mode (plain `ferry up`) PORT is the ONE door clients use: litellm sits
+# In STACK mode (`ferry up --with-local` / FERRY_LOCAL=1) PORT is the ONE door clients use: litellm sits
 # there and fans out to the cloud lanes plus the two MLX backends below, which
 # listen on their own ports and are NOT meant to be addressed directly by clients.
 PORT="8090"               # litellm front door — the single LAN endpoint
@@ -400,8 +400,11 @@ Usage:
   ferry <command> [options]
 
 Commands:
-  install            Install uv, litellm, and link globally (+ mlx-vlm & models on macOS)
-  up                 [Host] Start local GPU server or cloud API proxy (boots Catalog by default)
+  install            Install uv, litellm, and link globally (+ mlx-vlm on macOS)
+                        ferry install [--with-local]   # --with-local: also download the ~42 GB of
+                                                       local MLX models (or set FERRY_LOCAL=1)
+  up                 [Host] Start the cloud lanes (default) or, on opt-in, the local GPU lanes too
+                        ferry up [--with-local]   # --with-local (or FERRY_LOCAL=1) adds the 3 MLX lanes
   down               [Host] Stop all running servers (local, cloud, sharing)
                         ferry down [--port P]   # --port P: stop ONLY the ferry proxy on :P
   reload             [Host] Restart ONLY the litellm front door (re-reads the
@@ -498,7 +501,12 @@ Encrypted transfer over an UNTRUSTED channel (no LAN required):
                        ferry pickup <blob> [--to PATH] [--pass-file FILE]
 
 Options for 'up':
-  (no flags)         THE STACK — all eight lanes on one endpoint (:$PORT):
+  (no flags)         The CLOUD lanes only (:$PORT). The three local GPU lanes below
+                       (local-orch, local-sub, schematron: ~42 GB of MLX weights) are
+                       OFF unless you opt in: --with-local / -a / --all / --stack, or
+                       FERRY_LOCAL=1 (shell or ~/.config/ferry/secrets.env), which
+                       makes a no-flag 'ferry up' the full stack. THE FULL STACK is
+                       all eight lanes on one endpoint (:$PORT):
                        heavy        cloud  GPT-6 Astra (ChatGPT subscription), Sol fallback
                        medium       cloud  GPT-5.6 Terra (ChatGPT subscription), OpenRouter Terra fallback
                        flash        cloud  GPT-5.6 Luna (OpenRouter), Gemini/Terra fallbacks
@@ -514,7 +522,9 @@ Options for 'up':
                      address :$PORT and pick a lane by name. The cloud extractor
                      is still reachable, as its own lane 'schematron-cloud' —
                      nothing falls back to it from 'schematron'.
-  -a, --all, --stack Same as no flags (explicit form)
+  -a, --all, --stack, --with-local
+                     The FULL STACK: cloud lanes + the three local GPU lanes
+                       (explicit opt-in; same as a no-flag 'ferry up' when FERRY_LOCAL=1)
   -l, --local, --local-orch
                      Launch ONLY the local orchestrator lane ($LOCAL_MODEL_ORCH)
                        [macOS / Apple Silicon only]
@@ -539,12 +549,14 @@ Options for 'up':
                         Since v1.36.0 it also starts the lane's local MLX backend on
                         :$LOCAL_SCHEMATRON_PORT — or REUSES it untouched if the main
                         stack already has it warm.
-   -i, --interactive  Force launch the interactive lane/model selection catalog
+   -i, --interactive  Interactive lane/model selection catalog. If the Gemini list is
+                        unavailable it falls back to the CLOUD lanes, never a local lane
   -p, --port <port>  Override listening port [default: $PORT]
 
 Examples:
-  ferry up             # The full stack: orch + flash + local-orch + local-sub + schematron on :$PORT
-  ferry up --route     # Cloud lanes only (no GPU weights resident)
+  ferry up             # Cloud lanes only on :$PORT (no GPU weights resident); FERRY_LOCAL=1 = full stack
+  ferry up --with-local # The full stack: cloud + local-orch + local-sub + schematron on :$PORT
+  ferry up --route     # Cloud lanes only, explicitly (same as the no-flag default)
   ferry up --schematron # The extraction lane alone, on its own door (:$SCHEMATRON_PORT)
   ferry up --local-sub # Just the Nemotron subagent lane, alone on :$PORT
   ferry up --local-schematron  # Just the Schematron-8B extraction lane, alone on :$PORT
@@ -619,6 +631,20 @@ PYEOF
 }
 
 cmd_install() {
+  # Local models (~42 GB of MLX weights) are OPT-IN: they download only with
+  # `ferry install --with-local` or FERRY_LOCAL=1 (env or secrets.env).
+  local with_local=0
+  _ferry_local_enabled && with_local=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --with-local) with_local=1; shift ;;
+      *)
+        echo "ferry install: unexpected argument '$1' (see: ferry help install)" >&2
+        exit 2
+        ;;
+    esac
+  done
+
   echo "================================================================="
   echo "               PROVISIONING LLM-FERRY SYSTEM HOST"
   echo "================================================================="
@@ -655,8 +681,14 @@ cmd_install() {
   echo ">>> Installing 'litellm' via uv..."
   uv tool install 'litellm[proxy]==1.99.0' --with 'prisma' --with 'prometheus_client' --force
 
-  # Download default local models (macOS only — Linux has no local MLX serving).
-  if (( IS_MAC )); then
+  # Download default local models (macOS only — Linux has no local MLX serving)
+  # — and only on an explicit opt-in. mlx-vlm itself (a small tool install,
+  # above) stays unconditional so `ferry up --with-local` works the moment the
+  # operator opts in; the ~42 GB of weights and the nemotron patch do not.
+  if (( IS_MAC && ! with_local )); then
+    echo ">>> Skipping local model downloads (local GPU lanes are opt-in)."
+    echo "    To fetch them: ferry install --with-local   (or set FERRY_LOCAL=1)"
+  elif (( IS_MAC )); then
     echo ">>> Downloading default local models..."
     download_model() {
       local model_id=$1
@@ -727,6 +759,15 @@ cmd_install() {
   echo "    Ensure ~/.local/bin is in your PATH. Run: ferry --help"
   echo "================================================================="
 }
+# Local GPU lanes (local-orch, local-sub, local-schematron: ~42 GB of MLX
+# weights) are OPT-IN. This is the single predicate for the persistent opt-in:
+# FERRY_LOCAL=1 in the host shell or in ~/.config/ferry/secrets.env (ferry-core
+# sources that file at startup, exactly like GEMINI_API_KEY). Only the literal
+# value 1 counts; unset, empty, 0 or anything else means off.
+_ferry_local_enabled() {
+  [[ "${FERRY_LOCAL:-}" == "1" ]]
+}
+
 
 # Dynamic interactive catalog selector querying Gemini API live list
 select_model_from_catalog() {
@@ -738,8 +779,8 @@ select_model_from_catalog() {
   if [[ -z "${GEMINI_API_KEY:-}" ]]; then
     echo "Error: GEMINI_API_KEY is not set in your environment or ~/.config/ferry/secrets.env."
     echo "Please set GEMINI_API_KEY to access cloud models dynamically."
-    echo "Fallback: launching the local-orch GPU lane instead."
-    LAUNCH_MODE="local-orch"
+    echo "Fallback: serving the cloud lanes instead (local GPU lanes are opt-in)."
+    LAUNCH_MODE="route"
     return
   fi
 
@@ -747,8 +788,8 @@ select_model_from_catalog() {
   local raw_models
   if ! raw_models=$(curl -fsS -m 5 "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}" 2>/dev/null); then
     echo "WARNING: Could not connect to Gemini's server to retrieve live list."
-    echo "Fallback: launching the local-orch GPU lane instead."
-    LAUNCH_MODE="local-orch"
+    echo "Fallback: serving the cloud lanes instead (local GPU lanes are opt-in)."
+    LAUNCH_MODE="route"
     return
   fi
 
@@ -803,9 +844,10 @@ chat_models.sort(key=lambda x: x[0], reverse=True)
 
 # Generate list of options
 options = []
-# Option 1 is ALWAYS the full stack: every lane on one endpoint. Options 2-4 are the
-# single GPU lanes for when you want ONE model on :8090 and nothing else resident.
-options.append(("stack", "FULL STACK - orch + flash (cloud) + local-orch + local-sub + schematron (GPU), one endpoint"))
+# Option 1 is the CLOUD lanes (the safe default: Enter, no tty, or a bad number
+# all land here). The local GPU lanes below are opt-in: choosing one is explicit.
+options.append(("route", "CLOUD LANES - heavy/medium/flash/super-flash via litellm, one endpoint (no GPU weights resident)"))
+options.append(("stack", "FULL STACK (opt-in, ~42GB of weights) - cloud lanes + local-orch + local-sub + schematron (GPU), one endpoint"))
 options.append(("local-orch", "Local GPU Qwen 3.8-27B nvfp4 only (local-orch lane, APC + speculative MTP)"))
 options.append(("local-sub", "Local GPU NVIDIA Nemotron 3 Nano 30B A3B NVFP4 only (local-sub lane)"))
 options.append(("local-schematron", "Local GPU Schematron-8B 8-bit only (local-schematron lane, HTML->JSON)"))
@@ -820,7 +862,7 @@ sys.stderr.write("==============================================================
 for idx, (m_id, label) in enumerate(options, 1):
     sys.stderr.write(f"  {idx}) {label}\n")
 sys.stderr.write("=================================================================\n")
-sys.stderr.write(f"Select a lane to launch (1-{len(options)}) [Default: 1 = full stack]: ")
+sys.stderr.write(f"Select a lane to launch (1-{len(options)}) [Default: 1 = cloud lanes]: ")
 sys.stderr.flush()
 
 try:
@@ -843,9 +885,11 @@ PYEOF
      || "$chosen_model" == "local-orch" || "$chosen_model" == "local-sub" \
      || "$chosen_model" == "local-schematron" ]]; then
     LAUNCH_MODE="$chosen_model"
+  elif [[ "$chosen_model" == "route" ]]; then
+    LAUNCH_MODE="route"
   elif [[ "$chosen_model" == "__ERROR:"* ]]; then
-    echo "Error parsing live models. Falling back to the full stack."
-    LAUNCH_MODE="stack"
+    echo "Error parsing live models. Falling back to the cloud lanes (local GPU lanes are opt-in)."
+    LAUNCH_MODE="route"
   else
     LAUNCH_MODE="cloud"
     CLOUD_MODEL="$chosen_model"
@@ -877,8 +921,9 @@ _ferry_cloud_key_var() {
 }
 
 # ---- Stack helpers ---------------------------------------------------------
-# `ferry up` (no args) runs the STACK: litellm on $PORT is the ONE door clients
-# use, and it fans out to the cloud lanes plus two MLX servers on internal ports.
+# `ferry up --with-local` (or FERRY_LOCAL=1) runs the STACK: litellm on $PORT is the
+# ONE door clients use, and it fans out to the cloud lanes plus the MLX servers
+# on internal ports. A plain `ferry up` serves the cloud lanes only.
 # These helpers exist so the stack and the single-lane flags launch MLX the same
 # way — one launch line, one governor, no drift between them.
 
@@ -1212,24 +1257,34 @@ cmd_up() {
     exit 1
   fi
 
-  local LAUNCH_MODE="stack" # Default if arguments parsed override it
+  # Default: the CLOUD lanes only. The local GPU lanes start only on an explicit
+  # opt-in: --with-local / -a / --all / --stack, a single-lane flag, -i choosing
+  # one, or FERRY_LOCAL=1 (env or ~/.config/ferry/secrets.env).
+  local LAUNCH_MODE="route"
+  local local_off_banner=0
+  if _ferry_local_enabled; then
+    LAUNCH_MODE="stack"
+  else
+    local_off_banner=1
+  fi
   local CLOUD_PROVIDER=""
   local CLOUD_MODEL=""
   local target_port="$PORT"
   local port_given=0
   local skip_catalog=0
 
-  # No arguments = the FULL STACK (all four lanes on one endpoint). The
-  # interactive catalog, which used to be the no-arg default, now lives behind -i.
+  # No arguments = the default above (cloud lanes; the full stack only when
+  # FERRY_LOCAL=1). The interactive catalog, which used to be the no-arg
+  # default, now lives behind -i.
   if [[ $# -eq 0 ]]; then
-    LAUNCH_MODE="stack"
     skip_catalog=1
   fi
   
   if (( ! skip_catalog )); then
     while [[ $# -gt 0 ]]; do
       case "$1" in
-        -a|--all|--stack)
+        -a|--all|--stack|--with-local)
+          # Explicit opt-in to the local GPU lanes: cloud + all three MLX lanes.
           LAUNCH_MODE="stack"
           skip_catalog=1
           shift
@@ -1536,6 +1591,10 @@ cmd_up() {
     echo ">>> Serving the CLOUD lanes via litellm route config:"
     echo "    Config: $FERRY_ROUTE_CONFIG"
     echo "    Port:   $target_port"
+    if (( local_off_banner )); then
+      echo "    Local GPU lanes are OFF (local-orch, local-sub, local-schematron)."
+      echo "    Opt in with:  ferry up --with-local    (or set FERRY_LOCAL=1)"
+    fi
 
     _ferry_reset_log "$cloud_log"
     if ! _ferry_launch_front "$FERRY_ROUTE_CONFIG" "$target_port" "$cloud_log"; then
@@ -8496,7 +8555,7 @@ _FERRY_PASSTHROUGH_CMDS=(dash)
 
 # Commands that take NO arguments. Anything after them is an error (exit 2)
 # rather than being silently ignored while the command runs.
-_FERRY_NOARG_CMDS=(install reload status share log)
+_FERRY_NOARG_CMDS=(reload status share log)
 
 if [[ $# -lt 1 ]]; then
   usage
@@ -8534,7 +8593,7 @@ if (( ${_FERRY_NOARG_CMDS[(Ie)$COMMAND]} )) && [[ $# -gt 0 ]]; then
 fi
 
 case "$COMMAND" in
-  install)       cmd_install ;;
+  install)       cmd_install "$@" ;;
   up)            cmd_up "$@" ;;
   down)          cmd_down "$@" ;;
   reload)        cmd_reload ;;

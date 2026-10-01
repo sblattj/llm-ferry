@@ -5,8 +5,8 @@
 # Supports both Host Mode and Client Mode (on connecting laptops).
 #
 # Usage:
-#   ferry install                # Provision dependencies, models, and global link
-#   ferry up [options]           # [Host] Start local GPU server or cloud proxy (Gemini)
+#   ferry install [--with-local] # Provision dependencies and global link (+ local models on opt-in)
+#   ferry up [options]           # [Host] Start the cloud lanes (local GPU lanes only on --with-local / FERRY_LOCAL=1)
 #   ferry down                   # [Host] Stop all relay servers, proxies, and shares
 #   ferry status                 # [Dual] View active status, LAN IPs, and test connections
 #   ferry share                  # [Host] Expose client-bootstrap.sh over LAN
@@ -114,7 +114,7 @@ detect_mdns_name() {
 }
 
 # ---- Ports ----
-# In STACK mode (plain `ferry up`) PORT is the ONE door clients use: litellm sits
+# In STACK mode (`ferry up --with-local` / FERRY_LOCAL=1) PORT is the ONE door clients use: litellm sits
 # there and fans out to the cloud lanes plus the two MLX backends below, which
 # listen on their own ports and are NOT meant to be addressed directly by clients.
 PORT="8090"               # litellm front door — the single LAN endpoint

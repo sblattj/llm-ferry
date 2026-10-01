@@ -128,7 +128,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 
 ## Quickstart
 
-**1 · Host (your Mac).** One line installs `uv`, MLX inference (`mlx-vlm`), the cloud proxy (`litellm`), downloads the default local models (~16.6 GB), and links the `ferry` CLI globally:
+**1 · Host (your Mac).** One line installs `uv`, MLX inference (`mlx-vlm`), the cloud proxy (`litellm`), and links the `ferry` CLI globally. The local GPU lanes are **opt-in**: the ~42 GB of local models are downloaded only with `--with-local` (or `FERRY_LOCAL=1`):
 
 ```bash
 curl -fsSL https://github.com/sblattj/llm-ferry/archive/refs/heads/main.tar.gz | tar xz && ./llm-ferry-main/host-bootstrap.sh
@@ -140,7 +140,7 @@ For cloud mode, set a provider key (never commit it) and start serving:
 ```bash
 export OPENROUTER_API_KEY="..."      # or drop it in ~/.config/ferry/secrets.env
 ferry auth-claude login              # optional: Claude Pro/Max subscription lanes (browser OAuth)
-ferry up                             # interactive: pick from the host's live model catalog
+ferry up                             # serve the cloud lanes (local GPU lanes stay off); `ferry up -i` = pick from the live model catalog
 ferry share                          # print the one-liner clients run (LAN share server on 8095)
 ```
 
@@ -170,7 +170,7 @@ That's it — every editor and CLI on the client now talks to one endpoint on th
 
 ## The stack — eight lanes on one endpoint
 
-`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **stack**: eight named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus three local MLX servers.
+`ferry up -c/-m` serves **one** model. Plain **`ferry up`** serves the **cloud lanes** of the stack. **`ferry up --with-local`** (or `FERRY_LOCAL=1` in the shell or `~/.config/ferry/secrets.env`, which makes a plain `ferry up` do the same) serves the full **stack**: eight named **lanes** on a single OpenAI-compatible endpoint, driven by a [LiteLLM config](https://docs.litellm.ai/docs/proxy/configs) plus three local MLX servers. **The three local GPU lanes (~42 GB of weights) never start or download unless you opt in.**
 
 | Lane | Where it runs | What it is |
 |---|---|---|
@@ -228,7 +228,7 @@ Fleet internals — sticky-selection vs `FERRY_FLEET` visibility, the headerless
 
 ## The local GPU lanes
 
-All three GPU lanes run under `mlx-vlm` and start together with `ferry up`; each can also be served alone on `:8090` with `ferry up --local-orch` / `--local-sub` / `--local-schematron`.
+The local GPU lanes are **opt-in**. All three run under `mlx-vlm` and start together with `ferry up --with-local` (or a plain `ferry up` when `FERRY_LOCAL=1`); each can also be served alone on `:8090` with `ferry up --local-orch` / `--local-sub` / `--local-schematron`. Fetch the weights with `ferry install --with-local`. `./host-reset.sh --full` relaunches them only if you opted in or they were already running.
 
 - **`local-orch` — Qwen 3.8-27B nvfp4** (~15 GB) with an MTP speculative draft model. The heavier, more capable local model, and the only local lane with a drafter.
 - **`local-sub` — NVIDIA Nemotron 3 Nano 30B A3B NVFP4** (~18 GB). A `nemotron_h` hybrid MoE whose KV cache is ~6 KB/token — under 1 GB per 128k-token agent stream — which is what makes it the right lane for **concurrent subagents**.
@@ -337,7 +337,7 @@ Measured known issues — the `local-orch` deep-prefill streaming crash (self-re
 | **macOS (Apple Silicon)** | ✓ | ✓ |
 | **Linux / Ubuntu** | — *(macOS only)* | ✓ |
 
-**Local GPU serving uses Apple MLX and is macOS / Apple Silicon only.** On Linux, plain `ferry up` automatically degrades to the cloud lanes; serve models with `--route`, `--cloud`, or `--model <id>` against a cloud / OpenAI-compatible endpoint instead. `ferry install` on Ubuntu skips MLX and the model downloads, and may prompt you to `apt install zsh` (ferry is a zsh script); `avahi-daemon` (so `.local` mDNS names resolve) and `iproute2` are recommended.
+**Local GPU serving uses Apple MLX and is macOS / Apple Silicon only.** On Linux, `ferry up --with-local` automatically degrades to the cloud lanes (a plain `ferry up` is already cloud-only); serve models with `--route`, `--cloud`, or `--model <id>` against a cloud / OpenAI-compatible endpoint instead. `ferry install` skips the model downloads unless you pass `--with-local` (or set `FERRY_LOCAL=1`); on Ubuntu it also skips MLX, and may prompt you to `apt install zsh` (ferry is a zsh script); `avahi-daemon` (so `.local` mDNS names resolve) and `iproute2` are recommended.
 
 ## Device keys
 
@@ -370,8 +370,8 @@ Everything runs on your own hardware and network. The front door answers only re
 
 | Command | Mode | What it does |
 |---|---|---|
-| `install` | host | Install `uv`, `litellm` (+ `mlx-vlm` & default models on macOS), link `ferry` globally |
-| `up [-c\|-m <id>\|-r\|--schematron\|--local-*\|-i]` / `down [--port P]` | host | **No args → the full stack**: all eight lanes on `8090`; `-r` → cloud only; `--local-*` → one GPU lane raw; `--schematron` → the extraction lane on its own door (`8094`); `-i` → interactive catalog. `down` stops everything; `--port P` retires one door |
+| `install [--with-local]` | host | Install `uv`, `litellm` (+ `mlx-vlm` on macOS), link `ferry` globally; `--with-local` / `FERRY_LOCAL=1` also downloads the local models |
+| `up [--with-local\|-c\|-m <id>\|-r\|--schematron\|--local-*\|-i]` / `down [--port P]` | host | **No args → the cloud lanes** on `8090` (local GPU lanes off); `--with-local` / `-a` / `--stack` (or `FERRY_LOCAL=1`) → the full stack, all eight lanes; `-r` → cloud only; `--local-*` → one GPU lane raw; `--schematron` → the extraction lane on its own door (`8094`); `-i` → interactive catalog. `down` stops everything; `--port P` retires one door |
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up (host rebuilds and re-links, client re-pulls). `--full` also reloads the GPU lanes |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |
@@ -400,7 +400,7 @@ Everything runs on your own hardware and network. The front door answers only re
 
 **Does any of my data leave the LAN?** Local-lane inference never leaves the host; cloud lanes call the provider from the host over HTTPS with the host's keys. Client↔host traffic is plain HTTP on your private network behind a ferry key (the master key or a per-device key) — for hostile networks, front the endpoint with [Tailscale](#remote-access-tailscale). See [Privacy](#privacy).
 
-**Does it run on Linux?** The CLI, cloud proxy, dashboards, and LAN share/transfer run on macOS and Linux/Ubuntu. Local MLX GPU serving is macOS / Apple Silicon only — on Linux, `ferry up` degrades to the cloud lanes automatically. See [Platform support](#platform-support).
+**Does it run on Linux?** The CLI, cloud proxy, dashboards, and LAN share/transfer run on macOS and Linux/Ubuntu. Local MLX GPU serving is macOS / Apple Silicon only — on Linux, `ferry up --with-local` degrades to the cloud lanes automatically. See [Platform support](#platform-support).
 
 **Do clients need API keys?** No provider keys. A client holds one ferry key for the front door — its own [device key](#device-keys) from v1.39.0, or the shared master key on older setups; provider keys and OAuth subscription logins exist only on the host.
 

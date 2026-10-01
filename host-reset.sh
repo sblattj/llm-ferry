@@ -27,6 +27,7 @@ PORT="${FERRY_PORT:-8090}"
 SHARE_PORT="${FERRY_SHARE_PORT:-8095}"
 LOCAL_ORCH_PORT=8092
 LOCAL_SUB_PORT=8093
+LOCAL_SCHEMATRON_PORT="${FERRY_LOCAL_SCHEMATRON_PORT:-8100}"
 ROUTE_CONFIG="$HOME/.config/ferry/litellm.yaml"
 SECRETS="$HOME/.config/ferry/secrets.env"
 FERRY_BIN="$APP_DIR/ferry"
@@ -37,7 +38,11 @@ Usage: ./host-reset.sh [options]
 
   --full        Also bounce the local GPU lanes (ferry down && ferry up).
                 Reloads ~33GB of weights — minutes, and drops in-flight work.
-                Without it the MLX lanes are left running untouched and only
+                The local lanes are OPT-IN: they come back only if FERRY_LOCAL=1
+                (shell or ~/.config/ferry/secrets.env) or they were running
+                when the reset started. Otherwise --full is a clean cloud-only
+                `ferry down && ferry up` and nothing local starts.
+                Without --full the MLX lanes are left running untouched and only
                 litellm + the share server restart.
   --no-pull     Skip the git fast-forward. Use offline, or to reset onto the
                 working tree exactly as it stands.
@@ -58,6 +63,31 @@ while [[ $# -gt 0 ]]; do
 done
 
 say()  { echo "$@"; }
+
+# Local GPU lanes are opt-in. Same rule ferry applies (_ferry_local_enabled in
+# lib/ferry-serve.zsh): FERRY_LOCAL must be exactly 1, and ferry sources
+# secrets.env AFTER the shell, so a FERRY_LOCAL line there wins. Read it with a
+# dumb grep here — never source the file.
+local_opted_in() {
+  local v="${FERRY_LOCAL:-}" line
+  if [[ -f "$SECRETS" ]]; then
+    line="$(grep -E '^[[:space:]]*(export[[:space:]]+)?FERRY_LOCAL=' "$SECRETS" 2>/dev/null | tail -1)"
+    if [[ -n "$line" ]]; then
+      v="$(print -r -- "${line#*=}" | tr -d "\"'[:space:]")"
+    fi
+  fi
+  [[ "$v" == "1" ]]
+}
+
+# Is any MLX lane listening right now? Same probe the verifier uses (a plain
+# TCP connect on the lane's loopback port).
+local_lanes_running() {
+  local p
+  for p in "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" "$LOCAL_SCHEMATRON_PORT"; do
+    lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
 ok()   { echo "    \033[1;32m$*\033[0m"; }
 warn() { echo "    \033[1;33m$*\033[0m"; }
 die()  { echo "    \033[1;31mError: $*\033[0m" >&2; exit 1; }
@@ -347,9 +377,23 @@ ok "route config is valid"
 # --- 5. Restart -------------------------------------------------------------
 echo ""
 if (( FULL )); then
-  say ">>> FULL restart: stopping everything, then reloading the GPU lanes..."
-  "$FERRY_BIN" down
-  "$FERRY_BIN" up
+  # Decide BEFORE `ferry down`: afterwards nothing is listening and "were they
+  # running" is unanswerable. The local lanes return only on an opt-in.
+  RELAUNCH_LOCAL=0
+  if local_opted_in; then
+    RELAUNCH_LOCAL=1
+  elif local_lanes_running; then
+    RELAUNCH_LOCAL=1
+  fi
+  if (( RELAUNCH_LOCAL )); then
+    say ">>> FULL restart: stopping everything, then reloading the GPU lanes (opted in / were running)..."
+    "$FERRY_BIN" down
+    "$FERRY_BIN" up --with-local --port "$PORT"
+  else
+    say ">>> FULL restart: stopping everything, then relaunching the cloud lanes (local GPU lanes are opt-in and were not running)..."
+    "$FERRY_BIN" down
+    "$FERRY_BIN" up --route --port "$PORT"
+  fi
 else
   # `ferry up --route` reads the SAME litellm.yaml the stack does, so bouncing it
   # re-reads the config without touching the MLX servers — litellm reaches those
@@ -537,11 +581,20 @@ fi
 # listing as health is how a dead GPU lane stays invisible until a client hits it.
 echo ""
 say ">>> Verifying..."
-python3 - "$PORT" "$ROUTE_CONFIG" "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" "$SECRETS" <<'PYEOF' || RESET_FAILED=1
+LOCAL_WANTED=0
+if local_opted_in || (( ${RELAUNCH_LOCAL:-0} )); then
+  LOCAL_WANTED=1
+elif (( ! FULL )) && local_lanes_running; then
+  LOCAL_WANTED=1
+fi
+python3 - "$PORT" "$ROUTE_CONFIG" "$LOCAL_ORCH_PORT" "$LOCAL_SUB_PORT" "$SECRETS" "$LOCAL_WANTED" <<'PYEOF' || RESET_FAILED=1
 import json, os, re, socket, sys, urllib.error, urllib.request
 
 port, cfg_path, orch_port, sub_port, secrets_path = (
     sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5])
+# 6th argv: "1" when the operator opted in to the local GPU lanes (or they were
+# running), so a DOWN backend is a fault. "0" = local lanes are off by design.
+local_wanted = len(sys.argv) > 6 and sys.argv[6] == "1"
 
 # v1.22.0: general_settings.master_key gates /v1/models behind a bearer.
 # Resolve the key the way ferry does — shell first, then secrets.env (the same
@@ -663,6 +716,9 @@ for label, p in (("local-orch", orch_port), ("local-sub", sub_port)):
     s.close()
     if up:
         print(f"    {label} backend :{p} ✓")
+    elif not local_wanted:
+        print(f"    {label} backend :{p} off (local GPU lanes are opt-in: "
+              f"FERRY_LOCAL=1 or 'ferry up --with-local')")
     else:
         print(f"    {label} backend :{p} DOWN — calls to that lane will fail. "
               f"Reload it with: ./host-reset.sh --full")
@@ -681,7 +737,7 @@ echo "Previous opencode configs are kept beside each file as <name>.<UTC>.jsonc.
 echo "Previous cline configs are kept beside each file as <name>.<UTC>.ferry.bak."
 echo "Previous Prime Agent models.json versions are kept beside it as models.json.<UTC>.ferry.bak."
 if (( ! FULL )); then
-  echo "The GPU lanes were left running. Use --full to reload them."
+  echo "The GPU lanes were left as they were (local lanes are opt-in). Use --full to bounce them."
 fi
 echo "Catch clients up:  curl -fsSL http://<host>:$SHARE_PORT/client-reset.sh | zsh"
 echo "================================================================="

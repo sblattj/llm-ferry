@@ -55,8 +55,11 @@ Usage:
   ferry <command> [options]
 
 Commands:
-  install            Install uv, litellm, and link globally (+ mlx-vlm & models on macOS)
-  up                 [Host] Start local GPU server or cloud API proxy (boots Catalog by default)
+  install            Install uv, litellm, and link globally (+ mlx-vlm on macOS)
+                        ferry install [--with-local]   # --with-local: also download the ~42 GB of
+                                                       local MLX models (or set FERRY_LOCAL=1)
+  up                 [Host] Start the cloud lanes (default) or, on opt-in, the local GPU lanes too
+                        ferry up [--with-local]   # --with-local (or FERRY_LOCAL=1) adds the 3 MLX lanes
   down               [Host] Stop all running servers (local, cloud, sharing)
                         ferry down [--port P]   # --port P: stop ONLY the ferry proxy on :P
   reload             [Host] Restart ONLY the litellm front door (re-reads the
@@ -153,7 +156,12 @@ Encrypted transfer over an UNTRUSTED channel (no LAN required):
                        ferry pickup <blob> [--to PATH] [--pass-file FILE]
 
 Options for 'up':
-  (no flags)         THE STACK — all eight lanes on one endpoint (:$PORT):
+  (no flags)         The CLOUD lanes only (:$PORT). The three local GPU lanes below
+                       (local-orch, local-sub, schematron: ~42 GB of MLX weights) are
+                       OFF unless you opt in: --with-local / -a / --all / --stack, or
+                       FERRY_LOCAL=1 (shell or ~/.config/ferry/secrets.env), which
+                       makes a no-flag 'ferry up' the full stack. THE FULL STACK is
+                       all eight lanes on one endpoint (:$PORT):
                        heavy        cloud  GPT-6 Astra (ChatGPT subscription), Sol fallback
                        medium       cloud  GPT-5.6 Terra (ChatGPT subscription), OpenRouter Terra fallback
                        flash        cloud  GPT-5.6 Luna (OpenRouter), Gemini/Terra fallbacks
@@ -169,7 +177,9 @@ Options for 'up':
                      address :$PORT and pick a lane by name. The cloud extractor
                      is still reachable, as its own lane 'schematron-cloud' —
                      nothing falls back to it from 'schematron'.
-  -a, --all, --stack Same as no flags (explicit form)
+  -a, --all, --stack, --with-local
+                     The FULL STACK: cloud lanes + the three local GPU lanes
+                       (explicit opt-in; same as a no-flag 'ferry up' when FERRY_LOCAL=1)
   -l, --local, --local-orch
                      Launch ONLY the local orchestrator lane ($LOCAL_MODEL_ORCH)
                        [macOS / Apple Silicon only]
@@ -194,12 +204,14 @@ Options for 'up':
                         Since v1.36.0 it also starts the lane's local MLX backend on
                         :$LOCAL_SCHEMATRON_PORT — or REUSES it untouched if the main
                         stack already has it warm.
-   -i, --interactive  Force launch the interactive lane/model selection catalog
+   -i, --interactive  Interactive lane/model selection catalog. If the Gemini list is
+                        unavailable it falls back to the CLOUD lanes, never a local lane
   -p, --port <port>  Override listening port [default: $PORT]
 
 Examples:
-  ferry up             # The full stack: orch + flash + local-orch + local-sub + schematron on :$PORT
-  ferry up --route     # Cloud lanes only (no GPU weights resident)
+  ferry up             # Cloud lanes only on :$PORT (no GPU weights resident); FERRY_LOCAL=1 = full stack
+  ferry up --with-local # The full stack: cloud + local-orch + local-sub + schematron on :$PORT
+  ferry up --route     # Cloud lanes only, explicitly (same as the no-flag default)
   ferry up --schematron # The extraction lane alone, on its own door (:$SCHEMATRON_PORT)
   ferry up --local-sub # Just the Nemotron subagent lane, alone on :$PORT
   ferry up --local-schematron  # Just the Schematron-8B extraction lane, alone on :$PORT

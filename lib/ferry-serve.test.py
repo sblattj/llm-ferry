@@ -1048,6 +1048,164 @@ class TestMasterKeyProbes(unittest.TestCase):
                              "a printed command embeds a literal key value")
 
 
+class TestLocalLanesAreOptIn(unittest.TestCase):
+    """The three local MLX GPU lanes (~42 GB) never start or download unless the
+    operator opts in: `--with-local` / `-a` / `--stack`, a single-lane flag, or
+    FERRY_LOCAL=1. Source-inspection of the generated `ferry`, plus one behavioural
+    check of the real `_ferry_local_enabled` predicate."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FERRY) as fh:
+            cls.src = fh.read()
+
+    def _fn(self, name):
+        m = re.search(r"^%s\(\) \{\n.*?^\}$" % re.escape(name), self.src, re.S | re.M)
+        self.assertIsNotNone(m, "%s() is missing from ferry" % name)
+        return m.group(0)
+
+    def _cmd_up_head(self):
+        """cmd_up from its opening through the end of argument parsing."""
+        body = self._fn("cmd_up")
+        return body[:body.index("_ferry_stop_litellm")]
+
+    # ---- the predicate ----------------------------------------------------
+    def _enabled(self, **env_overrides):
+        env = dict(os.environ)
+        env.pop("FERRY_LOCAL", None)
+        env.update(env_overrides)
+        script = self._fn("_ferry_local_enabled") + "\n_ferry_local_enabled && echo ON || echo OFF\n"
+        r = subprocess.run(["zsh", "-c", script], capture_output=True, text=True,
+                           env=env, timeout=30)
+        return r.stdout.strip()
+
+    def test_only_the_literal_1_enables(self):
+        self.assertEqual(self._enabled(FERRY_LOCAL="1"), "ON")
+        for off in (None, "", "0", "true", "yes", "2", "on"):
+            with self.subTest(value=off):
+                env = {} if off is None else {"FERRY_LOCAL": off}
+                self.assertEqual(self._enabled(**env), "OFF")
+
+    def test_secrets_env_is_sourced_by_core_so_the_env_var_can_live_there(self):
+        # FERRY_LOCAL is read the way GEMINI_API_KEY is: ferry-core sources
+        # ~/.config/ferry/secrets.env before any command runs.
+        self.assertRegex(self.src, r'source "\$HOME/\.config/ferry/secrets\.env"')
+
+    # ---- ferry up ---------------------------------------------------------
+    def test_default_launch_mode_is_route_not_stack(self):
+        head = self._cmd_up_head()
+        self.assertIn('local LAUNCH_MODE="route"', head)
+        self.assertNotIn('local LAUNCH_MODE="stack"', head)
+
+    def test_stack_default_only_when_opted_in_by_env(self):
+        head = self._cmd_up_head()
+        m = re.search(r'if _ferry_local_enabled; then\n\s+LAUNCH_MODE="stack"\n\s+else', head)
+        self.assertIsNotNone(m, "FERRY_LOCAL must be the only default route to the stack")
+
+    def test_no_arg_does_not_select_the_stack(self):
+        head = self._cmd_up_head()
+        m = re.search(r'if \[\[ \$# -eq 0 \]\]; then(.*?)\n  fi', head, re.S)
+        self.assertIsNotNone(m)
+        self.assertNotIn('LAUNCH_MODE="stack"', m.group(1))
+
+    def test_with_local_and_all_and_stack_select_the_stack(self):
+        head = self._cmd_up_head()
+        m = re.search(r'-a\|--all\|--stack\|--with-local\)(.*?);;', head, re.S)
+        self.assertIsNotNone(m, "--with-local must share the -a/--all/--stack arm")
+        self.assertIn('LAUNCH_MODE="stack"', m.group(1))
+
+    def test_single_lane_flags_stay_explicit_opt_in(self):
+        head = self._cmd_up_head()
+        for flag, mode in (("-l|--local|--local-orch", "local-orch"),
+                           ("-s|--sub|--local-sub", "local-sub"),
+                           ("--local-schematron", "local-schematron"),
+                           ("-o|--orch", "local-orch"),
+                           ("--schematron", "schematron")):
+            with self.subTest(flag=flag):
+                arm = re.search(re.escape(flag) + r"\)(.*?);;", head, re.S)
+                self.assertIsNotNone(arm, "%s arm missing" % flag)
+                self.assertIn('LAUNCH_MODE="%s"' % mode, arm.group(1))
+
+    def test_the_cloud_default_says_how_to_opt_in(self):
+        body = self._fn("cmd_up")
+        m = re.search(r'elif \[\[ "\$LAUNCH_MODE" == "route" \]\]; then(.*?)\n  elif', body, re.S)
+        self.assertIsNotNone(m)
+        route = m.group(1)
+        self.assertIn("local_off_banner", route)
+        self.assertIn("Local GPU lanes are OFF", route)
+        self.assertIn("ferry up --with-local", route)
+        self.assertIn("FERRY_LOCAL=1", route)
+
+    def test_the_route_branch_never_launches_mlx_or_needs_mlx_vlm(self):
+        body = self._fn("cmd_up")
+        m = re.search(r'elif \[\[ "\$LAUNCH_MODE" == "route" \]\]; then(.*?)\n  elif', body, re.S)
+        route = m.group(1)
+        self.assertNotIn("_ferry_launch_mlx", route)
+        self.assertNotIn("_ferry_wait_http", route)
+        # The mlx_vlm.server prerequisite guard is scoped to stack/local-*/schematron.
+        self.assertRegex(body, r'if \[\[ "\$LAUNCH_MODE" == "stack" \|\| "\$LAUNCH_MODE" == local-\* '
+                               r'\|\| "\$LAUNCH_MODE" == "schematron" \]\]; then')
+
+    def test_the_stack_is_still_the_only_branch_that_launches_the_three_lanes(self):
+        body = self._fn("cmd_up")
+        stack = re.search(r'if \[\[ "\$LAUNCH_MODE" == "stack" \]\]; then(.*?)\n  elif \[\[ "\$LAUNCH_MODE" == "local-orch"',
+                          body, re.S).group(1)
+        self.assertEqual(re.findall(r'_ferry_launch_mlx "([\w-]+)"', stack),
+                         ["local-orch", "local-sub", "local-schematron"])
+
+    # ---- the -i catalog ---------------------------------------------------
+    def test_catalog_fallbacks_never_pick_a_local_lane(self):
+        body = self._fn("select_model_from_catalog")
+        # The fallbacks are every assignment OUTSIDE the explicit-choice arm.
+        explicit = re.search(r'if \[\[ "\$chosen_model" == "stack".*?LAUNCH_MODE="\$chosen_model"', body, re.S)
+        self.assertIsNotNone(explicit)
+        fallbacks = body.replace(explicit.group(0), "")
+        modes = re.findall(r'LAUNCH_MODE="([^"]+)"', fallbacks)
+        self.assertTrue(modes, "no fallback assignments found")
+        for mode in modes:
+            self.assertIn(mode, ("route", "cloud"),
+                          "a catalog fallback launches %r; fallbacks must be cloud-only" % mode)
+        self.assertNotIn("launching the local-orch GPU lane", body)
+        self.assertNotIn("Falling back to the full stack", body)
+
+    def test_catalog_default_choice_is_the_cloud_lanes(self):
+        # Enter, no tty, or an out-of-range number all fall to option 1 — which
+        # must therefore not be a local lane.
+        body = self._fn("select_model_from_catalog")
+        first = re.search(r"options = \[\]\n(?:#[^\n]*\n)*options\.append\(\(\"(\w[\w-]*)\"", body)
+        self.assertIsNotNone(first)
+        self.assertEqual(first.group(1), "route")
+        self.assertIn("[Default: 1 = cloud lanes]", body)
+        self.assertRegex(body, r'"\$chosen_model" == "route" \]\]; then\n\s+LAUNCH_MODE="route"')
+
+    def test_catalog_menu_choices_for_local_lanes_stay_explicit(self):
+        body = self._fn("select_model_from_catalog")
+        for lane in ('"stack"', '"local-orch"', '"local-sub"', '"local-schematron"'):
+            self.assertIn(lane, body)
+
+    # ---- ferry install ----------------------------------------------------
+    def test_install_skips_downloads_and_patch_by_default(self):
+        body = self._fn("cmd_install")
+        self.assertIn("--with-local) with_local=1", body)
+        self.assertIn("_ferry_local_enabled && with_local=1", body)
+        skip = body.index("if (( IS_MAC && ! with_local )); then")
+        dl = body.index('echo ">>> Downloading default local models..."')
+        patch = body.index("_ferry_patch_nemotron_batching\n")
+        self.assertLess(skip, dl)
+        self.assertLess(dl, patch)
+        # The download + patch live in the elif arm, after the skip arm.
+        self.assertRegex(body[skip:dl], r"elif \(\( IS_MAC \)\); then")
+        self.assertIn("ferry install --with-local", body[skip:dl])
+
+    def test_install_still_installs_mlx_vlm(self):
+        body = self._fn("cmd_install")
+        self.assertIn("uv tool install mlx-vlm", body)
+
+    def test_install_accepts_with_local_through_the_dispatcher(self):
+        self.assertIn('install)       cmd_install "$@" ;;', self.src)
+        self.assertNotRegex(self.src, r"_FERRY_NOARG_CMDS=\([^)]*\binstall\b")
+
+
 class TestWarnMissingKeys(unittest.TestCase):
     """2026-09-04: _ferry_warn_missing_keys is DERIVED from the route config in
     use ($FERRY_ROUTE_CONFIG), not hardcoded to GLM_API_KEY/GEMINI_API_KEY (both

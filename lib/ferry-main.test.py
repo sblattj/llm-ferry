@@ -32,7 +32,7 @@ USAGE_OWNERS = [os.path.join(HERE, m) for m in
 # Commands whose -h/--help is forwarded to a child script (see
 # _FERRY_PASSTHROUGH_CMDS in lib/ferry-main.zsh).
 PASSTHROUGH = {"dash"}
-NOARG = {"install", "reload", "status", "share", "log"}
+NOARG = {"reload", "status", "share", "log"}
 
 
 def dispatch_table():
@@ -51,7 +51,13 @@ class DispatcherHelpGuard(unittest.TestCase):
         cls.table = dispatch_table()
         with open(USAGE) as f:
             usage_vars = sorted(set(re.findall(r"\$([A-Z_][A-Z_0-9]*)", f.read())))
-        lines = ["set -eu", f'export HOME="{cls.tmp}/home"']
+        lines = ["set -eu", f'export HOME="{cls.tmp}/home"',
+                 # Containment: a stray command substitution in the usage text
+                 # (unquoted heredoc + backticks) once ran the REAL ferry up
+                 # against a live host. No PATH to reach it by, and a function
+                 # that records and refuses if anything calls it.
+                 'export PATH="/usr/bin:/bin:/usr/sbin:/sbin"',
+                 'ferry() { print -r -- "REAL-FERRY-CALLED $*" >> "$FERRY_TEST_MARKER"; return 97; }']
         lines += [f'{v}="dummy-{v}"' for v in usage_vars]
         lines.append(f"source {USAGE}")
         lines += [f"source {m}" for m in USAGE_OWNERS]
@@ -107,6 +113,25 @@ class DispatcherHelpGuard(unittest.TestCase):
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertIn(label, proc.stdout)
                     self.assertNotIn("Unknown command", proc.stdout)
+
+    def test_help_never_calls_the_real_ferry(self):
+        for argv in (["help"], ["--help"], ["help", "up"], ["up", "--help"]):
+            with self.subTest(argv=argv):
+                proc, invoked = self.run_ferry(*argv)
+                self.assertNotIn("REAL-FERRY-CALLED", invoked)
+
+    def test_usage_heredoc_has_no_command_substitution(self):
+        # The banner is an UNQUOTED heredoc (it needs $PORT etc.), so a backtick
+        # or a dollar-paren in its text EXECUTES. Use plain quotes in help prose.
+        with open(USAGE) as f:
+            text = f.read()
+        bodies = re.findall(r"cat <<EOF\n(.*?)\nEOF\n", text, re.S)
+        self.assertTrue(bodies, "no unquoted cat <<EOF heredoc in ferry-usage.zsh")
+        for body in bodies:
+            # A backslash-escaped one (the existing \$(ferry env ...) example)
+            # is literal and safe; an unescaped one executes.
+            self.assertIsNone(re.search(r"(?<!\\)" + chr(96), body))
+            self.assertIsNone(re.search(r"(?<!\\)\$\(", body))
 
     def test_help_output_is_the_commands_own_section(self):
         proc, _ = self.run_ferry("reload", "--help")

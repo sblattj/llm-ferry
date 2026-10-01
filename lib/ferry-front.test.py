@@ -21,6 +21,7 @@ No litellm import is needed: the filter and the middleware are exercised
 directly, so the suite runs offline in milliseconds.
 """
 import asyncio
+import copy
 import io
 import json
 import os
@@ -2418,6 +2419,147 @@ model_list:
             with mock.patch("sys.stderr", io.StringIO()):
                 app = FF.build_app(litellm_app=mock.AsyncMock())
         self.assertEqual(app.messages_lanes, frozenset({"domestic.heavy"}))
+
+
+# Literal capture from the wire: Codex 0.159 multi-agent hands a subagent its
+# task as an `agent_message` input item. The payload is PLAINTEXT but rides in
+# a part typed `encrypted_content`, which OpenRouter's native Responses API
+# silently drops.
+CODEX_AGENT_MESSAGE = {
+    "type": "agent_message", "id": "amsg_1", "author": "/root",
+    "recipient": "/root/pong_reply",
+    "content": [
+        {"type": "input_text",
+         "text": "Message Type: NEW_TASK\nTask name: /root/pong_reply\n"
+                 "Sender: /root\nPayload:\n"},
+        {"type": "encrypted_content",
+         "encrypted_content": "Reply with exactly: PONG-7731"},
+    ],
+}
+
+
+class TestAgentMessagePayload(FleetHarness):
+    """Codex's plaintext agent_message payload must survive OpenRouter."""
+
+    def test_the_captured_payload_becomes_an_input_text_part(self):
+        doc = {"input": [copy.deepcopy(CODEX_AGENT_MESSAGE)]}
+        self.assertTrue(FF.rewrite_agent_message_payload(doc))
+        parts = doc["input"][0]["content"]
+        self.assertEqual(parts[0], CODEX_AGENT_MESSAGE["content"][0])
+        self.assertEqual(parts[1], {"type": "input_text",
+                                    "text": "Reply with exactly: PONG-7731"})
+        for key in ("type", "id", "author", "recipient"):
+            self.assertEqual(doc["input"][0][key], CODEX_AGENT_MESSAGE[key])
+
+    def test_the_input_objects_are_copied_not_mutated(self):
+        item = copy.deepcopy(CODEX_AGENT_MESSAGE)
+        snapshot = copy.deepcopy(item)
+        doc = {"input": [item]}
+        self.assertTrue(FF.rewrite_agent_message_payload(doc))
+        self.assertEqual(item, snapshot)
+
+    def test_reasoning_encrypted_content_is_left_alone(self):
+        reasoning = {"type": "reasoning", "id": "rs_1", "summary": [],
+                     "encrypted_content": "gAAAAAopaqueblob=="}
+        doc = {"input": [reasoning, copy.deepcopy(CODEX_AGENT_MESSAGE)]}
+        self.assertTrue(FF.rewrite_agent_message_payload(doc))
+        self.assertEqual(doc["input"][0], reasoning)
+        only = {"input": [copy.deepcopy(reasoning)]}
+        before = json.dumps(only)
+        self.assertFalse(FF.rewrite_agent_message_payload(only))
+        self.assertEqual(json.dumps(only), before)
+
+    def test_other_items_and_parts_are_untouched(self):
+        other_part = {"type": "input_image", "image_url": "data:x"}
+        msg = {"type": "message", "role": "user",
+               "content": [{"type": "encrypted_content",
+                            "encrypted_content": "not an agent_message"}]}
+        agent = copy.deepcopy(CODEX_AGENT_MESSAGE)
+        agent["content"].append(other_part)
+        doc = {"input": ["plain string item", msg, agent]}
+        self.assertTrue(FF.rewrite_agent_message_payload(doc))
+        self.assertEqual(doc["input"][0], "plain string item")
+        self.assertEqual(doc["input"][1], msg)
+        self.assertEqual(doc["input"][2]["content"][2], other_part)
+
+    def test_malformed_shapes_fail_open(self):
+        shapes = [
+            {"input": "just a string"},
+            {"input": {"type": "agent_message"}},
+            {"input": [{"type": "agent_message", "content": "text"}]},
+            {"input": [{"type": "agent_message"}]},
+            {"input": [{"type": "agent_message", "content": [
+                {"type": "encrypted_content"}]}]},
+            {"input": [{"type": "agent_message", "content": [
+                {"type": "encrypted_content", "encrypted_content": 7}]}]},
+            {"input": [{"type": "agent_message", "content": [None, "x", 3]}]},
+            {"input": [None, 1, "x"]},
+            {},
+        ]
+        for doc in shapes:
+            with self.subTest(doc=doc):
+                before = json.dumps(doc)
+                self.assertFalse(FF.rewrite_agent_message_payload(doc))
+                self.assertEqual(json.dumps(doc), before)
+        self.assertFalse(FF.rewrite_agent_message_payload("not a dict"))
+        self.assertFalse(FF.rewrite_agent_message_payload(None))
+
+    def test_a_raising_pass_leaves_the_document_untouched(self):
+        class Boom(dict):
+            def get(self, *args):
+                raise RuntimeError("boom")
+        doc = {"input": [Boom(type="agent_message", content=[
+            {"type": "encrypted_content", "encrypted_content": "x"}])]}
+        self.assertFalse(FF.rewrite_agent_message_payload(doc))
+
+    def test_end_to_end_the_rewritten_bytes_reach_the_app(self):
+        app = BodyApp()
+        raw = json.dumps({"model": "domestic.heavy",
+                          "input": [CODEX_AGENT_MESSAGE]}).encode()
+        scope, sent = self.drive_body(
+            self.mw(app), "/v1/responses", raw,
+            headers=[(b"content-length", str(len(raw)).encode())])
+        self.assertEqual(collect(sent)[0]["status"], 200)
+        doc = json.loads(app.body)
+        self.assertEqual(doc["input"][0]["content"][1],
+                         {"type": "input_text",
+                          "text": "Reply with exactly: PONG-7731"})
+        self.assertNotIn(b"encrypted_content", app.body)
+        self.assertNotEqual(app.body, raw)
+        headers = dict((bytes(k).lower(), bytes(v)) for k, v in scope["headers"])
+        self.assertEqual(headers[b"content-length"], str(len(app.body)).encode())
+
+    def test_a_body_without_agent_messages_is_forwarded_byte_for_byte(self):
+        app = BodyApp()
+        # Deliberately non-compact JSON: any re-serialization would show.
+        raw = (b'{"model": "domestic.heavy",  "input": [{"type": "reasoning",'
+               b' "encrypted_content": "gAAAA=="}, "hi"]}')
+        self.drive_body(self.mw(app), "/v1/responses", raw,
+                        headers=[(b"content-length", str(len(raw)).encode())])
+        self.assertEqual(app.body, raw)
+
+    def test_other_paths_are_not_rewritten(self):
+        app = BodyApp()
+        raw = json.dumps({"model": "domestic.heavy",
+                          "input": [CODEX_AGENT_MESSAGE]}).encode()
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)
+
+    def test_the_bare_responses_alias_is_rewritten_too(self):
+        app = BodyApp()
+        raw = json.dumps({"model": "domestic.heavy",
+                          "input": [CODEX_AGENT_MESSAGE]}).encode()
+        self.drive_body(self.mw(app), "/responses", raw)
+        self.assertNotIn(b"encrypted_content", app.body)
+
+    def test_a_raising_helper_replays_the_original_bytes(self):
+        app = BodyApp()
+        raw = json.dumps({"model": "domestic.heavy",
+                          "input": [CODEX_AGENT_MESSAGE]}).encode()
+        with mock.patch.object(FF, "rewrite_agent_message_payload",
+                               side_effect=RuntimeError("boom")):
+            self.drive_body(self.mw(app), "/v1/responses", raw)
+        self.assertEqual(app.body, raw)
 
 
 class TestFleetWarn(unittest.TestCase):

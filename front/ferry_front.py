@@ -907,6 +907,62 @@ def strip_hosted_search(doc) -> list:
     return found
 
 
+# Codex CLI 0.159 (multi-agent) hands a subagent its task as an `agent_message`
+# input item on POST /v1/responses. The header rides in an `input_text` part,
+# but the PAYLOAD is PLAINTEXT sitting in a part typed `encrypted_content`:
+#   {"type":"encrypted_content","encrypted_content":"Reply with exactly: ..."}
+# litellm routes OpenRouter deployments natively to OpenRouter's /v1/responses
+# (OpenRouterResponsesAPIConfig), and OpenRouter silently DROPS that part. The
+# subagent then sees an empty "Payload:", wanders the filesystem, and the
+# parent waits forever. Retyping the part as `input_text` fixes it (A/B on the
+# identical capture, 4 runs each: verbatim 0/4 answered, retyped 4/4). The
+# rewrite is NOT lane-scoped: plaintext in an input_text part is correct for
+# every backend, and a lane check would only add a way to miss. It IS
+# path-scoped (RESPONSES_PATHS, at the call site) because `agent_message` is a
+# Responses-API item type and chat bodies must stay byte-identical.
+# `reasoning` items also carry `encrypted_content`, but those are real opaque
+# blobs and are never touched: only `agent_message` content parts are retyped.
+def rewrite_agent_message_payload(doc) -> bool:
+    """Retype plaintext `encrypted_content` parts of `agent_message` input items.
+
+    Mutates `doc["input"]` only by REPLACING it with a rebuilt list; the
+    original item and part objects are copied, never edited. Returns True only
+    when something was rewritten. Never raises: on any failure `doc` is left
+    exactly as it was and the caller forwards the original bytes."""
+    try:
+        items = doc.get("input") if isinstance(doc, dict) else None
+        if not isinstance(items, list):
+            return False
+        rebuilt = []
+        changed = False
+        for item in items:
+            parts = item.get("content") if (
+                isinstance(item, dict) and item.get("type") == "agent_message"
+            ) else None
+            if isinstance(parts, list):
+                new_parts = []
+                touched = False
+                for part in parts:
+                    if (isinstance(part, dict)
+                            and part.get("type") == "encrypted_content"
+                            and isinstance(part.get("encrypted_content"), str)):
+                        new_parts.append({"type": "input_text",
+                                          "text": part["encrypted_content"]})
+                        touched = True
+                    else:
+                        new_parts.append(part)
+                if touched:
+                    item = dict(item)
+                    item["content"] = new_parts
+                    changed = True
+            rebuilt.append(item)
+        if changed:
+            doc["input"] = rebuilt
+        return changed
+    except Exception:
+        return False
+
+
 def fleet_gaps(fleets: dict) -> list:
     """Human-readable complaints about fleets missing a cloud lane.
 
@@ -2151,6 +2207,18 @@ class LaneCatalogueFilter:
                             scope[SCHEMA_WARNINGS_KEY] = found
                     except Exception:
                         pass
+        if isinstance(doc, dict) and scope.get("path") in RESPONSES_PATHS:
+            # Codex agent_message payloads (see rewrite_agent_message_payload).
+            # Fail-open: the helper assigns doc["input"] only once it holds a
+            # complete rebuilt list, so a failure leaves `doc` as it was and
+            # `changed` untouched. The edits already made above (fleet model,
+            # complied schemas) are NOT thrown away by reparsing, and with no
+            # other edit the ORIGINAL bytes go upstream.
+            try:
+                if rewrite_agent_message_payload(doc):
+                    changed = True
+            except Exception:
+                pass
         entry = scope.get(KEY_ENTRY_SCOPE)
         if entry is not None:
             resolved = doc.get("model") if isinstance(doc, dict) else None

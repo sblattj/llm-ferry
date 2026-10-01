@@ -53,6 +53,18 @@
 # before first launch is a supported flow (there is no cline CLI to detect).
 # --no-cline skips the step entirely. The choice is recorded in client.json as
 # "cline_mode" (full / none), the same way, for client-reset.sh to re-apply.
+#
+# CODEX (the OpenAI Codex CLI) and PRIME AGENT (PrimeIntellect-ai/prime-agent)
+# are the fourth and fifth integrations, each with its own single switch and
+# decided exactly like Cline's (no CLI detection, so full is the plain default):
+#   * `ferry codex` installs the codex-ferry / codex-ferry-flash wrappers in ~/.zshrc (they carry -c overrides; ~/.codex
+#     is never touched) — baked wrappers work before Codex is installed.
+#     --no-codex skips it; recorded as "codex_mode" (full / none).
+#   * `ferry prime` adds a 'ferry' provider to Prime Agent's models.json
+#     (~/.prime/agent) — pre-seeding before prime-agent is installed is a
+#     supported flow. --no-prime skips it; recorded as "prime_mode" (full / none).
+# Both are read back by client-reset.sh; absent on an older profile reads as
+# "none" — a reset never widens.
 
 set -eu
 
@@ -68,6 +80,8 @@ OC_MODE="full"
 GUARDRAILS=""   # empty = follow the mode; 1/0 = explicit --with/--no-guardrails
 NO_CLAUDE=0
 NO_CLINE=0
+NO_CODEX=0
+NO_PRIME=0
 # The shared master key (v1.22.0): optional. Env first; an explicit --key wins.
 MASTER_KEY="${FERRY_MASTER_KEY:-}"
 
@@ -87,6 +101,10 @@ usage() {
   echo "         installed when a 'claude' CLI is on PATH)"
   echo "       --no-cline   (skip the Cline (VS Code) provider files; by default"
   echo "         ~/.cline is pre-seeded even when VS Code isn't installed yet)"
+  echo "       --no-codex   (skip the Codex CLI wrappers codex-ferry/-flash;"
+  echo "         by default they are installed even when codex isn't installed yet)"
+  echo "       --no-prime   (skip the Prime Agent models.json provider; by default"
+  echo "         ~/.prime/agent is pre-seeded even when prime-agent isn't installed yet)"
   echo "       -h | --help"
 }
 
@@ -99,6 +117,8 @@ while [[ $# -gt 0 ]]; do
     --no-guardrails)   GUARDRAILS=0; shift ;;
     --no-claude)       NO_CLAUDE=1; shift ;;
     --no-cline)        NO_CLINE=1; shift ;;
+    --no-codex)        NO_CODEX=1; shift ;;
+    --no-prime)        NO_PRIME=1; shift ;;
     --key)
       if [[ $# -lt 2 || -z "$2" ]]; then
         echo "Error: --key needs a value"; exit 1
@@ -107,7 +127,7 @@ while [[ $# -gt 0 ]]; do
     --key=*)
       MASTER_KEY="${1#--key=}"; shift ;;
     -h|--help)         usage; exit 0 ;;
-    *) echo "Unknown flag: $1"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --key KEY, --with-guardrails, --no-guardrails, --no-claude, --no-cline, --help"; exit 1 ;;
+    *) echo "Unknown flag: $1"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --key KEY, --with-guardrails, --no-guardrails, --no-claude, --no-cline, --no-codex, --no-prime, --help"; exit 1 ;;
   esac
 done
 
@@ -382,6 +402,13 @@ else
   CLINE_MODE="full"
 fi
 
+# Codex and Prime Agent scope: same reasoning as Cline — no CLI detection
+# (the wrappers are baked and work before codex exists; prime's models.json is
+# pre-seeded before prime-agent exists), so full is the default and --no-codex /
+# --no-prime are the only ways they narrow.
+CODEX_MODE="full"; [[ $NO_CODEX -eq 1 ]] && CODEX_MODE="none"
+PRIME_MODE="full"; [[ $NO_PRIME -eq 1 ]] && PRIME_MODE="none"
+
 # Write local client JSON config profile
 echo ">>> Creating client configuration profile..."
 mkdir -p "$HOME/.config/ferry"
@@ -394,6 +421,8 @@ mkdir -p "$HOME/.config/ferry"
 # cline_mode is the same idea again for the Cline (VS Code) provider files:
 # full when they were written, none when --no-cline was passed. Absent on a
 # pre-cline profile reads as "none" — a reset never widens.
+# codex_mode / prime_mode: the same again for the Codex wrappers and the Prime
+# Agent provider (full / none; absent reads as "none").
 # master_key rides in the profile ONLY when a key was supplied. Its absence is
 # how every reader (client-reset.sh, the ferry CLI) knows this host takes no
 # key — so the JSON shape below is byte-stable when MASTER_KEY is empty.
@@ -419,7 +448,9 @@ fi
   "name": "$CLIENT_NAME",
   "opencode_mode": "$OC_MODE",
   "claude_mode": "$CLAUDE_MODE",
-  "cline_mode": "$CLINE_MODE"${MASTER_KEY_JSON}
+  "cline_mode": "$CLINE_MODE",
+  "codex_mode": "$CODEX_MODE",
+  "prime_mode": "$PRIME_MODE"${MASTER_KEY_JSON}
 }
 EOF
 )
@@ -1163,8 +1194,8 @@ fi
 
 # 4b. Migration hygiene (v1.39.0). A client first bootstrapped before v1.39.0
 # had the master key baked into every ferry-written config, and `ferry
-# opencode` / `ferry claude` / `ferry cline` back each one up before rewriting
-# it. Those writers redact the master they replace; this pass also catches
+# opencode` / `ferry claude` / `ferry cline` / `ferry prime` back each one up
+# before rewriting it. Those writers redact the master they replace; this pass also catches
 # every older ferry-made backup of the same targets (and anything the writers
 # could not parse). Backups are REDACTED in place, never deleted. Only ferry's
 # own backup names are touched, and only after a successful enroll: a supplied
@@ -1179,13 +1210,16 @@ SHAPES = {
     os.path.join(home, ".config", "ferry"): re.compile(
         r"^(opencode-cloud|opencode-local|opencode-super)" + TS + r"\.jsonc$"
         r"|^claude\.json" + TS + r"\.bak$"
-        r"|^cline\.json" + TS + r"\.bak$"),
+        r"|^cline\.json" + TS + r"\.bak$"
+        r"|^prime\.json" + TS + r"\.bak$"),
     os.path.join(home, ".config", "opencode"): re.compile(
         r"^(opencode|tui)" + TS + r"\.jsonc$"),
     os.path.join(home, ".cline", "data"): re.compile(
         r"^(globalState|secrets)\.json" + TS + r"\.ferry\.bak$"),
     os.path.join(home, ".cline", "data", "settings"): re.compile(
         r"^providers\.json" + TS + r"\.ferry\.bak$"),
+    os.path.join(home, ".prime", "agent"): re.compile(
+        r"^models\.json" + TS + r"\.ferry\.bak$"),
 }
 n = 0
 for d, pat in SHAPES.items():
@@ -1237,6 +1271,49 @@ if [[ $CLINE_FAILED -eq 1 ]]; then
   echo "    set baseURL http://$HOST_NAME:$HOST_PORT/v1, apiKey $APIKEY_HINT,"
   echo "    model = a LANE NAME — or edit the ~/.cline/data files directly"
   echo "    (with VS Code closed), or re-run this script / client-reset.sh."
+fi
+
+# 4d. Codex CLI integration. `ferry codex` installs the codex-ferry wrappers
+# (a marker block in ~/.zshrc carrying `-c` overrides; ~/.codex is never read or
+# written) and the ~/.config/ferry/codex.json record. Works with codex absent.
+echo ""
+CODEX_FAILED=0
+if [[ "$CODEX_MODE" == "full" ]]; then
+  echo ">>> Wiring the Codex CLI to the host..."
+  # No --key (client.json carries it) and env -u OPENCODE_CONFIG, as for cline.
+  if ! env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" codex \
+        --host "$HOST_NAME" --port "$HOST_PORT"; then
+    CODEX_FAILED=1
+  fi
+else
+  echo ">>> Skipping Codex wiring (--no-codex)."
+fi
+if [[ $CODEX_FAILED -eq 1 ]]; then
+  echo "    WARNING: 'ferry codex' failed. By hand: run codex with"
+  echo "    -c model_provider=ferry and a model_providers.ferry table"
+  echo "    (base_url http://$HOST_NAME:$HOST_PORT/v1, wire_api=\"responses\","
+  echo "    env_key for the key $APIKEY_HINT), or re-run this script / client-reset.sh."
+fi
+
+# 4e. Prime Agent integration. `ferry prime` adds a 'ferry' custom provider to
+# Prime Agent's models.json (default ~/.prime/agent) and writes the
+# ~/.config/ferry/prime.json record. Works with prime-agent absent.
+echo ""
+PRIME_FAILED=0
+if [[ "$PRIME_MODE" == "full" ]]; then
+  echo ">>> Wiring Prime Agent to the host..."
+  if ! env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" prime \
+        --host "$HOST_NAME" --port "$HOST_PORT"; then
+    PRIME_FAILED=1
+  fi
+else
+  echo ">>> Skipping Prime Agent wiring (--no-prime)."
+fi
+if [[ $PRIME_FAILED -eq 1 ]]; then
+  echo "    WARNING: 'ferry prime' failed. By hand: add a provider to"
+  echo "    ~/.prime/agent/models.json with baseUrl http://$HOST_NAME:$HOST_PORT/v1,"
+  echo "    apiKey $APIKEY_HINT, api \"openai-completions\" and the lane names as"
+  echo "    models, or re-run this script / client-reset.sh."
 fi
 
 # 5. Wrap up
@@ -1322,6 +1399,38 @@ case "$CLINE_MODE" in
     ;;
   none)
     echo ">>> CLINE (VS CODE) WAS NOT CONFIGURED (--no-cline)."
+    ;;
+esac
+
+case "$CODEX_MODE" in
+  full)
+    echo ">>> CODEX CLI ON THE FERRY BACKEND:"
+    echo "    codex-ferry (heavy) / codex-ferry-flash (flash)"
+    echo "    are in ~/.zshrc; bare 'codex' and ~/.codex are untouched."
+    echo "    Codex not installed yet? The wrappers are in place — install it with:"
+    echo "      npm i -g @openai/codex"
+    if [[ $CODEX_FAILED -eq 1 ]]; then
+      echo "    (WARNING: the wiring step FAILED above — the wrappers may not be installed.)"
+    fi
+    ;;
+  none)
+    echo ">>> CODEX WAS NOT CONFIGURED (--no-codex)."
+    ;;
+esac
+
+case "$PRIME_MODE" in
+  full)
+    echo ">>> PRIME AGENT ON THE FERRY BACKEND:"
+    echo "    Prime Agent's models.json now has a 'ferry' provider pointing at this host."
+    echo "    Run: prime-agent --provider ferry --model heavy"
+    echo "    prime-agent not installed yet? The config is pre-seeded — install it with:"
+    echo "      curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
+    if [[ $PRIME_FAILED -eq 1 ]]; then
+      echo "    (WARNING: the wiring step FAILED above — models.json may not be written yet.)"
+    fi
+    ;;
+  none)
+    echo ">>> PRIME AGENT WAS NOT CONFIGURED (--no-prime)."
     ;;
 esac
 echo ""

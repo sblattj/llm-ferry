@@ -109,7 +109,7 @@ with acceptance criteria and rival citations: `issues/queue.jsonl` in the run di
 | 20 | P2 | api-breadth | Image-generation lanes: an `image` lane type serving `/v1/images/generations` and `/v1/images/edits` |
 | 21 | P2 | api-breadth | Audio lanes (`/v1/audio/transcriptions`, `/v1/audio/speech`) and an explicit realtime/WebSocket position |
 | 22 | P2 | api-breadth | First-class embeddings lanes behind the already-served `/v1/embeddings` |
-| 23 | P2 | api-breadth | Make the served `/v1/responses` surface first-class: a codex-ferry wrapper, docs, and streaming tests |
+| 23 | P2 | api-breadth | Make the served `/v1/responses` surface first-class: a codex-ferry wrapper, docs, and streaming tests *(codex-ferry wrapper part DONE in v1.41.0: `ferry codex` + `codex-ferry*` wrappers and docs; the streaming-tests part remains open)* |
 | 25 | P2 | observability | Opt-in session transcripts with a dash viewer (default-off, retention-bounded) |
 | 26 | P2 | observability | One loopback management API behind `ferry` verbs and Signal Studio |
 | 27 | P2 | observability | Headless host deployment: service units, `ferry install --yes`, Linux-honest status |

@@ -517,6 +517,19 @@ if ! "$FERRY_BIN" cline --host 127.0.0.1 --port "$PORT"; then
   RESET_FAILED=1
 fi
 
+# Codex CLI: like claude, the wrappers live in ~/.zshrc, so `--wrappers`
+# re-bakes just that block pointed at this host (no codex.json record on the
+# host path, same as `ferry claude --wrappers`). ~/.codex is never touched.
+if ! "$FERRY_BIN" codex --wrappers --host 127.0.0.1 --port "$PORT"; then
+  RESET_FAILED=1
+fi
+
+# Prime Agent: its provider lives in models.json (default ~/.prime/agent), so
+# like cline there is no --wrappers step; the surgical edit is idempotent.
+if ! "$FERRY_BIN" prime --host 127.0.0.1 --port "$PORT"; then
+  RESET_FAILED=1
+fi
+
 # --- 7. Verify against the running endpoint ---------------------------------
 # Nothing above proves the lanes answer. Ask the endpoint, then check the local
 # backends separately: litellm lists local-orch and local-sub whether or not an
@@ -666,6 +679,7 @@ fi
 echo "\033[1;32mHOST RESET COMPLETE\033[0m"
 echo "Previous opencode configs are kept beside each file as <name>.<UTC>.jsonc."
 echo "Previous cline configs are kept beside each file as <name>.<UTC>.ferry.bak."
+echo "Previous Prime Agent models.json versions are kept beside it as models.json.<UTC>.ferry.bak."
 if (( ! FULL )); then
   echo "The GPU lanes were left running. Use --full to reload them."
 fi

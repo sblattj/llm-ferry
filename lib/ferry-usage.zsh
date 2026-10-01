@@ -107,7 +107,7 @@ Commands:
                        the ~/.cline provider config (openai-compatible lane)
                         ferry cline [--host H] [--port P] [--key K] [--model LANE] [--data-dir DIR] [--keep N]
   codex              [Dual] Wire the OpenAI Codex CLI to the ferry endpoint: installs the
-                       codex-ferry / codex-ferry-flash / codex-ferry-local wrappers
+                       codex-ferry / codex-ferry-flash wrappers
                        (-c overrides; ~/.codex untouched) and records the lane map
                         ferry codex [--host H] [--port P] [--key K] [--wrappers]
   prime              [Dual] Point Prime Agent at this ferry host: adds a 'ferry'

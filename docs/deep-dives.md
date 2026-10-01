@@ -14,6 +14,8 @@ Forensic internals moved out of the [README](../README.md) so it stays scannable
 - [Route config forensics](#route-config-forensics)
 - [The opencode goal-plugin install internals](#the-opencode-goal-plugin-install-internals)
 - [The cline takeover internals](#the-cline-takeover-internals)
+- [Codex wiring](#codex-wiring)
+- [Prime Agent wiring](#prime-agent-wiring)
 - [Fleets — configuration detail](#fleets--configuration-detail)
 - [Event tap, schema repair & attribution](#event-tap-schema-repair--attribution)
 - [Encrypted drop — crypto detail](#encrypted-drop--crypto-detail)
@@ -341,6 +343,28 @@ Then, in a terminal wider than 120 columns, `ctrl+p` → **Plugins** lists an *E
 **The fleet header is baked, not templated.** opencode's config is evaluated by opencode, so ferry can write a live placeholder — `X-Ferry-Fleet: {env:FERRY_FLEET}` — that resolves per launch. Cline's config is a static JSON file read by a VS Code extension that never expands it, so `ferry cline` writes `X-Ferry-Fleet` into `openAiHeaders` **only when `$FERRY_FLEET` is set at the moment it runs**, baking the value in. Changing fleets means re-running `ferry cline` (or editing the header by hand) — `ferry fleet use` on the host does not reach into a client's static file.
 
 **Close VS Code first.** The extension caches its config in memory and writes it back out, so files edited under a running VS Code can be silently overwritten from memory the moment it exits or saves settings. `ferry cline` detects a running VS Code (`pgrep -f "Visual Studio Code"`), warns, and continues — the files are still correct if nothing in the extension rewrites them, but the warning is the contract. Relatedly, a machine with no VS Code yet is a supported target, not an error: pre-seeding `~/.cline` before the first launch means Cline comes up already pointed at ferry, and the one-time marketplace hint (`code --install-extension saoudrizwan.claude-dev`) is printed as a note.
+
+## Codex wiring
+
+**Codex is wired with `-c` overrides in shell functions, not config files.** `ferry codex` writes a marker block (`# >>> ferry codex profiles >>>` … `# <<< ferry codex profiles <<<`) into `~/.zshrc` defining `codex-ferry` (lane `heavy`) and `codex-ferry-flash` (`flash`). Each runs the `codex` binary with `-c model_provider=ferry` plus a `model_providers.ferry` table (`base_url=http://HOST:PORT/v1`, `wire_api="responses"`, `env_key="FERRY_CODEX_KEY"`, `http_headers` carrying `X-Ferry-Client` and, when `$FERRY_FLEET` is set at run time, `X-Ferry-Fleet`) and `-c model="<lane>"`; your own arguments come last so `-m other-lane` wins. Host, port and key are baked at install time so the wrappers work with ferry down; re-running `ferry codex` strips and rewrites the block (the same strip the claude block uses). The only other file is the record `~/.config/ferry/codex.json` (mode 0600; host, port, base URL, lane map, and the key under `api_key` for a device key or `master_key` otherwise, never mislabeled).
+
+**Why overrides and not a profile or `CODEX_HOME`.** Codex 0.158 rejects legacy `[profiles.*]`; the new-style profile is a `<name>.config.toml` file inside `~/.codex`, which ferry never writes; and a separate `CODEX_HOME` loses the ChatGPT login, history and sessions. `-c` touches nothing. The key rides in the `FERRY_CODEX_KEY` env var (config `env_key`), so it stays out of `ps`.
+
+**Subagent model names are remapped by an instruction override.** Codex's own AGENTS.md tells it to pass `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-6-astra` as subagent models, none of which ferry serves (HTTP 400 "Invalid model name"). Each wrapper therefore also passes `-c developer_instructions="FERRY ROUTING: …"` (a real Codex config key), which states the lanes that exist (`heavy`, `medium`, `flash`, `super-flash`), that the gpt-* names do not, and which to use instead: `flash` for light/mechanical work, `medium` for ordinary implementation, `heavy` for architecture/adversarial review. Like every override it is per-launch and lives in `~/.zshrc`, not in `~/.codex`.
+
+**The lane must serve `/v1/responses`.** Codex 0.158+ only speaks the Responses API (`wire_api="chat"` is removed and config load fails on it) and appends `/responses` to the base URL, which is why the base URL carries `/v1`. The ferry front door serves `/v1/responses`; a lane behind it that cannot is a lane Codex cannot use. An unknown lane name only makes Codex print a non-fatal "Model metadata for `X` not found" warning; the request is still sent. Codex's `/goal` works through the wrappers (it is a TUI feature of the Codex session).
+
+**Never touched:** `~/.codex` (config.toml, auth.json, history, sessions), `CODEX_HOME`, and bare `codex` (no function shadows it). Cleanup (`client-cleanup.sh`) strips only the marker block from `~/.zshrc` and removes `codex.json` with the rest of `~/.config/ferry`; `host-reset.sh` re-bakes the block with `ferry codex --wrappers` at `127.0.0.1`, like claude.
+
+## Prime Agent wiring
+
+**Prime Agent (`PrimeIntellect-ai/prime-agent`) keeps custom providers in `<agent dir>/models.json`** — default `~/.prime/agent`, relocated by `$PRIME_AGENT_CODING_AGENT_DIR` (or `ferry prime --agent-dir`). `ferry prime` adds one provider, `providers.ferry`: `api: "openai-completions"`, `baseUrl: http://HOST:PORT/v1` (Prime Agent appends `/chat/completions`), `apiKey` plus `authHeader: true` (so it sends `Authorization: Bearer`), `headers` with `X-Ferry-Client` (and `X-Ferry-Fleet` when set, baked at run time), a `compat` block pinning the plain OpenAI dialect (no `store`, no developer role, `max_tokens`) so a LiteLLM-fronted local lane accepts the request, and every served lane as a model (the `GET /v1/models` catalogue when reachable, else the fixed lane set). The file is `{"providers": {...}}` and is JSONC, so users keep comments in it.
+
+**The edit is text-surgical, not a JSON round trip.** The `ferry` member is replaced in place or appended to `providers`; comments, trailing commas, other providers and formatting survive byte for byte. The result is re-parsed and compared with the original before writing, and a file that cannot be parsed or edited safely is left untouched (the snippet to add by hand is printed, exit 1). `models.json` is written mode 0600 (it holds the key) and snapshotted to `models.json.<UTC>.ferry.bak` only when its content actually changes (`--keep N`, default 10); a device key replacing a master key redacts the master in those snapshots. The record is `~/.config/ferry/prime.json`.
+
+**Never touched:** the rest of `~/.prime` (sessions, login) and `settings.json` (ferry does not set a default provider; it prints `prime-agent --provider ferry --model heavy` instead). Cleanup restores the newest `.ferry.bak` snapshot and deletes the rest, then runs a guarded text-surgical strip of `providers.ferry` (only while its `baseUrl` is the recorded ferry host, or, with no record, while it carries the `X-Ferry-Client` header); `models.json` itself is never deleted.
+
+**Unverified.** Config shape and the URL join were read from the prime-agent source, but ferry has not been exercised against a live `prime-agent` binary, and whether a running prime-agent daemon re-reads `models.json` without a restart is unknown.
 
 ## Fleets — configuration detail
 

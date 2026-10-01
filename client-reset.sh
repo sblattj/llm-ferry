@@ -48,6 +48,12 @@
 # ~/.cline catch up with the host; anything else — "none", or the key absent —
 # means the machine never opted in, and the step is skipped.
 #
+# Codex and Prime Agent are read the same way: "codex_mode" / "prime_mode" out
+# of client.json. "full" re-runs `ferry codex --host/--port` (the codex-ferry
+# wrappers in ~/.zshrc) / `ferry prime --host/--port` (the 'ferry' provider in
+# Prime Agent's models.json); "none" or the key absent means never opted in,
+# and the step is skipped. Failures are warnings, not fatal.
+#
 # The MASTER KEY (v1.22.0) is threaded the same way: read out of client.json
 # and passed to the CLI as --key ONLY when the bootstrap stored one — never
 # printed, and never invented for a profile that has none.
@@ -93,7 +99,7 @@ echo "================================================================="
 # Injected value wins; otherwise the last bootstrap's profile. We never prompt:
 # a reset is a catch-up on a machine that has already been set up, so if there
 # is no profile the right answer is the bootstrap, not an interactive guess.
-saved_host=""; saved_share=""; saved_port=""; saved_mode=""; saved_cline=""; saved_key=""
+saved_host=""; saved_share=""; saved_port=""; saved_mode=""; saved_cline=""; saved_codex=""; saved_prime=""; saved_key=""
 if [[ -f "$CLIENT_JSON" ]]; then
   saved=$(python3 - "$CLIENT_JSON" <<'PYEOF'
 import json, sys
@@ -101,7 +107,7 @@ try:
     c = json.load(open(sys.argv[1]))
 except Exception:
     c = {}
-print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}\t{c.get('cline_mode','')}\t{c.get('api_key') or c.get('master_key','')}")
+print(f"{c.get('host','')}\t{c.get('share_port','')}\t{c.get('port','')}\t{c.get('opencode_mode','')}\t{c.get('claude_mode','')}\t{c.get('cline_mode','')}\t{c.get('codex_mode','')}\t{c.get('prime_mode','')}\t{c.get('api_key') or c.get('master_key','')}")
 PYEOF
 )
   # Peel the fields off one at a time. A `##*\t` shortcut for the last field
@@ -112,6 +118,8 @@ PYEOF
   saved_mode="${rest%%$'\t'*}";   rest="${rest#*$'\t'}"
   saved_claude="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
   saved_cline="${rest%%$'\t'*}";  rest="${rest#*$'\t'}"
+  saved_codex="${rest%%$'\t'*}";  rest="${rest#*$'\t'}"
+  saved_prime="${rest%%$'\t'*}";  rest="${rest#*$'\t'}"
   saved_key="$rest"
 fi
 
@@ -149,6 +157,20 @@ case "$CLINE_MODE" in
      CLINE_MODE="none" ;;
 esac
 
+# Codex / Prime Agent scope: identical semantics to Cline's above.
+CODEX_MODE="${saved_codex:-none}"
+case "$CODEX_MODE" in
+  full|none) ;;
+  *) echo "Warning: unrecognised codex_mode '$CODEX_MODE' in $CLIENT_JSON — skipping Codex."
+     CODEX_MODE="none" ;;
+esac
+PRIME_MODE="${saved_prime:-none}"
+case "$PRIME_MODE" in
+  full|none) ;;
+  *) echo "Warning: unrecognised prime_mode '$PRIME_MODE' in $CLIENT_JSON — skipping Prime Agent."
+     PRIME_MODE="none" ;;
+esac
+
 [[ "$HOST_NAME"  == "HOST_MDNS_PLACEHOLDER"  ]] && HOST_NAME="$saved_host"
 [[ "$SHARE_PORT" == "SHARE_PORT_PLACEHOLDER" ]] && SHARE_PORT="${saved_share:-8095}"
 HOST_PORT="${HOST_PORT:-${saved_port:-8090}}"
@@ -172,6 +194,14 @@ esac
 case "$CLINE_MODE" in
   full) echo "cline scope:    FULL (~/.cline provider files re-applied)" ;;
   none) echo "cline scope:    NONE (skipped)" ;;
+esac
+case "$CODEX_MODE" in
+  full) echo "codex scope:    FULL (codex-ferry wrappers in ~/.zshrc re-applied)" ;;
+  none) echo "codex scope:    NONE (skipped)" ;;
+esac
+case "$PRIME_MODE" in
+  full) echo "prime scope:    FULL (Prime Agent models.json provider re-applied)" ;;
+  none) echo "prime scope:    NONE (skipped)" ;;
 esac
 [[ -n "$OC_MODE_OVERRIDE" ]] && echo "                (flag override for this run; client.json is not rewritten)"
 echo "================================================================="
@@ -232,6 +262,8 @@ echo ""
 RESET_FAILED=0
 CLAUDE_APPLIED=0
 CLINE_APPLIED=0
+CODEX_APPLIED=0
+PRIME_APPLIED=0
 if [[ "$OC_MODE" == "none" ]]; then
   echo ">>> opencode scope is 'none' — no config written."
   echo "    The CLI above is up to date, which is the whole reset for this machine."
@@ -332,6 +364,43 @@ if [[ "$CLINE_MODE" != "none" ]]; then
   fi
 fi
 
+# --- 5. Re-apply the Codex CLI wiring ------------------------------------------
+# Same mechanism as the cline step: `ferry codex` re-bakes the codex-ferry
+# wrappers (marker block in ~/.zshrc; ~/.codex is never touched) and its
+# ~/.config/ferry/codex.json record whenever client.json records "codex_mode"
+# != "none". Warning, not fatal: the re-pull and opencode takeover already
+# succeeded. client.json is never rewritten here.
+if [[ "$CODEX_MODE" != "none" ]]; then
+  echo ""
+  echo ">>> Re-applying the Codex CLI wiring..."
+  if ! env -u OPENCODE_CONFIG "$FERRY_BIN" codex \
+        --host "$HOST_NAME" --port "$HOST_PORT" "${key_args[@]}"; then
+    echo "    WARNING: 'ferry codex' failed. The codex-ferry wrappers in ~/.zshrc"
+    echo "    may be missing or stale (an older host CLI has no 'codex' step)."
+    echo "    Check the host serves a current CLI, then re-run this script."
+  else
+    CODEX_APPLIED=1
+  fi
+fi
+
+# --- 6. Re-apply the Prime Agent wiring ----------------------------------------
+# `ferry prime` re-edits the 'ferry' provider in Prime Agent's models.json
+# (other providers/comments untouched) and ~/.config/ferry/prime.json whenever
+# client.json records "prime_mode" != "none".
+if [[ "$PRIME_MODE" != "none" ]]; then
+  echo ""
+  echo ">>> Re-applying the Prime Agent wiring..."
+  if ! env -u OPENCODE_CONFIG "$FERRY_BIN" prime \
+        --host "$HOST_NAME" --port "$HOST_PORT" "${key_args[@]}"; then
+    echo "    WARNING: 'ferry prime' failed. Prime Agent's models.json may be"
+    echo "    missing or stale (an older host CLI has no 'prime' step, or the file"
+    echo "    could not be edited safely — see the snippet above)."
+    echo "    Check the host serves a current CLI, then re-run this script."
+  else
+    PRIME_APPLIED=1
+  fi
+fi
+
 echo ""
 echo "================================================================="
 if [[ $RESET_FAILED -eq 1 ]]; then
@@ -356,5 +425,13 @@ fi
 if [[ $CLINE_APPLIED -eq 1 ]]; then
   echo "Cline (VS Code) wiring re-applied: provider files under ~/.cline"
   echo "(cline_mode scope from client.json)."
+fi
+if [[ $CODEX_APPLIED -eq 1 ]]; then
+  echo "Codex wiring re-applied: codex-ferry / codex-ferry-flash in ~/.zshrc"
+  echo "(codex_mode scope from client.json; ~/.codex untouched)."
+fi
+if [[ $PRIME_APPLIED -eq 1 ]]; then
+  echo "Prime Agent wiring re-applied: 'ferry' provider in its models.json"
+  echo "(prime_mode scope from client.json)."
 fi
 echo "================================================================="

@@ -1470,9 +1470,9 @@ class ScriptContractTest(unittest.TestCase):
         self.assertIn("master_key", reset)
         self.assertIn('key_args=(--key "$saved_key")', reset)
         # Every ferry re-apply call rides the array — opencode's per-config
-        # loop, the claude wrappers, and (v1.40.0) the cline pre-seed; empty
-        # when no key was stored.
-        self.assertEqual(reset.count('"${key_args[@]}"'), 3)
+        # loop, the claude wrappers, the cline pre-seed (v1.40.0), and the
+        # codex + prime steps (v1.41.0); empty when no key was stored.
+        self.assertEqual(reset.count('"${key_args[@]}"'), 5)
         self.assertIn("c.get('api_key') or c.get('master_key'", reset)
 
     def test_client_to_host_never_promotes_a_device_key_to_master(self):
@@ -1559,6 +1559,211 @@ class ClineTestCase(ClientHarness):
         # directory is not even created.
         self.assertFalse(os.path.exists(self.path(".cline")),
                          "--no-cline created ~/.cline anyway")
+
+
+CX_START = "# >>> ferry codex profiles >>>"
+CX_END = "# <<< ferry codex profiles <<<"
+USER_MODELS = """{
+  // my own providers — keep this comment
+  "providers": {
+    "ollama": {
+      "baseUrl": "http://localhost:11434",
+      "apiKey": "none",
+      "api": "openai-completions",
+      "models": [{ "id": "llama3" }],
+    },
+  },
+}
+"""
+
+
+class CodexPrimeTestCase(ClientHarness):
+    """v1.41.0 — `ferry codex` and `ferry prime` are first-class clients.
+
+    Same shape as the Cline tests above: client.json records codex_mode /
+    prime_mode (default "full": no CLI detection, both pre-seed before the
+    tool exists), --no-codex / --no-prime record "none" and touch nothing, a
+    reset re-applies exactly the recorded scope (absent key reads as none),
+    and cleanup unwires ONLY ferry's own wiring — ~/.codex and ~/.prime are
+    the user's and never deleted.
+    """
+
+    def models_path(self):
+        return self.path(".prime", "agent", "models.json")
+
+    def prime_baks(self):
+        d = self.path(".prime", "agent")
+        return sorted(f for f in os.listdir(d) if f.endswith(".ferry.bak")) \
+            if os.path.isdir(d) else []
+
+    def write_user_models(self):
+        os.makedirs(self.path(".prime", "agent"))
+        with open(self.models_path(), "w") as f:
+            f.write(USER_MODELS)
+
+    # --- bootstrap ------------------------------------------------------------
+    def test_full_bootstrap_wires_codex_and_prime(self):
+        out = self.run_script(BOOTSTRAP).stdout
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof.get("codex_mode"), "full")
+        self.assertEqual(prof.get("prime_mode"), "full")
+
+        rc = self.zshrc()
+        self.assertIn(CX_START, rc)
+        self.assertIn("codex-ferry-flash()", rc)
+        self.assertIn(f"http://127.0.0.1:{self.port}/v1", rc)
+        cx = self.read_json(".config", "ferry", "codex.json")
+        self.assertEqual(cx["wire_api"], "responses")
+        self.assertEqual(cx["lanes"]["codex-ferry"], "heavy")
+
+        models = self.read_json(".prime", "agent", "models.json")
+        fp = models["providers"]["ferry"]
+        self.assertEqual(fp["baseUrl"], f"http://127.0.0.1:{self.port}/v1")
+        self.assertEqual(fp["api"], "openai-completions")
+        self.assertIn("heavy", [m["id"] for m in fp["models"]])
+        self.assertEqual(self.read_json(".config", "ferry", "prime.json")["provider"], "ferry")
+
+        # install hints for the absent tools, never the installers run
+        self.assertIn("npm i -g @openai/codex", out)
+        self.assertIn("https://app.primeintellect.ai/prime-agent/install.sh", out)
+        self.assertFalse(os.path.exists(self.path(".codex")),
+                         "ferry codex wrote into ~/.codex")
+
+    def test_no_codex_and_no_prime_record_none_and_touch_nothing(self):
+        self.run_script(BOOTSTRAP, "--no-codex", "--no-prime")
+        prof = self.read_json(".config", "ferry", "client.json")
+        self.assertEqual(prof.get("codex_mode"), "none")
+        self.assertEqual(prof.get("prime_mode"), "none")
+        self.assertNotIn(CX_START, self.zshrc())
+        self.assertFalse(os.path.exists(self.path(".config", "ferry", "codex.json")))
+        self.assertFalse(os.path.exists(self.path(".config", "ferry", "prime.json")))
+        self.assertFalse(os.path.exists(self.path(".prime")),
+                         "--no-prime created ~/.prime anyway")
+        self.assertFalse(os.path.exists(self.path(".codex")))
+
+    def test_the_two_switches_are_independent(self):
+        self.run_script(BOOTSTRAP, "--no-prime")
+        self.assertIn(CX_START, self.zshrc())
+        self.assertFalse(os.path.exists(self.path(".prime")))
+        self.assertEqual(self.read_json(".config", "ferry", "client.json")["codex_mode"], "full")
+
+    # --- reset ----------------------------------------------------------------
+    def test_reset_re_applies_codex_and_prime(self):
+        self.run_script(BOOTSTRAP)
+        # break both wirings, then let the catch-up repair them
+        with open(self.path(".zshrc"), "w") as f:
+            f.write("# nothing\n")
+        os.remove(self.models_path())
+        out = self.run_script(RESET).stdout
+        self.assertIn("codex scope:    FULL", out)
+        self.assertIn("prime scope:    FULL", out)
+        self.assertIn(CX_START, self.zshrc())
+        self.assertIn("ferry", self.read_json(".prime", "agent", "models.json")["providers"])
+
+    def test_reset_skips_codex_and_prime_when_the_keys_are_absent(self):
+        """A pre-v1.41 profile never opted in; a reset must not widen it."""
+        self.run_script(BOOTSTRAP, "--no-codex", "--no-prime")
+        prof_path = self.path(".config", "ferry", "client.json")
+        prof = self.read_json(".config", "ferry", "client.json")
+        del prof["codex_mode"], prof["prime_mode"]
+        with open(prof_path, "w") as f:
+            json.dump(prof, f)
+        out = self.run_script(RESET).stdout
+        self.assertIn("codex scope:    NONE", out)
+        self.assertIn("prime scope:    NONE", out)
+        self.assertNotIn(CX_START, self.zshrc())
+        self.assertFalse(os.path.exists(self.path(".prime")))
+        self.assertEqual(self.read_json(".config", "ferry", "client.json"), prof,
+                         "reset rewrote client.json")
+
+    def test_a_failing_codex_or_prime_step_is_a_warning_not_fatal(self):
+        self.run_script(BOOTSTRAP)
+        # An unparseable models.json makes `ferry prime` refuse (exit 1).
+        with open(self.models_path(), "w") as f:
+            f.write("this is not json")
+        p = self.run_script(RESET)
+        self.assertIn("WARNING: 'ferry prime' failed", p.stdout)
+        with open(self.models_path()) as f:
+            self.assertEqual(f.read(), "this is not json")
+
+    # --- cleanup --------------------------------------------------------------
+    def test_cleanup_strips_the_codex_block_and_leaves_dot_codex(self):
+        os.makedirs(self.path(".codex"))
+        with open(self.path(".codex", "config.toml"), "w") as f:
+            f.write('model = "gpt-5"\n')
+        with open(self.path(".zshrc"), "w") as f:
+            f.write("export KEEP_ME=1\n")
+        self.run_script(BOOTSTRAP)
+        self.assertIn(CX_START, self.zshrc())
+
+        self.run_script(CLEANUP)
+
+        rc = self.zshrc()
+        self.assertNotIn(CX_START, rc)
+        self.assertNotIn("codex-ferry", rc)
+        self.assertIn("KEEP_ME", rc)
+        self.assertFalse(os.path.exists(self.path(".config", "ferry", "codex.json")))
+        with open(self.path(".codex", "config.toml")) as f:
+            self.assertEqual(f.read(), 'model = "gpt-5"\n')
+
+    def test_cleanup_restores_the_pre_ferry_models_json_from_the_snapshot(self):
+        self.write_user_models()
+        self.run_script(BOOTSTRAP)
+        self.assertTrue(self.prime_baks(), "ferry prime left no snapshot to restore")
+        with open(self.models_path()) as f:
+            self.assertIn('"ferry"', f.read())
+
+        self.run_script(CLEANUP)
+
+        with open(self.models_path()) as f:
+            self.assertEqual(f.read(), USER_MODELS)
+        self.assertEqual(self.prime_baks(), [])
+        self.assertFalse(os.path.exists(self.path(".config", "ferry", "prime.json")))
+
+    def test_cleanup_strips_only_the_ferry_provider_when_no_snapshot_exists(self):
+        self.write_user_models()
+        self.run_script(BOOTSTRAP)
+        for b in self.prime_baks():
+            os.remove(self.path(".prime", "agent", b))
+        # the user keeps editing after ferry wired it: a comment + provider
+        with open(self.models_path()) as f:
+            text = f.read()
+        with open(self.models_path(), "w") as f:
+            f.write(text + "// trailing user comment\n")
+
+        out = self.run_script(CLEANUP).stdout
+
+        self.assertIn("Removed 'providers.ferry'", out)
+        with open(self.models_path()) as f:
+            after = f.read()
+        self.assertIn("my own providers", after)
+        self.assertIn("trailing user comment", after)
+        self.assertNotIn('"ferry"', after)
+        self.assertIn("ollama", after)
+        self.assertTrue(os.path.isdir(self.path(".prime")))
+
+    def test_cleanup_leaves_a_ferry_provider_it_cannot_prove_is_its_own(self):
+        self.run_script(BOOTSTRAP)
+        for b in self.prime_baks():
+            os.remove(self.path(".prime", "agent", b))
+        m = self.read_json(".prime", "agent", "models.json")
+        m["providers"]["ferry"]["baseUrl"] = "http://elsewhere.example:9/v1"
+        with open(self.models_path(), "w") as f:
+            json.dump(m, f)
+        self.run_script(CLEANUP)
+        self.assertIn("ferry", self.read_json(".prime", "agent", "models.json")["providers"])
+
+    def test_cleanup_dry_run_changes_neither_codex_nor_prime(self):
+        self.write_user_models()
+        self.run_script(BOOTSTRAP)
+        rc_before = self.zshrc()
+        with open(self.models_path()) as f:
+            m_before = f.read()
+        out = self.run_script(CLEANUP, "--dry-run").stdout
+        self.assertEqual(self.zshrc(), rc_before)
+        with open(self.models_path()) as f:
+            self.assertEqual(f.read(), m_before)
+        self.assertIn("[dry-run]", out)
 
 
 if __name__ == "__main__":

@@ -106,6 +106,10 @@ Commands:
   cline              [Dual] Point Cline (VS Code) at this ferry host: writes
                        the ~/.cline provider config (openai-compatible lane)
                         ferry cline [--host H] [--port P] [--key K] [--model LANE] [--data-dir DIR] [--keep N]
+  codex              [Dual] Wire the OpenAI Codex CLI to the ferry endpoint: installs the
+                       codex-ferry / codex-ferry-flash / codex-ferry-local wrappers
+                       (-c overrides; ~/.codex untouched) and records the lane map
+                        ferry codex [--host H] [--port P] [--key K] [--wrappers]
   fleet              [Dual] Read or switch which fleet (routing set) bare lane
                        names resolve to
                         ferry fleet ls | show | use <fleet> [--default] | use --clear

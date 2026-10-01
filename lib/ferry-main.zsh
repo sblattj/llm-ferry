@@ -87,6 +87,7 @@ case "$COMMAND" in
   claude)        cmd_claude "$@" ;;
   auth-claude)   cmd_auth_claude "$@" ;;
   cline)         cmd_cline "$@" ;;
+  codex)         cmd_codex "$@" ;;
   fleet)         cmd_fleet "$@" ;;
   keys)          cmd_keys "$@" ;;
   update)        cmd_update "$@" ;;

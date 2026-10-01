@@ -491,13 +491,33 @@ class AgentDirTest(PrimeHarness):
         self.assertFalse(os.path.exists(env_dir))
 
 
+def _path_without_prime_agent():
+    # The inherited PATH minus every dir holding a prime-agent, so the test
+    # sees "not installed" even on a machine where it really is installed.
+    keep = [d for d in os.environ.get("PATH", "").split(os.pathsep)
+            if d and not os.access(os.path.join(d, "prime-agent"), os.X_OK)]
+    return os.pathsep.join(keep)
+
+
 class NoPrimeAgentTest(PrimeHarness):
     def test_a_missing_binary_is_a_note_not_an_error(self):
-        # An empty-ish PATH hides prime-agent but keeps the system tools the
-        # command needs (zsh, python3 resolved before; pgrep/uname in /usr/bin).
-        p = self.run_prime()
+        p = self.run_prime(env_extra={"PATH": _path_without_prime_agent()})
         self.assertIn("isn't on this machine yet", p.stdout)
         self.assertIn("install.sh", p.stdout)
+        self.assertTrue(os.path.exists(self.models))
+
+    def test_control_an_installed_binary_prints_no_note(self):
+        # CONTROL: a prime-agent on PATH must suppress the note, or the test
+        # above passes no matter what the machine has installed.
+        bindir = os.path.join(self.home, "fakebin")
+        os.makedirs(bindir, exist_ok=True)
+        fake = os.path.join(bindir, "prime-agent")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fake, 0o755)
+        path = bindir + os.pathsep + _path_without_prime_agent()
+        p = self.run_prime(env_extra={"PATH": path})
+        self.assertNotIn("isn't on this machine yet", p.stdout)
         self.assertTrue(os.path.exists(self.models))
 
 

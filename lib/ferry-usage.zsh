@@ -110,6 +110,9 @@ Commands:
                        codex-ferry / codex-ferry-flash / codex-ferry-local wrappers
                        (-c overrides; ~/.codex untouched) and records the lane map
                         ferry codex [--host H] [--port P] [--key K] [--wrappers]
+  prime              [Dual] Point Prime Agent at this ferry host: adds a 'ferry'
+                       provider to its models.json (openai-completions lanes)
+                        ferry prime [--host H] [--port P] [--key K] [--model LANE] [--agent-dir DIR] [--keep N]
   fleet              [Dual] Read or switch which fleet (routing set) bare lane
                        names resolve to
                         ferry fleet ls | show | use <fleet> [--default] | use --clear

@@ -7642,9 +7642,16 @@ except Exception as e:
     print(f"    WARNING: could not read the lane catalogue at {base}/models",
           file=sys.stderr)
     print(f"    ({e}); listing the standard lanes unchecked.", file=sys.stderr)
+served = bool(lanes)
 if not lanes:
     lanes = list(FIXED_LANES)
-elif model not in lanes:
+# The front door's tier aliases (LANE_ALIASES in front/ferry_front.py) are not
+# in /v1/models, but prime-agent only spawns a child on a model it lists — so
+# list `light` / `super-light` wherever their target lane is served.
+for alias, target in (("light", "flash"), ("super-light", "super-flash")):
+    if target in lanes and alias not in lanes:
+        lanes.append(alias)
+if served and model not in lanes:
     print(f"    WARNING: the host does not serve lane '{model}'; falling back.",
           file=sys.stderr)
     print(f"    Catalogue: {', '.join(lanes)}", file=sys.stderr)

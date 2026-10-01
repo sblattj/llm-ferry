@@ -194,7 +194,7 @@ class FreshInstallTest(PrimeHarness):
 
     def test_models_are_the_served_lanes_with_ids_and_names(self):
         models = self.ferry_provider()["models"]
-        self.assertEqual([m["id"] for m in models], ["heavy", "medium", "flash"])
+        self.assertEqual([m["id"] for m in models], ["heavy", "medium", "flash", "light"])
         for m in models:
             self.assertTrue(m["name"])
 
@@ -222,14 +222,29 @@ class LaneListTest(PrimeHarness):
         p = self.run_prime(port=1)
         ids = [m["id"] for m in self.ferry_provider()["models"]]
         self.assertEqual(ids, ["heavy", "flash", "super-flash",
-                               "local-orch", "local-sub"])
+                               "local-orch", "local-sub", "light", "super-light"])
         self.assertIn("WARNING", p.stderr)
 
     def test_the_chosen_lane_is_listed_first(self):
         self.run_prime("--model", "flash")
         ids = [m["id"] for m in self.ferry_provider()["models"]]
-        self.assertEqual(ids, ["flash", "heavy", "medium"])
+        self.assertEqual(ids, ["flash", "heavy", "medium", "light"])
         self.assertEqual(self.read_json(self.record_path())["model"], "flash")
+
+    def test_tier_aliases_follow_their_served_target(self):
+        # The catalogue serves flash but not super-flash: `light` is listed
+        # (prime-agent can only spawn a child on a listed model) and
+        # `super-light` is not, since its target has no backend here.
+        self.run_prime()
+        ids = [m["id"] for m in self.ferry_provider()["models"]]
+        self.assertIn("light", ids)
+        self.assertNotIn("super-light", ids)
+
+    def test_an_alias_is_a_valid_default_model(self):
+        p = self.run_prime("--model", "light")
+        self.assertNotIn("does not serve", p.stderr)
+        self.assertEqual(self.read_json(self.record_path())["model"], "light")
+        self.assertEqual(self.ferry_provider()["models"][0]["id"], "light")
 
     def test_an_unserved_lane_falls_back_to_heavy(self):
         p = self.run_prime("--model", "nope")

@@ -2224,6 +2224,173 @@ class TestFleetMiddleware(FleetHarness):
         self.assertIsInstance(warn.call_args[0][0], FF.FleetStateError)
 
 
+class KimiLikeResponsesApp:
+    """Mock litellm-over-Kimi for /v1/responses, shaped on the 2026-09-30 capture.
+
+    With a hosted `web_search` tool in the request, Kimi's Anthropic endpoint
+    streams a `server_tool_use` block with no `id`; litellm's chunk_parser
+    raises KeyError('id') and the proxy ends the SSE with a bare error line —
+    no `response.completed`, which Codex reports as "stream closed before
+    response.completed". Without the tool the stream completes normally."""
+
+    def __init__(self):
+        self.body = None
+
+    async def __call__(self, scope, receive, send):
+        buf = b""
+        while True:
+            msg = await receive()
+            buf += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        self.body = buf
+        doc = json.loads(buf)
+        hosted = any(isinstance(t, dict) and str(t.get("type", "")).startswith("web_search")
+                     for t in doc.get("tools") or [])
+        events = [{"type": "response.created", "response": {"status": "in_progress"}},
+                  {"type": "response.output_text.delta", "delta": "Search results for query: "}]
+        if hosted:
+            events.append({"error": {"message": "litellm.APIConnectionError: 'id'",
+                                     "type": None, "code": "500"}})
+        else:
+            events.append({"type": "response.completed",
+                           "response": {"status": "completed"}})
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/event-stream")]})
+        for ev in events:
+            await send({"type": "http.response.body", "more_body": True,
+                        "body": ("data: %s\n\n" % json.dumps(ev)).encode()})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+# The tool mix Codex 0.158 sends on every /v1/responses turn (names trimmed).
+CODEX_TOOLS = [
+    {"type": "function", "name": "exec_command", "parameters": {"type": "object"}},
+    {"type": "function", "name": "write_stdin", "parameters": {"type": "object"}},
+    {"type": "namespace", "name": "multi_agent_v1", "tools": []},
+    {"type": "web_search"},
+]
+
+
+class TestHostedSearchOnMessagesLanes(FleetHarness):
+    """Codex's hosted `web_search` must never reach a Messages-dialect lane."""
+
+    MESSAGES = frozenset({"international.heavy"})   # FLEETS: anthropic/k3
+
+    def mw_with(self, app, messages_lanes):
+        return LaneCatalogueFilter(app, frozenset(), fleets=FLEETS,
+                                   state=self.state, messages_lanes=messages_lanes)
+
+    def codex_turn(self, app, messages_lanes, fleet="international",
+                   path="/v1/responses", tools=None):
+        raw = json.dumps({"model": "heavy", "stream": True, "input": "hi",
+                          "instructions": "x" * 40000,
+                          "tools": CODEX_TOOLS if tools is None else tools,
+                          "tool_choice": "auto"}).encode()
+        scope, sent = self.drive_body(
+            self.mw_with(app, messages_lanes), path, raw,
+            headers=[(b"x-ferry-fleet", fleet.encode()),
+                     (b"content-length", str(len(raw)).encode())])
+        return raw, scope, sent
+
+    def test_control_without_the_fix_the_stream_never_completes(self):
+        # Proves the mock reproduces the outage: same request, no messages
+        # lanes known (the pre-fix front), and response.completed is missing.
+        app = KimiLikeResponsesApp()
+        _, _, sent = self.codex_turn(app, frozenset())
+        self.assertNotIn(b"response.completed", collect(sent)[1])
+        self.assertIn(b"'id'", collect(sent)[1])
+
+    def test_a_codex_turn_on_a_messages_lane_completes(self):
+        app = KimiLikeResponsesApp()
+        _, scope, sent = self.codex_turn(app, self.MESSAGES)
+        start, payload = collect(sent)
+        self.assertEqual(start["status"], 200)
+        self.assertIn(b'"type": "response.completed"', payload)
+        doc = json.loads(app.body)
+        self.assertEqual(doc["model"], "international.heavy")
+        self.assertEqual([t.get("name") for t in doc["tools"]],
+                         ["exec_command", "write_stdin", "multi_agent_v1"])
+        self.assertEqual(doc["tool_choice"], "auto")
+        headers = dict((bytes(k).lower(), bytes(v)) for k, v in scope["headers"])
+        self.assertEqual(headers[b"content-length"], str(len(app.body)).encode())
+
+    def test_a_responses_native_lane_keeps_hosted_search(self):
+        # domestic.heavy is chatgpt/responses/* in FLEETS: the tool runs
+        # upstream there and must survive.
+        app = KimiLikeResponsesApp()
+        self.codex_turn(app, self.MESSAGES, fleet="domestic")
+        doc = json.loads(app.body)
+        self.assertEqual(doc["model"], "domestic.heavy")
+        self.assertIn({"type": "web_search"}, doc["tools"])
+
+    def test_chat_completions_on_a_messages_lane_is_untouched(self):
+        app = BodyApp()
+        raw = json.dumps({"model": "international.heavy",
+                          "tools": [{"type": "web_search"}]}).encode()
+        mw = self.mw_with(app, self.MESSAGES)
+        self.drive_body(mw, "/v1/chat/completions", raw)
+        self.assertEqual(app.body, raw)
+
+    def test_dropping_the_only_tool_drops_tool_choice_too(self):
+        app = KimiLikeResponsesApp()
+        self.codex_turn(app, self.MESSAGES, tools=[{"type": "web_search_preview"}])
+        doc = json.loads(app.body)
+        self.assertNotIn("tools", doc)
+        self.assertNotIn("tool_choice", doc)
+
+    def test_a_forced_hosted_search_choice_falls_back_to_auto(self):
+        doc = {"tools": [{"type": "web_search"}, {"type": "function", "name": "f"}],
+               "tool_choice": {"type": "web_search"}}
+        found = FF.strip_hosted_search(doc)
+        self.assertEqual(doc["tool_choice"], "auto")
+        self.assertEqual(found, [{"tool": "web_search", "path": "(root)",
+                                  "rule": FF.HOSTED_SEARCH_RULE, "fixed": True}])
+
+    def test_strip_is_a_noop_without_hosted_tools(self):
+        doc = {"tools": [{"type": "function", "name": "f"}], "tool_choice": "auto"}
+        before = json.dumps(doc)
+        self.assertEqual(FF.strip_hosted_search(doc), [])
+        self.assertEqual(json.dumps(doc), before)
+        self.assertEqual(FF.strip_hosted_search("not a dict"), [])
+
+    def _write(self, text):
+        path = os.path.join(self.dir, "litellm.yaml")
+        with open(path, "w") as handle:
+            handle.write(text)
+        return path
+
+    def test_messages_lanes_cover_direct_deployments_and_fallback_parents(self):
+        path = self._write("""
+model_list:
+  - {model_name: domestic.heavy, litellm_params: {model: chatgpt/responses/gpt-5.6-sol}}
+  - {model_name: international.heavy, litellm_params: {model: zai/glm-5.3}}
+  - {model_name: international.heavy-kimi, litellm_params: {model: anthropic/k3}}
+  - {model_name: claude-opus, litellm_params: {model: claude-oauth/claude-opus-4.5}}
+  - {model_name: claude-opus-or, litellm_params: {model: openrouter/anthropic/claude-opus-4.5}}
+router_settings:
+  fallbacks: [{"international.heavy": ["international.heavy-kimi"]}, {"domestic.heavy": []}]
+""")
+        self.assertEqual(FF.messages_dialect_lanes(path), frozenset({
+            "international.heavy", "international.heavy-kimi", "claude-opus"}))
+
+    def test_messages_lanes_fail_open_to_empty(self):
+        self.assertEqual(FF.messages_dialect_lanes(""), frozenset())
+        self.assertEqual(FF.messages_dialect_lanes(self._write(": : not yaml [")),
+                         frozenset())
+
+    def test_build_app_wires_the_messages_lanes(self):
+        path = self._write("""
+model_list:
+  - {model_name: domestic.heavy, litellm_params: {model: anthropic/k3}, model_info: {public: true}}
+""")
+        with mock.patch.dict(os.environ, {"CONFIG_FILE_PATH": path,
+                                          "FERRY_FLEETS": self.state_path}):
+            with mock.patch("sys.stderr", io.StringIO()):
+                app = FF.build_app(litellm_app=mock.AsyncMock())
+        self.assertEqual(app.messages_lanes, frozenset({"domestic.heavy"}))
+
+
 class TestFleetWarn(unittest.TestCase):
     """One line per distinct failure per interval — a signal, not a flood."""
 

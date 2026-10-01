@@ -77,10 +77,14 @@ PYEOF
 # FERRY_CODEX_KEY env var, never argv. User args come LAST, so `-m other-lane`
 # or their own `-c` overrides the lane picked here.
 #
+# developer_instructions: Codex's own AGENTS.md tells it to pass gpt-5.6-luna /
+# gpt-5.6-terra / gpt-6-astra as subagent models; ferry serves none of those
+# (400 Invalid model name), so one override maps them onto ferry lane names.
+#
 # Host, port and key are baked at install time: the wrapper must work with
 # ferry down. There is deliberately no bare `codex` function. `codex` is
 # resolved by name at run time so a user's own function/alias still applies.
-unalias codex-ferry codex-ferry-flash codex-ferry-local 2>/dev/null
+unalias codex-ferry codex-ferry-flash 2>/dev/null
 
 _codex_ferry_run() {
   local model="$1"; shift
@@ -93,6 +97,7 @@ _codex_ferry_run() {
       -c 'model_providers.ferry.base_url="http://__FERRY_CX_HOST__:__FERRY_CX_PORT__/v1"' \
       -c 'model_providers.ferry.env_key="FERRY_CODEX_KEY"' \
       -c 'model_providers.ferry.wire_api="responses"' \
+      -c 'developer_instructions="FERRY ROUTING: this session runs on the llm-ferry endpoint, which serves only the lanes heavy, medium, flash and super-flash. The model names gpt-5.6-luna, gpt-5.6-terra, gpt-6-astra, gpt-6-luna and gpt-6-sol do NOT exist here; when any instruction names them for a subagent, pass flash for light/mechanical work, medium for ordinary implementation, heavy for architecture/adversarial review."' \
       -c "model_providers.ferry.http_headers=${hdrs}" \
       -c "model=\"${model}\"" \
       "$@"
@@ -102,8 +107,6 @@ _codex_ferry_run() {
 codex-ferry() { _codex_ferry_run heavy "$@"; }
 # codex-ferry-flash: the cloud worker lane.
 codex-ferry-flash() { _codex_ferry_run flash "$@"; }
-# codex-ferry-local: the GPU lane — nothing leaves this machine.
-codex-ferry-local() { _codex_ferry_run local-orch "$@"; }
 # <<< ferry codex profiles <<<
 EOF
 )
@@ -116,7 +119,6 @@ EOF
   echo ">>> codex shell wrappers installed in $rc:"
   echo "    codex-ferry        -> cloud driver lane: heavy"
   echo "    codex-ferry-flash  -> cloud worker lane: flash"
-  echo "    codex-ferry-local  -> GPU lane:          local-orch"
   echo "    (bare 'codex' and ~/.codex are untouched — run: source $rc)"
 }
 
@@ -127,8 +129,8 @@ ferry codex — point the OpenAI Codex CLI at the ferry endpoint by lane name.
 Usage:
   ferry codex [--host H] [--port P] [--key K] [--wrappers]
 
-  (no flags)   Install the ~/.zshrc wrappers (codex-ferry / codex-ferry-flash /
-               codex-ferry-local) and write ~/.config/ferry/codex.json
+  (no flags)   Install the ~/.zshrc wrappers (codex-ferry / codex-ferry-flash)
+               and write ~/.config/ferry/codex.json
                recording the lane map. Host resolves from --host, else
                ~/.config/ferry/client.json; on a host machine (no client.json)
                it defaults to 127.0.0.1:8090.
@@ -142,7 +144,7 @@ Usage:
 Codex is wired with `-c` overrides at launch (Responses API, /v1/responses);
 ~/.codex/config.toml and CODEX_HOME are never touched.
 
-Lane map:  codex-ferry=heavy  codex-ferry-flash=flash  codex-ferry-local=local-orch
+Lane map:  codex-ferry=heavy  codex-ferry-flash=flash
 EOF
 }
 
@@ -238,7 +240,6 @@ cfg = {
     "lanes": {
         "codex-ferry": "heavy",
         "codex-ferry-flash": "flash",
-        "codex-ferry-local": "local-orch",
     },
 }
 # Mirrored only when it is a real key ('local'/empty is the keyless default).
@@ -256,7 +257,7 @@ with os.fdopen(fd, "w") as f:
     f.write("\n")
 os.chmod(path, 0o600)
 print(f"    Wired codex     -> http://{host}:{port}/v1 (Responses API)")
-print("    Lanes: codex-ferry=heavy codex-ferry-flash=flash codex-ferry-local=local-orch")
+print("    Lanes: codex-ferry=heavy codex-ferry-flash=flash")
 print(f"    Config written: {path}")
 PYEOF
 

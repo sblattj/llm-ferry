@@ -2,8 +2,9 @@
 # client-cleanup.sh — remove every trace of llm-ferry from a CLIENT laptop.
 # The inverse of client-bootstrap.sh: uninstall the ferry CLI, delete the
 # client profile and ferry-written opencode + claude + cline configs, strip
-# the shell wrappers (opencode and claude) and the host-code alias from
-# ~/.zshrc, and remove the guardrail files bootstrap installed.
+# the shell wrappers (opencode, claude and codex) and the host-code alias from
+# ~/.zshrc, unwire the ferry provider from Prime Agent's models.json, and
+# remove the guardrail files bootstrap installed.
 #
 #   curl -fsSL http://<host>:<share-port>/client-cleanup.sh | zsh
 #   curl -fsSL http://<host>:<share-port>/client-cleanup.sh | zsh -s -- --full
@@ -124,14 +125,43 @@ CLINE_HOST="${cline_rec%%$'\t'*}"; cline_rest="${cline_rec#*$'\t'}"
 CLINE_PORT="${cline_rest%%$'\t'*}"
 CLINE_KEY="${cline_rest#*$'\t'}"
 
+# --- 2c. Capture the Prime Agent record BEFORE ~/.config/ferry goes ----------
+# Same reason as 2b: the Prime unwire in section 5c must know which models.json
+# `ferry prime` wrote (agent_dir / models_path) and the host:port that proves
+# the provider is ferry's, and ~/.config/ferry/prime.json is deleted in
+# section 3. prime.json first, client.json as the fallback for host/port/key.
+# Fields come back tab-separated; absent stays empty (best-effort then).
+PRIME_HOST=""; PRIME_PORT=""; PRIME_MODELS=""
+prime_rec=$(python3 - "$HOME/.config/ferry/prime.json" "$HOME/.config/ferry/client.json" <<'PYEOF'
+import json, sys
+rec = {}
+for p in sys.argv[1:]:
+    try:
+        with open(p) as f:
+            d = json.load(f)
+    except Exception:
+        continue
+    if not isinstance(d, dict):
+        continue
+    for k in ("host", "port", "models_path"):
+        if k not in rec and d.get(k) is not None:
+            rec[k] = str(d.get(k))
+print(f"{rec.get('host','')}\t{rec.get('port','')}\t{rec.get('models_path','')}")
+PYEOF
+)
+PRIME_HOST="${prime_rec%%$'\t'*}"; prime_rest="${prime_rec#*$'\t'}"
+PRIME_PORT="${prime_rest%%$'\t'*}"
+PRIME_MODELS="${prime_rest#*$'\t'}"
+
 # --- 3. Remove the client profile + ferry-written opencode profiles ---------
 # The whole directory goes, which also takes the claude profile
-# (~/.config/ferry/claude.json), the cline record (~/.config/ferry/cline.json)
-# and the client.json "claude_mode"/"cline_mode" keys with it — there is no
-# scenario where client.json survives this script. Section 2b already read out
-# what the cline unwire needs; nothing else looks back.
+# (~/.config/ferry/claude.json), the cline/codex/prime records
+# (~/.config/ferry/{cline,codex,prime}.json) and the client.json
+# "claude_mode"/"cline_mode"/"codex_mode"/"prime_mode" keys with it — there is
+# no scenario where client.json survives this script. Sections 2b/2c already
+# read out what the cline and prime unwires need; nothing else looks back.
 echo ">>> Removing ~/.config/ferry (client profile, opencode lane profiles,"
-echo "    claude + cline records, last-lane marker, takeover snapshots)..."
+echo "    claude + cline + codex + prime records, last-lane marker, takeover snapshots)..."
 if [[ -d "$HOME/.config/ferry" ]]; then
   run rm -rf "$HOME/.config/ferry"
   echo "    Removed ~/.config/ferry"
@@ -498,8 +528,9 @@ fi
 echo ""
 
 # --- 5. Strip the shell wrappers + host-code alias from ~/.zshrc ------------
-# Reuses bootstrap's own markers for the wrapper block(s) — the opencode one
-# and the claude one `ferry claude` installs — plus the host-code alias, its
+# Reuses bootstrap's own markers for the wrapper block(s) — the opencode one,
+# the claude one `ferry claude` installs and the codex one `ferry codex`
+# installs (# >>> ferry codex profiles >>>; ~/.codex is never touched) — plus the host-code alias, its
 # comment banner, and the legacy `alias opencode*=` / `alias claude-ferry*=`
 # lines from older hand-wired setups. Delimited-block removal is line-based
 # and safe; the alias/banner are single lines matched exactly.
@@ -507,7 +538,7 @@ ZSHRC="$HOME/.zshrc"
 echo ">>> Stripping ferry wrappers from ~/.zshrc..."
 if [[ -f "$ZSHRC" ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
-    hits=$(grep -cE 'ferry opencode profiles|ferry claude profiles|alias host-code=|# LLM-Ferry Shortcut|alias claude-ferry' "$ZSHRC" 2>/dev/null || true)
+    hits=$(grep -cE 'ferry opencode profiles|ferry claude profiles|ferry codex profiles|alias host-code=|# LLM-Ferry Shortcut|alias claude-ferry' "$ZSHRC" 2>/dev/null || true)
     echo "    [dry-run] $hits ferry line(s)/marker(s) found in ~/.zshrc"
   else
     python3 - "$ZSHRC" <<'PYEOF'
@@ -525,6 +556,10 @@ for ln in lines:
     if s == "# >>> ferry claude profiles >>>":
         skip = True; removed += 1; continue
     if s == "# <<< ferry claude profiles <<<":
+        skip = False; removed += 1; continue
+    if s == "# >>> ferry codex profiles >>>":
+        skip = True; removed += 1; continue
+    if s == "# <<< ferry codex profiles <<<":
         skip = False; removed += 1; continue
     if skip:
         continue
@@ -694,6 +729,244 @@ else
 fi
 echo ""
 
+# --- 5c. Unwire Prime Agent ----------------------------------------------------
+# `ferry prime` adds ONE provider, providers.ferry, to Prime Agent's models.json
+# (default ~/.prime/agent/models.json, or $PRIME_AGENT_CODING_AGENT_DIR, or the
+# models_path section 2c recorded) and keeps a models.json.<UTC>.ferry.bak
+# snapshot beside it before every content change. NEVER rm -rf ~/.prime: the
+# user's sessions and login live there. models.json itself is never deleted —
+# the user may have their own providers in it. Order:
+#   - snapshots present -> restore the NEWEST one's content, delete every
+#     snapshot (same posture as the Cline unwire above), then run the guarded
+#     strip below on the result so a snapshot that itself still carried an
+#     older ferry provider cannot leave it behind;
+#   - no snapshots      -> the guarded strip alone.
+# The guarded strip removes only providers.ferry, and only while it proves out
+# as ferry's: baseUrl equals the recorded http://host:port/v1 (or, with no
+# record, the entry carries ferry's X-Ferry-Client header). It is a TEXT edit,
+# so the file's comments, trailing commas, other providers and formatting
+# survive byte for byte (the file is JSONC); the result is re-parsed against
+# the original before anything is written, and anything unparseable is left
+# untouched.
+PRIME_BASE=""
+[[ -n "$PRIME_HOST" && -n "$PRIME_PORT" ]] && PRIME_BASE="$PRIME_HOST:$PRIME_PORT"
+PRIME_FILE="${PRIME_MODELS:-${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.prime/agent}/models.json}"
+unwire_prime_models() {   # <path> <host:port or empty>
+  python3 - "$1" "$2" <<'PYEOF'
+import json, re, sys
+
+path, base = sys.argv[1], sys.argv[2]
+ferry_url = f"http://{base}/v1" if base else ""
+
+class Bad(Exception):
+    pass
+
+def skip_ws(t, i):
+    n = len(t)
+    while i < n:
+        c = t[i]
+        if c in " \t\r\n\ufeff":
+            i += 1
+        elif t.startswith("//", i):
+            j = t.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif t.startswith("/*", i):
+            j = t.find("*/", i + 2)
+            if j < 0:
+                raise Bad("unterminated /* comment")
+            i = j + 2
+        else:
+            break
+    return i
+
+def end_string(t, i):
+    j = i + 1
+    while j < len(t):
+        if t[j] == "\\":
+            j += 2
+        elif t[j] == '"':
+            return j + 1
+        else:
+            j += 1
+    raise Bad("unterminated string")
+
+SCALAR = re.compile(r"-?\d[\d.eE+\-]*|true|false|null")
+
+def parse_value(t, i):
+    i = skip_ws(t, i)
+    if i >= len(t):
+        raise Bad("unexpected end of file")
+    c = t[i]
+    if c == "{":
+        return parse_object(t, i)[0]
+    if c == "[":
+        i += 1
+        while True:
+            i = skip_ws(t, i)
+            if i >= len(t):
+                raise Bad("unterminated array")
+            if t[i] == "]":
+                return i + 1
+            i = skip_ws(t, parse_value(t, i))
+            if i < len(t) and t[i] == ",":
+                i += 1
+            elif i < len(t) and t[i] != "]":
+                raise Bad("expected , or ] in array")
+    if c == '"':
+        return end_string(t, i)
+    m = SCALAR.match(t, i)
+    if not m:
+        raise Bad(f"unexpected character {c!r}")
+    return m.end()
+
+def parse_object(t, i):
+    """(index past the closing brace, members); member = (key, key_start,
+    value_start, value_end)."""
+    members = []
+    i += 1
+    while True:
+        i = skip_ws(t, i)
+        if i >= len(t):
+            raise Bad("unterminated object")
+        if t[i] == "}":
+            return i + 1, members
+        if t[i] != '"':
+            raise Bad("expected a string key")
+        ks = i
+        ke = end_string(t, i)
+        k = json.loads(t[i:ke])
+        i = skip_ws(t, ke)
+        if i >= len(t) or t[i] != ":":
+            raise Bad("expected ':' after a key")
+        vs = skip_ws(t, i + 1)
+        ve = parse_value(t, vs)
+        members.append((k, ks, vs, ve))
+        i = skip_ws(t, ve)
+        if i < len(t) and t[i] == ",":
+            i += 1
+        elif i < len(t) and t[i] != "}":
+            raise Bad("expected , or } in object")
+
+def strip_jsonc(t):
+    out, i, n = [], 0, len(t)
+    while i < n:
+        c = t[i]
+        if c == '"':
+            j = end_string(t, i)
+            out.append(t[i:j]); i = j
+        elif c == "/" or c in " \t\r\n\ufeff":
+            j = skip_ws(t, i)
+            if j > i:
+                out.append(" "); i = j
+            else:
+                out.append(c); i += 1
+        elif c == ",":
+            j = skip_ws(t, i + 1)
+            if not (j < n and t[j] in "}]"):
+                out.append(c)
+            i += 1
+        else:
+            out.append(c); i += 1
+    return "".join(out)
+
+def loads(t):
+    try:
+        return json.loads(strip_jsonc(t))
+    except (ValueError, IndexError) as e:
+        raise Bad(str(e))
+
+def leave(msg):
+    print(f"    {msg} — file left unchanged.")
+    sys.exit(0)
+
+try:
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    doc = loads(text)
+    if not isinstance(doc, dict):
+        raise Bad("top level is not a JSON object")
+    provs = doc.get("providers")
+    if not isinstance(provs, dict) or "ferry" not in provs:
+        leave("No ferry provider present")
+    entry = provs["ferry"]
+    if not isinstance(entry, dict):
+        leave("providers.ferry is not an object")
+    hdrs = entry.get("headers") if isinstance(entry.get("headers"), dict) else {}
+    if base:
+        proven = entry.get("baseUrl") == ferry_url
+        why = "its baseUrl is not the recorded ferry host"
+    else:
+        proven = "X-Ferry-Client" in hdrs
+        why = "no recorded host:port and no X-Ferry-Client header to prove it is ferry's"
+    if not proven:
+        leave(f"providers.ferry left in place ({why})")
+
+    start = skip_ws(text, 0)
+    _, top = parse_object(text, start)
+    pm = next(m for m in top if m[0] == "providers")
+    pend, pmembers = parse_object(text, pm[2])
+    idx = next(i for i, m in enumerate(pmembers) if m[0] == "ferry")
+    key, ks, vs, ve = pmembers[idx]
+    # Remove from the member's key to the end of its value, plus one adjacent
+    # comma: the trailing one when there is one, else the previous member's.
+    k = skip_ws(text, ve)
+    lo, hi = ks, ve
+    if k < len(text) and text[k] == ",":
+        hi = k + 1
+    elif idx > 0:
+        prev_end = pmembers[idx - 1][3]
+        c = skip_ws(text, prev_end)
+        if c < len(text) and text[c] == ",":
+            lo = c
+    # Swallow the member's own line when it stood alone on it.
+    ls = text.rfind("\n", 0, lo) + 1
+    le = text.find("\n", hi)
+    if (le >= 0 and text[ls:lo].strip() == "" and text[hi:le].strip() == ""):
+        lo, hi = ls, le + 1
+    new = text[:lo] + text[hi:]
+    want = json.loads(json.dumps(doc))
+    del want["providers"]["ferry"]
+    if loads(new) != want:
+        raise Bad("the edit did not round-trip")
+except Bad as e:
+    leave(f"Could not edit safely ({e})")
+except OSError as e:
+    leave(f"Could not read ({e})")
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(new)
+print("    Removed 'providers.ferry'")
+PYEOF
+}
+
+if [[ -f "$PRIME_FILE" ]]; then
+  echo ">>> Unwiring the ferry provider from Prime Agent's $PRIME_FILE ..."
+  p_baks=("$PRIME_FILE".*.ferry.bak(NOm))
+  if [[ $DRY_RUN -eq 1 ]]; then
+    if [[ ${#p_baks} -gt 0 ]]; then
+      echo "    [dry-run] would restore ${p_baks[-1]##*/} into $PRIME_FILE"
+      echo "    [dry-run] would delete ${#p_baks} ferry snapshot(s)"
+    fi
+    if grep -q '"ferry"' "$PRIME_FILE" 2>/dev/null; then
+      echo "    [dry-run] would strip providers.ferry from $PRIME_FILE (ownership-guarded)"
+    else
+      echo "    Nothing ferry-shaped found — file would be left alone."
+    fi
+  else
+    if [[ ${#p_baks} -gt 0 ]]; then
+      p_newest="${p_baks[-1]}"
+      run cp "$p_newest" "$PRIME_FILE"
+      for p_b in "${p_baks[@]}"; do run rm -f "$p_b"; done
+      echo "    Restored ${p_newest##*/} (newest pre-ferry snapshot)"
+      echo "    Removed ${#p_baks} ferry snapshot(s)"
+    fi
+    unwire_prime_models "$PRIME_FILE" "$PRIME_BASE"
+  fi
+else
+  echo ">>> Prime Agent: $PRIME_FILE not present — skipping."
+fi
+echo ""
+
 # --- 6. Remove the skill/command files installed into opencode's global dirs
 echo ">>> Removing the bundled opencode skills and commands"
 echo "    (/fan-out + spawning-subagents + using-the-goal-plugin)..."
@@ -741,5 +1014,9 @@ echo "  - the opencode binary itself (it is not ferry's)"
 [[ $FULL -eq 0 ]] && echo "  - $OC_DATA (your session history; --full --yes removes it)"
 echo "  - ~/.cline itself (Cline chat history/checkpoints are not ferry's;"
 echo "    only the ferry provider wiring was unwired above)"
+echo "  - ~/.codex itself (Codex config/login/history are not ferry's; only the"
+echo "    codex-ferry wrapper block was stripped from ~/.zshrc)"
+echo "  - ~/.prime itself and Prime Agent's models.json (only providers.ferry was"
+echo "    unwired; your other providers stay)"
 echo "Open a NEW terminal so the stripped wrappers/aliases unload."
 echo "================================================================="

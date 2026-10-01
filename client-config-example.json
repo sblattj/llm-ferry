@@ -92,6 +92,54 @@
     ]
   },
 
+  "codex_cli": {
+    "tool": "OpenAI Codex CLI — npm i -g @openai/codex",
+    "_warning": "Easiest of all: run `ferry codex` on the client — it installs exactly this as shell wrappers. Never edit ~/.codex/config.toml for this and never set CODEX_HOME: the wrappers pass everything as -c overrides so your ChatGPT login, history and config stay untouched.",
+    "wrappers_installed_in": "~/.zshrc  (marker block '# >>> ferry codex profiles >>>')",
+    "lanes": {
+      "codex-ferry": "heavy",
+      "codex-ferry-flash": "flash"
+    },
+    "by_hand": "FERRY_CODEX_KEY=<LITELLM_MASTER_KEY or \"local\" on a keyless LAN> codex -c model_provider=ferry -c 'model_providers.ferry.name=\"Ferry\"' -c 'model_providers.ferry.base_url=\"http://your-mac.local:8090/v1\"' -c 'model_providers.ferry.env_key=\"FERRY_CODEX_KEY\"' -c 'model_providers.ferry.wire_api=\"responses\"' -c 'model_providers.ferry.http_headers={\"X-Ferry-Client\"=\"your-laptop\"}' -c 'model=\"heavy\"'",
+    "_notes": [
+      "Codex 0.158+ only speaks the Responses API (wire_api = \"responses\"; \"chat\" is removed and config load fails on it), so the lane must serve /v1/responses.",
+      "base_url carries /v1 because Codex appends /responses itself.",
+      "The key travels in the FERRY_CODEX_KEY env var (env_key), never on argv.",
+      "Codex's /goal works through the wrappers. An unknown lane name only prints a non-fatal 'Model metadata not found' warning."
+    ]
+  },
+
+  "prime_agent": {
+    "tool": "Prime Agent — curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
+    "_warning": "Easiest of all: run `ferry prime` on the client — it edits models.json surgically (other providers and comments kept) and snapshots first. Not yet end-to-end tested against a live prime-agent.",
+    "file": "~/.prime/agent/models.json   (or $PRIME_AGENT_CODING_AGENT_DIR/models.json)",
+    "content": {
+      "providers": {
+        "ferry": {
+          "name": "ferry",
+          "baseUrl": "http://your-mac.local:8090/v1",
+          "apiKey": "<LITELLM_MASTER_KEY or \"local\" on a keyless LAN>",
+          "api": "openai-completions",
+          "authHeader": true,
+          "headers": { "X-Ferry-Client": "your-laptop" },
+          "compat": { "supportsStore": false, "supportsDeveloperRole": false, "maxTokensField": "max_tokens" },
+          "models": [
+            { "id": "heavy", "name": "ferry heavy" },
+            { "id": "flash", "name": "ferry flash" },
+            { "id": "local-orch", "name": "ferry local-orch" }
+          ]
+        }
+      }
+    },
+    "run": "prime-agent --provider ferry --model heavy",
+    "_notes": [
+      "The file is {\"providers\": {...}} (wrapped) and is JSONC: comments and trailing commas are fine.",
+      "baseUrl is the /v1 root: Prime Agent appends /chat/completions itself.",
+      "compat pins the plain OpenAI dialect (no store, no developer role, max_tokens) so a LiteLLM-fronted local lane accepts the request.",
+      "Merge into the existing file: keep every provider already there."
+    ]
+  },
+
   "cursor_ide": {
     "section": "Settings -> Models -> OpenAI-Compatible",
     "override_baseURL": "http://your-mac.local:8090/v1",

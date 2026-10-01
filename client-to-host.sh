@@ -18,7 +18,7 @@
 #   1. Confirm this machine is a client (~/.config/ferry/client.json present).
 #   2. Carry the client's master_key (if any) forward into
 #      ~/.config/ferry/secrets.env as LITELLM_MASTER_KEY, so the new host serves
-#      the same key the box was already using and its rewired opencode/claude/cline
+#      the same key the box was already using and its rewired opencode/claude/cline/codex/prime
 #      configs keep working. A key already in secrets.env always wins.
 #   3. Seed ~/.config/ferry/litellm.yaml from litellm-route-example.yaml if it is
 #      not there yet (host-reset.sh requires the route config to exist).
@@ -32,7 +32,7 @@
 #   6. Bring the host online via host-reset.sh: validate the route config,
 #      re-link the CLI, bounce the proxy + share server, re-apply the opencode
 #      takeover and the claude wrappers pointed at 127.0.0.1, and verify the lanes.
-#   7. Propagate the front-door master key into the host's OWN opencode/claude/cline
+#   7. Propagate the front-door master key into the host's OWN opencode/claude/cline/codex/prime
 #      configs. host-reset wires them keyless (it reads the bearer from the
 #      client.json we just archived), so on a keyed front door they would 401;
 #      this re-wires them with the key so the host's own tools keep working.
@@ -158,7 +158,7 @@ if [[ $DRY_RUN -eq 0 && $ASSUME_YES -eq 0 ]]; then
   fi
   echo "  - archive $CLIENT_JSON (reversible) so ferry leaves CLIENT_MODE"
   echo "  - run host-reset.sh: bounce the proxy + share server and rewire"
-  echo "    opencode/claude/cline at 127.0.0.1"
+  echo "    opencode/claude/cline/codex/prime at 127.0.0.1"
   echo ""
   printf "Proceed? [y/N]: "
   ans=""
@@ -171,7 +171,7 @@ fi
 
 # --- 3. Carry the client's master key forward -------------------------------
 # The client profile may hold the shared front-door key of the host it used. A
-# new host that reuses it keeps its rewired opencode/claude/cline configs valid and
+# new host that reuses it keeps its rewired opencode/claude/cline/codex/prime configs valid and
 # lets any laptops that will point at THIS box authenticate the same way. A key
 # already present in secrets.env always wins; the value is never printed.
 echo ""
@@ -261,28 +261,28 @@ reset_flags=()
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "    [dry-run] zsh $APP_DIR/host-reset.sh ${reset_flags[*]}"
   echo "              (validate route config, re-link ferry, bounce proxy + share,"
-  echo "               rewire opencode/claude/cline at 127.0.0.1, verify the lanes)"
+  echo "               rewire opencode/claude/cline/codex/prime at 127.0.0.1, verify the lanes)"
 else
   zsh "$APP_DIR/host-reset.sh" "${reset_flags[@]}"
 fi
 
 # --- 7b. Propagate the front-door key to the host's OWN configs -------------
-# host-reset's step 6 rewires opencode/claude/cline at 127.0.0.1, but resolves
+# host-reset's step 6 rewires opencode/claude/cline/codex/prime at 127.0.0.1, but resolves
 # the bearer from CLIENT_MASTER_KEY (loaded from client.json), which we archived
 # in step 6 above — so its calls bake the 'local' placeholder. The shipped
 # template gates the front door on LITELLM_MASTER_KEY (and host-reset generates
 # one if it is unset), so 'local' would 401 on every local request. Read the key
-# back and re-wire opencode, claude + cline WITH it. Keyless hosts (no
+# back and re-wire opencode, claude, cline, codex + prime WITH it. Keyless hosts (no
 # LITELLM_MASTER_KEY) skip this entirely. The value is passed to ferry but never
 # printed here.
 PORT_FOR_KEY="${FERRY_PORT:-8090}"
 OC_DEFAULT="${OPENCODE_CONFIG:-$HOME/.config/opencode/opencode.json}"
 echo ""
-say ">>> Matching the host's own opencode/claude/cline bearer to the front door..."
+say ">>> Matching the host's own opencode/claude/cline/codex/prime bearer to the front door..."
 if [[ $DRY_RUN -eq 1 ]]; then
   echo "    [dry-run] if $SECRETS defines LITELLM_MASTER_KEY: re-run 'ferry opencode --key ...'"
   echo "              for the default + cloud/local/super profiles, 'ferry claude --wrappers --key ...'"
-  echo "              and 'ferry cline --key ...', all at http://127.0.0.1:$PORT_FOR_KEY (value never printed)"
+  echo "              'ferry cline --key ...', 'ferry codex --key ...' and 'ferry prime --key ...', all at http://127.0.0.1:$PORT_FOR_KEY (value never printed)"
 else
   HOSTKEY="$(grep -E '^[[:space:]]*(export[[:space:]]+)?LITELLM_MASTER_KEY=' "$SECRETS" 2>/dev/null \
                | tail -1 \
@@ -305,8 +305,12 @@ else
       || warn "could not re-key the claude wrappers"
     "$APP_DIR/ferry" cline --host 127.0.0.1 --port "$PORT_FOR_KEY" --key "$HOSTKEY" >/dev/null 2>&1 \
       || warn "could not re-key the cline provider config"
+    "$APP_DIR/ferry" codex --host 127.0.0.1 --port "$PORT_FOR_KEY" --key "$HOSTKEY" >/dev/null 2>&1 \
+      || warn "could not re-key the codex wrappers"
+    "$APP_DIR/ferry" prime --host 127.0.0.1 --port "$PORT_FOR_KEY" --key "$HOSTKEY" >/dev/null 2>&1 \
+      || warn "could not re-key the prime provider config"
     unset HOSTKEY
-    ok "opencode, claude + cline now carry the front-door key (value not printed)."
+    ok "opencode, claude, cline, codex + prime now carry the front-door key (value not printed)."
   fi
 fi
 

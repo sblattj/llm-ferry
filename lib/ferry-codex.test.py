@@ -5,7 +5,7 @@ Run:  python3 lib/ferry-codex.test.py
 
 `ferry codex` is the OpenAI Codex twin of `ferry claude`: one marker-delimited
 block in ~/.zshrc defining `codex-ferry()` (heavy), `codex-ferry-flash()`
-(flash) and `codex-ferry-local()` (local-orch), each of which launches `codex`
+(flash), each of which launches `codex`
 with `-c` overrides that select a `ferry` model provider (Responses API) and
 pass the key via the FERRY_CODEX_KEY env var. The default action also writes
 ~/.config/ferry/codex.json (0600). The user's ~/.codex is NEVER touched.
@@ -121,12 +121,13 @@ class WrapperInstallTest(CodexHarness):
         text = self.rc_text()
         self.assertEqual(text.count(CANON_START), 1)
         self.assertEqual(text.count(CANON_END), 1)
-        for fn in ("codex-ferry() {", "codex-ferry-flash() {", "codex-ferry-local() {",
+        for fn in ("codex-ferry() {", "codex-ferry-flash() {",
                    "_codex_ferry_run() {"):
             self.assertEqual(text.count(fn), 1, fn)
         self.assertIn("_codex_ferry_run heavy", text)
         self.assertIn("_codex_ferry_run flash", text)
-        self.assertIn("_codex_ferry_run local-orch", text)
+        self.assertNotIn("codex-ferry-local", text)
+        self.assertNotIn("local-orch", text)
         # Shared -c list lives in ONE helper, not triplicated.
         self.assertEqual(text.count(f"http://{INSTALL_HOST}:{INSTALL_PORT}/v1"), 1)
         self.assertEqual(text.count('wire_api="responses"'), 1)
@@ -141,7 +142,7 @@ class WrapperInstallTest(CodexHarness):
             self.assertEqual(self.run_install().returncode, 0)
         self.assertEqual(self.count(CANON_START), 1)
         self.assertEqual(self.count(CANON_END), 1)
-        self.assertEqual(self.count("codex-ferry-local() {"), 1)
+        self.assertEqual(self.count("codex-ferry-flash() {"), 1)
         r = subprocess.run(["zsh", "-n", self.rc], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, f"generated ~/.zshrc does not parse: {r.stderr}")
 
@@ -213,8 +214,7 @@ class CodexJsonTest(CodexHarness):
         self.assertEqual(cfg["base_url"], f"http://{INSTALL_HOST}:{INSTALL_PORT}/v1")
         self.assertEqual(cfg["wire_api"], "responses")
         self.assertEqual(cfg["lanes"], {"codex-ferry": "heavy",
-                                        "codex-ferry-flash": "flash",
-                                        "codex-ferry-local": "local-orch"})
+                                        "codex-ferry-flash": "flash"})
         for k in ("api_key", "master_key", "key_source"):
             self.assertNotIn(k, cfg, "'local' placeholder must not be mirrored")
 
@@ -260,8 +260,7 @@ class WrapperBehaviorTest(CodexHarness):
         return argv, envkey
 
     def test_each_wrapper_selects_its_lane_with_the_ferry_provider(self):
-        for fn, lane in (("codex-ferry", "heavy"), ("codex-ferry-flash", "flash"),
-                         ("codex-ferry-local", "local-orch")):
+        for fn, lane in (("codex-ferry", "heavy"), ("codex-ferry-flash", "flash")):
             argv, _ = self.run_fn(fn)
             joined = "\n".join(argv)
             self.assertIn("model_provider=ferry", joined, fn)
@@ -270,6 +269,24 @@ class WrapperBehaviorTest(CodexHarness):
                           joined, fn)
             self.assertIn('model_providers.ferry.wire_api="responses"', joined, fn)
             self.assertIn('model_providers.ferry.env_key="FERRY_CODEX_KEY"', joined, fn)
+
+    def test_wrappers_pass_the_ferry_routing_developer_instructions(self):
+        """Codex's AGENTS.md names subagent models ferry does not serve
+        (gpt-5.6-luna/-terra, gpt-6-astra...); the wrapper must tell it the
+        lanes that exist, via the developer_instructions override."""
+        for fn in ("codex-ferry", "codex-ferry-flash"):
+            argv, _ = self.run_fn(fn)
+            di = [a for a in argv if a.startswith("developer_instructions=")]
+            self.assertEqual(len(di), 1, fn)
+            for must in ("FERRY ROUTING", "heavy, medium, flash and super-flash",
+                         "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-astra",
+                         "gpt-6-luna", "gpt-6-sol",
+                         "pass flash for light/mechanical work",
+                         "medium for ordinary implementation",
+                         "heavy for architecture/adversarial review"):
+                self.assertIn(must, di[0], f"{fn}: {must}")
+            # one argv element: the double-quoted TOML string survived the shell
+            self.assertTrue(di[0].endswith('review."'), di[0][-30:])
 
     def test_key_travels_by_env_never_argv(self):
         argv, envkey = self.run_fn("codex-ferry", "exec", "hello", key="fk-secret-key")

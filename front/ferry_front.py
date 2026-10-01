@@ -2693,6 +2693,86 @@ def install_chatgpt_system_compat(config_class=None):
     config_class.transform_responses_api_request = transform
 
 
+# Codex CLI sends /v1/responses with tools of type function, namespace,
+# tool_search and web_search. z.ai (the `zai/` deployments behind the
+# international lanes) rejects tool_search:
+#
+#   400 litellm.BadRequestError: ZaiException - tools[18].type:type is illegal
+#
+# so every Codex call to a zai primary failed over to OpenRouter. Stripping it at
+# the front door would also remove it from OpenRouter/ChatGPT hops, which accept
+# it, so it is stripped per deployment: litellm's
+# CustomLogger.async_pre_call_deployment_hook runs after the router has picked
+# the deployment and before the provider call (litellm/utils.py
+# async_pre_call_deployment_hook, called from the client wrapper), once per
+# fallback hop. Copy, never mutate: the same request may be retried on a hop
+# that needs tool_search.
+def _is_zai_deployment(kwargs) -> bool:
+    model = kwargs.get("model")
+    if isinstance(model, str) and model.startswith("zai/"):
+        return True
+    return kwargs.get("custom_llm_provider") == "zai"
+
+
+def strip_tool_search_for_zai(kwargs):
+    """Return kwargs minus tool_search tools for a zai deployment, else None.
+
+    None means "leave the request alone" (non-zai, no tools, malformed tools,
+    nothing to strip, or any error): fail open.
+    """
+    try:
+        if not isinstance(kwargs, dict) or not _is_zai_deployment(kwargs):
+            return None
+        tools = kwargs.get("tools")
+        if not isinstance(tools, list):
+            return None
+        kept = [t for t in tools
+                if not (isinstance(t, dict) and t.get("type") == "tool_search")]
+        if len(kept) == len(tools):
+            return None
+        out = dict(kwargs)
+        out["tools"] = kept
+        return out
+    except Exception:
+        return None
+
+
+_ZAI_TOOL_COMPAT_LOGGER = None
+
+
+def install_zai_tool_compat(callbacks=None, logger_base=None):
+    """Register the per-deployment tool_search stripper. Idempotent.
+
+    `callbacks` defaults to litellm.callbacks; `logger_base` to
+    litellm.integrations.custom_logger.CustomLogger (both injectable for tests).
+    Returns True when a hook is registered (now or earlier).
+    """
+    global _ZAI_TOOL_COMPAT_LOGGER
+    try:
+        if callbacks is None:
+            import litellm
+            callbacks = litellm.callbacks
+        if logger_base is None:
+            from litellm.integrations.custom_logger import CustomLogger
+            logger_base = CustomLogger
+        if any(getattr(c, "_ferry_zai_tool_compat", False) for c in callbacks):
+            return True
+
+        class ZaiToolCompat(logger_base):
+            _ferry_zai_tool_compat = True
+
+            async def async_pre_call_deployment_hook(self, kwargs, call_type):
+                return strip_tool_search_for_zai(kwargs)
+
+        hook = ZaiToolCompat()
+        callbacks.append(hook)
+        _ZAI_TOOL_COMPAT_LOGGER = hook
+        return True
+    except Exception as exc:
+        print(f"ferry: zai tool compat hook not installed: {exc}", file=sys.stderr)
+        return False
+
+
 # litellm's ChatGPT (subscription) provider does not send the client's system
 # prompt first. It PREPENDS its own, and that prompt tells the model it is Codex
 # running inside the Codex CLI:
@@ -2835,6 +2915,7 @@ def build_app(litellm_app=None):
 
     install_chatgpt_system_compat()
     install_claude_oauth_hook()
+    install_zai_tool_compat()
     if tap_enabled():
         install_reasoning_usage_hook()
 

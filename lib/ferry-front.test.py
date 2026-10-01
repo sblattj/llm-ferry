@@ -3621,6 +3621,76 @@ class TestSystemCompatHook(unittest.TestCase):
             self.assertTrue(getattr(MockConfig.transform_responses_api_request, "_ferry_system_compat", False))
 
 
+class TestZaiToolSearchStrip(unittest.TestCase):
+    """z.ai answers 400 "tools[N].type:type is illegal" to tool_search tools."""
+
+    TOOLS = [
+        {"type": "function", "name": "a"},
+        {"type": "namespace", "name": "ns"},
+        {"type": "tool_search"},
+        {"type": "web_search"},
+        {"type": "tool_search", "execution": "client"},
+    ]
+
+    def _strip(self, model, tools, **extra):
+        kwargs = dict(extra, model=model, tools=tools)
+        return FF.strip_tool_search_for_zai(kwargs)
+
+    def test_zai_model_drops_tool_search_and_keeps_rest(self):
+        original = copy.deepcopy(self.TOOLS)
+        tools = copy.deepcopy(self.TOOLS)
+        out = self._strip("zai/glm-5.3-flash", tools, input="hi")
+        self.assertEqual([t["type"] for t in out["tools"]],
+                         ["function", "namespace", "web_search"])
+        self.assertEqual(out["input"], "hi")
+        # the caller's list and dict are untouched (a retry may need tool_search)
+        self.assertEqual(tools, original)
+        self.assertIs(out["tools"] is tools, False)
+
+    def test_custom_llm_provider_zai(self):
+        out = FF.strip_tool_search_for_zai(
+            {"model": "glm-5.3", "custom_llm_provider": "zai",
+             "tools": copy.deepcopy(self.TOOLS)})
+        self.assertEqual(len(out["tools"]), 3)
+
+    def test_non_zai_untouched(self):
+        for model in ("openrouter/z-ai/glm-5.3", "chatgpt/responses/gpt-5.6-luna",
+                      "claude-oauth/x", "glm-5.3"):
+            self.assertIsNone(self._strip(model, copy.deepcopy(self.TOOLS)), model)
+
+    def test_no_or_malformed_tools_untouched(self):
+        self.assertIsNone(FF.strip_tool_search_for_zai({"model": "zai/glm-5.3"}))
+        for bad in (None, "x", 5, {"type": "tool_search"}, [], [1, None, "tool_search"],
+                    [{"type": "function"}]):
+            self.assertIsNone(self._strip("zai/glm-5.3", bad), repr(bad))
+        for bad in (None, "x", [], 7):
+            self.assertIsNone(FF.strip_tool_search_for_zai(bad))
+        self.assertIsNone(FF.strip_tool_search_for_zai({"model": 5, "tools": []}))
+
+    def test_malformed_entries_are_kept(self):
+        out = self._strip("zai/glm-5.3", ["x", None, {"type": "tool_search"}])
+        self.assertEqual(out["tools"], ["x", None])
+
+    def test_install_registers_hook_idempotently(self):
+        class Base:
+            pass
+        callbacks = []
+        self.assertTrue(FF.install_zai_tool_compat(callbacks=callbacks, logger_base=Base))
+        self.assertTrue(FF.install_zai_tool_compat(callbacks=callbacks, logger_base=Base))
+        self.assertEqual(len(callbacks), 1)
+        hook = callbacks[0]
+        self.assertIsInstance(hook, Base)
+        kwargs = {"model": "zai/glm-5.3", "tools": copy.deepcopy(self.TOOLS)}
+        out = asyncio.run(hook.async_pre_call_deployment_hook(kwargs, None))
+        self.assertEqual(len(out["tools"]), 3)
+        other = {"model": "openrouter/x", "tools": copy.deepcopy(self.TOOLS)}
+        self.assertIsNone(asyncio.run(hook.async_pre_call_deployment_hook(other, None)))
+
+    def test_install_fails_open(self):
+        with mock.patch("sys.stderr", io.StringIO()):
+            self.assertFalse(FF.install_zai_tool_compat(callbacks=object(), logger_base=object))
+
+
 class TestReasoningUsageHook(unittest.TestCase):
     def test_install_reasoning_usage_hook_default_adapter(self):
         import types

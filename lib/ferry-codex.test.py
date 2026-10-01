@@ -278,15 +278,26 @@ class WrapperBehaviorTest(CodexHarness):
             argv, _ = self.run_fn(fn)
             di = [a for a in argv if a.startswith("developer_instructions=")]
             self.assertEqual(len(di), 1, fn)
-            for must in ("FERRY ROUTING", "heavy, medium, flash and super-flash",
-                         "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-astra",
-                         "gpt-6-luna", "gpt-6-sol",
-                         "pass flash for light/mechanical work",
-                         "medium for ordinary implementation",
-                         "heavy for architecture/adversarial review"):
+            for must in ("FERRY ROUTING", "tier names heavy, medium, light and super-light",
+                         "pass the tier name itself as the spawn_agent model",
+                         "never an OpenAI model id"):
                 self.assertIn(must, di[0], f"{fn}: {must}")
+            self.assertNotIn("gpt-", di[0], fn)
             # one argv element: the double-quoted TOML string survived the shell
-            self.assertTrue(di[0].endswith('review."'), di[0][-30:])
+            self.assertTrue(di[0].endswith('model id."'), di[0][-30:])
+
+    def test_wrappers_pass_the_model_catalog_override(self):
+        want = f"model_catalog_json=\"{self.home}/.config/ferry/codex-catalog.json\""
+        for fn in ("codex-ferry", "codex-ferry-flash"):
+            argv, _ = self.run_fn(fn)
+            self.assertIn(want, argv, fn)
+
+    def test_wrappers_run_at_high_reasoning_effort(self):
+        for fn in ("codex-ferry", "codex-ferry-flash"):
+            argv, _ = self.run_fn(fn)
+            self.assertIn('model_reasoning_effort="high"', argv, fn)
+            self.assertEqual(argv.index('model_reasoning_effort="high"') + 2,  # -c between
+                             [i for i, a in enumerate(argv) if a.startswith("model_catalog_json=")][0], fn)
 
     def test_key_travels_by_env_never_argv(self):
         argv, envkey = self.run_fn("codex-ferry", "exec", "hello", key="fk-secret-key")
@@ -313,6 +324,143 @@ class WrapperBehaviorTest(CodexHarness):
         r = subprocess.run(["zsh", "-c", "whence -w codex-ferry"],
                            capture_output=True, text=True, env=self.env())
         self.assertIn("none", r.stdout)
+
+
+class CatalogTest(CodexHarness):
+    """~/.config/ferry/codex-catalog.json: Codex validates spawn_agent's model
+    client-side against its catalog, so the tier names must be in one."""
+
+    def catalog_path(self):
+        return os.path.join(self.cfg_dir, "codex-catalog.json")
+
+    def write_cache(self, models, codex_home=None):
+        d = codex_home or os.path.join(self.home, ".codex")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "models_cache.json"), "w") as f:
+            json.dump({"models": models}, f)
+
+    @staticmethod
+    def entry(slug, visibility="list", ctx=1000):
+        return {"slug": slug, "display_name": slug, "visibility": visibility,
+                "priority": 9, "context_window": ctx, "marker": f"from-{slug}",
+                "supported_reasoning_levels": [{"effort": "low", "description": "x"}],
+                "default_reasoning_level": "low", "shell_type": "shell_command",
+                "supported_in_api": True, "support_verbosity": False,
+                "truncation_policy": {"mode": "tokens", "limit": 1000},
+                "experimental_supported_tools": [], "base_instructions": "x"}
+
+    def slugs(self):
+        with open(self.catalog_path()) as f:
+            return [m["slug"] for m in json.load(f)["models"]]
+
+    def models(self):
+        with open(self.catalog_path()) as f:
+            return {m["slug"]: m for m in json.load(f)["models"]}
+
+    def test_four_tiers_in_order_from_the_newest_listed_models(self):
+        self.write_cache([
+            self.entry("gpt-6.9-sol"), self.entry("gpt-6.10-sol"),
+            self.entry("gpt-6.1-sol"), self.entry("gpt-7-sol", "hide"),
+            self.entry("gpt-5-astra"), self.entry("gpt-6-astra"),
+            self.entry("gpt-6-luna"), self.entry("gpt-5.6-luna"),
+            self.entry("gpt-reserve"), self.entry("codex-auto-review", "hide")])
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.slugs(), ["heavy", "medium", "light", "super-light"])
+        m = self.models()
+        self.assertEqual(m["heavy"]["marker"], "from-gpt-6-astra")
+        self.assertEqual(m["medium"]["marker"], "from-gpt-6.10-sol")  # 6.10 > 6.9; hidden 7 ignored
+        self.assertEqual(m["light"]["marker"], "from-gpt-6-luna")
+        self.assertEqual(m["super-light"]["marker"], "from-gpt-6-luna")
+        for i, slug in enumerate(("heavy", "medium", "light", "super-light"), 1):
+            self.assertEqual(m[slug]["display_name"], slug)
+            self.assertEqual(m[slug]["priority"], i)
+            self.assertEqual(m[slug]["visibility"], "list")
+            self.assertEqual(m[slug]["context_window"], 1000)  # real metadata copied
+            self.assertEqual(m[slug]["default_reasoning_level"], "high")  # not the copied "low"
+            self.assertEqual(m[slug]["multi_agent_reasoning_effort"], "high")
+
+    def test_tiers_drop_openai_code_mode_tools(self):
+        # gpt-6-astra's real entry sets code_mode_only; GLM behind heavy then
+        # narrated the tool call as text instead of making it.
+        e = self.entry("gpt-6-astra")
+        e.update({"tool_mode": "code_mode_only", "use_responses_lite": True,
+                  "apply_patch_tool_type": "freeform", "multi_agent_version": "v2"})
+        self.write_cache([e])
+        self.assertEqual(self.run_install().returncode, 0)
+        heavy = self.models()["heavy"]
+        for key in ("tool_mode", "use_responses_lite", "apply_patch_tool_type"):
+            self.assertNotIn(key, heavy)
+        self.assertEqual(heavy["multi_agent_version"], "v2")  # spawn_agent keeps working
+
+    def test_cache_is_only_read_and_catalog_has_no_key(self):
+        self.write_cache([self.entry("gpt-6-sol")])
+        cache = os.path.join(self.home, ".codex", "models_cache.json")
+        before = open(cache, "rb").read()
+        self.assertEqual(self.run_install("--key", "fk-secret-key").returncode, 0)
+        self.assertEqual(open(cache, "rb").read(), before)
+        self.assertNotIn("fk-secret-key", open(self.catalog_path()).read())
+
+    def test_codex_home_cache_is_honoured(self):
+        alt = os.path.join(self.home, "alt-codex")
+        self.write_cache([self.entry("gpt-6-sol")], codex_home=alt)
+        if MONOLITH:
+            cmd = [FERRY, "codex", "--host", INSTALL_HOST]
+        else:
+            cmd = ["zsh", "-c", f"source {REPO}/lib/ferry-core.zsh\n"
+                   f"source {REPO}/lib/ferry-codex.zsh\ncmd_codex \"$@\"\n",
+                   "x", "--host", INSTALL_HOST]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           env=self.env(CODEX_HOME=alt), cwd=self.home)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.models()["medium"]["marker"], "from-gpt-6-sol")
+
+    def test_fallback_when_cache_is_missing(self):
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.slugs(), ["heavy", "medium", "light", "super-light"])
+        for e in self.models().values():
+            self.assertEqual(e["default_reasoning_level"], "high")
+            self.assertEqual(e["multi_agent_reasoning_effort"], "high")
+            for f in ("supported_reasoning_levels", "shell_type", "visibility",
+                      "supported_in_api", "priority", "support_verbosity",
+                      "truncation_policy", "experimental_supported_tools",
+                      "base_instructions"):
+                self.assertIn(f, e)
+
+    def test_fallback_for_a_missing_family_and_a_corrupt_cache(self):
+        self.write_cache([self.entry("gpt-6-sol")])  # no astra, no luna
+        self.assertEqual(self.run_install().returncode, 0)
+        m = self.models()
+        self.assertEqual(m["medium"]["marker"], "from-gpt-6-sol")
+        self.assertNotIn("marker", m["heavy"])
+        self.assertNotIn("marker", m["light"])
+        d = os.path.join(self.home, ".codex")
+        with open(os.path.join(d, "models_cache.json"), "w") as f:
+            f.write("{not json")
+        self.assertEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.slugs(), ["heavy", "medium", "light", "super-light"])
+
+    def test_wrappers_only_run_also_writes_the_catalog(self):
+        self.assertEqual(self.run_install("--wrappers").returncode, 0)
+        self.assertTrue(os.path.exists(self.catalog_path()))
+
+    @unittest.skipUnless(shutil.which("codex"), "codex binary not installed")
+    def test_real_codex_lists_exactly_the_four_tiers(self):
+        for cache in (True, False):  # copied entries, then the minimal fallback
+            if os.path.exists(self.catalog_path()):
+                os.remove(self.catalog_path())
+            if cache:
+                self.write_cache([self.entry("gpt-6-sol")])
+            else:
+                shutil.rmtree(os.path.join(self.home, ".codex"), ignore_errors=True)
+            self.assertEqual(self.run_install().returncode, 0)
+            r = subprocess.run(
+                ["codex", "-c", f'model_catalog_json="{self.catalog_path()}"',
+                 "debug", "models"],
+                capture_output=True, text=True, env=self.env(), cwd=self.home,
+                stdin=subprocess.DEVNULL, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual([m["slug"] for m in json.loads(r.stdout)["models"]],
+                             ["heavy", "medium", "light", "super-light"], f"cache={cache}")
 
 
 # --- end-to-end against the REAL codex binary ---------------------------------

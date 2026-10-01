@@ -25,6 +25,87 @@
 FERRY_CX_MARK_START="# >>> ferry codex profiles >>>"
 FERRY_CX_MARK_END="# <<< ferry codex profiles <<<"
 
+# Codex validates a spawn_agent `model` argument CLIENT-SIDE against its model
+# catalog, even under a custom provider, so the tier names (heavy, medium,
+# light, super-light) must exist in a catalog or the call dies with "Unknown
+# model" before reaching ferry. `model_catalog_json` (a top-level Codex config
+# key) points Codex at a catalog file; this writes it. Entries are deep copies
+# of the newest listed gpt-<ver>-<family> models in the user's own
+# models_cache.json (astra -> heavy, sol -> medium, luna -> light and
+# super-light) so Codex keeps real context/reasoning metadata; a missing cache
+# or family falls back to a minimal embedded entry (the field set Codex 0.159.3
+# requires: slug, display_name, supported_reasoning_levels, shell_type,
+# visibility, supported_in_api, priority, support_verbosity, truncation_policy,
+# experimental_supported_tools, and base_instructions or model_messages). The
+# cache is only READ; no secrets land in the catalog.
+_ferry_write_codex_catalog() {
+  python3 - "$HOME/.config/ferry/codex-catalog.json" \
+      "${CODEX_HOME:-$HOME/.codex}/models_cache.json" <<'PYEOF'
+import copy, json, os, re, sys
+
+out, cache = sys.argv[1:3]
+TIERS = [("heavy", "astra"), ("medium", "sol"), ("light", "luna"),
+         ("super-light", "luna")]
+DESC = {"heavy": "Ferry heavy lane", "medium": "Ferry medium lane",
+        "light": "Ferry light lane (flash)",
+        "super-light": "Ferry super-light lane (super-flash)"}
+MINIMAL = {
+    "supported_reasoning_levels": [
+        {"effort": e, "description": e} for e in ("low", "medium", "high")],
+    "shell_type": "shell_command",
+    "visibility": "list",
+    "supported_in_api": True,
+    "support_verbosity": False,
+    "truncation_policy": {"mode": "tokens", "limit": 10000},
+    "experimental_supported_tools": [],
+    "base_instructions": "You are a coding agent.",
+}
+
+best = {}  # family -> (version tuple, entry)
+try:
+    with open(cache) as f:
+        models = json.load(f).get("models") or []
+    for m in models:
+        if not isinstance(m, dict) or m.get("visibility") != "list":
+            continue
+        mt = re.fullmatch(r"gpt-(\d+(?:\.\d+)*)-(astra|sol|luna)",
+                          str(m.get("slug", "")))
+        if not mt:
+            continue
+        ver = tuple(int(x) for x in mt.group(1).split("."))
+        fam = mt.group(2)
+        if fam not in best or ver > best[fam][0]:
+            best[fam] = (ver, m)
+except Exception:
+    best = {}
+
+entries = []
+for i, (slug, fam) in enumerate(TIERS, 1):
+    e = copy.deepcopy(best[fam][1]) if fam in best else copy.deepcopy(MINIMAL)
+    # High effort everywhere: the copied entries carry OpenAI's defaults (low
+    # for gpt-6.1-sol), which spawned subagents would otherwise inherit.
+    e.update({"slug": slug, "display_name": slug, "description": DESC[slug],
+              "priority": i, "visibility": "list",
+              "default_reasoning_level": "high",
+              "multi_agent_reasoning_effort": "high"})
+    # OpenAI's entries also switch Codex to code-mode tools (tool_mode
+    # "code_mode_only", the responses-lite wire, freeform apply_patch). A ferry
+    # backend such as GLM then narrates or writes functions.exec(...) as text
+    # instead of calling the tool, so the tiers keep plain function tools.
+    for key in ("tool_mode", "use_responses_lite", "apply_patch_tool_type"):
+        e.pop(key, None)
+    entries.append(e)
+
+os.makedirs(os.path.dirname(out), exist_ok=True)
+tmp = out + ".tmp"
+with open(tmp, "w") as f:
+    json.dump({"models": entries}, f, indent=2)
+    f.write("\n")
+os.chmod(tmp, 0o644)
+os.replace(tmp, out)
+PYEOF
+}
+
 _ferry_install_codex_wrappers() {
   local cx_host="$1" cx_port="$2" cx_key="${3:-}"
   # Empty / absent key keeps the legacy 'local' bearer, so a front door without
@@ -32,6 +113,10 @@ _ferry_install_codex_wrappers() {
   [[ -z "$cx_key" ]] && cx_key="local"
   local rc="$HOME/.zshrc"
   touch "$rc"
+
+  # The wrappers reference this file; write it first so a wrapper never points
+  # at nothing. A failure only costs subagent model names, so warn, don't abort.
+  _ferry_write_codex_catalog || echo "    WARNING: could not write ~/.config/ferry/codex-catalog.json" >&2
 
   # Strip the canonical block, then re-add (same strip as the claude block).
   python3 - "$rc" "$FERRY_CX_MARK_START" "$FERRY_CX_MARK_END" <<'PYEOF'
@@ -77,9 +162,13 @@ PYEOF
 # FERRY_CODEX_KEY env var, never argv. User args come LAST, so `-m other-lane`
 # or their own `-c` overrides the lane picked here.
 #
-# developer_instructions: Codex's own AGENTS.md tells it to pass gpt-5.6-luna /
-# gpt-5.6-terra / gpt-6-astra as subagent models; ferry serves none of those
-# (400 Invalid model name), so one override maps them onto ferry lane names.
+# model_catalog_json + developer_instructions: Codex validates spawn_agent's
+# `model` client-side against its model catalog, so a catalog of the tier names
+# (~/.config/ferry/codex-catalog.json, written by `ferry codex`) makes
+# heavy / medium / light / super-light legal subagent models; the instruction
+# override tells Codex to pass those names, never an OpenAI id (ferry 400s on
+# them). model_reasoning_effort=high plus the catalog's high defaults run the
+# parent and spawned subagents at high effort. light / super-light resolve to flash / super-flash at the front door.
 #
 # Host, port and key are baked at install time: the wrapper must work with
 # ferry down. There is deliberately no bare `codex` function. `codex` is
@@ -97,7 +186,9 @@ _codex_ferry_run() {
       -c 'model_providers.ferry.base_url="http://__FERRY_CX_HOST__:__FERRY_CX_PORT__/v1"' \
       -c 'model_providers.ferry.env_key="FERRY_CODEX_KEY"' \
       -c 'model_providers.ferry.wire_api="responses"' \
-      -c 'developer_instructions="FERRY ROUTING: this session runs on the llm-ferry endpoint, which serves only the lanes heavy, medium, flash and super-flash. The model names gpt-5.6-luna, gpt-5.6-terra, gpt-6-astra, gpt-6-luna and gpt-6-sol do NOT exist here; when any instruction names them for a subagent, pass flash for light/mechanical work, medium for ordinary implementation, heavy for architecture/adversarial review."' \
+      -c 'model_reasoning_effort="high"' \
+      -c 'model_catalog_json="'"$HOME"'/.config/ferry/codex-catalog.json"' \
+      -c 'developer_instructions="FERRY ROUTING: this session runs on the llm-ferry endpoint. Its subagent models are the tier names heavy, medium, light and super-light; pass the tier name itself as the spawn_agent model, never an OpenAI model id."' \
       -c "model_providers.ferry.http_headers=${hdrs}" \
       -c "model=\"${model}\"" \
       "$@"
@@ -119,6 +210,7 @@ EOF
   echo ">>> codex shell wrappers installed in $rc:"
   echo "    codex-ferry        -> cloud driver lane: heavy"
   echo "    codex-ferry-flash  -> cloud worker lane: flash"
+  echo "    model catalog: ~/.config/ferry/codex-catalog.json (heavy, medium, light, super-light)"
   echo "    (bare 'codex' and ~/.codex are untouched — run: source $rc)"
 }
 
@@ -130,8 +222,9 @@ Usage:
   ferry codex [--host H] [--port P] [--key K] [--wrappers]
 
   (no flags)   Install the ~/.zshrc wrappers (codex-ferry / codex-ferry-flash)
-               and write ~/.config/ferry/codex.json
-               recording the lane map. Host resolves from --host, else
+               write ~/.config/ferry/codex.json
+               (the lane map) and ~/.config/ferry/codex-catalog.json (the tier
+               names as a Codex model catalog, so spawn_agent accepts them). Host resolves from --host, else
                ~/.config/ferry/client.json; on a host machine (no client.json)
                it defaults to 127.0.0.1:8090.
   --wrappers   Install ONLY the zshrc wrappers (used by host-reset.sh).

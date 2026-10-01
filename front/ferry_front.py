@@ -800,6 +800,113 @@ def discover_fleets(config_path: str) -> dict:
         return {}
 
 
+# Hosted (server-side) web search on a /v1/responses call that litellm serves
+# through its Anthropic Messages handler. Codex sends `{"type": "web_search"}`
+# in every request's tools; litellm translates it to Anthropic's
+# `web_search_20250305` server tool, and the backend answers with a
+# `server_tool_use` content block. Two failures follow, both in litellm's
+# llms/anthropic/chat/handler.py ModelResponseIterator.chunk_parser (1.99):
+#
+#   1. Kimi's Anthropic-compatible endpoint (api.kimi.com/coding) runs a
+#      pre-search on EVERY such request and streams
+#      `{"type":"server_tool_use","name":"web_search"}` with NO `id`. The
+#      parser reads content_block["id"] unconditionally (handler.py:913),
+#      raises KeyError('id'), the streaming wrapper re-raises it as
+#      MidStreamFallbackError, and the proxy's async_data_generator ends the
+#      SSE stream with a bare `data: {"error": ...}` line — no
+#      `response.completed`, so Codex retries 5x and exits with "stream
+#      closed before response.completed". (Its web_search_tool_result is
+#      empty, so the tool never bought anything on this backend.)
+#   2. Even with an `id` (real Anthropic, the claude-oauth lane), the same
+#      parser turns server_tool_use into an ordinary FUNCTION tool call named
+#      `web_search`, which the Responses bridge hands back to the client as a
+#      function_call it has no handler for.
+#
+# So the hosted search tool is dropped from a /v1/responses request whose
+# resolved lane — or any fallback hop of it — is served in the Messages
+# dialect. Responses-native backends (chatgpt/responses/*) keep it: there the
+# tool is executed upstream and round-trips correctly.
+RESPONSES_PATHS = frozenset({"/v1/responses", "/responses"})
+MESSAGES_DIALECT_PREFIXES = ("anthropic/", "claude-oauth/")
+HOSTED_SEARCH_RULE = "hosted_search_unsupported_on_messages_backend"
+
+
+def messages_dialect_lanes(config_path: str) -> frozenset:
+    """Every model_name that is, or falls back to, a Messages-dialect deployment.
+
+    A name qualifies when ANY deployment carrying it has a `litellm_params.model`
+    with a MESSAGES_DIALECT_PREFIXES prefix, or when any name in its
+    `router_settings.fallbacks` entry does — the front cannot know which hop
+    litellm will pick, and a mid-stream fallback onto the Messages hop fails
+    exactly like a primary would. Any read or parse problem returns an empty
+    set, which leaves every request untouched (the pre-fix behaviour)."""
+    if not config_path or not os.path.exists(config_path):
+        return frozenset()
+    try:
+        import yaml
+
+        with open(config_path) as handle:
+            cfg = yaml.safe_load(handle) or {}
+        direct = set()
+        for entry in cfg.get("model_list") or []:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("model_name")
+            params = entry.get("litellm_params")
+            model = params.get("model") if isinstance(params, dict) else None
+            if (isinstance(name, str) and isinstance(model, str)
+                    and model.startswith(MESSAGES_DIALECT_PREFIXES)):
+                direct.add(name)
+        out = set(direct)
+        router = cfg.get("router_settings") or {}
+        chains = router.get("fallbacks") if isinstance(router, dict) else None
+        for chain in chains if isinstance(chains, list) else []:
+            if not isinstance(chain, dict):
+                continue
+            for name, hops in chain.items():
+                if isinstance(hops, list) and any(h in direct for h in hops):
+                    out.add(name)
+        return frozenset(out)
+    except Exception:
+        return frozenset()
+
+
+def strip_hosted_search(doc) -> list:
+    """Drop hosted web-search tools from a Responses body, IN PLACE.
+
+    Returns one schema_warnings-shaped finding per dropped tool (`fixed: True`)
+    and leaves `doc` untouched when there is nothing to drop. A body whose
+    tools are ALL dropped loses `tools` and `tool_choice` too, since a
+    tool_choice with no tools is a 400 on most backends. Never raises."""
+    found = []
+    try:
+        tools = doc.get("tools") if isinstance(doc, dict) else None
+        if not isinstance(tools, list):
+            return found
+        kept = []
+        for tool in tools:
+            kind = tool.get("type") if isinstance(tool, dict) else None
+            if isinstance(kind, str) and kind.startswith("web_search"):
+                found.append({"tool": kind, "path": "(root)",
+                              "rule": HOSTED_SEARCH_RULE, "fixed": True})
+            else:
+                kept.append(tool)
+        if found:
+            if kept:
+                doc["tools"] = kept
+                choice = doc.get("tool_choice")
+                if (isinstance(choice, dict) and isinstance(choice.get("type"), str)
+                        and choice["type"].startswith("web_search")):
+                    doc["tool_choice"] = "auto"   # it forced the dropped tool
+            else:
+                doc.pop("tools", None)
+                doc.pop("tool_choice", None)
+                doc.pop("parallel_tool_calls", None)
+    except Exception:
+        return []
+    return found
+
+
 def fleet_gaps(fleets: dict) -> list:
     """Human-readable complaints about fleets missing a cloud lane.
 
@@ -1606,9 +1713,13 @@ def _set_content_length(scope, length: int) -> None:
 class LaneCatalogueFilter:
     """ASGI middleware that filters the model listing and nothing else."""
 
-    def __init__(self, app, public: frozenset[str], fleets=None, state=None) -> None:
+    def __init__(self, app, public: frozenset[str], fleets=None, state=None,
+                 messages_lanes=frozenset()) -> None:
         self.app = app
         self.public = public
+        # Lanes served (or fallen back to) in the Anthropic Messages dialect:
+        # see messages_dialect_lanes / strip_hosted_search.
+        self.messages_lanes = frozenset(messages_lanes or ())
         # `fleets` is the discovery map {fleet: {lane: provider model}}; `state`
         # is the FleetState over fleets.json. BOTH default to the pre-fleets
         # behaviour: with `state is None` not one byte of a request is read or
@@ -2024,6 +2135,22 @@ class LaneCatalogueFilter:
             if resolved and resolved != doc["model"]:
                 doc["model"] = resolved
                 changed = True
+        if (self.messages_lanes and isinstance(doc, dict)
+                and scope.get("path") in RESPONSES_PATHS
+                and doc.get("model") in self.messages_lanes):
+            # After fleet resolution, so the check sees `domestic.heavy`, not
+            # the bare `heavy` the client sent. Recorded beside the schema
+            # findings so the event record names the drop.
+            dropped = strip_hosted_search(doc)
+            if dropped:
+                changed = True
+                found = list(found) + dropped
+                if tap_enabled():
+                    try:
+                        if _tap() is not None:
+                            scope[SCHEMA_WARNINGS_KEY] = found
+                    except Exception:
+                        pass
         entry = scope.get(KEY_ENTRY_SCOPE)
         if entry is not None:
             resolved = doc.get("model") if isinstance(doc, dict) else None
@@ -2654,7 +2781,8 @@ def build_app(litellm_app=None):
     if not should_wrap(public):
         # Nothing to do — behave exactly like plain litellm.
         return litellm_app
-    return LaneCatalogueFilter(litellm_app, public, fleets=fleets, state=state)
+    return LaneCatalogueFilter(litellm_app, public, fleets=fleets, state=state,
+                               messages_lanes=messages_dialect_lanes(config_path))
 
 
 def _prepare_multiproc_metrics(port: int) -> None:

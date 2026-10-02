@@ -3653,6 +3653,17 @@ class TestZaiToolSearchStrip(unittest.TestCase):
              "tools": copy.deepcopy(self.TOOLS)})
         self.assertEqual(len(out["tools"]), 3)
 
+    def test_anthropic_adapter_drops_tool_search(self):
+        # Kimi K3 (`anthropic/k3`, domestic.heavy): litellm's anthropic adapter
+        # raises "Unsupported tool type: tool_search" before any network call.
+        out = self._strip("anthropic/k3", copy.deepcopy(self.TOOLS))
+        self.assertEqual([t["type"] for t in out["tools"]],
+                         ["function", "namespace", "web_search"])
+        out = FF.strip_tool_search_for_zai(
+            {"model": "k3", "custom_llm_provider": "anthropic",
+             "tools": copy.deepcopy(self.TOOLS)})
+        self.assertEqual(len(out["tools"]), 3)
+
     def test_non_zai_untouched(self):
         for model in ("openrouter/z-ai/glm-5.3", "chatgpt/responses/gpt-5.6-luna",
                       "claude-oauth/x", "glm-5.3"):

@@ -7195,6 +7195,17 @@ MINIMAL = {
     "base_instructions": "You are a coding agent.",
 }
 
+IDENTITY = re.compile(r"an agent based on GPT-\d+(?:\.\d+)*")
+
+def rename(node, lane):
+    if isinstance(node, str):
+        return IDENTITY.sub(lane, node)
+    if isinstance(node, list):
+        return [rename(v, lane) for v in node]
+    if isinstance(node, dict):
+        return {k: rename(v, lane) for k, v in node.items()}
+    return node
+
 best = {}  # family -> (version tuple, entry)
 try:
     with open(cache) as f:
@@ -7228,6 +7239,10 @@ for i, (slug, fam) in enumerate(TIERS, 1):
     # instead of calling the tool, so the tiers keep plain function tools.
     for key in ("tool_mode", "use_responses_lite", "apply_patch_tool_type"):
         e.pop(key, None)
+    # The copied prompts say "You are Codex, an agent based on GPT-6", so a
+    # ferry backend asked its model reports GPT-6. Name the lane instead; the
+    # upstream model behind it is the front door's choice, unknown here.
+    e = rename(e, 'an agent running on the llm-ferry "%s" lane' % slug)
     entries.append(e)
 
 os.makedirs(os.path.dirname(out), exist_ok=True)

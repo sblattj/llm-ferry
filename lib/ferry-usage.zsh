@@ -95,6 +95,9 @@ Commands:
   expose-vnc         [Client] Publish this machine's VNC server (5900) through the host,
                        tagged so 'ferry serve-vnc' can show it in a browser
                        ferry expose-vnc [--local PORT] [--as PUBLIC] [--host H] [--port P] [--token T]
+  expose-tmux        [Client] Publish this machine's sshd (22) through the host so the
+                       host can tmux in (turn on Remote Login first)
+                       ferry expose-tmux [--local PORT] [--as PUBLIC] [--host H] [--port P] [--token T]
   env                [Client] Emit shell exports so downloads route via the host proxy
                        eval "\$(ferry env --host H)"  [--proxy-port P] [--hf-port P2] [--write]
   opencode           [Client] Auto-wire opencode to route through the host (detects served models)
@@ -143,6 +146,8 @@ Ferrying models & files across the LAN:
   send <path> <cli>  [Host] Push a file/dir to a listening client  [--port P]
   serve-hf           [Host] Start EXPERIMENTAL HuggingFace pass-through proxy [--port P] (default $HF_PORT)
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
+  tmux [client]      [Host] Attach a tmux session on a client that ran 'ferry expose-tmux'
+                       (ssh through the relay)  ferry tmux [CLIENT] [--list] [--session NAME] [--user U] [--print]
   serve-vnc          [Host] Serve the browser VNC viewer for ports published with
                        'ferry expose-vnc' [--port P] [--bind ADDR] [--foreground] [--fetch] (default $VNC_PORT)
 

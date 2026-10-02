@@ -139,6 +139,12 @@ class DispatcherHelpGuard(unittest.TestCase):
         self.assertNotIn("Ferrying models", proc.stdout)  # not the whole banner
         proc, _ = self.run_ferry("expose", "--help")
         self.assertNotIn("expose-vnc", proc.stdout)
+        proc, _ = self.run_ferry("expose-tmux", "--help")
+        self.assertIn("Remote Login", proc.stdout)
+        self.assertNotIn("Attach a tmux session", proc.stdout)  # not the host entry
+        proc, _ = self.run_ferry("help", "tmux")
+        self.assertIn("Attach a tmux session", proc.stdout)
+        self.assertNotIn("Publish this machine's sshd", proc.stdout)  # not expose-tmux's
         proc, _ = self.run_ferry("up", "-h")
         self.assertIn("Options for 'up':", proc.stdout)
         self.assertIn("--local-schematron", proc.stdout)

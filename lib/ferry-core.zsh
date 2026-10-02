@@ -328,6 +328,11 @@ RELAY_LOG="$LOG_DIR/relay-$RELAY_PORT.log"
 # WebSocket->TCP bridge onto ports the relay has published as kind=vnc.
 VNC_PORT="8099"
 VNC_LOG="$LOG_DIR/vnc-$VNC_PORT.log"
+
+# Default PUBLIC port `ferry expose-tmux` asks the relay for (the client's sshd is
+# on 22, which the relay refuses: public ports are 1024+). Deliberately NOT in the
+# relay's reserved list, or clients could not publish on it.
+TMUX_PORT="8101"
 NOVNC_VERSION="1.7.0"
 NOVNC_URL="${FERRY_NOVNC_URL:-https://github.com/novnc/noVNC/archive/refs/tags/v$NOVNC_VERSION.tar.gz}"
 NOVNC_SHA256="${FERRY_NOVNC_SHA256:-b1003a11b6e6e8d8f7f5e5586daae7f8ca651d8aee0aa155ff9ac841c48f52c6}"

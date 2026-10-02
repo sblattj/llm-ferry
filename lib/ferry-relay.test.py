@@ -15,6 +15,7 @@ outlives its client is an open port nobody remembers opening.
 """
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -97,6 +98,18 @@ class RfbService(EchoService):
     def serve(self, conn):
         try:
             conn.sendall(b"RFB 003.008\n")
+        except OSError:
+            conn.close()
+            return
+        super().serve(conn)
+
+
+class SshService(EchoService):
+    """A fake sshd: greets with an SSH identification string, then echoes."""
+
+    def serve(self, conn):
+        try:
+            conn.sendall(b"SSH-2.0-OpenSSH_9.6\r\n")
         except OSError:
             conn.close()
             return
@@ -423,6 +436,111 @@ class ExposeVncTest(RelayTest):
         r = self.status_kind_tags()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("[vnc]", r.stdout)
+
+
+class ExposeTmuxTest(RelayTest):
+    def tmux_args(self, local):
+        return ("expose-tmux", "--local", str(local), "--as", str(self.public_port),
+                "--host", "127.0.0.1", "--port", str(self.relay_port), "--token", self.token())
+
+    def test_local_port_must_be_a_number(self):
+        r = self.run_ferry("expose-tmux", "--local", "abc")
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("must be a port number", r.stdout + r.stderr)
+        self.assertNotIn("Traceback", r.stdout + r.stderr)
+
+    def test_refuses_a_local_port_that_is_not_ssh(self):
+        if not shutil.which("tmux"):
+            self.skipTest("tmux is not installed here")
+        self.start_relay()
+        r = self.run_ferry(*self.tmux_args(self.echo.port))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("not an SSH server", r.stdout)
+        self.assertNotIn(str(self.public_port), self.state())
+
+    def test_refuses_a_closed_local_port(self):
+        if not shutil.which("tmux"):
+            self.skipTest("tmux is not installed here")
+        self.start_relay()
+        r = self.run_ferry(*self.tmux_args(free_port()))
+        self.assertEqual(r.returncode, 1, r.stdout)
+        self.assertIn("Remote Login", r.stdout)
+
+    def test_refuses_when_tmux_is_not_on_path(self):
+        bindir = os.path.join(self.tmp, "nobin")
+        os.makedirs(bindir)
+        for tool in ("python3", "zsh"):
+            os.symlink(shutil.which(tool), os.path.join(bindir, tool))
+        path = bindir + ":/usr/bin:/bin:/usr/sbin:/sbin"
+        if shutil.which("tmux", path=path):
+            self.skipTest("a system tmux is on the minimal PATH")
+        env = self.env()
+        env["PATH"] = path
+        r = subprocess.run(["zsh", FERRY, "expose-tmux", "--local", str(self.echo.port)],
+                           env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("brew install tmux", r.stdout)
+
+    def test_publishes_an_ssh_service_as_kind_tmux_with_the_user(self):
+        if not shutil.which("tmux"):
+            self.skipTest("tmux is not installed here")
+        ssh = SshService()
+        ssh.start()
+        self.addCleanup(ssh.shutdown)
+        self.start_relay()
+        p = self.ferry(*self.tmux_args(ssh.port))
+        self.wait_for_port(self.public_port, "the published ssh port")
+        entry = self.state()[str(self.public_port)]
+        self.assertEqual(entry["kind"], "tmux")
+        self.assertEqual(entry.get("user"), os.environ.get("USER", ""))
+        with socket.create_connection(("127.0.0.1", self.public_port), timeout=10) as s:
+            self.assertTrue(s.recv(8).startswith(b"SSH-"))
+        self.kill(p)
+        out = p.stdout.read()
+        self.assertIn("ferry tmux", out)
+
+    def test_default_public_port_is_the_tmux_port(self):
+        # Without --as, expose-tmux asks the relay for TMUX_PORT.
+        with open(FERRY) as f:
+            m = re.search(r'^TMUX_PORT="(\d+)"', f.read(), re.M)
+        self.assertIsNotNone(m, "TMUX_PORT is not defined in ferry")
+        self.assertEqual(m.group(1), "8101")
+
+
+class RelayUserFieldTest(RelayTest):
+    def register(self, **extra):
+        s = socket.create_connection(("127.0.0.1", self.relay_port), timeout=10)
+        self.addCleanup(s.close)
+        msg = {"op": "register", "token": self.token(), "public_port": self.public_port,
+               "label": "box", "kind": "tmux"}
+        msg.update(extra)
+        s.sendall((json.dumps(msg) + "\n").encode())
+        buf = b""
+        while not buf.endswith(b"\n"):
+            buf += s.recv(1)
+        reply = json.loads(buf)
+        # The relay answers before it writes the state file; wait for the entry.
+        end = time.time() + 10
+        while time.time() < end and str(self.public_port) not in self.state():
+            time.sleep(0.1)
+        return reply
+
+    def test_hostile_user_is_dropped(self):
+        self.start_relay()
+        self.assertTrue(self.register(user="a b;rm")["ok"])
+        entry = self.state()[str(self.public_port)]
+        self.assertEqual(entry["kind"], "tmux")
+        self.assertNotIn("user", entry)
+
+    def test_valid_user_is_stored_and_old_clients_still_work(self):
+        self.start_relay()
+        self.assertTrue(self.register(user="stephen.b-1_x")["ok"])
+        self.assertEqual(self.state()[str(self.public_port)]["user"], "stephen.b-1_x")
+
+    def test_missing_user_registers_without_a_user_key(self):
+        self.start_relay()
+        self.assertTrue(self.register()["ok"])
+        self.assertNotIn("user", self.state()[str(self.public_port)])
 
 
 if __name__ == "__main__":

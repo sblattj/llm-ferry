@@ -1336,6 +1336,27 @@ PYEOF
     fi
   fi
 
+  # tmux-over-ssh: one hint per client that published its sshd with expose-tmux.
+  # Reads the state file alone (a stale file is the relay's to clean up).
+  if [[ -f "$RELAY_STATE_FILE" ]]; then
+    python3 - "$RELAY_STATE_FILE" <<'PYEOF' || true
+import json, sys
+try:
+    pub = json.load(open(sys.argv[1]))
+    if not isinstance(pub, dict):
+        pub = {}
+    seats = {p: i for p, i in pub.items()
+             if str(p).isascii() and str(p).isdigit() and isinstance(i, dict) and i.get("kind") == "tmux"}
+    if seats:
+        print(">>> tmux clients (ssh through the relay):")
+    for port, info in sorted(seats.items(), key=lambda kv: int(kv[0])):
+        who = info.get("label") or port
+        print(f"    ferry tmux {who}    (port {port}, {info.get('client', '?')})")
+except Exception:
+    sys.exit(0)
+PYEOF
+  fi
+
   # Offered files manifest (from `ferry offer`).
   local offered_file="$HOME/.config/ferry/offered.json"
   if [[ -f "$offered_file" ]]; then

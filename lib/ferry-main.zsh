@@ -72,6 +72,8 @@ case "$COMMAND" in
   relay)         cmd_relay "$@" ;;
   expose)        cmd_expose "$@" ;;
   expose-vnc)    cmd_expose_vnc "$@" ;;
+  expose-tmux)   cmd_expose_tmux "$@" ;;
+  tmux)          cmd_tmux "$@" ;;
   offer)         cmd_offer "$@" ;;
   pull)          cmd_pull "$@" ;;
   get)           cmd_get "$@" ;;

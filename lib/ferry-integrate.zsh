@@ -1030,6 +1030,32 @@ def is_user_goal_path(entry):
                for d in GOAL_PLUGIN_DIRS)
 
 
+def user_goal_is_pinned_pkg(entry):
+    """Is this user install the SAME package ferry pins (not a fork)?
+
+    True when the nearest package.json at or above the entry's path (three
+    levels at most: a dir, or dist/goal-plugin.js inside one) names
+    GOAL_PLUGIN_PKG. The pro-max installer's own directory qualifies, so that
+    host still gets the using-the-goal-plugin skill even though ferry wrote no
+    spec; a fork under another name, or a path that does not exist, does not.
+    """
+    raw = entry[0] if isinstance(entry, list) and entry else entry
+    p = local_path_of(raw)
+    if p is None:
+        return False
+    d = p if os.path.isdir(p) else os.path.dirname(p)
+    for _ in range(3):
+        pj = os.path.join(d, "package.json")
+        if os.path.isfile(pj):
+            try:
+                with open(pj) as f:
+                    return json.load(f).get("name") == GOAL_PLUGIN_PKG
+            except (OSError, ValueError, AttributeError):
+                return False
+        d = os.path.dirname(d)
+    return False
+
+
 def is_goal_plugin(entry):
     """Does this entry already SATISFY the requirement (upstream or a fork)?"""
     if is_managed_tui_entry(entry):        # ferry's own colon-free copy
@@ -1672,6 +1698,12 @@ if set_default and goal_entry == GOAL_PLUGIN and spec_out:
         f.write(f"{GOAL_PLUGIN}\n{GOAL_PLUGIN_REF}\n{GOAL_PLUGIN_PKG}\n"
                 f"{tui_file or ''}\n{goal_tui_dir()}\n{goal_cache_root}\n"
                 f"{'1' if tui_dir_unusable() else '0'}\n")
+elif set_default and user_goal and spec_out and user_goal_is_pinned_pkg(user_goal):
+    # The user's local install IS the pinned package (the pro-max installer's
+    # copy), so the doctrine still applies: line 8 asks for the skill alone,
+    # with line 1 empty so nothing is pre-installed or synced.
+    with open(spec_out, "w") as f:
+        f.write("\n" * 7 + "skill\n")
 
 print(f"    Wired opencode -> {base}")
 print(f"    Provider: ferry   Lanes: {driver} (driver), {light} (light), {standard} (standard), {explore} (explore), {compaction} (compaction), {house} (title/summary)")
@@ -1737,7 +1769,7 @@ PYEOF
   # _ferry_preinstall_goal_plugin). Doing it here is what turns "the config
   # looks right" into "the plugin is on disk and loadable".
   local goal_spec="" goal_ref="" goal_pkg=""
-  local goal_tui_file="" goal_tui_dir="" goal_cache_root="" goal_tui_bad="0"
+  local goal_tui_file="" goal_tui_dir="" goal_cache_root="" goal_tui_bad="0" goal_skill_only=""
   if [[ -s "$oc_specfile" ]]; then
     goal_spec="$(sed -n 1p "$oc_specfile")"
     goal_ref="$(sed -n 2p "$oc_specfile")"
@@ -1746,6 +1778,7 @@ PYEOF
     goal_tui_dir="$(sed -n 5p "$oc_specfile")"
     goal_cache_root="$(sed -n 6p "$oc_specfile")"
     goal_tui_bad="$(sed -n 7p "$oc_specfile")"
+    goal_skill_only="$(sed -n 8p "$oc_specfile")"
   fi
   rm -f "$oc_specfile"
 
@@ -1756,7 +1789,9 @@ PYEOF
   # skill describing wiring ferry did not do. Deliberately NOT gated on
   # (( do_install )): copying one file out of the checkout is local work, while
   # --no-install is about skipping the network fetch of the plugin package.
-  [[ -n "$goal_spec" ]] && _ferry_install_goal_skill
+  # The one exception is a local install of the pinned package itself (line 8
+  # = "skill"): ferry wrote no spec, but the doctrine describes that plugin.
+  [[ -n "$goal_spec" || "$goal_skill_only" == skill ]] && _ferry_install_goal_skill
 
   if (( do_install )) && [[ -n "$goal_spec" ]]; then
     if command -v opencode >/dev/null 2>&1; then

@@ -228,8 +228,43 @@ class LiveBase(unittest.TestCase):
                               cwd=self.tmp)
 
 
+def _etime_seconds(s):
+    """ps `etime` ([[dd-]hh:]mm:ss) as seconds."""
+    days, _, rest = s.rpartition("-")
+    parts = [int(p) for p in rest.split(":")]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    h, m, sec = parts
+    return (int(days) if days else 0) * 86400 + h * 3600 + m * 60 + sec
+
+
+def sweep_orphan_relays(min_age=600):
+    """Stop relays an EARLIER, interrupted run of this suite left behind.
+
+    The relay disowns itself, so a run killed before its cleanups ran leaves
+    one listening forever (seen 2026-10-02: a two-day-old relay on *:64716).
+    Only processes whose argv names a ferry-ansi-home-* directory are touched,
+    and only those older than `min_age`, so a concurrent run keeps its own.
+    """
+    r = subprocess.run(["ps", "-axo", "pid=,etime=,command="],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or "ferry-ansi-home-" not in parts[2]:
+            continue
+        try:
+            if _etime_seconds(parts[1]) >= min_age:
+                os.kill(int(parts[0]), signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+
+
 class RelayTokenTest(LiveBase):
     """The relay banner carries the shared TOKEN — the highest-stakes site."""
+
+    @classmethod
+    def setUpClass(cls):
+        sweep_orphan_relays()
 
     def reap(self, port):
         r = subprocess.run(["lsof", "-t", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],

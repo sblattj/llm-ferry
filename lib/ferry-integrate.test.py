@@ -2055,6 +2055,34 @@ class TestGoalSkillInstall(FerryOpencodeCase):
         self.assertNotIn("Skill:", out)
         self.assertFalse(os.path.exists(self.installed()))
 
+    def _local_install(self, pkg_name):
+        """A real directory shaped like the pro-max installer's, holding a
+        package.json with `pkg_name`, wired into the config as a file:// URL."""
+        d = os.path.join(self.dir, "share", "opencode-goal-pro-max-complete-plugin")
+        os.makedirs(os.path.join(d, "dist"), exist_ok=True)
+        with open(os.path.join(d, "package.json"), "w") as f:
+            json.dump({"name": pkg_name, "version": "1.1.0"}, f)
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": ["file://" + d]}, f)
+
+    def test_a_local_install_of_the_pinned_package_still_gets_the_skill(self):
+        # The pro-max installer's own copy IS the plugin ferry pins, so the
+        # doctrine applies even though ferry wrote no spec and installed nothing.
+        self._local_install("opencode-goal-pro-max-complete-plugin")
+        out = self.run_ferry(ferry_bin=self.checkout())
+        self.assertIn("local install", out)
+        self.assertIn(self.LINE, out)
+        with open(self.SRC, "rb") as f, open(self.installed(), "rb") as g:
+            self.assertEqual(g.read(), f.read())
+
+    def test_a_local_install_under_another_package_name_gets_no_skill(self):
+        # Control for the case above: same path shape, a fork's package name.
+        self._local_install("my-goal-fork")
+        out = self.run_ferry(ferry_bin=self.checkout())
+        self.assertIn("local install", out)
+        self.assertNotIn("Skill:", out)
+        self.assertFalse(os.path.exists(self.installed()))
+
 
 class TestGoalSkillFromFerryInstall(unittest.TestCase):
     """The OTHER entry point: `ferry install`.
@@ -2147,6 +2175,37 @@ class TestGoalSkillFromFerryInstall(unittest.TestCase):
             self.home, ".config", "opencode", "skill", "spawning-subagents",
             "SKILL.md")))
         self.assertFalse(os.path.exists(self.installed()))
+
+
+class TestGoalPluginPinResolves(unittest.TestCase):
+    """The pinned tarball must still exist upstream.
+
+    v1.43.1: the plugin repo was renamed, the old URL went 404, and every
+    `ferry opencode` kept writing a spec opencode could not install, while the
+    offline suite stayed green. This reads the URL out of the source, so it
+    follows the next bump, and skips (not passes) when the network is down.
+    """
+
+    def pinned_url(self):
+        with open(os.path.join(REPO, "lib", "ferry-integrate.zsh")) as f:
+            src = f.read()
+        repo = re.search(r'^GOAL_PLUGIN_REPO = "([^"]+)"', src, re.M).group(1)
+        ref = re.search(r'^GOAL_PLUGIN_REF = "([^"]+)"', src, re.M).group(1)
+        return f"https://github.com/{repo}/archive/refs/tags/{ref}.tar.gz"
+
+    def test_the_pinned_tarball_downloads(self):
+        import urllib.error
+        import urllib.request
+        url = self.pinned_url()
+        req = urllib.request.Request(url, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                status = r.status
+        except urllib.error.HTTPError as e:
+            self.fail(f"{url} -> HTTP {e.code}: bump GOAL_PLUGIN_REPO/REF")
+        except (urllib.error.URLError, OSError) as e:
+            self.skipTest(f"network unavailable: {e}")
+        self.assertEqual(status, 200, url)
 
 
 if __name__ == "__main__":

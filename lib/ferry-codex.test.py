@@ -392,6 +392,23 @@ class CatalogTest(CodexHarness):
             self.assertNotIn(key, heavy)
         self.assertEqual(heavy["multi_agent_version"], "v2")  # spawn_agent keeps working
 
+    def test_tiers_name_their_ferry_lane_not_the_copied_openai_model(self):
+        # A subagent on `light` (GLM 5.3 Flash behind ferry) answered "based on
+        # GPT-6" because the copied luna template says so.
+        e = self.entry("gpt-6-luna")
+        e["base_instructions"] = "You are Codex, an agent based on GPT-6.1. Be brief."
+        e["model_messages"] = {"instructions_template":
+                               "You are Codex, an agent based on GPT-6. You and the user share one workspace."}
+        self.write_cache([e])
+        self.assertEqual(self.run_install().returncode, 0)
+        for slug in ("light", "super-light"):
+            m = self.models()[slug]
+            want = f'You are Codex, an agent running on the llm-ferry "{slug}" lane.'
+            self.assertEqual(m["model_messages"]["instructions_template"],
+                             want + " You and the user share one workspace.")
+            self.assertEqual(m["base_instructions"], want + " Be brief.")
+            self.assertNotIn("GPT-6", json.dumps(m))
+
     def test_cache_is_only_read_and_catalog_has_no_key(self):
         self.write_cache([self.entry("gpt-6-sol")])
         cache = os.path.join(self.home, ".codex", "models_cache.json")

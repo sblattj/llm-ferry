@@ -212,7 +212,12 @@ path, mode = sys.argv[1], sys.argv[2]
 # --- Mirrored from lib/ferry-integrate.zsh (GOAL_* constants, is_path_entry,
 # is_goal_spec, GOAL_COMMAND). Duplicated on purpose: this script is fetched
 # and piped straight into zsh, so it cannot import anything.
+# The plugin moved: through v0.11.0 it was sblattj/OpenCode-goal-plugin (npm name
+# opencode-goal-plugin, repo now gone); since then it is
+# sblattj/opencode-goal-pro-max-complete-plugin. Both are ferry's to remove.
 GOAL_NAME_MATCHES = {
+    "opencode-goal-pro-max-complete-plugin",
+    "github:sblattj/opencode-goal-pro-max-complete-plugin",
     "opencode-goal-plugin",
     "@prevalentware/opencode-goal-plugin",
     "willytop8/opencode-goal-plugin",
@@ -220,7 +225,9 @@ GOAL_NAME_MATCHES = {
     "sblattj/opencode-goal-plugin",
     "github:sblattj/opencode-goal-plugin",
 }
-GOAL_REPO_MARKERS = ("sblattj/opencode-goal-plugin", "willytop8/opencode-goal-plugin")
+GOAL_REPO_MARKERS = ("sblattj/opencode-goal-pro-max-complete-plugin",
+                     "sblattj/opencode-goal-plugin",
+                     "willytop8/opencode-goal-plugin")
 GOAL_COMMAND = {
     "description": "Set a session-scoped goal and auto-continue until complete.",
     "template": "$ARGUMENTS",
@@ -283,7 +290,7 @@ def pkg_name(entry):
     if "#" in entry:
         entry = entry.rsplit("#", 1)[0]
     # Split at the FIRST separating "@": the canonical spec is
-    # `opencode-goal-plugin@https://...`, and a URL may carry an "@" of its own.
+    # `opencode-goal-pro-max-complete-plugin@https://...`, and a URL may carry an "@" of its own.
     # A leading "@" is an npm SCOPE, not a separator.
     if entry.startswith("@"):
         rest = entry[1:]
@@ -425,7 +432,7 @@ PYEOF
 # over-report a fork that happens to live under a directory called ferry/ — a
 # dry run says "would", and the run itself still decides by location.
 grep_goal_plugin() {
-  if grep -iE '"[^"]*opencode-goal-plugin' "$1" 2>/dev/null \
+  if grep -iE '"[^"]*opencode-goal-(pro-max-complete-)?plugin' "$1" 2>/dev/null \
        | grep -qvE '"(/|\.|~|file:)'; then
     return 0
   fi

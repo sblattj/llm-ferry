@@ -627,12 +627,21 @@ class TestGoalPlugin(FerryOpencodeCase):
     # package.json declares build/prepack additionally dies in pacote's prepare
     # step inside the bun binary. The ref is still pinned because the spec
     # string IS opencode's cache key. Bump alongside GOAL_PLUGIN_REF.
-    REF = "v0.11.0"
-    PKG = "opencode-goal-plugin"
-    BASE = "github:sblattj/OpenCode-goal-plugin"
-    TARBALL = (f"https://github.com/sblattj/OpenCode-goal-plugin"
+    REF = "v1.1.0"
+    VERSION = "1.1.0"
+    PKG = "opencode-goal-pro-max-complete-plugin"
+    BASE = "github:sblattj/opencode-goal-pro-max-complete-plugin"
+    TARBALL = (f"https://github.com/sblattj/opencode-goal-pro-max-complete-plugin"
                f"/archive/refs/tags/{REF}.tar.gz")
     PLUGIN = f"{PKG}@{TARBALL}"
+    # The plugin's FIRST home, through v0.11.0. That repo is gone (404), so the
+    # canonical spec every earlier ferry wrote is now an uninstallable entry -
+    # these spellings are historical and must keep being RECOGNISED, never
+    # written. The legacy-spelling tests below build from these on purpose.
+    OLD_PKG = "opencode-goal-plugin"
+    OLD_BASE = "github:sblattj/OpenCode-goal-plugin"
+    OLD_PLUGIN = (f"{OLD_PKG}@https://github.com/sblattj/OpenCode-goal-plugin"
+                  f"/archive/refs/tags/v0.11.0.tar.gz")
     GOAL_COMMAND = {
         "description": "Set a session-scoped goal and auto-continue until complete.",
         "template": "$ARGUMENTS",
@@ -665,25 +674,25 @@ class TestGoalPlugin(FerryOpencodeCase):
         refreshes a cached git plugin, so an unpinned entry pins a machine to
         whatever commit it first fetched. Rewriting it is the rollout."""
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [self.BASE]}, f)
+            json.dump({"plugin": [self.OLD_BASE]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [self.PLUGIN])
 
     def test_an_older_pin_is_rewritten_to_the_current_ref(self):
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [f"{self.BASE}#v0.9.0"]}, f)
+            json.dump({"plugin": [f"{self.OLD_BASE}#v0.9.0"]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [self.PLUGIN])
 
     def test_an_unpinned_tuple_entry_is_repinned_and_keeps_its_options(self):
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [[self.BASE, {"enabled": True}]]}, f)
+            json.dump({"plugin": [[self.OLD_BASE, {"enabled": True}]]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [[self.PLUGIN, {"enabled": True}]])
 
     def test_repinning_is_idempotent_on_a_second_run(self):
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [self.BASE]}, f)
+            json.dump({"plugin": [self.OLD_BASE]}, f)
         self.run_ferry()
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [self.PLUGIN])
@@ -816,7 +825,7 @@ class TestGoalPlugin(FerryOpencodeCase):
     # discarded, so a machine carrying one has never once run the plugin.
     def test_the_v1294_bare_github_pin_is_migrated(self):
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [f"{self.BASE}#v0.9.1"]}, f)
+            json.dump({"plugin": [f"{self.OLD_BASE}#v0.9.1"]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [self.PLUGIN])
 
@@ -825,7 +834,7 @@ class TestGoalPlugin(FerryOpencodeCase):
         the plugin has declared build+prepack since v0.9.1, so a git spec still
         dies with `git dep preparation failed`. Only the tarball is immune."""
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [f"{self.PKG}@{self.BASE}#v0.9.0"]}, f)
+            json.dump({"plugin": [f"{self.OLD_PKG}@{self.OLD_BASE}#v0.9.0"]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [self.PLUGIN])
 
@@ -838,7 +847,7 @@ class TestGoalPlugin(FerryOpencodeCase):
         self.assertEqual(self.read()["plugin"], [self.PLUGIN])
 
     def test_an_older_named_tarball_is_migrated(self):
-        old = f"{self.PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
+        old = f"{self.OLD_PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
         with open(self.cfg, "w") as f:
             json.dump({"plugin": [old]}, f)
         self.run_ferry()
@@ -860,12 +869,12 @@ class TestGoalPlugin(FerryOpencodeCase):
 
     def test_a_bare_github_tuple_is_migrated_and_keeps_its_options(self):
         with open(self.cfg, "w") as f:
-            json.dump({"plugin": [[f"{self.BASE}#v0.9.1", {"enabled": True}]]}, f)
+            json.dump({"plugin": [[f"{self.OLD_BASE}#v0.9.1", {"enabled": True}]]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [[self.PLUGIN, {"enabled": True}]])
 
     def test_a_tarball_tuple_is_migrated_and_keeps_its_options(self):
-        old = f"{self.PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
+        old = f"{self.OLD_PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
         with open(self.cfg, "w") as f:
             json.dump({"plugin": [[old, {"enabled": False}]]}, f)
         self.run_ferry()
@@ -875,8 +884,8 @@ class TestGoalPlugin(FerryOpencodeCase):
         with open(self.cfg, "w") as f:
             json.dump({"plugin": [
                 "some-other-plugin",
-                f"{self.BASE}#v0.9.1",
-                f"{self.PKG}@{self.BASE}#v0.9.0",
+                f"{self.OLD_BASE}#v0.9.1",
+                f"{self.OLD_PKG}@{self.OLD_BASE}#v0.9.0",
                 "https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.9.1.tar.gz",
                 "@prevalentware/opencode-goal-plugin",
             ]}, f)
@@ -901,6 +910,91 @@ class TestGoalPlugin(FerryOpencodeCase):
             json.dump({"plugin": [fork]}, f)
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [fork])
+
+    # ── the plugin moved: sblattj/OpenCode-goal-plugin (404) -> pro-max ─────
+    # The pro-max plugin's own installer writes a file:// entry for its local
+    # install. A remote spec next to it would load the plugin twice (or, for the
+    # dead v0.11.0 spec, fail silently on every start), so a LOCAL install that
+    # satisfies the plugin now means ferry writes NO remote spec at all.
+    USER_INSTALL = "file:///Users/someone/.local/share/opencode-goal-pro-max-complete-plugin"
+
+    def seed_cache(self, spec, pkg):
+        d = os.path.normpath(os.path.join(self.packages_root(), spec))
+        os.makedirs(os.path.join(d, "node_modules", pkg), exist_ok=True)
+        with open(os.path.join(d, "node_modules", pkg, "package.json"), "w") as f:
+            json.dump({"name": pkg, "version": "0.11.0"}, f)
+        return d
+
+    def test_a_user_install_replaces_the_dead_spec_and_its_cache_is_purged(self):
+        """Case (a): the live config on the host that found this - the pro-max
+        installer's file:// entry plus ferry's dead v0.11.0 spec. The spec goes
+        (it is in migrated_from, so its cache directory is purged) and nothing
+        remote is written back."""
+        dead = self.seed_cache(self.OLD_PLUGIN, self.OLD_PKG)
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.USER_INSTALL, self.OLD_PLUGIN]}, f)
+        out = self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.USER_INSTALL])
+        self.assertFalse(os.path.exists(dead), out)
+        self.assertIn("Cache purged", out)
+        self.assertIn("provided by " + self.USER_INSTALL, out)
+
+    def test_a_user_install_also_drops_the_current_canonical_spec(self):
+        """Not just dead spellings: the user's install satisfies the plugin, so
+        even the spec this ferry would write is removed."""
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.PLUGIN, "some-other-plugin", self.USER_INSTALL]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], ["some-other-plugin", self.USER_INSTALL])
+
+    def test_an_empty_plugin_list_gets_the_new_canonical_spec(self):
+        """Case (b), spelled out against the literal new spec."""
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": []}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [
+            "opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/"
+            "opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.1.0.tar.gz"])
+
+    def test_the_old_repos_dead_v0110_spec_is_migrated_to_the_new_one(self):
+        """Case (c): every machine ferry v1.43.0 or earlier wired."""
+        dead = self.seed_cache(self.OLD_PLUGIN, self.OLD_PKG)
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.OLD_PLUGIN]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+        self.assertFalse(os.path.exists(dead))
+
+    def test_the_new_repos_github_spelling_is_migrated_too(self):
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [f"{self.BASE}#v1.0.0"]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.PLUGIN])
+
+    def test_a_dev_checkout_of_the_new_plugin_counts_as_present(self):
+        dev = "/Users/someone/code/opencode-goal-pro-max-complete-plugin/dist/goal-plugin.js"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.OLD_PLUGIN, dev]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [dev])
+
+    def test_a_neighbouring_new_name_directory_does_not_count(self):
+        """Case (e), the control for the two above: a directory that merely
+        STARTS with the new package name is not the plugin."""
+        near = "/x/opencode-goal-pro-max-complete-plugin-extras/"
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [near]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [near, self.PLUGIN])
+
+    def test_an_old_name_dev_path_still_satisfies_and_drops_the_spec(self):
+        """Case (f): a checkout under the OLD directory name is still the goal
+        plugin, so it satisfies the requirement - and, being a local install,
+        it now pushes the remote spec out instead of sitting beside it."""
+        with open(self.cfg, "w") as f:
+            json.dump({"plugin": [self.LOCAL_FORK, self.OLD_PLUGIN]}, f)
+        self.run_ferry()
+        self.assertEqual(self.read()["plugin"], [self.LOCAL_FORK])
 
 
 class TestGoalPluginTuiConfig(FerryOpencodeCase):
@@ -1013,6 +1107,7 @@ class TestGoalPluginCacheHygiene(FerryOpencodeCase):
     PLUGIN = TestGoalPlugin.PLUGIN
     PKG = TestGoalPlugin.PKG
     BASE = TestGoalPlugin.BASE
+    OLD_PKG = TestGoalPlugin.OLD_PKG
 
     # The exact directory opencode 1.18.29 creates for the canonical spec.
     # Node's path.join COLLAPSES the "//" after "https:"; python's os.path.join
@@ -1020,20 +1115,32 @@ class TestGoalPluginCacheHygiene(FerryOpencodeCase):
     # literal is the observable: it was read off a real
     # `opencode plugin '<spec>' --global` run.
     CANONICAL_REL = os.path.join(
-        "opencode-goal-plugin@https:", "github.com", "sblattj",
-        "OpenCode-goal-plugin", "archive", "refs", "tags",
+        "opencode-goal-pro-max-complete-plugin@https:", "github.com", "sblattj",
+        "opencode-goal-pro-max-complete-plugin", "archive", "refs", "tags",
         f"{TestGoalPlugin.REF}.tar.gz")
+    # Where every ferry up to v1.43.0 installed the plugin: the old repo's
+    # v0.11.0 tarball. That repo is gone, so this directory is dead weight.
+    OLD_CANONICAL_REL = os.path.join(
+        "opencode-goal-plugin@https:", "github.com", "sblattj",
+        "OpenCode-goal-plugin", "archive", "refs", "tags", "v0.11.0.tar.gz")
 
     def pkgdir(self, *parts):
         return os.path.join(self.packages_root(), *parts)
 
-    def seed(self, rel, populated=False):
+    def seed(self, rel, populated=False, pkg=None):
+        # Directories under the OLD package name hold the OLD package: a
+        # directory whose first component is `opencode-goal-plugin@...` was
+        # installed by an old spec and carries node_modules/opencode-goal-plugin.
+        if pkg is None:
+            first = rel if isinstance(rel, str) else rel[0]
+            pkg = self.PKG if first.startswith(self.PKG) else self.OLD_PKG
         d = self.pkgdir(rel) if isinstance(rel, str) else self.pkgdir(*rel)
-        target = os.path.join(d, "node_modules", self.PKG)
+        target = os.path.join(d, "node_modules", pkg)
         os.makedirs(os.path.join(target, "dist"), exist_ok=True)
         if populated:
             with open(os.path.join(target, "package.json"), "w") as f:
-                json.dump({"name": self.PKG, "version": "0.11.0"}, f)
+                json.dump({"name": pkg, "version": TestGoalPlugin.VERSION
+                           if pkg == self.PKG else "0.11.0"}, f)
         return d
 
     def test_the_canonical_cache_path_is_the_node_normalised_one(self):
@@ -1059,6 +1166,9 @@ class TestGoalPluginCacheHygiene(FerryOpencodeCase):
             os.path.join("github:sblattj", "OpenCode-goal-plugin#v0.9.1"),
             os.path.join("github:sblattj", "OpenCode-goal-plugin"),
             "opencode-goal-plugin@latest",
+            # The old repo's last canonical spec, purged even when no config
+            # names it any more (e.g. a user install replaced it by hand).
+            self.OLD_CANONICAL_REL,
         ]
         made = [self.seed(d, populated=True) for d in dead]
         self.run_ferry()
@@ -1073,7 +1183,7 @@ class TestGoalPluginCacheHygiene(FerryOpencodeCase):
         self.assertTrue(os.path.exists(keep), "an unrelated cache dir was deleted")
 
     def test_a_migrated_away_spec_loses_its_cache_directory(self):
-        old_spec = f"{self.PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
+        old_spec = f"{self.OLD_PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"
         d = self.seed(os.path.join(
             "opencode-goal-plugin@https:", "github.com", "sblattj",
             "OpenCode-goal-plugin", "archive", "refs", "tags",
@@ -1095,7 +1205,7 @@ class TestGoalPluginCacheHygiene(FerryOpencodeCase):
             "v0.10.0.tar.gz"), populated=True)
         with open(self.cfg, "w") as f:
             json.dump({"plugin": [
-                f"{self.PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"]}, f)
+                f"{self.OLD_PKG}@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.10.0.tar.gz"]}, f)
         self.run_ferry()
         self.assertFalse(os.path.exists(stale))
         self.assertTrue(os.path.exists(os.path.join(good, "node_modules",
@@ -1137,14 +1247,17 @@ if os.environ.get("FERRY_TEST_STUB_FAIL") == "1":
     print("git dep preparation failed")
     sys.exit(1)
 
+# The package lands under node_modules/<the spec's NAME half>, exactly as the
+# real install does for a name-prefixed tarball spec.
+pkg = spec.split("@", 1)[0]
 root = os.path.join(
     os.path.normpath(os.path.join(os.environ["XDG_CACHE_HOME"], "opencode",
                                   "packages", spec)),
-    "node_modules", "opencode-goal-plugin")
+    "node_modules", pkg)
 os.makedirs(os.path.join(root, "dist"), exist_ok=True)
 with open(os.path.join(root, "package.json"), "w") as f:
-    json.dump({"name": "opencode-goal-plugin",
-               "version": os.environ.get("FERRY_TEST_STUB_VERSION", "0.11.0")}, f)
+    json.dump({"name": pkg,
+               "version": os.environ.get("FERRY_TEST_STUB_VERSION", "1.1.0")}, f)
 halves = ["goal-plugin.js", "goal-tui.js"]
 # A cache that installed the SERVER half and not the TUI half: the shape the
 # pre-install must report, and the one the TUI copy must refuse to make.
@@ -1159,7 +1272,7 @@ print("Installed %s" % spec)
 
 class GoalPluginStubCase(FerryOpencodeCase):
     """A fake `opencode` on PATH that populates the package cache like the real
-    one: <cache>/opencode/packages/<spec>/node_modules/opencode-goal-plugin with
+    one: <cache>/opencode/packages/<spec>/node_modules/<pkg> with
     a package.json and both dist halves."""
 
     PLUGIN = TestGoalPlugin.PLUGIN
@@ -1236,7 +1349,7 @@ class TestGoalPluginPreInstall(GoalPluginStubCase):
 
     def test_a_successful_install_is_reported_with_the_cached_version(self):
         out = self.run_install()
-        self.assertIn("installed opencode-goal-plugin 0.11.0", out)
+        self.assertIn("installed opencode-goal-pro-max-complete-plugin 1.1.0", out)
         self.assertIn("ready for next opencode start", out)
         self.assertNotIn("WARNING", out)
 
@@ -1312,18 +1425,18 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
         with open(self.tui) as f:
             return json.load(f)
 
-    def seed_copy(self, version=None, marker_spec=None, leftover=None):
+    def seed_copy(self, version=None, marker_spec=None, leftover=None, pkg=None):
         """A managed copy already on disk, as a previous run would have left it."""
         os.makedirs(os.path.join(self.copy, "dist"), exist_ok=True)
         with open(os.path.join(self.copy, "package.json"), "w") as f:
-            json.dump({"name": self.PKG, "version": version or "0.11.0"}, f)
+            json.dump({"name": pkg or self.PKG, "version": version or "1.1.0"}, f)
         open(os.path.join(self.copy, "dist", "goal-tui.js"), "w").close()
         open(os.path.join(self.copy, "dist", "goal-plugin.js"), "w").close()
         if leftover:
             open(os.path.join(self.copy, leftover), "w").close()
         with open(os.path.join(self.copy, self.MARKER), "w") as f:
             f.write("%s\n%s\n%s\n" % (marker_spec or self.PLUGIN,
-                                      "v" + (version or "0.11.0"), self.PKG))
+                                      "v" + (version or "1.1.0"), pkg or self.PKG))
 
     def copy_version(self):
         with open(os.path.join(self.copy, "package.json")) as f:
@@ -1349,9 +1462,9 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
         with open(self.global_cfg) as f:
             self.assertEqual(json.load(f)["plugin"], [self.PLUGIN])
         self.assertTrue(os.path.isfile(os.path.join(self.copy, self.MARKER)))
-        self.assertEqual(self.copy_version(), "0.11.0")
+        self.assertEqual(self.copy_version(), "1.1.0")
         self.assertTrue(os.path.exists(os.path.join(self.copy, "dist", "goal-tui.js")))
-        self.assertIn("TUI plugin: %s (0.11.0) -> %s" % (self.copy, self.tui), out)
+        self.assertIn("TUI plugin: %s (1.1.0) -> %s" % (self.copy, self.tui), out)
 
     def test_the_marker_records_the_spec_the_copy_came_from(self):
         """A copy with no provenance cannot be refreshed on a ref bump, and
@@ -1411,7 +1524,7 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
         self.assertFalse(os.path.exists(os.path.join(bad, "ferry")))
         # Control: the pre-install still ran, so this is a TUI-copy refusal and
         # not a run that fell over before it got there.
-        self.assertIn("installed opencode-goal-plugin 0.11.0", out)
+        self.assertIn("installed opencode-goal-pro-max-complete-plugin 1.1.0", out)
 
     def test_a_cache_without_the_tui_bundle_is_reported_not_copied(self):
         out = self.run_install(config=self.global_cfg, no_tui=True)
@@ -1422,19 +1535,19 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
 
     # ── a ref bump ────────────────────────────────────────────────────────
     def test_a_stale_copy_is_replaced_wholesale_and_named(self):
-        self.seed_copy(version="0.9.0", leftover="gone-in-0.11.0.js")
+        self.seed_copy(version="0.9.0", leftover="gone-in-1.1.0.js")
         out = self.run_install(config=self.global_cfg)
-        self.assertIn("copy holds 0.9.0, expected 0.11.0", out)
+        self.assertIn("copy holds 0.9.0, expected 1.1.0", out)
         self.assertIn("refreshed after the install below", out)
-        self.assertEqual(self.copy_version(), "0.11.0")
+        self.assertEqual(self.copy_version(), "1.1.0")
         self.assertEqual(self.read_tui()["plugin"], [self.uri])
         # Wholesale, not merged: a file the old version shipped is gone.
-        self.assertFalse(os.path.exists(os.path.join(self.copy, "gone-in-0.11.0.js")))
+        self.assertFalse(os.path.exists(os.path.join(self.copy, "gone-in-1.1.0.js")))
 
     def test_no_install_with_a_stale_copy_says_how_to_fix_it(self):
         self.seed_copy(version="0.9.0")
         out = self.run_ferry("--no-install", config=self.global_cfg)
-        self.assertIn("copy holds 0.9.0, expected 0.11.0", out)
+        self.assertIn("copy holds 0.9.0, expected 1.1.0", out)
         self.assertIn("rerun without --no-install", out)
         self.assertEqual(self.copy_version(), "0.9.0")   # nothing refreshed it
 
@@ -1504,6 +1617,63 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
         self.assertEqual(self.read_tui()["plugin"], [fork])
         self.assertIn("upstream not added", out)
         self.assertFalse(os.path.exists(self.copy))
+
+    # ── a LOCAL install of the pro-max plugin (its own installer's entry) ──
+    USER_INSTALL = TestGoalPlugin.USER_INSTALL
+    OLD_PLUGIN = TestGoalPlugin.OLD_PLUGIN
+
+    def test_a_user_install_in_both_files_drops_the_spec_and_the_managed_copy(self):
+        """Case (d), the live host's shape: tui.json holds the installer's
+        file:// entry AND ferry's managed copy, opencode.json the installer's
+        entry AND ferry's dead spec. Both files end with the user entry alone,
+        and nothing is pre-installed or copied."""
+        self.seed_copy(version="0.11.0", marker_spec=self.OLD_PLUGIN,
+                       pkg=TestGoalPlugin.OLD_PKG)
+        os.makedirs(self.oc_dir, exist_ok=True)
+        with open(self.global_cfg, "w") as f:
+            json.dump({"plugin": [self.USER_INSTALL, self.OLD_PLUGIN]}, f)
+        with open(self.tui, "w") as f:
+            json.dump({"plugin": [self.USER_INSTALL, self.uri]}, f)
+        out = self.run_install(config=self.global_cfg)
+        with open(self.global_cfg) as f:
+            self.assertEqual(json.load(f)["plugin"], [self.USER_INSTALL])
+        self.assertEqual(self.read_tui()["plugin"], [self.USER_INSTALL])
+        self.assertFalse(os.path.exists(self.record), "pre-install ran")
+        self.assertEqual(self.copy_version(), "0.11.0")   # not refreshed either
+        self.assertIn("provided by " + self.USER_INSTALL, out)
+        self.assertNotIn("copy holds", out)
+        self.assertNotIn("pre-installing", out)
+
+    def test_a_user_install_only_in_tui_json_keeps_opencode_jsons_cache(self):
+        """tui.json alone holding a user path drops the spec THERE, but
+        opencode.json still points at the canonical cache directory - which
+        must not be purged as a 'migrated' spec."""
+        self.run_install(config=self.global_cfg)
+        canon = os.path.join(self.packages_root(), *TestGoalPluginCacheHygiene
+                             .CANONICAL_REL.split(os.sep))
+        installed = os.path.join(canon, "node_modules", self.PKG, "package.json")
+        self.assertTrue(os.path.exists(installed), installed)
+        with open(self.tui, "w") as f:
+            json.dump({"plugin": [self.USER_INSTALL, self.PLUGIN, self.uri]}, f)
+        out = self.run_ferry("--no-install", config=self.global_cfg)
+        self.assertEqual(self.read_tui()["plugin"], [self.USER_INSTALL])
+        with open(self.global_cfg) as f:
+            self.assertEqual(json.load(f)["plugin"], [self.PLUGIN])
+        self.assertTrue(os.path.exists(installed), out)
+
+    def test_an_old_repos_copy_is_refreshed_to_the_new_plugin(self):
+        """Every host ferry v1.43.0 wired holds a 0.11.0 copy of the OLD
+        package. The version compare must refresh it to 1.1.0 of the new one."""
+        self.seed_copy(version="0.11.0", marker_spec=self.OLD_PLUGIN,
+                       pkg=TestGoalPlugin.OLD_PKG)
+        out = self.run_install(config=self.global_cfg)
+        self.assertIn("copy holds 0.11.0, expected 1.1.0", out)
+        self.assertEqual(self.copy_version(), "1.1.0")
+        with open(os.path.join(self.copy, "package.json")) as f:
+            self.assertEqual(json.load(f)["name"], self.PKG)
+        with open(os.path.join(self.copy, self.MARKER)) as f:
+            self.assertEqual(f.read().splitlines(), [self.PLUGIN, self.REF, self.PKG])
+        self.assertEqual(self.read_tui()["plugin"], [self.uri])
 
     def test_the_canonical_cache_directory_survives_the_tui_rewrite(self):
         """tui.json moving off the spec is NOT a migration: opencode.json still

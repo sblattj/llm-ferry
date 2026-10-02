@@ -395,7 +395,8 @@ class ClientScopeTest(ClientHarness):
         # nowhere else, so the full takeover has to write one beside the config
         # it just took over (packages/opencode/src/config/tui.ts:157-210).
         tui = self.read_json(".config", "opencode", "tui.json")
-        self.assertTrue(any("opencode-goal-plugin@" in str(p) for p in tui["plugin"]),
+        self.assertTrue(any("opencode-goal-pro-max-complete-plugin@" in str(p)
+                            for p in tui["plugin"]),
                         tui)
 
     def test_full_scope_bare_opencode_follows_the_super_last_lane(self):
@@ -1002,8 +1003,12 @@ class ClientCleanupTest(ClientHarness):
 # The three things `ferry opencode` writes for the goal plugin, spelled out here
 # so a drift in either direction fails: the canonical spec and the verbatim
 # /goal command (lib/ferry-integrate.zsh's GOAL_PLUGIN / GOAL_COMMAND).
-GOAL_SPEC = ("opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin"
-             "/archive/refs/tags/v0.11.0.tar.gz")
+GOAL_SPEC = ("opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/"
+             "opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.1.0.tar.gz")
+# What every ferry up to v1.43.0 wrote, before the plugin's repo was renamed
+# (sblattj/OpenCode-goal-plugin is gone). Cleanup must still take it out.
+OLD_GOAL_SPEC = ("opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin"
+                 "/archive/refs/tags/v0.11.0.tar.gz")
 GOAL_COMMAND = {
     "description": "Set a session-scoped goal and auto-continue until complete.",
     "template": "$ARGUMENTS",
@@ -1018,8 +1023,11 @@ LOCAL_FORK = "/Users/someone/src/OpenCode-goal-plugin/index.js"
 # tui.json at THAT. The marker file inside is what makes the copy ferry's to
 # delete; its content is "<spec>\n<ref>\n<pkg>\n".
 GOAL_TUI_MARKER = ".ferry-goal-plugin"
-GOAL_PKG = "opencode-goal-plugin"
-GOAL_REF = "v0.11.0"
+GOAL_PKG = "opencode-goal-pro-max-complete-plugin"
+GOAL_REF = "v1.1.0"
+# The managed copy's directory name did NOT follow the rename: it is still
+# <data>/ferry/opencode-goal-plugin, whatever package it holds.
+GOAL_TUI_DIRNAME = "opencode-goal-plugin"
 
 
 class ClientCleanupGoalPluginTest(ClientHarness):
@@ -1059,7 +1067,7 @@ class ClientCleanupGoalPluginTest(ClientHarness):
         """Ferry's own copy of the plugin — the shell's
         ${XDG_DATA_HOME:-$HOME/.local/share}/ferry/opencode-goal-plugin."""
         base = data_home if data_home is not None else self.path(".local", "share")
-        return os.path.join(base, "ferry", GOAL_PKG)
+        return os.path.join(base, "ferry", GOAL_TUI_DIRNAME)
 
     def install_managed(self, data_home=None, marker=True):
         """Plant that copy, with or without the marker that makes it ferry's."""
@@ -1125,6 +1133,8 @@ class ClientCleanupGoalPluginTest(ClientHarness):
         """ensure_goal_plugin() rewrote all of these onto machines over time."""
         self.write_oc({"plugin": [
             "opencode-goal-plugin",
+            OLD_GOAL_SPEC,
+            "github:sblattj/opencode-goal-pro-max-complete-plugin#v1.0.0",
             "@prevalentware/opencode-goal-plugin",
             "github:sblattj/OpenCode-goal-plugin#v0.9.1",
             "git+https://github.com/sblattj/OpenCode-goal-plugin.git",
@@ -1431,7 +1441,9 @@ class ScriptContractTest(unittest.TestCase):
         same spellings, or a cleanup silently leaves one behind."""
         integrate = self.read(os.path.join(REPO, "lib", "ferry-integrate.zsh"))
         cleanup = self.read(CLEANUP)
-        for spelling in ("opencode-goal-plugin",
+        for spelling in ("opencode-goal-pro-max-complete-plugin",
+                         "sblattj/opencode-goal-pro-max-complete-plugin",
+                         "opencode-goal-plugin",
                          "@prevalentware/opencode-goal-plugin",
                          "willytop8/opencode-goal-plugin",
                          "github:willytop8/opencode-goal-plugin",

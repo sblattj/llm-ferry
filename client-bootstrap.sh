@@ -539,6 +539,8 @@ else
   # exactly what --profiles-only exists to leave alone.
   #
   # Keep this heredoc in sync with opencode/skills/using-the-goal-plugin/SKILL.md
+  # (itself a verbatim copy of skills/using-the-goal-plugin/SKILL.md at tag v1.1.0
+  # of sblattj/opencode-goal-pro-max-complete-plugin, the pinned plugin release)
   # in the llm-ferry repo. lib/ferry-clientbootstrap.test.py asserts the file this
   # writes is byte-identical to that one.
   if [[ "$OC_MODE" == "full" ]]; then
@@ -546,7 +548,7 @@ else
     cat > "$HOME/.config/opencode/skills/using-the-goal-plugin/SKILL.md" <<'GOALSKILL'
 ---
 name: using-the-goal-plugin
-description: "Use when a goal is running or requested: the prompt carries a <goal_continuation> or <goal_plan> block, the sidebar shows a Goal panel, the turn says 'Start working toward this goal now', the user types /goal, pastes a handoff, asks for unattended multi-step work or to 'keep going until done', or asks how a goal is doing. Covers setting and decomposing goals, the goal_* tools, CEV evidence, the [goal:evidence]/[goal:complete]/[goal:blocked] markers, budgets, and the sidebar."
+description: "Use when a goal is running or requested: the prompt carries a <goal_continuation> or <goal_plan> block, the sidebar shows a Goal panel, the turn says 'Start working toward this goal now', the user types /goal, pastes a handoff, asks for unattended multi-step work or to 'keep going until done', asks how a goal is doing, or asks why the native Todo list rewrote itself or why the Goal panel reads 'todo list stale' or 'mirror drift'. Covers setting and decomposing goals, the goal_* tools, CEV evidence, the [goal:evidence]/[goal:complete]/[goal:blocked] markers, budgets, the todo mirror (the Todo section is the plan, and one todowrite({todos: []}) redraws it), and the sidebar."
 ---
 
 # Using the goal plugin
@@ -657,6 +659,15 @@ goal_plan_set(actions: [
 
 Re-plan when the world proves the plan wrong; `goal_plan_get` re-reads the current ledger.
 
+The sidebar's built-in Todo section is this plan, not a second list. On every `todowrite` the plugin
+redraws it from the plan and keeps any rows of your own below the plan rows, so: track goal work as
+plan actions, not as todo items, and call `todowrite({todos: []})` WHEN A TURN'S PROMPT ASKS YOU TO -
+that call is a refresh only while the goal block is in your context. `a2` in the Todo row and `a2` in
+the plan are the same action. An action that is `done` without a passing verdict shows as in-progress
+there with `— needs claim/evidence/verdict`; a blocked one shows as in-progress with
+`— BLOCKED: <reason>`. When a goal stops or completes, the Todo list is yours again - your next
+`todowrite` replaces it.
+
 ## 4. Working one action
 
 1. `goal_action_update(id: "a2", status: "in_progress")` before you start it.
@@ -665,7 +676,7 @@ Re-plan when the world proves the plan wrong; `goal_plan_get` re-reads the curre
    whole turn counts, not your last message: one tool call anywhere in it clears the strike, so a
    turn that ran tools and then closed with a prose summary is fine. `goal_*` calls are the
    exception - bookkeeping against the goal is not work, so a turn whose only tool call was
-   `goal_status` or `goal_plan_set` still counts as tool-free.
+   `goal_status`, `goal_plan_set`, or a mirror-refresh `todowrite` still counts as tool-free.
 3. Finish it with `goal_action_update(id: "a2", status: "done", claim: ..., evidence: ...,
    verdict: "pass")`. All three are required; `done` without them is refused, and a `done` action
    lacking `verdict: "pass"` blocks goal completion later.
@@ -817,11 +828,19 @@ inserts a leading `p/t` step field right after the objective. Peak context is ne
 The sidebar Goal panel shows the same state from session metadata: a state mark (active, paused,
 blocked, completed), the objective label, a stats line reading `1/∞ turns · 1m/8h · 147k/100m tokens`
 and gaining a fourth `147k/1m ctx` stat ONLY when a context ceiling is known, a `step p/t` line in an
-ordered sequence, `<verified>/<total> actions verified` plus any blocked count, up to 12 action lines
-with status mark and verdict, and notes for blocked, stopped, success criteria and constraints. Three
-stats instead of four means the goal is running with no context ceiling, not that the panel broke. An
-action shown as done WITHOUT a passing verdict is not verified - the usual reason a goal looks finished
-but will not complete.
+ordered sequence, `<verified>/<total> actions verified` plus any blocked count, up to 12 lines for the
+actions that still need attention, with status mark and verdict, and notes for blocked, stopped,
+success criteria and constraints. Three stats instead of four means the goal is running with no
+context ceiling, not that the panel broke. An action shown as done WITHOUT a passing verdict is not
+verified - the usual reason a goal looks finished but will not complete.
+
+The Goal panel no longer repeats the plan: it prints the progress line plus only the actions that need
+attention (done-without-evidence, blocked, in progress). A fully verified plan prints one line. If the
+progress line says `todo list stale` or `mirror drift`, the Todo section above is showing an older copy
+or a different list - one `todowrite({todos: []})` fixes either. A pending row of your own keeps the Todo section on screen after
+every action has verified; it is not goal work and does not block completion. A `todowrite` bubble in
+scrollback shows the redrawn list too, not the wording you sent, because the host records the
+rewritten arguments.
 
 ## 9. State, restarts, and other processes
 

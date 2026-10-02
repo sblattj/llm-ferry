@@ -206,7 +206,7 @@ Routing rules the template ships with (each with full forensic detail in [Deep d
 | explore | `explore` | `flash` | `local-sub` |
 | compaction / title / summary | `compaction`, `title`, `summary` | `super-flash` | `local-sub` |
 
-The goal plugin the takeover installs has its own forensic history — [install internals](docs/deep-dives.md#the-opencode-goal-plugin-install-internals).
+The goal plugin the takeover installs is [`opencode-goal-pro-max-complete-plugin`](https://github.com/sblattj/opencode-goal-pro-max-complete-plugin) v1.1.0. It was renamed from `sblattj/OpenCode-goal-plugin`, and that repo is gone. Old spellings are migrated. If your config already loads the plugin from a local path or `file://` URL (for example from the plugin's own installer), ferry writes no remote spec, removes any that is there, and skips the pre-install. It has its own forensic history — [install internals](docs/deep-dives.md#the-opencode-goal-plugin-install-internals).
 ## Fleets
 
 A **fleet** is a complete routing set — a primary and a fallback entry for every cloud lane (`heavy`, `medium`, `flash`, `super-flash`) — living in the same `litellm.yaml`, distinguished only by a `<fleet>.<lane>` prefix on deployment names. Clients keep sending bare lane names exactly as before; the front door resolves each request from an explicit `X-Ferry-Fleet` header, the caller's own sticky selection, or the host-wide default. Any session can move between fleets without a config edit or a restart.

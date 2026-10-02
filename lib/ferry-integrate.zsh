@@ -60,6 +60,11 @@ _ferry_install_opencode_guardrails() {
 # deliberately ships no skill, and a promise here would be contradicted by the
 # bootstrap's own report five lines later.
 #
+# Provenance: that file is a verbatim copy of skills/using-the-goal-plugin/SKILL.md
+# at tag v1.1.0 of sblattj/opencode-goal-pro-max-complete-plugin (the pinned
+# GOAL_PLUGIN_REF). Bumping the ref means re-copying it from the new tag, and
+# client-bootstrap.sh's GOALSKILL heredoc with it.
+#
 # The destination is a GLOBAL opencode path, independent of $OPENCODE_CONFIG,
 # and singular `skill/` like the guardrails installer — so it lands where
 # opencode looks even on a host whose config lives in a dotfiles directory.
@@ -414,7 +419,7 @@ PYEOF
 #
 # The TUI half of a plugin cannot be loaded out of opencode's package cache: the
 # canonical spec's cache directory contains the component
-# `opencode-goal-plugin@https:`, Bun's runtime plugin runner splits a module
+# `<pkg>@https:`, Bun's runtime plugin runner splits a module
 # path at the FIRST colon into `namespace:path`, and a file under a colon path
 # therefore never reaches opentui's host-module shim
 # (packages/opencode/src/plugin/tui/runtime.ts:47) that supplies solid-js. The
@@ -422,7 +427,9 @@ PYEOF
 # the breakage invisible. Full trace, and the one-factor-varied path table, in
 # the GOAL_TUI_MARKER comment block in the python above.
 #
-# So: copy <cache>/node_modules/<pkg> to $XDG_DATA_HOME/ferry/<pkg> (no colon,
+# So: copy <cache>/node_modules/<pkg> (pkg = GOAL_PLUGIN_PKG, handed in by the
+# python block) to $XDG_DATA_HOME/ferry/opencode-goal-plugin, a fixed directory
+# name kept across the pro-max rename (no colon,
 # no '#'), stamp it with a marker file that proves the copy is ferry's, and
 # rewrite the tui.json entry from the spec to a file:// URL for the copy.
 #
@@ -585,10 +592,13 @@ cmd_opencode() {
   # baseURL/apiKey (see the prov["ferry"] block below) - it carries this
   # machine's identity and a one-shot fleet override, never a real model id.
   # `plugin` gets the goal plugin appended only when no entry already IS that
-  # plugin - which includes a LOCAL PATH to a fork of it, since opencode accepts
-  # a filesystem path and a private fork can only be named that way. The spec is
+  # plugin. A LOCAL install of it (a path or file:// URL: the pro-max plugin's
+  # own installer, a dev checkout, a private fork) wins outright - the file then
+  # gets NO remote spec, and any remote goal spec already in it is removed and
+  # its cache purged; in tui.json ferry's managed-copy entry goes too, and the
+  # pre-install and TUI-copy refresh are skipped. The spec is
   # the NAME-PREFIXED TARBALL form
-  # `opencode-goal-plugin@https://github.com/.../vX.Y.Z.tar.gz`, because on
+  # `opencode-goal-pro-max-complete-plugin@https://github.com/.../vX.Y.Z.tar.gz`, because on
   # opencode 1.18.29 a bare `github:` spec installs to disk and is then silently
   # discarded, and any git spec dies in pacote's prepare step - see the
   # GOAL_PLUGIN comment block for the file:line trace. Every earlier spelling
@@ -599,7 +609,7 @@ cmd_opencode() {
   # the server loader alone, so the plugin's sidebar panel never appears without
   # it. tui.json does NOT get the spec, though: the TUI loader cannot load a
   # module out of the package cache, whose directory name contains
-  # `opencode-goal-plugin@https:`, because Bun splits a module path at the first
+  # `<pkg>@https:`, because Bun splits a module path at the first
   # colon (see the GOAL_TUI_MARKER block). It gets a file:// URL for a
   # colon-free COPY ferry keeps in $XDG_DATA_HOME/ferry/opencode-goal-plugin and
   # refreshes from the cache after the pre-install. Only the full-takeover
@@ -753,9 +763,22 @@ TUI_SCHEMA = "https://opencode.ai/tui.json"
 # resolution and the cache short-circuit (defect 1); a remote tarball is fetched
 # by pacote's RemoteFetcher, which never enters the git prepare path at all, so
 # it is IMMUNE to defect 2 rather than merely dodging its trigger. Verified end
-# to end against opencode 1.18.29.
-GOAL_PLUGIN_PKG = "opencode-goal-plugin"
-GOAL_PLUGIN_REPO = "sblattj/OpenCode-goal-plugin"
+# to end against opencode 1.18.29, and again for the pro-max v1.1.0 tarball on
+# opencode 1.18.34.
+#
+# THE PLUGIN MOVED. Through v0.11.0 it lived at sblattj/OpenCode-goal-plugin
+# (npm name `opencode-goal-plugin`); that repo is gone - the API and the
+# tarball URL both 404 - and the plugin continues, renamed, as
+# sblattj/opencode-goal-pro-max-complete-plugin (npm name below; it is NOT on
+# the npm registry, so the tarball form is still the only one). Every config
+# ferry v1.43.0 or earlier wrote therefore names a spec that can no longer
+# install. The old spellings stay RECOGNISED (LEGACY_GOAL_PLUGINS,
+# LEGACY_GOAL_PLUGIN_BASES, GOAL_REPO_MARKERS, GOAL_PLUGIN_DIRS) so they get
+# migrated or removed; nothing writes them.
+GOAL_PLUGIN_PKG = "opencode-goal-pro-max-complete-plugin"
+GOAL_PLUGIN_REPO = "sblattj/opencode-goal-pro-max-complete-plugin"
+# The npm name the plugin shipped under through v0.11.0 (sblattj/OpenCode-goal-plugin).
+OLD_GOAL_PLUGIN_PKG = "opencode-goal-plugin"
 # PIN THE REF, and bump it on every release that ships a new plugin version.
 # opencode installs a plugin into ~/.cache/opencode/packages/<the spec string>/
 # and, if node_modules/<pkg> already exists in that directory, returns
@@ -765,34 +788,50 @@ GOAL_PLUGIN_REPO = "sblattj/OpenCode-goal-plugin"
 # while the fork's HEAD was 0.9.1. The spec string IS the cache key, so a NEW
 # ref means a NEW directory and a guaranteed fresh install. That is why the ref
 # is pinned here and why cutting a plugin release means bumping GOAL_PLUGIN_REF.
-GOAL_PLUGIN_REF = "v0.11.0"
+GOAL_PLUGIN_REF = "v1.1.0"
 GOAL_PLUGIN_URL = (f"https://github.com/{GOAL_PLUGIN_REPO}"
                    f"/archive/refs/tags/{GOAL_PLUGIN_REF}.tar.gz")
 # Current spec, spelled out for grep:
-# opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.11.0.tar.gz
+# opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.1.0.tar.gz
 GOAL_PLUGIN = f"{GOAL_PLUGIN_PKG}@{GOAL_PLUGIN_URL}"
 # Kept for MATCHING configs written by older ferries; never written any more.
 GOAL_PLUGIN_BASE = f"github:{GOAL_PLUGIN_REPO}"
+# The `github:` base every ferry before the rename derived from the OLD repo.
+# Spelled out, because GOAL_PLUGIN_BASE now derives from the new one.
+LEGACY_GOAL_PLUGIN_BASES = ("github:sblattj/OpenCode-goal-plugin",)
 LEGACY_GOAL_PLUGINS = {
     "@prevalentware/opencode-goal-plugin",
-    "opencode-goal-plugin",
+    OLD_GOAL_PLUGIN_PKG,
     "willytop8/opencode-goal-plugin",
     "github:willytop8/opencode-goal-plugin",
     "sblattj/opencode-goal-plugin",
+    *LEGACY_GOAL_PLUGIN_BASES,
 }
 # Substrings that identify OUR plugin inside any spec shape a previous ferry (or
 # a hand edit) could have written: `github:owner/repo`, `owner/repo#ref`,
 # `git+https://github.com/owner/repo.git`, an `archive/refs/tags/*.tar.gz` URL.
-# Matched case-insensitively because the repo is CamelCase and half the historic
-# spellings are not. Never applied to a local filesystem path - see is_goal_plugin.
-GOAL_REPO_MARKERS = ("sblattj/opencode-goal-plugin", "willytop8/opencode-goal-plugin")
-# The package's own directory name, used to recognise a LOCAL PATH pointing at
-# the same plugin. opencode accepts a filesystem path as a plugin entry, and Bun
-# cannot resolve a PRIVATE repo over `github:` - so a hard fork of this plugin
-# can only be named by path. A path never equals the npm name, so a presence
-# check on the name alone re-appended upstream on EVERY run, leaving opencode
-# loading both the fork and the very package the fork exists to replace.
-GOAL_PLUGIN_DIR = GOAL_PLUGIN_REPO.rsplit("/", 1)[-1].lower()
+# Matched case-insensitively because the old repo was CamelCase and half the
+# historic spellings are not. Never applied to a local filesystem path - see
+# is_goal_plugin.
+GOAL_REPO_MARKERS = ("sblattj/opencode-goal-pro-max-complete-plugin",
+                     "sblattj/opencode-goal-plugin",
+                     "willytop8/opencode-goal-plugin")
+# The package's directory names (new and old), used to recognise a LOCAL PATH
+# pointing at the same plugin. opencode accepts a filesystem path as a plugin
+# entry; the pro-max plugin's own installer writes a `file://` URL for its local
+# install (`~/.local/share/opencode-goal-pro-max-complete-plugin`), a dev
+# checkout is named by its `dist/goal-plugin.js`, and Bun cannot resolve a
+# PRIVATE repo over `github:`, so a hard fork can only be named by path.
+#
+# A path that SATISFIES the plugin now wins outright (ensure_goal_plugin): the
+# file gets NO remote goal spec at all, and any remote spec already in it is
+# removed and its cache directory purged. Until this release ferry kept the
+# remote spec next to a fork path, so opencode loaded the plugin twice - and
+# after the repo rename the remote half was a dead spec that failed silently on
+# every start. Both names stay in the set because a checkout or fork made before
+# the rename still sits under the old directory name.
+GOAL_PLUGIN_DIRS = (GOAL_PLUGIN_REPO.rsplit("/", 1)[-1].lower(),
+                    OLD_GOAL_PLUGIN_PKG)
 
 # --- Why tui.json CANNOT carry the spec, and points at a copy instead. ---
 #
@@ -800,7 +839,8 @@ GOAL_PLUGIN_DIR = GOAL_PLUGIN_REPO.rsplit("/", 1)[-1].lower()
 # `~/.cache/opencode/packages/<the spec, verbatim>/node_modules/<pkg>`
 # (packages/core/src/npm.ts:43-47,79; sanitize() is a no-op off Windows), so the
 # canonical tarball spec's directory literally contains the path component
-# `opencode-goal-plugin@https:`. Bun's runtime plugin runner splits any module
+# `<pkg>@https:` (today `opencode-goal-pro-max-complete-plugin@https:`; through
+# v0.11.0 `opencode-goal-plugin@https:`). Bun's runtime plugin runner splits any module
 # path at the FIRST colon into `namespace:path`, so a module living under a
 # colon-bearing directory never reaches opentui's host-module shim
 # (`ensureRuntimePluginSupport`, packages/opencode/src/plugin/tui/runtime.ts:47)
@@ -921,7 +961,7 @@ def pkg_name(entry):
     if "#" in entry:
         entry = entry.rsplit("#", 1)[0]
     # Split at the FIRST separating "@", never the last: the canonical spec is
-    # `opencode-goal-plugin@https://...`, and rsplit() would hand back the whole
+    # `opencode-goal-pro-max-complete-plugin@https://...`, and rsplit() would hand back the whole
     # `name@https://github.com/...` string the moment a URL carried an "@" of its
     # own. A leading "@" is an npm SCOPE, not a separator.
     if entry.startswith("@"):
@@ -968,26 +1008,40 @@ def is_goal_spec(entry):
     return any(m in low for m in GOAL_REPO_MARKERS)
 
 
+def is_user_goal_path(entry):
+    """Is this a LOCAL install of the goal plugin that is NOT ferry's copy?
+
+    The pro-max installer's `file://.../opencode-goal-pro-max-complete-plugin`,
+    a dev checkout's `.../opencode-goal-pro-max-complete-plugin/dist/goal-plugin.js`,
+    or a fork under the pre-rename name `.../opencode-goal-plugin/...`. One of
+    GOAL_PLUGIN_DIRS has to be a whole PATH SEGMENT, with or without a file
+    extension, so ".../opencode-goal-plugin.js" counts while a neighbouring
+    ".../opencode-goal-pro-max-complete-plugin-extras/..." does not. file://
+    and file: URLs are normalised by local_path_of() first.
+    """
+    raw = entry[0] if isinstance(entry, list) and entry else entry
+    if not is_path_entry(raw) or is_managed_tui_entry(raw):
+        return False
+    p = local_path_of(raw)
+    if p is None:
+        return False
+    segs = [s.lower() for s in p.split("/") if s]
+    return any(d in segs or d in (os.path.splitext(s)[0] for s in segs)
+               for d in GOAL_PLUGIN_DIRS)
+
+
 def is_goal_plugin(entry):
     """Does this entry already SATISFY the requirement (upstream or a fork)?"""
     if is_managed_tui_entry(entry):        # ferry's own colon-free copy
+        return True
+    if is_user_goal_path(entry):           # a local install / fork / checkout
         return True
     name = pkg_name(entry)
     if not isinstance(name, str):
         return False
     # The canonical spec's name half, plus the bare `github:` form an older
     # ferry wrote (pkg_name() has already stripped any trailing #ref).
-    if name.lower() in (GOAL_PLUGIN_PKG.lower(), GOAL_PLUGIN_BASE.lower()):
-        return True
-    # Match the package's directory name as a whole PATH SEGMENT, with or
-    # without a file extension, so ".../opencode-goal-plugin/dist/server.js"
-    # and ".../opencode-goal-plugin.js" both count as present while a
-    # neighbouring ".../opencode-goal-plugin-extras/..." does not.
-    if name.startswith(("/", ".", "~")):
-        segs = [s.lower() for s in name.split("/") if s]
-        return GOAL_PLUGIN_DIR in segs or GOAL_PLUGIN_DIR in (
-            os.path.splitext(s)[0].lower() for s in segs)
-    return False
+    return name.lower() in (GOAL_PLUGIN_PKG.lower(), GOAL_PLUGIN_BASE.lower())
 
 
 def ensure_goal_plugin(plugins, want=None):
@@ -1003,16 +1057,37 @@ def ensure_goal_plugin(plugins, want=None):
     there is migrated back to the spec), while tui.json gets the colon-free
     managed copy - see the GOAL_TUI_MARKER block for why.
 
+    A USER'S LOCAL INSTALL WINS (new with the pro-max rename). When the list
+    already holds a path / file:// entry that satisfies the plugin and is not
+    ferry's managed copy (is_user_goal_path), NOTHING is written: every remote
+    goal spec is removed rather than rewritten, ferry's managed-copy entry is
+    dropped too, and the user's entry is returned as goal_entry. Before this,
+    ferry kept a remote spec next to a fork path, so opencode loaded the plugin
+    twice. Removed remote specs - GOAL_PLUGIN included - go into migrated_from
+    so their cache directories are purged; the caller keeps GOAL_PLUGIN's
+    directory when the OTHER file still uses it.
+
     Returns (plugins, goal_entry, migrated_from); migrated_from lists the raw
     spec strings this run replaced - i.e. the cache directories nothing
-    references any more. GOAL_PLUGIN is never listed even when tui.json moves
-    off it (opencode.json still points at that cache directory), and neither is
-    the managed copy, which is not a cache directory at all.
+    references any more. On the rewrite path GOAL_PLUGIN is never listed even
+    when tui.json moves off it (opencode.json still points at that cache
+    directory), and the managed copy never is: it is not a cache directory.
     """
     if want is None:
         want = GOAL_PLUGIN
     if not isinstance(plugins, list):
         plugins = []
+    user = next((p for p in plugins if is_user_goal_path(p)), None)
+    if user is not None:
+        kept, migrated_from = [], []
+        for p in plugins:
+            if is_goal_spec(p):
+                old = p[0] if isinstance(p, list) and p else p
+                if not is_managed_tui_entry(old) and old not in migrated_from:
+                    migrated_from.append(old)
+                continue
+            kept.append(p)
+        return kept, user, migrated_from
     migrated_from, out = [], []
     for p in plugins:
         if not is_goal_spec(p):
@@ -1106,6 +1181,10 @@ DEAD_CACHE_SPECS = (
     "github:sblattj/OpenCode-goal-plugin",
     "github:sblattj/opencode-goal-plugin",
     "opencode-goal-plugin@latest",
+    # The canonical spec of every ferry up to v1.43.0. Its repo is gone, so the
+    # directory is dead even when no config names it any more (a hand edit, or
+    # the pro-max installer replacing the entry, leaves it behind).
+    "opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.11.0.tar.gz",
 )
 
 
@@ -1120,7 +1199,7 @@ def cache_dir_for(spec):
     NORMPATH IS LOAD-BEARING. opencode builds this with node's path.join, which
     COLLAPSES the `//` after `https:`; python's os.path.join does not. So the
     canonical spec lands at
-    `<packages>/opencode-goal-plugin@https:/github.com/sblattj/OpenCode-goal-plugin/archive/refs/tags/v0.11.0.tar.gz`
+    `<packages>/opencode-goal-pro-max-complete-plugin@https:/github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.1.0.tar.gz`
     with a SINGLE slash after `https:`, and a path built without normpath points
     at a directory that does not exist - which reads as "nothing to purge" and
     as "the plugin is not installed".
@@ -1138,11 +1217,15 @@ def purgeable(spec, path):
 
     (3) is deliberately not "the LEAF is the package name". A spec's slashes
     become directories, so the tarball form's leaf is a TAG
-    (`v0.11.0.tar.gz`) and its first component is `opencode-goal-plugin@https:`,
+    (`v1.1.0.tar.gz`) and its first component is `<pkg>@https:`,
     while the pre-v1.30.1 `github:` form's leaf is `OpenCode-goal-plugin#v0.9.1`
     and its first component is `github:sblattj`. A rule anchored to either end
     alone refuses half the directories this exists to clean. `packages/foo`
     matches nothing under any of them.
+
+    "The package name" is BOTH names: neither `opencode-goal-plugin` nor
+    `opencode-goal-pro-max-complete-plugin` is a substring of the other, and
+    the old name is the one every directory this has to clean carries.
     """
     root = cache_packages_root()
     p = os.path.normpath(path)
@@ -1151,19 +1234,19 @@ def purgeable(spec, path):
     rel = [s for s in os.path.relpath(p, root).split(os.sep) if s]
     if not rel or os.pardir in rel:
         return False
-    marker = GOAL_PLUGIN_PKG.lower()
-    if not (is_goal_spec(spec) or marker in str(spec).lower()):
+    markers = (GOAL_PLUGIN_PKG.lower(), OLD_GOAL_PLUGIN_PKG.lower())
+    if not (is_goal_spec(spec) or any(m in str(spec).lower() for m in markers)):
         return False
-    return any(marker in seg.lower() for seg in rel)
+    return any(m in seg.lower() for seg in rel for m in markers)
 
 
 def purge_cache(specs):
     """Remove the per-spec directory of each spec — and ONLY that directory.
 
-    NOT the whole `opencode-goal-plugin@https:` subtree: every tarball spec of
+    NOT the whole `<pkg>@https:` subtree: every tarball spec of
     this package shares that first component, so wiping it while migrating a
-    stale `...v0.10.0.tar.gz` entry would also delete an already-good
-    `...v0.11.0.tar.gz` install and leave an offline laptop with nothing. The
+    stale `...v1.0.0.tar.gz` entry would also delete an already-good
+    `...v1.1.0.tar.gz` install and leave an offline laptop with nothing. The
     exact per-spec directory is the minimal correct unit; empty scaffolding is
     pruned below.
     """
@@ -1461,6 +1544,9 @@ prov["ferry"] = {
 # the ~/.cache/opencode/packages directories nothing references any more.
 migrated_from = []
 goal_entry = None
+# The raw path/file:// entry when a user's own local install of the plugin
+# satisfies opencode.json; None when ferry's spec is the one in play.
+user_goal = None
 tui_file = None
 tui_snap = None
 
@@ -1494,10 +1580,14 @@ if set_default:
     # Additive — a plugin list belongs to the user; we only ensure ours is in it.
     # Every earlier spelling of OUR entry is rewritten to the canonical spec (see
     # ensure_goal_plugin and the GOAL_PLUGIN comment block: the forms ferry wrote
-    # before v1.30.1 install to disk and are then silently discarded).
+    # before v1.30.1 install to disk and are then silently discarded). A user's
+    # LOCAL install of the plugin (is_user_goal_path) wins outright: no remote
+    # spec is written and any present is removed - see ensure_goal_plugin.
     plugins, goal_entry, migrated = ensure_goal_plugin(cfg.get("plugin"))
     cfg["plugin"] = plugins
     migrated_from.extend(migrated)
+    if is_user_goal_path(goal_entry):
+        user_goal = goal_entry[0] if isinstance(goal_entry, list) else goal_entry
 
     # MERGE, never take over: the plugin's /goal slash command needs a
     # top-level `command.goal` entry or it never appears in opencode. Only the
@@ -1553,6 +1643,10 @@ if tui_file:
 # --- Purge the cache directories this run just orphaned. ---
 purged = []
 if set_default and not keep_cache:
+    # A user install in tui.json removes GOAL_PLUGIN from THAT file only; when
+    # opencode.json still names the spec, its cache directory is live.
+    if raw_goal == GOAL_PLUGIN:
+        migrated_from = [s for s in migrated_from if s != GOAL_PLUGIN]
     specs = list(dict.fromkeys(list(migrated_from) + list(DEAD_CACHE_SPECS)))
     purged = purge_cache(specs)
     # The canonical directory is kept when it holds a real install and removed
@@ -1565,7 +1659,9 @@ if set_default and not keep_cache:
         purged += purge_cache([GOAL_PLUGIN])
 
 # Hand the canonical spec to the pre-install pass, but only when ferry's own
-# entry is the one in play: a local fork must not trigger an upstream install.
+# entry is the one in play: a user's local install (user_goal) must trigger
+# neither an upstream install nor a refresh of ferry's managed TUI copy, and an
+# empty spec file skips both, plus the goal skill.
 # Lines 4-7 are for _ferry_sync_goal_tui_copy, which runs after the install and
 # needs to know which tui.json was written (empty when none was), where the
 # managed copy lives, which cache directory to copy FROM, and whether that
@@ -1600,15 +1696,24 @@ if set_default:
         tui_note = "spec, TUI copy pending install"
     else:
         tui_note = tui_want
-    print(f"    Plugin: {label}  (/goal command wired; tui.json: {tui_note})")
-    if label != GOAL_PLUGIN:
-        print(f"                    (counts as {GOAL_PLUGIN}; upstream not added)")
-    if tui_file and tui_dir_unusable():
+    if user_goal:
+        # The local-install rule: nothing remote was written, nothing will be
+        # pre-installed or copied, and ferry's managed copy is not in play.
+        print(f"    Plugin: provided by {user_goal}  (local install; /goal command wired; tui.json: {tui_note})")
+        print(f"                    (no remote spec written, upstream not added, nothing pre-installed)")
+    else:
+        print(f"    Plugin: {label}  (/goal command wired; tui.json: {tui_note})")
+        if label != GOAL_PLUGIN:
+            print(f"                    (counts as {GOAL_PLUGIN}; upstream not added)")
+    # Both notes below are about ferry's managed copy, which a user install
+    # takes out of play.
+    copy_in_play = tui_file and not user_goal
+    if copy_in_play and tui_dir_unusable():
         print(f"    WARNING: {goal_tui_dir()} contains ':' or '#'. Bun splits a module")
         print("             path at the first colon, so opencode's TUI loader cannot load a")
         print("             plugin from there; tui.json keeps the spec and the sidebar half")
         print("             will not appear. Set XDG_DATA_HOME to a path without ':' or '#'.")
-    elif tui_file and tui_state and (tui_state["spec"] != GOAL_PLUGIN
+    elif copy_in_play and tui_state and (tui_state["spec"] != GOAL_PLUGIN
                                      or tui_state["version"] != GOAL_PLUGIN_REF.lstrip("v")):
         stale = f"    TUI plugin: copy holds {tui_state['version']}, expected {GOAL_PLUGIN_REF.lstrip('v')}"
         print(stale + ("; refreshed after the install below" if do_install

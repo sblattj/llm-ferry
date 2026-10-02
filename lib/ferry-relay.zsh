@@ -130,7 +130,7 @@ cmd_relay() {
   # killed the wrapper, reported success, and left the relay listening. The python
   # reads argv[1:6] and ignores the rest, exactly as the share server does.
   exec python3 - "$relay_port" "$bind_addr" "$RELAY_TOKEN_FILE" "$RELAY_STATE_FILE" "$reserved" "$marker" <<'PYEOF'
-import hmac, json, os, socket, sys, threading, time
+import hmac, json, os, re, socket, sys, threading, time
 
 port, bind_addr, token_file, state_file, reserved_csv = sys.argv[1:6]
 port = int(port)
@@ -212,7 +212,11 @@ def splice(a, b):
 def serve_registration(ctrl, addr, req):
     public_port = int(req.get("public_port", 0))
     label = str(req.get("label", ""))[:120]
-    kind = "vnc" if req.get("kind") == "vnc" else "tcp"
+    kind = req.get("kind") if req.get("kind") in ("vnc", "tmux") else "tcp"
+    # The client's login name, kept only if it is safe to hand to `ssh user@host`
+    # later; anything else (or nothing, from an older client) is dropped.
+    user = req.get("user")
+    user = user if isinstance(user, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", user) else None
     if public_port < 1024 or public_port > 65535:
         send_json(ctrl, {"ok": False, "error": f"public port {public_port} out of range (1024-65535)"})
         return
@@ -235,6 +239,8 @@ def serve_registration(ctrl, addr, req):
     with published_lock:
         published[public_port] = {"client": addr[0], "label": label, "kind": kind,
                                   "since": time.strftime("%Y-%m-%d %H:%M:%S"), "bind": bind_addr}
+        if user:
+            published[public_port]["user"] = user
     write_state()
     log(f"published {bind_addr}:{public_port} for {addr[0]} {('(' + label + ')') if label else ''}")
 
@@ -421,6 +427,9 @@ cmd_expose() {
     echo "    Native client: vnc://$host:$public_port"
     echo "    Browser:       http://$host:${VNC_PORT:-}/vnc/$public_port   (host runs 'ferry serve-vnc')"
   fi
+  if [[ "${kind:-tcp}" == "tmux" ]]; then
+    echo "    Host attaches with: ferry tmux $(hostname -s 2>/dev/null || echo client)"
+  fi
   # exec, not a child: the tunnel's lifetime IS this process's lifetime. Run the
   # python as a child and `kill <the pid you started>` kills only the zsh wrapper,
   # leaving the control connection open and the host still publishing a port whose
@@ -503,7 +512,8 @@ except OSError as e:
     print("       Is 'ferry relay' running on the host?")
     sys.exit(1)
 
-send_json(ctrl, {"op": "register", "token": token, "public_port": public_port, "label": label, "kind": kind})
+send_json(ctrl, {"op": "register", "token": token, "public_port": public_port, "label": label, "kind": kind,
+                 "user": os.environ.get("USER", "")})
 reply = read_line(ctrl)
 if reply is None:
     print("Error: the relay closed the connection during registration.")

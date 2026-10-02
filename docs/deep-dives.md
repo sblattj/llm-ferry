@@ -503,6 +503,35 @@ own password is what gates the screen. The viewer serves plain HTTP on the
 LAN like every other ferry port — pass `--bind 127.0.0.1` to `ferry serve-vnc`
 to keep it off the LAN entirely.
 
+### tmux detail
+
+`ferry expose-tmux` is `ferry expose 22 --as 8101` with preflights and a kind
+tag. It checks that `tmux` is on the client's `PATH` (else: `brew install
+tmux`), then connects to `127.0.0.1:<local>` and reads the banner: a refused
+connection means Remote Login is off (System Settings > General > Sharing), and
+a greeting that does not start with `SSH-` is refused as not an SSH server, so
+a wrong port never reaches the relay. It registers with `"kind": "tmux"` and
+the client's `$USER`; the relay keeps the user only if it matches
+`[A-Za-z0-9._-]{1,64}`, so `ferry tmux` can default the login name. The default
+public port is `8101` (public ports below 1024 are refused, so 22 cannot be
+mirrored); it is not in the relay's reserved list, so a client may publish
+there.
+
+`ferry tmux [CLIENT]` (host only) reads the same relay state, selects the
+`tmux` entries, and runs `ssh -p <port> -o HostKeyAlias=ferry-tmux-<label> -t
+<user>@<addr> 'PATH=/opt/homebrew/bin:/usr/local/bin:$PATH exec tmux
+new-session -A -s <session>'`. `HostKeyAlias` stops `known_hosts` collisions
+when a port is reused by a different laptop; the remote `PATH` prefix is there
+because non-interactive ssh on macOS does not include Homebrew. `<addr>` is
+`127.0.0.1` for a `0.0.0.0` bind, else the relay's bind address. `--print`
+shows the command without running it; `--list` shows the published clients.
+
+**Security.** The relay token authenticates the publisher only. Who gets a
+shell is decided by the client's sshd (its keys or password), and ssh encrypts
+the session end to end. Anyone on the host's LAN can reach the published port
+(`--bind 127.0.0.1` on `ferry relay` keeps it host-local) but still has to
+get past sshd.
+
 ## Local model known issues
 
 Both lanes run at these settings, so the stack keeps ~33GB of weights resident and two simultaneously-busy deep-context lanes can approach the ~90-100GB wired ceiling. If that bites, shrink the subagent lane first — `LOCAL_SUB_MAX_KV=65536` — since fan-out work rarely needs 128k of context.
@@ -535,6 +564,7 @@ Both lanes run at these settings, so the stack keeps ~33GB of weights resident a
 | **8098** | Reverse-relay control port — a client dials this to register, then publishes one of its own local ports through the host | `ferry relay` |
 | **8099** | Browser VNC viewer + WebSocket bridge onto ports published with `ferry expose-vnc` | `ferry serve-vnc` |
 | **8100** | `local-schematron` MLX backend (**internal** — clients use 8090, or the 8094 door). 8100 and not a gap in 8090-8099 because that block is full | `ferry up --with-local`, `ferry up --schematron` |
+| **8101** | Default public port for a client's sshd published with `ferry expose-tmux` (a relay publish target, not a listener of its own) | `ferry expose-tmux` |
 | **9099** | Default netcat port for direct `ferry send` / `ferry receive` | `ferry send` / `ferry receive` |
 | **3001 / 8429 / 9428 / 9092** | Grafana / VictoriaMetrics / VictoriaLogs / metrics exporter (localhost only) | `ferry dash --grafana` |
 

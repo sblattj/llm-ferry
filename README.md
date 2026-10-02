@@ -264,7 +264,7 @@ Ferry supplies **confidentiality, not delivery** — a deliberate limit that kee
 
 ## Ports
 
-**8090** endpoint · **8091** dashboard · **8094** extraction door · **8095** LAN share · **8096** HF proxy · **8097** forward proxy · **8098** relay · **8099** VNC viewer · **8092/8093/8100** internal MLX backends · **9099** netcat — the full table with who starts each: [Deep dives](docs/deep-dives.md#ports).
+**8090** endpoint · **8091** dashboard · **8094** extraction door · **8095** LAN share · **8096** HF proxy · **8097** forward proxy · **8098** relay · **8099** VNC viewer · **8101** default tmux/ssh publish port · **8092/8093/8100** internal MLX backends · **9099** netcat — the full table with who starts each: [Deep dives](docs/deep-dives.md#ports).
 
 ## Ferrying models & files across the LAN
 
@@ -306,9 +306,12 @@ ferry expose 4290 --as 4290 --token <token>  # client: serve 127.0.0.1:4290 from
 ferry expose-vnc --token <token>   # client: publish the screen (RFB preflight, kind: vnc)
 ferry serve-vnc --fetch            # host, once: download the pinned noVNC release
 ferry serve-vnc                    # host: browser VNC viewer + WebSocket bridge on 8099
+
+ferry expose-tmux --token <token>  # client: publish its sshd (tmux + Remote Login preflight, kind: tmux)
+ferry tmux                         # host: ssh in through the relay and attach a tmux session
 ```
 
-The token authenticates the client that *registers* — expose something with its own auth. Ferry's own ports are refused as publish targets outright. Published ports bind the LAN by default (`--bind 127.0.0.1` keeps an exposure host-local); `ferry status` lists them, `ferry down` tears the relay down. How the bytes move, teardown semantics, and the VNC security model: [Deep dives](docs/deep-dives.md#reverse-expose--how-the-bytes-move).
+For `expose-tmux`, ssh is what authenticates and encrypts, so Remote Login must be on in the client's System Settings. The token authenticates the client that *registers* — expose something with its own auth. Ferry's own ports are refused as publish targets outright. Published ports bind the LAN by default (`--bind 127.0.0.1` keeps an exposure host-local); `ferry status` lists them, `ferry down` tears the relay down. How the bytes move, teardown semantics, and the VNC security model: [Deep dives](docs/deep-dives.md#reverse-expose--how-the-bytes-move).
 
 ## Remote access (Tailscale)
 
@@ -380,7 +383,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `msg <text>` / `log` / `inbox` | client / host | Send a note or pipe stdin to the host's log; read it back dated and attributed |
 | `fleet ls\|show\|use <name>` | both | List fleets, show resolved selections, set a caller's sticky fleet |
 | `keys add\|list\|revoke\|set` | host | Per-device client keys: mint (shown once), list with usage, revoke, and set lane / RPM / monthly token limits |
-| `relay` / `expose <port>` / `expose-vnc` | host / client | Reverse expose: client dials out, host publishes its port (RFB preflight for VNC) |
+| `relay` / `expose <port>` / `expose-vnc` / `expose-tmux` / `tmux` | host / client | Reverse expose: client dials out, host publishes its port (RFB preflight for VNC; `expose-tmux` publishes sshd and `ferry tmux` attaches a tmux session over ssh) |
 | `serve-vnc [--bind ADDR] [--fetch]` | host | Browser VNC viewer + WebSocket bridge (default `8099`) |
 | `offer [--as NAME] <path>...` / `get <name>` | host / client | Record files for clients (a name collision is refused; `.app` bundles keep their signature; `--selftest` offers a fixture); fetch an offered file/dir by name |
 | `pull <model-id> [--transport http\|hf\|nc]` | client | Pull a model from the host cache (three transports) |

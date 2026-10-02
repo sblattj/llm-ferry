@@ -2707,15 +2707,26 @@ def install_chatgpt_system_compat(config_class=None):
 # async_pre_call_deployment_hook, called from the client wrapper), once per
 # fallback hop. Copy, never mutate: the same request may be retried on a hop
 # that needs tool_search.
+#
+# litellm's own anthropic adapter (Kimi K3, `anthropic/k3`, behind
+# domestic.heavy) refuses it before any network call, so every Codex heavy call
+# there failed over to GLM too:
+#
+#   litellm.APIConnectionError: Unsupported tool type: tool_search
+#   (litellm/llms/anthropic/chat/transformation.py)
+_TOOL_SEARCH_REJECTORS = ("zai", "anthropic")
+
+
 def _is_zai_deployment(kwargs) -> bool:
     model = kwargs.get("model")
-    if isinstance(model, str) and model.startswith("zai/"):
+    if isinstance(model, str) and model.split("/", 1)[0] in _TOOL_SEARCH_REJECTORS \
+            and "/" in model:
         return True
-    return kwargs.get("custom_llm_provider") == "zai"
+    return kwargs.get("custom_llm_provider") in _TOOL_SEARCH_REJECTORS
 
 
 def strip_tool_search_for_zai(kwargs):
-    """Return kwargs minus tool_search tools for a zai deployment, else None.
+    """Return kwargs minus tool_search tools for a zai or anthropic deployment, else None.
 
     None means "leave the request alone" (non-zai, no tools, malformed tools,
     nothing to strip, or any error): fail open.

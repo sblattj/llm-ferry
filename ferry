@@ -3975,8 +3975,9 @@ cmd_tmux() {
         echo "  --session N   the tmux session to attach or create [default: ferry]"
         echo "  --user U      the login on the client [default: what the client reported]"
         echo "  --dir PATH    where a NEW session starts (tmux -c); PATH is a path on the client, and a"
-        echo "                leading ~ or ~/ means the client user's home. Ignored when the session already"
-        echo "                exists (tmux ignores -c when -A attaches)"
+        echo "                leading ~ or ~/ means the client user's home (an unquoted ~ your shell expanded to"
+        echo "                this host's home is mapped back). Ignored when the session already exists"
+        echo "                (tmux ignores -c when -A attaches)"
         echo "  --print       print the ssh command instead of running it"
         echo "ssh authenticates you: with the host's ferry key (~/.config/ferry/tmux_ed25519, made by"
         echo "'ferry relay') if present, else your own keys. A client on '--user-sshd' accepts only the former."
@@ -3989,7 +3990,7 @@ cmd_tmux() {
 
   local out rc=0
   out="$(python3 - "$RELAY_STATE_FILE" "$list" "$client" "$session" "$user" "$TMUX_KEY_FILE" "${dir_args[@]}" <<'PYEOF'
-import json, os, re, shlex, sys
+import getpass, json, os, re, shlex, sys
 
 state_file, list_mode, client, session, user, key_file = sys.argv[1:7]
 dir_given = len(sys.argv) > 7
@@ -4057,6 +4058,15 @@ if dir_given:
         fail("--dir needs a non-empty path", show=False)
     if any(c in start_dir for c in "\n\r\0"):
         fail("--dir must not contain a newline, carriage return or NUL", show=False)
+    # An unquoted `--dir ~/x` reaches us already expanded to THIS host's home. When the
+    # client login differs from ours, that path cannot be what was meant: map it back to ~.
+    host_home = os.environ.get("HOME", "").rstrip("/")
+    if (host_home and user != getpass.getuser()
+            and (start_dir == host_home or start_dir.startswith(host_home + "/"))):
+        mapped = "~" + start_dir[len(host_home):]
+        print(f"Note: --dir {start_dir} is under this host's home; your shell expanded ~ here. "
+              f"Using {mapped} on the client (quote it, '~/...', to skip this note).", file=sys.stderr)
+        start_dir = mapped
     if start_dir == "~":
         dir_opt = ' -c "$HOME"'
     elif start_dir.startswith("~/"):
@@ -4079,8 +4089,15 @@ alias = "ferry-tmux-" + re.sub(r"[^A-Za-z0-9._-]", "_", str(info.get("label") or
 # laptop; sharing one alias would trip "REMOTE HOST IDENTIFICATION HAS CHANGED".
 if info.get("sshd") == "user":
     alias += "-user"
-# Non-interactive macOS ssh has no Homebrew on PATH, so tmux would not be found.
-remote = f"PATH=/opt/homebrew/bin:/usr/local/bin:$PATH exec tmux new-session -A -s {session}{dir_opt}"
+# Non-interactive ssh gets only /usr/bin:/bin:/usr/sbin:/sbin, and a login shell does not
+# help when Homebrew's shellenv lives in .zshrc. So search the usual tmux homes ourselves,
+# a per-user Homebrew (~/homebrew, common on managed Macs without admin rights) first,
+# and say so plainly when tmux is not there instead of a bare "command not found".
+TMUX_PATH = ("$HOME/homebrew/bin:$HOME/.homebrew/bin:$HOME/.local/bin:/opt/homebrew/bin:"
+             "/usr/local/bin:/opt/local/bin:$HOME/.nix-profile/bin:/run/current-system/sw/bin")
+remote = (f'PATH="{TMUX_PATH}:$PATH"; command -v tmux >/dev/null 2>&1 || '
+          f'{{ echo "ferry: tmux is not installed on this client (searched $PATH)" >&2; exit 127; }}; '
+          f"exec tmux new-session -A -s {session}{dir_opt}")
 argv = ["ssh", "-p", str(port), "-o", f"HostKeyAlias={alias}"]
 # The host's ferry key, when `ferry relay` has made one. No IdentitiesOnly: a system
 # sshd must still be offered the user's default keys.

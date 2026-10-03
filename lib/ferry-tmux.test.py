@@ -7,6 +7,7 @@ Spawns the real built `ferry` with a throwaway $HOME holding a hand-written rela
 state file. `--print` is the seam: it prints the exact ssh argv instead of
 exec'ing it, so no test ever opens a real ssh session.
 """
+import getpass
 import json
 import os
 import re
@@ -249,9 +250,25 @@ class TmuxDirTest(TmuxTestBase):
         return subprocess.run(["sh", "-c", "HOME=/h; printf %s " + operand],
                               capture_output=True, text=True, timeout=20)
 
-    def test_without_dir_the_remote_is_unchanged(self):
-        self.assertEqual(self.remote(),
-                         "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH exec tmux new-session -A -s ferry")
+    def test_without_dir_there_is_no_start_directory(self):
+        remote = self.remote()
+        self.assertTrue(remote.endswith("exec tmux new-session -A -s ferry"), remote)
+        self.assertNotIn(" -c ", remote)
+
+    def test_host_expanded_tilde_is_mapped_back_to_the_client_home(self):
+        self.write_state({"8101": entry("laptop")})
+        r = self.ferry("tmux", "--print", "--dir", self.home + "/dev")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(shlex.split(r.stdout.strip())[-1].endswith('-s ferry -c "$HOME"/dev'), r.stdout)
+        self.assertIn("Using ~/dev on the client", r.stderr)
+        r = self.ferry("tmux", "--print", "--dir", self.home)
+        self.assertTrue(shlex.split(r.stdout.strip())[-1].endswith('-s ferry -c "$HOME"'), r.stdout)
+
+    def test_host_home_is_kept_when_the_client_login_is_ours(self):
+        me = getpass.getuser()
+        remote = self.remote("--user", me, "--dir", self.home + "/dev")
+        self.assertTrue(remote.endswith(" -c " + shlex.quote(self.home + "/dev")), remote)
+
 
     def test_dir_with_space_is_single_quoted(self):
         remote = self.remote("--dir", "/tmp/x y")
@@ -288,6 +305,45 @@ class TmuxDirTest(TmuxTestBase):
         r = self.ferry("tmux", "--dir")
         self.assertEqual(r.returncode, 1)
         self.assertIn("Error: --dir needs a path", r.stdout)
+
+
+class TmuxRemotePathTest(TmuxTestBase):
+    """Runs the generated remote command in a real sh with a fake client $HOME."""
+
+    def remote(self):
+        self.write_state({"8101": entry("laptop")})
+        return self.argv()[-1]
+
+    def run_remote(self, remote, client_home):
+        return subprocess.run(["sh", "-c", remote], capture_output=True, text=True, timeout=20,
+                              env={"HOME": client_home, "PATH": "/usr/bin:/bin"})
+
+    def fake_tmux(self, bindir):
+        os.makedirs(bindir)
+        path = os.path.join(bindir, "tmux")
+        with open(path, "w") as f:
+            f.write('#!/bin/sh\necho "fake-tmux $*"\n')
+        os.chmod(path, 0o755)
+
+    def test_per_user_homebrew_tmux_is_found(self):
+        client_home = os.path.join(self.tmp, "client")
+        self.fake_tmux(os.path.join(client_home, "homebrew", "bin"))
+        r = self.run_remote(self.remote(), client_home)
+        self.assertEqual(r.stdout.strip(), "fake-tmux new-session -A -s ferry", r.stderr)
+
+    def test_missing_tmux_says_so(self):
+        client_home = os.path.join(self.tmp, "client")
+        os.makedirs(client_home)
+        remote = self.remote()
+        # Point the fixed system dirs at an empty one, so this host's own tmux cannot answer.
+        empty = os.path.join(self.tmp, "empty")
+        os.makedirs(empty)
+        for d in ("/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin", "/run/current-system/sw/bin"):
+            self.assertIn(d + ":", remote)
+            remote = remote.replace(d + ":", empty + ":")
+        r = self.run_remote(remote, client_home)
+        self.assertEqual(r.returncode, 127, r.stdout + r.stderr)
+        self.assertIn("ferry: tmux is not installed on this client", r.stderr)
 
 
 class StatusReportsTmuxTest(TmuxTestBase):

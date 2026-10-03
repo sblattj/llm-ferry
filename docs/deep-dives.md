@@ -543,7 +543,7 @@ and restart the relay.
 
 `ferry tmux [CLIENT]` (host only) reads the same relay state, selects the
 `tmux` entries, and runs `ssh -p <port> -o HostKeyAlias=ferry-tmux-<label> [-i
-~/.config/ferry/tmux_ed25519] -t <user>@<addr> 'PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+~/.config/ferry/tmux_ed25519] -t <user>@<addr> 'PATH="<tmux dirs>:$PATH"; command -v tmux ... || exit 127;
 exec tmux new-session -A -s <session>'`. `-i` is added only when the key exists,
 and `IdentitiesOnly` is deliberately not, so a system sshd is still offered the
 user's own keys. `HostKeyAlias` stops `known_hosts` collisions when a port is
@@ -551,7 +551,12 @@ reused by a different laptop; for a user-sshd entry it becomes
 `ferry-tmux-<label>-user`, because that sshd's host key differs from the system
 sshd's on the same laptop and sharing one alias would trip ssh's "REMOTE HOST
 IDENTIFICATION HAS CHANGED". The remote `PATH` prefix is there because
-non-interactive ssh on macOS does not include Homebrew. `<addr>` is `127.0.0.1`
+non-interactive ssh on macOS gets only `/usr/bin:/bin:/usr/sbin:/sbin`, and a login shell
+does not help when Homebrew's shellenv lives in `.zshrc`. It searches a per-user Homebrew
+first (`$HOME/homebrew/bin`, `$HOME/.homebrew/bin`, common on managed Macs without admin
+rights), then `$HOME/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, MacPorts and Nix.
+When tmux is in none of them the client prints `ferry: tmux is not installed on this
+client` and exits 127, instead of a bare `command not found`. `<addr>` is `127.0.0.1`
 for a `0.0.0.0` bind, else the relay's bind address. `--print` shows the command
 without running it; `--list` shows the published clients.
 
@@ -559,6 +564,9 @@ without running it; `--list` shows the published clients.
 `-A` attaches to an existing session. `PATH` is a client path: a leading `~` or `~/...`
 becomes `"$HOME"` / `"$HOME"/<quoted rest>` for the remote shell to expand, anything
 else is `shlex.quote`d, `~otheruser` and empty/newline/CR/NUL values are rejected.
+An unquoted `--dir ~/x` arrives already expanded to the HOST's home; when the client login
+differs from the host's, a path under the host's `$HOME` is mapped back to `~/...` with a
+note on stderr.
 Without `--dir` the remote command is unchanged.
 
 **Security.** The relay token authenticates the publisher only. Who gets a

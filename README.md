@@ -309,7 +309,7 @@ ferry serve-vnc                    # host: browser VNC viewer + WebSocket bridge
 
 ferry expose-tmux --token <token>  # client: publish an sshd (system one if Remote Login is on, else a no-sudo one; kind: tmux)
 ferry tmux                         # host: ssh in through the relay and attach a tmux session
-ferry tmux --dir ~/code/foo        # same, but a NEW session starts in that client directory (~ = the client's home)
+ferry tmux --dir '~/code/foo'      # same, but a NEW session starts in that client directory (~ = the client's home)
 ```
 
 For `expose-tmux`, ssh is what authenticates and encrypts. Remote Login is no longer required: with it off (or with `--user-sshd`) the client runs its own no-sudo sshd on `127.0.0.1`, pubkey-only, trusting just the host's ferry key (`~/.config/ferry/tmux_ed25519`, made by `ferry relay` and fetched over the relay), and stops it with the tunnel; `--system-sshd` forces the system sshd on port 22. The token authenticates the client that *registers* — expose something with its own auth. Ferry's own ports are refused as publish targets outright. Published ports bind the LAN by default (`--bind 127.0.0.1` keeps an exposure host-local); `ferry status` lists them, `ferry down` tears the relay down. How the bytes move, teardown semantics, and the VNC security model: [Deep dives](docs/deep-dives.md#reverse-expose--how-the-bytes-move).

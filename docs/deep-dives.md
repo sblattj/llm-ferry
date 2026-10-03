@@ -555,6 +555,12 @@ non-interactive ssh on macOS does not include Homebrew. `<addr>` is `127.0.0.1`
 for a `0.0.0.0` bind, else the relay's bind address. `--print` shows the command
 without running it; `--list` shows the published clients.
 
+`--dir PATH` appends `-c <PATH>` so a new session starts there; tmux ignores `-c` when
+`-A` attaches to an existing session. `PATH` is a client path: a leading `~` or `~/...`
+becomes `"$HOME"` / `"$HOME"/<quoted rest>` for the remote shell to expand, anything
+else is `shlex.quote`d, `~otheruser` and empty/newline/CR/NUL values are rejected.
+Without `--dir` the remote command is unchanged.
+
 **Security.** The relay token authenticates the publisher only. Who gets a
 shell is decided by the client's sshd, and ssh encrypts the session end to end.
 The no-sudo sshd is narrow by construction: it listens on `127.0.0.1` only (the

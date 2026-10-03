@@ -26,7 +26,7 @@ message explicitly asks you to resume.
 | Stop reason | Means | Do |
 |---|---|---|
 | `paused` | user ran `/goal pause` | nothing until they resume |
-| `user intervention` | a human message arrived mid-loop; latest instruction wins | answer the human; do not resume the loop |
+| `user intervention` | a human message arrived mid-loop and `noInterruptOnUserMessage` is `false`; latest instruction wins | answer the human; do not resume the loop |
 | `blocked` | your `[goal:blocked]` was accepted | wait for the input you named |
 | `no progress` / `no tool calls` | 2 consecutive stalled turns, or 10 consecutive turns that called no tool | say plainly what stalled you and what step you would run next |
 | `format validation failures` | rejected completions/blockers hit the cap | re-read section 5 before the next attempt |
@@ -239,8 +239,10 @@ stall/format counter reset to zero, while the goal id, objective, plan, and chec
 
 ## 7. Interaction rules
 
-1. A real human message pauses the loop. That is correct behavior: answer the human, and do not
-   restart goal work in that turn or the next one. Only their `/goal resume` restarts it.
+1. A real human message steers the loop by default: the goal keeps running, so answer or act on
+   the message first and treat it as the latest instruction for the goal work that follows. If
+   the goal stopped with `user intervention` (`noInterruptOnUserMessage: false`), answer the
+   human and do not restart goal work in that turn or the next one; only `/goal resume` does.
 2. `/goal status`, `/goal history`, `/goal list`, `/goal pause`, `/goal clear`, a HELD goal
    (rule 4) and any error or no-op reply from a `/goal` command are READ-ONLY control turns. The
    plugin already executed them, handed you the result inside `<goal_command_control>` and told

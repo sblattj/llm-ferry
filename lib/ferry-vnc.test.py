@@ -6,7 +6,7 @@ Run:  python3 lib/ferry-vnc.test.py
 Spawns the real built `ferry` with a throwaway $HOME holding a hand-written relay
 state file and a stub noVNC directory, then talks HTTP and WebSocket to it.
 """
-import base64, hashlib, http.client, io, json, os, re, shutil, socket, struct, subprocess, tarfile, tempfile, threading, time, unittest
+import base64, hashlib, http.client, io, json, os, re, shutil, socket, struct, subprocess, sys, tarfile, tempfile, threading, time, unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FERRY = os.path.join(REPO, "ferry")
@@ -192,9 +192,9 @@ class VncServeTest(unittest.TestCase):
 class StatusReportsVncTest(unittest.TestCase):
     """`ferry status` (cmd_status in lib/ferry-serve.zsh) reports the browser VNC
     viewer. VNC_PORT is a fixed global (unlike serve-vnc's own --port), so the
-    check below reuses whatever already listens there rather than claiming it —
-    a stray unrelated process on that port satisfies cmd_status's lsof check
-    just as well, and this way the test never fights another listener for it."""
+    check below reuses a real ferry-vnc-marker listener if one is up, starts a
+    marker-carrying stand-in otherwise, and skips when a foreign process holds
+    the port (cmd_status now reports that as "held by another process")."""
 
     @classmethod
     def setUpClass(cls):
@@ -209,15 +209,40 @@ class StatusReportsVncTest(unittest.TestCase):
         cfg = os.path.join(self.home, ".config", "ferry")
         os.makedirs(cfg, exist_ok=True)
         self.state_path = os.path.join(cfg, "relay-published.json")
-        self._listener = None
+        # cmd_status only calls a listener "ours" when its argv carries the kill
+        # sentinel, so the stand-in listener is a subprocess whose argv ends with it.
+        if self._port_taken():
+            holder = self._holder_args()
+            if "ferry-vnc-marker" not in holder:
+                self.skipTest("VNC_PORT %d is held by a process that is not ferry's: %s"
+                              % (self.port, holder[:120] or "unknown"))
+            return  # a real ferry-vnc-marker process already serves it
+        code = ("import socket,sys,time\n"
+                "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(5)\n"
+                "time.sleep(600)\n")
+        proc = subprocess.Popen([sys.executable, "-c", code, str(self.port), "ferry-vnc-marker"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        deadline = time.time() + 10
+        while not self._port_taken():
+            self.assertLess(time.time(), deadline, "listener subprocess never accepted")
+            time.sleep(0.05)
+
+    def _port_taken(self):
         try:
             socket.create_connection(("127.0.0.1", self.port), timeout=0.5).close()
+            return True
         except OSError:
-            self._listener = socket.socket()
-            self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self._listener.bind(("127.0.0.1", self.port))
-            self._listener.listen(1)
-            self.addCleanup(self._listener.close)
+            return False
+
+    def _holder_args(self):
+        r = subprocess.run(["lsof", "-t", "-nP", "-iTCP:%d" % self.port, "-sTCP:LISTEN"],
+                           capture_output=True, text=True)
+        out = []
+        for pid in r.stdout.split():
+            out.append(subprocess.run(["ps", "-p", pid, "-o", "args="], capture_output=True, text=True).stdout.strip())
+        return " | ".join(out)
 
     def write_state(self, obj):
         with open(self.state_path, "w") as f:

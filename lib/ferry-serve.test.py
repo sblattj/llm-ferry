@@ -22,8 +22,11 @@ Two halves:
 """
 import os
 import re
+import socket
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1316,6 +1319,56 @@ class TestWarnMissingKeys(unittest.TestCase):
         self.assertIn("flash", out)
         self.assertNotIn("DEAD_KEY", out)
         self.assertNotIn("heavy-fallback", out)
+
+
+class TestPortHolder(unittest.TestCase):
+    """`_ferry_port_holder <port> <marker>` (lib/ferry-serve.zsh): rc 1 = nothing
+    listens, rc 0 = a listener's argv carries the marker, rc 2 = someone else holds
+    the port (and the output names the PID). Free ports only, so it never depends on
+    what the machine is already running."""
+
+    @classmethod
+    def setUpClass(cls):
+        src = open(FERRY).read()
+        m = re.search(r"^_ferry_port_holder\(\) \{\n.*?^\}$", src, re.S | re.M)
+        assert m, "_ferry_port_holder not found in the built ferry"
+        cls.func = m.group(0)
+
+    def query(self, port, marker):
+        r = subprocess.run(["zsh", "-c", "%s\n_ferry_port_holder %d %s; echo rc=$?" % (self.func, port, marker)],
+                           capture_output=True, text=True, timeout=30)
+        rc = int(re.search(r"rc=(\d+)\s*$", r.stdout).group(1))
+        return rc, r.stdout
+
+    def listener(self):
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        code = ("import socket,sys,time\ns=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(5); time.sleep(600)\n")
+        proc = subprocess.Popen([sys.executable, "-c", code, str(port), "ferry-test-marker"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        deadline = time.time() + 10
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.5).close(); break
+            except OSError:
+                self.assertLess(time.time(), deadline, "listener never came up")
+                time.sleep(0.05)
+        return port, proc
+
+    def test_free_port_is_rc1(self):
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()
+        self.assertEqual(self.query(port, "ferry-test-marker")[0], 1)
+
+    def test_listener_carrying_the_marker_is_rc0(self):
+        port, _ = self.listener()
+        self.assertEqual(self.query(port, "ferry-test-marker")[0], 0)
+
+    def test_listener_without_the_marker_is_rc2_and_names_the_pid(self):
+        port, proc = self.listener()
+        rc, out = self.query(port, "ferry-other-marker")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("PID %d:" % proc.pid, out)
 
 
 if __name__ == "__main__":

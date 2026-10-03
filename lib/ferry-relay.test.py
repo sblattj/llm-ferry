@@ -543,5 +543,186 @@ class RelayUserFieldTest(RelayTest):
         self.assertNotIn("user", self.state()[str(self.public_port)])
 
 
+class RelayHostKeyTest(RelayTest):
+    def key_path(self):
+        return os.path.join(self.home, ".config", "ferry", "tmux_ed25519")
+
+    def ask(self, token):
+        with socket.create_connection(("127.0.0.1", self.relay_port), timeout=10) as s:
+            s.sendall((json.dumps({"op": "hostkey", "token": token}) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                chunk = s.recv(1)
+                if not chunk:
+                    break
+                buf += chunk
+        return json.loads(buf)
+
+    def test_starting_the_relay_creates_the_tmux_key(self):
+        self.start_relay()
+        self.assertTrue(os.path.exists(self.key_path()))
+        self.assertTrue(os.path.exists(self.key_path() + ".pub"))
+        self.assertEqual(oct(os.stat(self.key_path()).st_mode)[-3:], "600")
+        with open(self.key_path() + ".pub") as f:
+            self.assertTrue(f.read().startswith("ssh-ed25519 "))
+
+    def test_the_key_is_not_regenerated(self):
+        self.start_relay()
+        with open(self.key_path() + ".pub") as f:
+            first = f.read()
+        self.run_ferry("relay", "--port", str(free_port()), "--token")  # --token returns early
+        with open(self.key_path() + ".pub") as f:
+            self.assertEqual(first, f.read())
+
+    def test_hostkey_op_returns_the_public_key_for_the_right_token(self):
+        self.start_relay()
+        reply = self.ask(self.token())
+        with open(self.key_path() + ".pub") as f:
+            self.assertEqual(reply, {"ok": True, "pubkey": f.read().strip()})
+
+    def test_hostkey_op_refuses_a_wrong_token(self):
+        self.start_relay()
+        reply = self.ask("not-the-token")
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["error"], "bad token")
+        self.assertNotIn("pubkey", reply)
+
+    def test_sshd_user_is_recorded_and_other_values_are_ignored(self):
+        self.start_relay()
+        for value, expect in (("user", "user"), ("system", None)):
+            port = free_port()
+            s = socket.create_connection(("127.0.0.1", self.relay_port), timeout=10)
+            self.addCleanup(s.close)
+            s.sendall((json.dumps({"op": "register", "token": self.token(), "public_port": port,
+                                   "label": "box", "kind": "tmux", "sshd": value}) + "\n").encode())
+            buf = b""
+            while not buf.endswith(b"\n"):
+                buf += s.recv(1)
+            end = time.time() + 10
+            while time.time() < end and str(port) not in self.state():
+                time.sleep(0.1)
+            self.assertEqual(self.state()[str(port)].get("sshd"), expect)
+
+
+class ExposeTmuxUserSshdTest(RelayTest):
+    """The no-sudo path, end to end with a REAL sshd and a REAL ssh client."""
+
+    def setUp(self):
+        super().setUp()
+        if not (os.path.exists("/usr/sbin/sshd") and shutil.which("ssh") and shutil.which("ssh-keygen")):
+            self.skipTest("needs /usr/sbin/sshd, ssh and ssh-keygen")
+        self.bin = os.path.join(self.tmp, "stubbin")
+        os.makedirs(self.bin)
+        stub = os.path.join(self.bin, "tmux")
+        with open(stub, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(stub, 0o755)
+
+    def env(self):
+        e = super().env()
+        e["PATH"] = self.bin + ":" + e["PATH"]
+        return e
+
+    def alive(self, pid):
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    def wait_until(self, cond, what, deadline=20.0):
+        end = time.time() + deadline
+        while time.time() < end:
+            if cond():
+                return
+            time.sleep(0.2)
+        self.fail(f"timed out waiting for {what}")
+
+    def ssh(self, key, port, remote_cmd="echo FERRY-USER-SSHD-OK"):
+        user = os.environ.get("USER") or subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip()
+        return subprocess.run(
+            ["ssh", "-F", "/dev/null", "-p", str(port), "-i", key, "-o", "IdentitiesOnly=yes",
+             "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+             "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", f"{user}@127.0.0.1", remote_cmd],
+            capture_output=True, text=True, timeout=60)
+
+    def start_user_sshd_expose(self):
+        self.start_relay()
+        p = self.ferry("expose-tmux", "--user-sshd", "--host", "127.0.0.1",
+                       "--port", str(self.relay_port), "--token", self.token(),
+                       "--as", str(self.public_port))
+        self.wait_until(lambda: self.state().get(str(self.public_port), {}).get("sshd") == "user",
+                        "the relay to list the user-sshd entry")
+        pidfile = os.path.join(self.home, ".config", "ferry", "tmux-sshd", "sshd.pid")
+        self.wait_until(lambda: os.path.exists(pidfile), "the sshd pid file")
+        with open(pidfile) as f:
+            sshd_pid = int(f.read().strip())
+        self.addCleanup(lambda: self.alive(sshd_pid) and os.kill(sshd_pid, 9))
+        return p, sshd_pid
+
+    def host_key(self):
+        return os.path.join(self.home, ".config", "ferry", "tmux_ed25519")
+
+    def test_host_key_logs_in_other_key_does_not_and_sigterm_stops_the_sshd(self):
+        p, sshd_pid = self.start_user_sshd_expose()
+        entry = self.state()[str(self.public_port)]
+        self.assertEqual(entry["kind"], "tmux")
+        # The sshd listens on 127.0.0.1 only.
+        ok = self.ssh(self.host_key(), self.public_port)
+        self.assertIn("FERRY-USER-SSHD-OK", ok.stdout, ok.stdout + ok.stderr)
+        # Control: a different key is refused (pubkey-only, one authorized key).
+        other = os.path.join(self.tmp, "other_key")
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", other], check=True)
+        bad = self.ssh(other, self.public_port)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertNotIn("FERRY-USER-SSHD-OK", bad.stdout)
+        # authorized_keys holds exactly the host's pubkey.
+        with open(self.host_key() + ".pub") as f:
+            pub = f.read().strip()
+        with open(os.path.join(self.home, ".config", "ferry", "tmux-sshd", "authorized_keys")) as f:
+            self.assertEqual(f.read().strip(), pub)
+        # kill <pid> (SIGTERM): the sshd goes and the port is unpublished.
+        p.terminate()
+        p.wait(timeout=15)
+        self.wait_until(lambda: not self.alive(sshd_pid), "the sshd to exit after SIGTERM")
+        self.wait_until(lambda: str(self.public_port) not in self.state(), "the relay to unpublish")
+
+    def test_sigint_also_stops_the_sshd(self):
+        import signal
+        p, sshd_pid = self.start_user_sshd_expose()
+        p.send_signal(signal.SIGINT)
+        p.wait(timeout=15)
+        self.wait_until(lambda: not self.alive(sshd_pid), "the sshd to exit after SIGINT")
+
+    def test_an_older_relay_that_closes_without_answering_is_explained(self):
+        # A fake "relay" that accepts and closes, like a relay that predates the hostkey op.
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        self.addCleanup(srv.close)
+
+        def closer():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                c.close()
+        threading.Thread(target=closer, daemon=True).start()
+        r = self.run_ferry("expose-tmux", "--user-sshd", "--host", "127.0.0.1",
+                           "--port", str(srv.getsockname()[1]), "--token", "x")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("predates this feature", r.stdout)
+        self.assertIn("ferry update", r.stdout)
+
+    def test_a_wrong_token_prints_the_token_hint(self):
+        self.start_relay()
+        r = self.run_ferry("expose-tmux", "--user-sshd", "--host", "127.0.0.1",
+                           "--port", str(self.relay_port), "--token", "wrong")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("bad token", r.stdout)
+        self.assertIn("ferry relay --token", r.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

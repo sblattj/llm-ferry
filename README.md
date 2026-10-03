@@ -307,11 +307,11 @@ ferry expose-vnc --token <token>   # client: publish the screen (RFB preflight, 
 ferry serve-vnc --fetch            # host, once: download the pinned noVNC release
 ferry serve-vnc                    # host: browser VNC viewer + WebSocket bridge on 8099
 
-ferry expose-tmux --token <token>  # client: publish its sshd (tmux + Remote Login preflight, kind: tmux)
+ferry expose-tmux --token <token>  # client: publish an sshd (system one if Remote Login is on, else a no-sudo one; kind: tmux)
 ferry tmux                         # host: ssh in through the relay and attach a tmux session
 ```
 
-For `expose-tmux`, ssh is what authenticates and encrypts, so Remote Login must be on in the client's System Settings. The token authenticates the client that *registers* — expose something with its own auth. Ferry's own ports are refused as publish targets outright. Published ports bind the LAN by default (`--bind 127.0.0.1` keeps an exposure host-local); `ferry status` lists them, `ferry down` tears the relay down. How the bytes move, teardown semantics, and the VNC security model: [Deep dives](docs/deep-dives.md#reverse-expose--how-the-bytes-move).
+For `expose-tmux`, ssh is what authenticates and encrypts. Remote Login is no longer required: with it off (or with `--user-sshd`) the client runs its own no-sudo sshd on `127.0.0.1`, pubkey-only, trusting just the host's ferry key (`~/.config/ferry/tmux_ed25519`, made by `ferry relay` and fetched over the relay), and stops it with the tunnel; `--system-sshd` forces the system sshd on port 22. The token authenticates the client that *registers* — expose something with its own auth. Ferry's own ports are refused as publish targets outright. Published ports bind the LAN by default (`--bind 127.0.0.1` keeps an exposure host-local); `ferry status` lists them, `ferry down` tears the relay down. How the bytes move, teardown semantics, and the VNC security model: [Deep dives](docs/deep-dives.md#reverse-expose--how-the-bytes-move).
 
 ## Remote access (Tailscale)
 
@@ -383,7 +383,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `msg <text>` / `log` / `inbox` | client / host | Send a note or pipe stdin to the host's log; read it back dated and attributed |
 | `fleet ls\|show\|use <name>` | both | List fleets, show resolved selections, set a caller's sticky fleet |
 | `keys add\|list\|revoke\|set` | host | Per-device client keys: mint (shown once), list with usage, revoke, and set lane / RPM / monthly token limits |
-| `relay` / `expose <port>` / `expose-vnc` / `expose-tmux` / `tmux` | host / client | Reverse expose: client dials out, host publishes its port (RFB preflight for VNC; `expose-tmux` publishes sshd and `ferry tmux` attaches a tmux session over ssh) |
+| `relay` / `expose <port>` / `expose-vnc` / `expose-tmux` / `tmux` | host / client | Reverse expose: client dials out, host publishes its port (RFB preflight for VNC; `expose-tmux` publishes an sshd, the system one or a no-sudo one, and `ferry tmux` attaches a tmux session over ssh) |
 | `serve-vnc [--bind ADDR] [--fetch]` | host | Browser VNC viewer + WebSocket bridge (default `8099`) |
 | `offer [--as NAME] <path>...` / `get <name>` | host / client | Record files for clients (a name collision is refused; `.app` bundles keep their signature; `--selftest` offers a fixture); fetch an offered file/dir by name |
 | `pull <model-id> [--transport http\|hf\|nc]` | client | Pull a model from the host cache (three transports) |

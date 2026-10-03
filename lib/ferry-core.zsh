@@ -324,6 +324,14 @@ RELAY_TOKEN_FILE="$HOME/.config/ferry/relay-token"
 RELAY_STATE_FILE="$HOME/.config/ferry/relay-published.json"
 RELAY_LOG="$LOG_DIR/relay-$RELAY_PORT.log"
 
+# `ferry expose-tmux` without Remote Login: the client runs its OWN sshd as an
+# ordinary user (no sudo) on a free high port, and trusts only the host's ferry
+# key. The host mints that key (TMUX_KEY_FILE, with a .pub beside it) when its relay
+# starts and serves the PUBLIC half to clients (`op: hostkey`). TMUX_SSHD_DIR holds
+# the client's sshd state: a stable host key, authorized_keys, sshd_config, pid, log.
+TMUX_KEY_FILE="$HOME/.config/ferry/tmux_ed25519"
+TMUX_SSHD_DIR="$HOME/.config/ferry/tmux-sshd"
+
 # Browser VNC viewer (`ferry serve-vnc`): noVNC served from the host plus a
 # WebSocket->TCP bridge onto ports the relay has published as kind=vnc.
 VNC_PORT="8099"

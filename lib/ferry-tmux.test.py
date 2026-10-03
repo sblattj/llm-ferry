@@ -181,6 +181,41 @@ class TmuxPrintTest(TmuxTestBase):
         self.assertIn("Host Mac", r.stdout + r.stderr)
 
 
+class TmuxKeyAndUserSshdTest(TmuxTestBase):
+    def make_key(self):
+        path = os.path.join(self.cfg, "tmux_ed25519")
+        with open(path, "w") as f:
+            f.write("not a real key; only its existence is read\n")
+        return path
+
+    def test_no_identity_flag_without_the_key_file(self):
+        self.write_state({"8101": entry("laptop")})
+        argv = self.argv()
+        self.assertNotIn("-i", argv)
+        self.assertEqual(len(argv), 8)
+
+    def test_identity_flag_appears_with_the_key_file(self):
+        key = self.make_key()
+        self.write_state({"8101": entry("laptop")})
+        argv = self.argv()
+        self.assertEqual(argv[argv.index("-i") + 1], key)
+        self.assertNotIn("IdentitiesOnly=yes", argv)
+        self.assertNotIn("-o IdentitiesOnly", " ".join(argv))
+        self.assertEqual(argv[-2], "alice@127.0.0.1")
+
+    def test_user_sshd_entry_gets_its_own_host_key_alias(self):
+        e = entry("laptop")
+        e["sshd"] = "user"
+        self.write_state({"8101": e})
+        self.assertIn("HostKeyAlias=ferry-tmux-laptop-user", self.argv())
+
+    def test_system_sshd_entry_keeps_the_plain_alias(self):
+        e = entry("laptop")
+        e["sshd"] = "something-else"
+        self.write_state({"8101": e})
+        self.assertIn("HostKeyAlias=ferry-tmux-laptop", self.argv())
+
+
 class TmuxListTest(TmuxTestBase):
     def test_list_none_prints_the_hint(self):
         self.write_state({})

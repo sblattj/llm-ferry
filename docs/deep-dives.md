@@ -509,32 +509,63 @@ to keep it off the LAN entirely.
 
 ### tmux detail
 
-`ferry expose-tmux` is `ferry expose 22 --as 8101` with preflights and a kind
-tag. It checks that `tmux` is on the client's `PATH` (else: `brew install
-tmux`), then connects to `127.0.0.1:<local>` and reads the banner: a refused
-connection means Remote Login is off (System Settings > General > Sharing), and
-a greeting that does not start with `SSH-` is refused as not an SSH server, so
-a wrong port never reaches the relay. It registers with `"kind": "tmux"` and
-the client's `$USER`; the relay keeps the user only if it matches
-`[A-Za-z0-9._-]{1,64}`, so `ferry tmux` can default the login name. The default
-public port is `8101` (public ports below 1024 are refused, so 22 cannot be
-mirrored); it is not in the relay's reserved list, so a client may publish
-there.
+`ferry expose-tmux` is `ferry expose <sshd port> --as 8101` with preflights and
+a kind tag. It checks that `tmux` is on the client's `PATH` (else: `brew install
+tmux`), then picks an sshd. With no flag it probes `127.0.0.1:22` for an `SSH-`
+greeting: if Remote Login is on it publishes that sshd (`--system-sshd` insists
+on it; `--local PORT` publishes any other sshd already listening, and a refused
+connection or a greeting that does not start with `SSH-` is refused before it
+reaches the relay). If nothing greets on 22 it runs its own sshd instead
+(`--user-sshd` forces that), so **Remote Login, and with it admin rights, is not
+required**. It registers with `"kind": "tmux"` and the client's `$USER`; the
+relay keeps the user only if it matches `[A-Za-z0-9._-]{1,64}`, so `ferry tmux`
+can default the login name. The default public port is `8101` (public ports
+below 1024 are refused, so 22 cannot be mirrored); it is not in the relay's
+reserved list, so a client may publish there.
+
+**The no-sudo sshd.** `ferry relay` makes a dedicated key on the host the first
+time it starts: `~/.config/ferry/tmux_ed25519` (and `.pub`), no passphrase, 0600.
+The relay serves the public half to any caller with the token: a
+`{"op":"hostkey","token":...}` request is answered with `{"ok":true,"pubkey":
+"ssh-ed25519 ..."}` (or `{"ok":false,"error":"bad token"}`). A client in
+user-sshd mode fetches it, then keeps its state in `~/.config/ferry/tmux-sshd/`
+(0700): a host key made once and reused, so the host's `known_hosts` stays valid;
+an `authorized_keys` holding exactly the fetched key, rewritten each run; and a
+fresh `sshd_config`, `sshd.pid` and `sshd.log`. It runs `/usr/sbin/sshd -D` as the
+ordinary user on a free `127.0.0.1` port picked at runtime, waits for the `SSH-`
+greeting, and publishes that port with `"sshd": "user"` in the registration. A
+stale sshd from a crashed run (its pid file names a live process whose command
+line carries our `sshd_config`) is killed first. The sshd belongs to the tunnel:
+`ferry expose` still `exec`s its python, which on SIGINT, SIGTERM or any exit
+(registration failure included) stops the sshd too. If the host's relay is older
+and closes without answering `hostkey`, the client says to `ferry update` the host
+and restart the relay.
 
 `ferry tmux [CLIENT]` (host only) reads the same relay state, selects the
-`tmux` entries, and runs `ssh -p <port> -o HostKeyAlias=ferry-tmux-<label> -t
-<user>@<addr> 'PATH=/opt/homebrew/bin:/usr/local/bin:$PATH exec tmux
-new-session -A -s <session>'`. `HostKeyAlias` stops `known_hosts` collisions
-when a port is reused by a different laptop; the remote `PATH` prefix is there
-because non-interactive ssh on macOS does not include Homebrew. `<addr>` is
-`127.0.0.1` for a `0.0.0.0` bind, else the relay's bind address. `--print`
-shows the command without running it; `--list` shows the published clients.
+`tmux` entries, and runs `ssh -p <port> -o HostKeyAlias=ferry-tmux-<label> [-i
+~/.config/ferry/tmux_ed25519] -t <user>@<addr> 'PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+exec tmux new-session -A -s <session>'`. `-i` is added only when the key exists,
+and `IdentitiesOnly` is deliberately not, so a system sshd is still offered the
+user's own keys. `HostKeyAlias` stops `known_hosts` collisions when a port is
+reused by a different laptop; for a user-sshd entry it becomes
+`ferry-tmux-<label>-user`, because that sshd's host key differs from the system
+sshd's on the same laptop and sharing one alias would trip ssh's "REMOTE HOST
+IDENTIFICATION HAS CHANGED". The remote `PATH` prefix is there because
+non-interactive ssh on macOS does not include Homebrew. `<addr>` is `127.0.0.1`
+for a `0.0.0.0` bind, else the relay's bind address. `--print` shows the command
+without running it; `--list` shows the published clients.
 
 **Security.** The relay token authenticates the publisher only. Who gets a
-shell is decided by the client's sshd (its keys or password), and ssh encrypts
-the session end to end. Anyone on the host's LAN can reach the published port
+shell is decided by the client's sshd, and ssh encrypts the session end to end.
+The no-sudo sshd is narrow by construction: it listens on `127.0.0.1` only (the
+relay's data connections are the only way in), allows public-key auth only
+(password and keyboard-interactive off, no PAM), accepts only the host's ferry
+key and only as the user who ran it (`PermitRootLogin no`), and has TCP
+forwarding, X11 forwarding and tunnels off. `StrictModes no` is set because the
+authorized keys live under the user's own config directory rather than a
+sshd-owned path. Anyone on the host's LAN can reach the published port
 (`--bind 127.0.0.1` on `ferry relay` keeps it host-local) but still has to
-get past sshd.
+present the host's private key, which never leaves the host.
 
 ## Local model known issues
 

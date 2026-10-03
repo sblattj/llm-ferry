@@ -149,7 +149,8 @@ Ferrying models & files across the LAN:
   serve-proxy        [Host] Start a general HTTP(S) forward proxy for client downloads [--port P] (default $PROXY_PORT)
   tmux [client]      [Host] Attach a tmux session on a client that ran 'ferry expose-tmux'
                        (ssh through the relay, offering the host's ferry key from 'ferry relay')
-                       ferry tmux [CLIENT] [--list] [--session NAME] [--user U] [--print]
+                       ferry tmux [CLIENT] [--list] [--session NAME] [--user U] [--dir PATH] [--print]
+                       --dir PATH: where a NEW session starts (tmux -c; ~ = the client's home; ignored when attaching)
   serve-vnc          [Host] Serve the browser VNC viewer for ports published with
                        'ferry expose-vnc' [--port P] [--bind ADDR] [--foreground] [--fetch] (default $VNC_PORT)
 

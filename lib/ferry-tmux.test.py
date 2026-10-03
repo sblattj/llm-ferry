@@ -236,6 +236,60 @@ class TmuxListTest(TmuxTestBase):
         self.assertNotIn("screen", r.stdout)
 
 
+class TmuxDirTest(TmuxTestBase):
+    def remote(self, *args):
+        self.write_state({"8101": entry("laptop")})
+        return self.argv(*args)[-1]
+
+    def operand(self, remote):
+        self.assertIn(" -s ferry -c ", remote)
+        return remote.split(" -s ferry -c ", 1)[1]
+
+    def shell(self, operand):
+        return subprocess.run(["sh", "-c", "HOME=/h; printf %s " + operand],
+                              capture_output=True, text=True, timeout=20)
+
+    def test_without_dir_the_remote_is_unchanged(self):
+        self.assertEqual(self.remote(),
+                         "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH exec tmux new-session -A -s ferry")
+
+    def test_dir_with_space_is_single_quoted(self):
+        remote = self.remote("--dir", "/tmp/x y")
+        self.assertTrue(remote.endswith("-s ferry -c '/tmp/x y'"), remote)
+
+    def test_tilde_is_the_remote_home(self):
+        self.assertTrue(self.remote("--dir", "~").endswith('-s ferry -c "$HOME"'))
+        self.assertTrue(self.remote("--dir", "~/code/foo").endswith('-s ferry -c "$HOME"/code/foo'))
+
+    def test_tilde_expands_in_a_real_shell(self):
+        r = self.shell(self.operand(self.remote("--dir", "~/code/foo")))
+        self.assertEqual(r.stdout, "/h/code/foo", r.stderr)
+        r = self.shell(self.operand(self.remote("--dir", "~")))
+        self.assertEqual(r.stdout, "/h", r.stderr)
+        r = self.shell(self.operand(self.remote("--dir", "~/my dir/$X")))
+        self.assertEqual(r.stdout, "/h/my dir/$X", r.stderr)
+
+    def test_hostile_value_stays_literal(self):
+        marker = "/tmp/PWNED-%s" % os.urandom(6).hex()
+        self.addCleanup(lambda: os.path.exists(marker) and os.remove(marker))
+        value = "/tmp/a;touch " + marker
+        r = self.shell(self.operand(self.remote("--dir", value)))
+        self.assertEqual(r.stdout, value, r.stderr)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_bad_values_are_rejected(self):
+        self.write_state({"8101": entry("laptop")})
+        for bad in ("", "/tmp/a\nb", "/tmp/a\rb", "~bob/x", "~bob"):
+            r = self.ferry("tmux", "--print", "--dir", bad)
+            self.assertEqual(r.returncode, 1, repr(bad))
+            self.assertIn("Error:", r.stdout, repr(bad))
+
+    def test_dir_needs_a_value(self):
+        r = self.ferry("tmux", "--dir")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("Error: --dir needs a path", r.stdout)
+
+
 class StatusReportsTmuxTest(TmuxTestBase):
     def test_status_hints_ferry_tmux_for_a_tmux_entry(self):
         self.write_state({"8101": entry("laptop")})

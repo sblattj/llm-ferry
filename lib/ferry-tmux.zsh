@@ -286,7 +286,7 @@ cmd_tmux() {
     echo "       The client side is 'ferry expose-tmux'."
     exit 1
   fi
-  local client="" session="ferry" user="" list=0 print_only=0
+  local client="" session="ferry" user="" list=0 print_only=0 dir_args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --list)    list=1; shift ;;
@@ -295,12 +295,17 @@ cmd_tmux() {
                  session="$2"; shift 2 ;;
       --user)    if [[ $# -lt 2 ]]; then echo "Error: --user needs a name"; exit 1; fi
                  user="$2"; shift 2 ;;
+      --dir)     if [[ $# -lt 2 ]]; then echo "Error: --dir needs a path"; exit 1; fi
+                 dir_args=("$2"); shift 2 ;;
       -h|--help)
-        echo "Usage: ferry tmux [CLIENT] [--list] [--session NAME] [--user U] [--print]"
+        echo "Usage: ferry tmux [CLIENT] [--list] [--session NAME] [--user U] [--dir PATH] [--print]"
         echo "  CLIENT        a client's label or its published port [default: the only one]"
         echo "  --list        list clients that ran 'ferry expose-tmux' and exit"
         echo "  --session N   the tmux session to attach or create [default: ferry]"
         echo "  --user U      the login on the client [default: what the client reported]"
+        echo "  --dir PATH    where a NEW session starts (tmux -c); PATH is a path on the client, and a"
+        echo "                leading ~ or ~/ means the client user's home. Ignored when the session already"
+        echo "                exists (tmux ignores -c when -A attaches)"
         echo "  --print       print the ssh command instead of running it"
         echo "ssh authenticates you: with the host's ferry key (~/.config/ferry/tmux_ed25519, made by"
         echo "'ferry relay') if present, else your own keys. A client on '--user-sshd' accepts only the former."
@@ -312,10 +317,12 @@ cmd_tmux() {
   done
 
   local out rc=0
-  out="$(python3 - "$RELAY_STATE_FILE" "$list" "$client" "$session" "$user" "$TMUX_KEY_FILE" <<'PYEOF'
+  out="$(python3 - "$RELAY_STATE_FILE" "$list" "$client" "$session" "$user" "$TMUX_KEY_FILE" "${dir_args[@]}" <<'PYEOF'
 import json, os, re, shlex, sys
 
 state_file, list_mode, client, session, user, key_file = sys.argv[1:7]
+dir_given = len(sys.argv) > 7
+start_dir = sys.argv[7] if dir_given else ""
 SAFE = re.compile(r"[A-Za-z0-9._-]+")
 
 try:
@@ -371,6 +378,24 @@ if not SAFE.fullmatch(user) or user.startswith("-"):
 if not SAFE.fullmatch(session):
     fail(f"--session '{session}' must match [A-Za-z0-9._-]+", show=False)
 
+# --dir is a path on the CLIENT. A leading ~ or ~/ is the client user's home, left
+# for the remote shell to expand as "$HOME"; everything else is single-quoted.
+dir_opt = ""
+if dir_given:
+    if start_dir == "":
+        fail("--dir needs a non-empty path", show=False)
+    if any(c in start_dir for c in "\n\r\0"):
+        fail("--dir must not contain a newline, carriage return or NUL", show=False)
+    if start_dir == "~":
+        dir_opt = ' -c "$HOME"'
+    elif start_dir.startswith("~/"):
+        rest = start_dir[2:]
+        dir_opt = ' -c "$HOME"' + ("/" + shlex.quote(rest) if rest else "/")
+    elif start_dir.startswith("~"):
+        fail(f"--dir '{start_dir}': only ~ and ~/... are supported (not ~otheruser)", show=False)
+    else:
+        dir_opt = " -c " + shlex.quote(start_dir)
+
 bind = str(info.get("bind") or "")
 addr = "127.0.0.1" if bind in ("", "0.0.0.0") else bind
 if not re.fullmatch(r"[A-Za-z0-9.:-]+", addr) or addr.startswith("-"):
@@ -384,7 +409,7 @@ alias = "ferry-tmux-" + re.sub(r"[^A-Za-z0-9._-]", "_", str(info.get("label") or
 if info.get("sshd") == "user":
     alias += "-user"
 # Non-interactive macOS ssh has no Homebrew on PATH, so tmux would not be found.
-remote = f"PATH=/opt/homebrew/bin:/usr/local/bin:$PATH exec tmux new-session -A -s {session}"
+remote = f"PATH=/opt/homebrew/bin:/usr/local/bin:$PATH exec tmux new-session -A -s {session}{dir_opt}"
 argv = ["ssh", "-p", str(port), "-o", f"HostKeyAlias={alias}"]
 # The host's ferry key, when `ferry relay` has made one. No IdentitiesOnly: a system
 # sshd must still be offered the user's default keys.

@@ -77,6 +77,14 @@ cmd_relay() {
     return 0
   fi
 
+  # The host's tmux key: the one identity `ferry tmux` offers, and the only key a
+  # client's no-sudo sshd (`ferry expose-tmux --user-sshd`) will accept. Made once
+  # here, before either launch path, so the background child finds it in place.
+  if [[ ! -f "$TMUX_KEY_FILE" ]]; then
+    ssh-keygen -q -t ed25519 -N '' -C "ferry-tmux@$(hostname -s 2>/dev/null || echo host)" -f "$TMUX_KEY_FILE" >/dev/null \
+      && chmod 600 "$TMUX_KEY_FILE"
+  fi
+
   # Ports ferry itself owns are refused as publish targets, so an exposure can
   # never quietly shadow the inference endpoint or the share server. Built from
   # the same constants those services use — 8091 is the dashboard, which is a
@@ -128,11 +136,12 @@ cmd_relay() {
   # port must be the one `ferry down` can match. Spawning the python as a child of
   # this shell put the sentinel on the PARENT — `pkill -f ferry-relay-marker` then
   # killed the wrapper, reported success, and left the relay listening. The python
-  # reads argv[1:6] and ignores the rest, exactly as the share server does.
-  exec python3 - "$relay_port" "$bind_addr" "$RELAY_TOKEN_FILE" "$RELAY_STATE_FILE" "$reserved" "$marker" <<'PYEOF'
+  # reads argv[1:7] and ignores the rest, exactly as the share server does — so the
+  # marker stays the LAST argv and anything new goes BEFORE it.
+  exec python3 - "$relay_port" "$bind_addr" "$RELAY_TOKEN_FILE" "$RELAY_STATE_FILE" "$reserved" "${TMUX_KEY_FILE}.pub" "$marker" <<'PYEOF'
 import hmac, json, os, re, socket, sys, threading, time
 
-port, bind_addr, token_file, state_file, reserved_csv = sys.argv[1:6]
+port, bind_addr, token_file, state_file, reserved_csv, tmux_pub_file = sys.argv[1:7]
 port = int(port)
 reserved = {int(p) for p in reserved_csv.split(",") if p.strip()}
 
@@ -241,6 +250,10 @@ def serve_registration(ctrl, addr, req):
                                   "since": time.strftime("%Y-%m-%d %H:%M:%S"), "bind": bind_addr}
         if user:
             published[public_port]["user"] = user
+        # Set only by a client running its own no-sudo sshd: that sshd has a
+        # different host key than the system one, which `ferry tmux` must know.
+        if req.get("sshd") == "user":
+            published[public_port]["sshd"] = "user"
     write_state()
     log(f"published {bind_addr}:{public_port} for {addr[0]} {('(' + label + ')') if label else ''}")
 
@@ -338,6 +351,21 @@ def handle(sock, addr):
                     pass
         serve_registration(sock, addr, req)
         close_quietly(sock)
+    elif op == "hostkey":
+        # The PUBLIC half of the host's ferry tmux key, for a client's user sshd to
+        # trust. Token-gated like everything else, though a public key is no secret.
+        try:
+            with open(tmux_pub_file) as f:
+                pub = f.read().strip()
+            if not pub or "\n" in pub:
+                raise ValueError("not a one-line public key")
+            send_json(sock, {"ok": True, "pubkey": pub})
+        except (OSError, ValueError) as e:
+            try:
+                send_json(sock, {"ok": False, "error": f"host tmux key unavailable ({e})"})
+            except OSError:
+                pass
+        close_quietly(sock)
     elif op == "data":
         cid = int(req.get("id", 0))
         with pending_lock:
@@ -368,6 +396,17 @@ finally:
         published.clear()
     write_state()
 PYEOF
+}
+
+# _relay_token_resolve <flag-value> — print the relay token: the flag, then the
+# environment, then whatever a previous run saved. Prints nothing if none is known.
+_relay_token_resolve() {
+  local t="$1"
+  [[ -z "$t" ]] && t="${FERRY_RELAY_TOKEN:-}"
+  if [[ -z "$t" && -f "$RELAY_TOKEN_FILE" ]]; then
+    t="$(cat "$RELAY_TOKEN_FILE")"
+  fi
+  print -r -- "$t"
 }
 
 # cmd_expose — the client half. Foreground on purpose, like `ssh -N -R`: the
@@ -410,10 +449,7 @@ cmd_expose() {
   fi
 
   # Token precedence: the flag, the environment, then whatever a previous run saved.
-  [[ -z "$token" ]] && token="${FERRY_RELAY_TOKEN:-}"
-  if [[ -z "$token" && -f "$RELAY_TOKEN_FILE" ]]; then
-    token="$(cat "$RELAY_TOKEN_FILE")"
-  fi
+  token="$(_relay_token_resolve "$token")"
   if [[ -z "$token" ]]; then
     echo "Error: no relay token. Run 'ferry relay --token' on the host, then:"
     echo "       ferry expose $local_port --as $public_port --token <token>"
@@ -435,11 +471,42 @@ cmd_expose() {
   # leaving the control connection open and the host still publishing a port whose
   # client is gone. Interactive Ctrl-C signals the whole process group and papers
   # over that; anything supervising ferry by pid does not.
-  exec python3 - "$host" "$relay_port" "$local_port" "$public_port" "$token" "$RELAY_TOKEN_FILE" "$(hostname -s 2>/dev/null || echo client)" "${kind:-tcp}" <<'PYEOF'
-import json, os, socket, sys, threading, time
+  exec python3 - "$host" "$relay_port" "$local_port" "$public_port" "$token" "$RELAY_TOKEN_FILE" "$(hostname -s 2>/dev/null || echo client)" "${kind:-tcp}" "${expose_sshd:-}" "${expose_companion_pid:-}" <<'PYEOF'
+import atexit, json, os, signal, socket, sys, threading, time
 
-host, relay_port, local_port, public_port, token, token_file, label, kind = sys.argv[1:9]
+host, relay_port, local_port, public_port, token, token_file, label, kind, sshd_mode, companion = sys.argv[1:11]
 relay_port, local_port, public_port = int(relay_port), int(local_port), int(public_port)
+
+# A companion process (the no-sudo sshd of `ferry expose-tmux`) lives exactly as
+# long as this tunnel. atexit covers every way out of here (a normal return,
+# sys.exit on a registration failure, Ctrl-C), and the SIGTERM handler turns
+# `kill <pid>` into a SystemExit so it takes the same road.
+def stop_companion():
+    if not companion.isdigit():
+        return
+    pid = int(companion)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    end = time.time() + 3
+    while time.time() < end:
+        try:
+            done, _ = os.waitpid(pid, os.WNOHANG)   # reap it: a zombie still "exists"
+        except ChildProcessError:
+            return
+        if done:
+            return
+        time.sleep(0.05)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+    except OSError:
+        pass
+
+atexit.register(stop_companion)
+signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
+signal.signal(signal.SIGHUP, lambda *_: sys.exit(129))
 
 def read_line(sock, limit=4096):
     """One byte at a time — see the note in the relay half."""
@@ -513,7 +580,8 @@ except OSError as e:
     sys.exit(1)
 
 send_json(ctrl, {"op": "register", "token": token, "public_port": public_port, "label": label, "kind": kind,
-                 "user": os.environ.get("USER", "")})
+                 "user": os.environ.get("USER", ""),
+                 **({"sshd": "user"} if sshd_mode == "user" else {})})
 reply = read_line(ctrl)
 if reply is None:
     print("Error: the relay closed the connection during registration.")

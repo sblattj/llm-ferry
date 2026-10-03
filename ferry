@@ -1947,6 +1947,26 @@ cmd_reload() {
   echo "================================================================="
 }
 
+# _ferry_port_holder <port> <marker>
+# Is the thing listening on <port> ferry's own? Each ferry service carries a kill
+# sentinel (ferry-relay-marker, ...) in its argv, so the argv tells ferry's
+# process from a stranger that merely holds the port.
+#   rc 1: nothing listens          rc 0: a listener's argv contains <marker>
+#   rc 2: held by something else   (prints "PID <pid>: <args>" of the first holder)
+_ferry_port_holder() {
+  local port="$1" marker="$2" pid args first=""
+  local -a pids
+  pids=( ${(f)"$(lsof -t -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null)"} )
+  (( ${#pids} )) || return 1
+  for pid in $pids; do
+    args=$(ps -p "$pid" -o args= 2>/dev/null)
+    [[ "$args" == *"$marker"* ]] && return 0
+    [[ -z "$first" ]] && first="PID $pid: ${args[1,120]}"
+  done
+  echo "$first"
+  return 2
+}
+
 cmd_status() {
   _ferry_colors
   if (( CLIENT_MODE )); then
@@ -2059,20 +2079,33 @@ cmd_status() {
   done
 
   # Experimental HuggingFace pass-through proxy (only reported when running).
-  if lsof -nP -iTCP:"$HF_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-    local hf_pid=$(lsof -t -iTCP:"$HF_PORT" -sTCP:LISTEN)
+  local _holder _rc
+  _rc=0; _holder=$(_ferry_port_holder "$HF_PORT" ferry-hf-marker) || _rc=$?
+  if (( _rc == 0 )); then
+    local hf_pid=$(lsof -t -nP -iTCP:"$HF_PORT" -sTCP:LISTEN | head -1)
     echo ">>> Port $HF_PORT is ${C_GREEN}ONLINE${C_RESET} (HF pass-through proxy, PID: $hf_pid)"
+  elif (( _rc == 2 )); then
+    echo ">>> Port $HF_PORT (HF pass-through proxy) is ${C_YELLOW}held by another process, not ferry's${C_RESET}: $_holder"
+    echo "    'ferry serve-hf' cannot start until it is freed."
   fi
 
   # General HTTP(S) download forward proxy (only reported when running).
-  if lsof -nP -iTCP:"$PROXY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  _rc=0; _holder=$(_ferry_port_holder "$PROXY_PORT" ferry-proxy-marker) || _rc=$?
+  if (( _rc == 0 )); then
     echo ">>> HTTP download proxy is ${C_GREEN}ONLINE${C_RESET} (port $PROXY_PORT)"
+  elif (( _rc == 2 )); then
+    echo ">>> Port $PROXY_PORT (HTTP download proxy) is ${C_YELLOW}held by another process, not ferry's${C_RESET}: $_holder"
+    echo "    'ferry serve-proxy' cannot start until it is freed."
   fi
 
   # Reverse-expose relay, and — the part that matters — every port a client has
   # published through it. A port opened on this machine on someone else's behalf
   # must be visible here, or nobody can answer "what is this host serving?".
-  if lsof -nP -iTCP:"$RELAY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  _rc=0; _holder=$(_ferry_port_holder "$RELAY_PORT" ferry-relay-marker) || _rc=$?
+  if (( _rc == 2 )); then
+    echo ">>> Port $RELAY_PORT (reverse relay) is ${C_YELLOW}held by another process, not ferry's${C_RESET}: $_holder"
+    echo "    'ferry relay' cannot start until it is freed."
+  elif (( _rc == 0 )); then
     echo ">>> Reverse relay is ${C_GREEN}ONLINE${C_RESET} (control port $RELAY_PORT)"
     if [[ -f "$RELAY_STATE_FILE" ]]; then
       python3 - "$RELAY_STATE_FILE" <<'PYEOF' || true
@@ -2096,7 +2129,11 @@ PYEOF
   fi
 
   # Browser VNC viewer: one URL per screen a client has published with expose-vnc.
-  if lsof -nP -iTCP:"$VNC_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  _rc=0; _holder=$(_ferry_port_holder "$VNC_PORT" ferry-vnc-marker) || _rc=$?
+  if (( _rc == 2 )); then
+    echo ">>> Port $VNC_PORT (VNC viewer) is ${C_YELLOW}held by another process, not ferry's${C_RESET}: $_holder"
+    echo "    'ferry serve-vnc' cannot start until it is freed."
+  elif (( _rc == 0 )); then
     echo ">>> VNC viewer is ${C_GREEN}ONLINE${C_RESET} (http://$MDNS_NAME:$VNC_PORT)"
     if [[ -f "$RELAY_STATE_FILE" ]]; then
       python3 - "$RELAY_STATE_FILE" "$MDNS_NAME" "$VNC_PORT" <<'PYEOF' || true
@@ -2636,9 +2673,15 @@ cmd_relay() {
   local reserved="$PORT,8091,$SHARE_PORT,$HF_PORT,$PROXY_PORT,$LOCAL_ORCH_PORT,$LOCAL_SUB_PORT,$LOCAL_SCHEMATRON_PORT,$SCHEMATRON_PORT,$relay_port,$VNC_PORT"
 
   if (( ! foreground )); then
-    if lsof -nP -iTCP:"$relay_port" -sTCP:LISTEN >/dev/null 2>&1; then
-      echo "Error: port $relay_port is already in use — a relay may already be running."
+    local _holder _rc
+    _rc=0; _holder=$(_ferry_port_holder "$relay_port" ferry-relay-marker) || _rc=$?
+    if (( _rc == 0 )); then
+      echo "Error: port $relay_port is already in use — a relay is already running."
       echo "       'ferry down' stops it, or pass --port to use another."
+      exit 1
+    elif (( _rc == 2 )); then
+      echo "Error: port $relay_port is held by another process, not ferry's: $_holder"
+      echo "       Free it, or pass --port to use another."
       exit 1
     fi
 

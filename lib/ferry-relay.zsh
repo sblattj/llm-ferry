@@ -92,9 +92,15 @@ cmd_relay() {
   local reserved="$PORT,8091,$SHARE_PORT,$HF_PORT,$PROXY_PORT,$LOCAL_ORCH_PORT,$LOCAL_SUB_PORT,$LOCAL_SCHEMATRON_PORT,$SCHEMATRON_PORT,$relay_port,$VNC_PORT"
 
   if (( ! foreground )); then
-    if lsof -nP -iTCP:"$relay_port" -sTCP:LISTEN >/dev/null 2>&1; then
-      echo "Error: port $relay_port is already in use — a relay may already be running."
+    local _holder _rc
+    _rc=0; _holder=$(_ferry_port_holder "$relay_port" ferry-relay-marker) || _rc=$?
+    if (( _rc == 0 )); then
+      echo "Error: port $relay_port is already in use — a relay is already running."
       echo "       'ferry down' stops it, or pass --port to use another."
+      exit 1
+    elif (( _rc == 2 )); then
+      echo "Error: port $relay_port is held by another process, not ferry's: $_holder"
+      echo "       Free it, or pass --port to use another."
       exit 1
     fi
 

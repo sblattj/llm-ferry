@@ -1278,6 +1278,15 @@ cmd_status() {
       local pid=$(lsof -t -iTCP:"$p" -sTCP:LISTEN | head -1)
       local cmd=$(ps -p "$pid" -o comm= 2>/dev/null | xargs basename 2>/dev/null || echo "unknown")
       echo ">>> Port $p ($_label) is ${C_GREEN}ONLINE${C_RESET} (PID: $pid, Command: $cmd)"
+      if [[ "$p" == "$PORT" ]]; then
+        # The domestic-fleet guard and the client lock live in ferry's front
+        # door (front/ferry_front.py). A bare litellm on this port has neither.
+        local _fd_rc=0 _fd_holder
+        _fd_holder=$(_ferry_port_holder "$p" ferry_front.py) || _fd_rc=$?
+        if (( _fd_rc == 2 )); then
+          echo "    ${C_RED}WARNING: :$p is served by ${_fd_holder#PID *: }, not ferry's front door — the domestic-fleet guard and client lock are NOT active. Run: ferry reload${C_RESET}"
+        fi
+      fi
 
       # phys_footprint is the number that matters for an MLX lane — RSS is blind
       # to wired GPU memory, so `ps` cheerfully under-reports a 50GB model server.

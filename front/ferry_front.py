@@ -2784,6 +2784,148 @@ def install_zai_tool_compat(callbacks=None, logger_base=None):
         return False
 
 
+def _fleet_guard():
+    return _front_sibling("ferry_fleet_guard")
+
+
+def startup_fleet_policy_problems(config_path):
+    """Violations of the domestic-fleet policy in the route config at `config_path`.
+
+    Returns (problems, error): `error` is a message when the file cannot be read
+    or parsed (the caller decides; an empty path means no config, nothing to
+    check). Same denylist and closure as the zsh pre-launch check.
+    """
+    if not config_path:
+        return [], None
+    guard = _fleet_guard()
+    try:
+        import yaml
+        with open(config_path) as fh:
+            config = yaml.safe_load(fh)
+    except Exception as exc:
+        return [], "cannot read route config %s: %s" % (config_path, exc)
+    if not isinstance(config, dict):
+        return [], "route config %s is not a YAML mapping" % config_path
+    return guard.check(config), None
+
+
+def enforce_startup_fleet_policy(config_path, stderr=None):
+    """Refuse to start (SystemExit 1) when the config breaks the fleet policy.
+
+    Covers launches that skip the zsh pre-launch check (uvicorn straight at
+    ferry_front:build_app, an unwrapped systemd/launchd unit). An unreadable
+    config is NOT refused here: litellm reports that itself.
+    """
+    stderr = sys.stderr if stderr is None else stderr
+    problems, error = startup_fleet_policy_problems(config_path)
+    if error:
+        print("ferry: fleet policy not checked: %s" % error, file=stderr)
+        return
+    if problems:
+        print(_fleet_guard().violation_report(config_path, problems), file=stderr)
+        raise SystemExit(1)
+
+
+def _hook_request_restriction(kwargs):
+    """(restricted, reason) for the request a deployment hook is looking at.
+
+    litellm's Router puts the group under kwargs["metadata"]["model_group"] and
+    passes the caller's own metadata keys through the same dict, so the marker
+    `ferry_domestic_only` and the group are read from there (litellm_metadata is
+    the proxy's alias for the same thing).
+    """
+    guard = _fleet_guard()
+    for key in ("metadata", "litellm_metadata"):
+        md = kwargs.get(key)
+        if not isinstance(md, dict):
+            continue
+        if md.get("ferry_domestic_only") is True:
+            return True, "request is marked ferry_domestic_only"
+        group = md.get("model_group")
+        if isinstance(group, str) and guard.fleet_of(group) in guard.RESTRICTED_FLEETS:
+            return True, "model group %s is a restricted fleet" % group
+    return False, None
+
+
+def fleet_policy_violation(kwargs):
+    """Message when this request is restricted AND the chosen deployment is Chinese.
+
+    Restricted requests fail CLOSED: params that cannot be read are a violation.
+    Unrestricted requests fail open on any error.
+    """
+    try:
+        restricted, why = _hook_request_restriction(kwargs)
+    except Exception:
+        return None
+    if not restricted:
+        return None
+    try:
+        guard = _fleet_guard()
+        params = {"model": kwargs.get("model"), "api_base": kwargs.get("api_base"),
+                  "custom_llm_provider": kwargs.get("custom_llm_provider")}
+        mi = kwargs.get("model_info")
+        if isinstance(mi, dict) and mi.get("base_model"):
+            params["base_model"] = mi["base_model"]
+        if not isinstance(kwargs.get("model"), str):
+            return "%s, but the chosen deployment's params are unreadable" % why
+        bad = guard.deployment_violation(params)
+    except Exception as exc:
+        return "%s, but the deployment check failed: %s" % (why, exc)
+    if bad:
+        return "%s and the chosen deployment is a Chinese model (%s)" % (why, bad)
+    return None
+
+
+def _fleet_policy_error(message, model):
+    """A litellm 403 the Router will not retry, falling back is still re-checked per hop."""
+    import httpx
+    import litellm
+    resp = httpx.Response(403, request=httpx.Request("POST", "https://ferry.invalid/fleet-policy"))
+    return litellm.PermissionDeniedError(
+        message="ferry fleet policy: " + message, llm_provider="ferry", model=str(model),
+        response=resp)
+
+
+_FLEET_POLICY_LOGGER = None
+
+
+def install_fleet_policy_hook(callbacks=None, logger_base=None):
+    """Register the per-deployment fleet-policy gate. Idempotent.
+
+    Runs in litellm's async_pre_call_deployment_hook, after the router has picked
+    a deployment and before the provider call, so it also covers deployments added
+    or swapped at runtime. Raises litellm.PermissionDeniedError to block.
+    Injectable args mirror install_zai_tool_compat.
+    """
+    global _FLEET_POLICY_LOGGER
+    try:
+        if callbacks is None:
+            import litellm
+            callbacks = litellm.callbacks
+        if logger_base is None:
+            from litellm.integrations.custom_logger import CustomLogger
+            logger_base = CustomLogger
+        if any(getattr(c, "_ferry_fleet_policy", False) for c in callbacks):
+            return True
+
+        class FleetPolicy(logger_base):
+            _ferry_fleet_policy = True
+
+            async def async_pre_call_deployment_hook(self, kwargs, call_type):
+                msg = fleet_policy_violation(kwargs)
+                if msg:
+                    raise _fleet_policy_error(msg, kwargs.get("model"))
+                return None
+
+        hook = FleetPolicy()
+        callbacks.insert(0, hook)
+        _FLEET_POLICY_LOGGER = hook
+        return True
+    except Exception as exc:
+        print(f"ferry: fleet policy hook not installed: {exc}", file=sys.stderr)
+        return False
+
+
 # litellm's ChatGPT (subscription) provider does not send the client's system
 # prompt first. It PREPENDS its own, and that prompt tells the model it is Codex
 # running inside the Codex CLI:
@@ -2920,6 +3062,9 @@ def build_app(litellm_app=None):
     # a factory-only launch (uvicorn pointed straight at ferry_front:build_app)
     # never runs main(), and a worker without it serves the Codex prompt.
     apply_chatgpt_instructions()
+    # Refuse a config whose domestic fleet reaches a Chinese model, whatever
+    # launched us (the zsh pre-launch check is only one entry point).
+    enforce_startup_fleet_policy(os.environ.get("CONFIG_FILE_PATH", ""))
 
     if litellm_app is None:
         from litellm.proxy.proxy_server import app as litellm_app
@@ -2927,6 +3072,7 @@ def build_app(litellm_app=None):
     install_chatgpt_system_compat()
     install_claude_oauth_hook()
     install_zai_tool_compat()
+    install_fleet_policy_hook()
     if tap_enabled():
         install_reasoning_usage_hook()
 
@@ -2994,6 +3140,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     os.environ["CONFIG_FILE_PATH"] = args.config
+    # Fail here, once, with a clean exit status, before any worker spawns.
+    enforce_startup_fleet_policy(args.config)
     # Before uvicorn: spawned workers snapshot os.environ at spawn time, and
     # litellm's ChatGPT provider reads CHATGPT_DEFAULT_INSTRUCTIONS per request
     # inside those workers. Logged so the launch log says which prompt is live.

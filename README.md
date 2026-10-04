@@ -224,6 +224,8 @@ ferry fleet use international     # this caller follows `international` from now
 FERRY_FLEET=international opencode-super   # one-shot pin, regardless of sticky selection
 ```
 
+**The `domestic` fleet is US-only, and ferry enforces it.** `ferry up` and `ferry reload` refuse to load a route config in which any `domestic.*` lane (or a fallback or `model_group_alias` target it reaches) points at a Chinese model or provider such as Kimi, GLM/z.ai, DeepSeek or Qwen. The error is `Error: the domestic fleet must use US models only; refusing to load <path>:`, followed by the offending lane, how it is reached, and the matching field. `ferry reload` checks before it stops anything, so the running proxy is left alone. Put such models in `international`.
+
 Fleet internals — sticky-selection vs `FERRY_FLEET` visibility, the headerless-Tailscale edge case, international-fleet guidance — in [Deep dives](docs/deep-dives.md#fleets--configuration-detail).
 
 ## The local GPU lanes

@@ -1227,6 +1227,35 @@ _ferry_require_route_config() {
     echo "Error: No route config at $FERRY_ROUTE_CONFIG and no template at $ROUTE_TEMPLATE."
     exit 1
   fi
+  _ferry_check_fleet_policy "$FERRY_ROUTE_CONFIG"
+}
+
+# _ferry_check_fleet_policy <config> — refuse a route config in which the
+# domestic fleet can reach a Chinese model/provider (directly, or through a
+# fallback or model_group_alias). Runs in zsh BEFORE any launch: the front's
+# failure falls back to plain litellm, so a guard inside ferry_front.py alone
+# could be skipped. In cmd_reload this runs before _ferry_stop_litellm, so a
+# refusal leaves the running proxy untouched. Like its caller it `exit`s, so it
+# is not command-substitution safe. If no python with PyYAML is found it
+# refuses: a policy that cannot be verified is not passed.
+_ferry_check_fleet_policy() {
+  local config="$1" py="" out="" rc=0
+  py="$(_ferry_front_python 2>/dev/null)" || py=""
+  if [[ -z "$py" ]]; then
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' >/dev/null 2>&1; then
+      py="python3"
+    else
+      echo "Error: cannot verify the domestic-fleet policy for $config: no python with PyYAML found."
+      echo "       Run: ferry install   (installs litellm, whose venv python is used)"
+      exit 1
+    fi
+  fi
+  out="$("$py" "$APP_DIR/front/ferry_fleet_guard.py" "$config" 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    print -r -- "$out"
+    exit 1
+  fi
+  return 0
 }
 
 # _ferry_warn_missing_keys — warn (never hard-fail) about unset keys the route

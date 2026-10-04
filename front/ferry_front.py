@@ -1149,8 +1149,47 @@ def caller_identity(scope, headers: dict) -> str:
     return str(client[0]) if client else ""
 
 
+# ── the client lock ──────────────────────────────────────────────────────────
+# Only the host may leave the domestic fleet; every other caller is pinned to
+# it. LOCK_FLEET (defined after _front_sibling) is a guard-restricted fleet.
+# Headers a reverse proxy (tailscale serve, nginx, ...) adds. A request from
+# loopback carrying any of them was relayed, so its peer address says nothing.
+_PROXY_HEADERS = frozenset({b"x-forwarded-for", b"forwarded", b"x-real-ip"})
+
+
+class FleetLockError(ResolveError):
+    """A non-host caller asked for a fleet other than the lock fleet.
+
+    Answered as HTTP 403 (a plain ResolveError is a 400)."""
+
+
+def lock_message(fleet) -> str:
+    return ("this ferry host locks clients to the %s fleet; %r is host-only"
+            % (LOCK_FLEET, fleet))
+
+
+def is_host_caller(scope, headers: dict) -> bool:
+    """Strict: whether this request is provably the host itself.
+
+    Distinct from caller_identity (sticky-selection bookkeeping, which counts a
+    headerless tailscale-served client as 'host'). All must hold: no device
+    key, a loopback peer, no proxy/tailscale header, and an X-Ferry-Client
+    that is absent or 'host'."""
+    scope = scope or {}
+    headers = headers or {}
+    if scope.get(KEY_ENTRY_SCOPE):
+        return False
+    if not _is_loopback_client(scope):
+        return False
+    for name in headers:
+        if name in _PROXY_HEADERS or name.startswith(b"tailscale-"):
+            return False
+    named = _header_text(headers, CLIENT_HEADER)
+    return not named or named == HOST_IDENTITY
+
+
 def resolve_model(model: str, header_fleet: str, identity: str,
-                  state: "FleetState") -> str:
+                  state: "FleetState", locked: bool = False) -> str:
     """The bare lane name a client sent, rewritten to a real fleet lane.
 
     Precedence, first match wins (spec §4): an explicit fleet prefix, a local
@@ -1158,7 +1197,11 @@ def resolve_model(model: str, header_fleet: str, identity: str,
     host-wide default. `orch`/`orchestrator` fold into `heavy` and `light`/`super-light`
     into `flash`/`super-flash` first (LANE_ALIASES).
     Anything that is not a cloud lane after that fold passes through untouched
-    so litellm answers it exactly as it does today."""
+    so litellm answers it exactly as it does today.
+
+    `locked` (a non-host caller): an explicit qualified name or the header
+    naming a fleet other than LOCK_FLEET raises FleetLockError, and a bare
+    lane ignores the sticky selection and the default and means LOCK_FLEET."""
     if not isinstance(model, str) or not model:
         return model
     fleets = state.fleets
@@ -1167,7 +1210,13 @@ def resolve_model(model: str, header_fleet: str, identity: str,
         # with no fleets there is nothing to resolve to. Without this, the
         # default falls back to the empty string and every cloud lane 400s.
         return model
+    if locked:
+        asked = (header_fleet or "").strip()
+        if asked and asked != LOCK_FLEET:
+            raise FleetLockError(lock_message(asked))
     if "." in model and model.split(".", 1)[0] in fleets:
+        if locked and model.split(".", 1)[0] != LOCK_FLEET:
+            raise FleetLockError(lock_message(model.split(".", 1)[0]))
         return model
     if model in LOCAL_LANES:
         return model
@@ -1175,6 +1224,8 @@ def resolve_model(model: str, header_fleet: str, identity: str,
     if lane not in CLOUD_LANES:
         return model
     fleet = (header_fleet or "").strip()
+    if locked:
+        fleet = LOCK_FLEET
     if not fleet:
         try:
             fleet = state.selection_for(identity) or state.default()
@@ -1208,6 +1259,19 @@ def rewrite_body_model(body: bytes, model: str) -> bytes:
     doc = json.loads(body.decode("utf-8") if isinstance(body, bytes) else body)
     doc["model"] = model
     return json.dumps(doc, separators=(",", ":")).encode()
+
+
+def mark_domestic_only(doc: dict) -> None:
+    """Stamp `metadata.ferry_domestic_only = true` on a non-host request body.
+
+    The per-deployment hook reads it to refuse Chinese deployments reached
+    through non-fleet names. Existing metadata keys survive; a non-dict
+    `metadata` is replaced (the marker is a security control, not optional)."""
+    meta = doc.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["ferry_domestic_only"] = True
+    doc["metadata"] = meta
 
 
 def synthesize_catalogue(payload: bytes, public: frozenset, fleets: dict,
@@ -1367,6 +1431,12 @@ def _front_sibling(name: str):
 
 def _keys_module():
     return _front_sibling("ferry_keys")
+
+
+# The one fleet a non-host caller may use: the guard's restricted (US-only) one.
+LOCK_FLEET = "domestic"
+assert LOCK_FLEET in _front_sibling("ferry_fleet_guard").RESTRICTED_FLEETS, \
+    "LOCK_FLEET must be a guard-restricted fleet"
 
 
 def _key_cache():
@@ -1828,7 +1898,7 @@ class LaneCatalogueFilter:
             if method == "GET":
                 try:
                     return await self._reply(
-                        send, 200, self.state.document(identity))
+                        send, 200, self._locked_document(scope, headers, identity))
                 except Exception as err:
                     return await self._reply(send, 503, {"errors": [str(err)]})
             if method != "POST":
@@ -1854,6 +1924,10 @@ class LaneCatalogueFilter:
                 return await self._reply(send, 403, {"error": {
                     "message": "the default is the host's to set",
                     "type": "ferry_fleet"}})
+            locked = not is_host_caller(scope, headers)
+            if locked and fleet is not None and fleet != LOCK_FLEET:
+                return await self._reply(send, 403, {"error": {
+                    "message": lock_message(fleet), "type": "ferry_fleet"}})
             if fleet is not None and fleet not in self.fleets:
                 return await self._reply(send, 400, {"error": {
                     "message": "unknown fleet %r; fleets: %s" % (
@@ -1869,7 +1943,7 @@ class LaneCatalogueFilter:
                 else:
                     self.state.set_selection(identity, fleet)
                 return await self._reply(
-                    send, 200, self.state.document(identity))
+                    send, 200, self._locked_document(scope, headers, identity))
             except Exception as err:
                 return await self._reply(send, 503, {"errors": [str(err)]})
         if path in (REORDER_CHAINS_PATH, REORDER_PATH,
@@ -2110,6 +2184,14 @@ class LaneCatalogueFilter:
         return await self._reply(send, 200, {"name": name, "key": token},
                                  headers=[(b"cache-control", b"no-store")])
 
+    def _locked_document(self, scope, headers, identity) -> dict:
+        """state.document, with `fleet` forced to LOCK_FLEET for a non-host
+        caller: that is what its bare lanes really resolve to."""
+        doc = self.state.document(identity)
+        if not is_host_caller(scope, headers):
+            doc["fleet"] = LOCK_FLEET
+        return doc
+
     async def _fleet_rewrite(self, scope, receive, send, collector=None):
         """Resolve this request's fleet and return a one-shot replay `receive`.
 
@@ -2165,17 +2247,24 @@ class LaneCatalogueFilter:
                     scope[SCHEMA_WARNINGS_KEY] = found
             except Exception:
                 pass
+        headers = _header_map(scope)
+        locked = not is_host_caller(scope, headers)
+        if locked and isinstance(doc, dict):
+            # Marker for the per-deployment hook: a non-host request must never
+            # reach a Chinese deployment, even through a non-fleet model name.
+            mark_domestic_only(doc)
+            changed = True
         if (self.state is not None and isinstance(doc, dict)
                 and isinstance(doc.get("model"), str)):
-            headers = _header_map(scope)
             header_fleet = headers.get(FLEET_HEADER, b"").decode(
                 "utf-8", "replace").strip()
             try:
                 resolved = resolve_model(
                     doc["model"], header_fleet,
-                    caller_identity(scope, headers), self.state)
+                    caller_identity(scope, headers), self.state, locked=locked)
             except ResolveError as err:
-                await self._reply(send, 400, {"error": {
+                await self._reply(send, 403 if isinstance(err, FleetLockError)
+                                  else 400, {"error": {
                     "message": str(err.args[0]), "type": "ferry_fleet"}})
                 return None
             except Exception as err:
@@ -2335,6 +2424,10 @@ class LaneCatalogueFilter:
             return None
         try:
             headers = _header_map(scope)
+            if not is_host_caller(scope, headers):
+                # A locked caller's bare names mean LOCK_FLEET whatever it
+                # sends; the inference path refuses the header outright.
+                return LOCK_FLEET if LOCK_FLEET in self.fleets else None
             fleet = headers.get(FLEET_HEADER, b"").decode(
                 "utf-8", "replace").strip()
             if not fleet:

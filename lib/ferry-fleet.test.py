@@ -55,12 +55,19 @@ DOCUMENT = {
 }
 
 
+LOCK_MESSAGE = ("this ferry host locks clients to the domestic fleet; "
+                "'international' is host-only")
+
+
 class _FleetHandler(BaseHTTPRequestHandler):
     # Set by do_POST only. Reset to None in setUp() before every test, so a
     # test that must NOT post (a typo, or --default refused client-side)
     # can assert on it staying None.
     LAST_HEADERS = None
     LAST_BODY = None
+    # A test sets this True to make do_POST answer the client lock's 403 for
+    # any non-domestic fleet. setUp() resets it.
+    LOCK_403 = False
 
     def _reply(self):
         body = json.dumps(DOCUMENT).encode()
@@ -86,6 +93,14 @@ class _FleetHandler(BaseHTTPRequestHandler):
         # case-insensitive, so this survives whatever casing urllib sends.
         type(self).LAST_HEADERS = self.headers
         type(self).LAST_BODY = json.loads(raw) if raw else None
+        if type(self).LOCK_403 and (type(self).LAST_BODY or {}).get("fleet") not in (None, "domestic"):
+            body = json.dumps({"error": {"message": LOCK_MESSAGE}}).encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self._reply()
 
     def log_message(self, *a):        # keep test output clean
@@ -110,6 +125,7 @@ class FerryFleetCase(unittest.TestCase):
     def setUp(self):
         _FleetHandler.LAST_HEADERS = None
         _FleetHandler.LAST_BODY = None
+        _FleetHandler.LOCK_403 = False
         self.home = tempfile.mkdtemp(prefix="ferry-fleet-home-")
         self.addCleanup(shutil.rmtree, self.home, True)
         cfg_dir = os.path.join(self.home, ".config", "ferry")
@@ -219,6 +235,29 @@ class TestUse(FerryFleetCase):
             proc.stderr,
         )
         self.assertNotIn("Traceback", proc.stderr)
+
+    def test_a_403_prints_the_server_text_and_the_host_hint_and_exits_1(self):
+        _FleetHandler.LOCK_403 = True
+        proc = self.run_fleet("use", "international")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn(LOCK_MESSAGE, proc.stderr)
+        self.assertIn("Clients are locked to the domestic fleet on this host; "
+                      "ask the host operator.", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertEqual(_FleetHandler.LAST_BODY, {"fleet": "international"})
+
+    def test_domestic_is_still_selectable_under_the_lock(self):
+        _FleetHandler.LOCK_403 = True
+        proc = self.run_fleet("use", "domestic")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("locked", proc.stderr)
+
+    def test_ls_on_a_client_marks_non_domestic_fleets_host_only(self):
+        proc = self.run_fleet("ls")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = {l.split()[0]: l for l in proc.stdout.splitlines()[1:]}
+        self.assertIn("(host only)", rows["international"])
+        self.assertNotIn("(host only)", rows["domestic"])
 
     def test_a_bare_default_flag_is_refused_before_any_http_call(self):
         proc = self.run_fleet("use", "--default")

@@ -27,6 +27,10 @@ import ferry_front as FF  # noqa: E402
 import ferry_keys as K  # noqa: E402
 
 MASTER = "sk-test-master"
+# The host's own peer. A master-key caller from here is the host and its body
+# is forwarded untouched; any other peer is a locked client and gets the
+# `ferry_domestic_only` metadata marker (see lib/ferry-clientlock.test.py).
+HOST_PEER = ("127.0.0.1", 50000)
 
 # Copied from lib/ferry-front.test.py FLEETS (valid at 43acdda) — a test file
 # must not import another test file.
@@ -309,7 +313,8 @@ class TestAmbiguousCredentials(KeyFrontCase):
         with mock.patch.object(FF, "_key_cache", boom):
             for label, (headers, key) in cases.items():
                 with self.subTest(label=label):
-                    scope, sent, send = drive(self.mw(), "/v1/chat/completions", headers)
+                    scope, sent, send = drive(self.mw(), "/v1/chat/completions", headers,
+                                              client=HOST_PEER)
                     self.assertEqual(reply(sent)[0], 200)
                     self.assertIs(self.app.send, send)
                     self.assertEqual(scope["ferry.key"], key)
@@ -434,7 +439,8 @@ class TestEveryLitellmCredentialSource(KeyFrontCase):
         boom = mock.Mock(side_effect=AssertionError("key store touched"))
         with mock.patch.object(FF, "_key_cache", boom):
             headers = [("x-litellm-api-key", MASTER), ("x-litellm-api-key", MASTER)]
-            scope, sent, send = drive(self.mw(), "/v1/chat/completions", headers)
+            scope, sent, send = drive(self.mw(), "/v1/chat/completions", headers,
+                                      client=HOST_PEER)
         self.assertEqual(reply(sent)[0], 200)
         self.assertIs(self.app.send, send)
         self.assertEqual(scope["ferry.key"], "master")
@@ -848,11 +854,15 @@ class TestIdentity(KeyFrontCase):
 
     def test_sticky_selection_is_stored_under_the_key_name(self):
         token = self.mint("mbp")
+        # A device key is a client: it may pin domestic, not international.
         _, sent, _ = drive(self.mw(self.state, FLEETS), FF.FLEET_PATH, bearer(token),
                            body=json.dumps({"fleet": "international"}).encode())
+        self.assertEqual(reply(sent)[0], 403)
+        _, sent, _ = drive(self.mw(self.state, FLEETS), FF.FLEET_PATH, bearer(token),
+                           body=json.dumps({"fleet": "domestic"}).encode())
         self.assertEqual(reply(sent)[0], 200)
         with open(self.state_path) as fh:
-            self.assertEqual(json.load(fh)["clients"], {"mbp": "international"})
+            self.assertEqual(json.load(fh)["clients"], {"mbp": "domestic"})
 
     def test_fleet_accepts_a_device_key_from_any_admitted_source(self):
         # authenticate admits x-api-key and ?key= as well as Authorization, and
@@ -922,9 +932,16 @@ class TestLimits(KeyFrontCase):
         with open(state_path, "w") as fh:
             json.dump({"default": "domestic", "clients": {}}, fh)
         mw = self.mw(FF.FleetState(state_path, FLEETS), FLEETS)
+        # A device key is a client, locked to domestic: bare `flash` resolves to
+        # domestic.flash, so a key limited to international.flash is refused
+        # either way (lane limit, then the lock for the qualified name).
         token = self.mint(lanes=["international.flash"])
         self.assertEqual(reply(self.chat(token, "flash", mw=mw)[1])[0], 403)
-        self.assertEqual(reply(self.chat(token, "international.flash", mw=mw)[1])[0], 200)
+        self.assertEqual(reply(self.chat(token, "international.flash", mw=mw)[1])[0], 403)
+        # The limit sees the RESOLVED lane: a domestic.flash key admits bare flash.
+        token = self.mint("dom", lanes=["domestic.flash"])
+        self.assertEqual(reply(self.chat(token, "flash", mw=mw)[1])[0], 200)
+        self.assertEqual(reply(self.chat(token, "domestic.flash", mw=mw)[1])[0], 200)
 
     def test_unparseable_body_on_a_lane_restricted_key_is_403(self):
         token = self.mint(lanes=["flash"])
@@ -980,7 +997,7 @@ class TestLimits(KeyFrontCase):
         self.chat(self.mint(), stream=True)
         self.assertEqual(json.loads(self.app.body)["stream_options"], {"include_usage": True})
         body = json.dumps({"model": "flash", "messages": [], "stream": True}).encode()
-        drive(self.mw(), "/v1/chat/completions", bearer(MASTER), body=body)
+        drive(self.mw(), "/v1/chat/completions", bearer(MASTER), body=body, client=HOST_PEER)
         self.assertEqual(self.app.body, body)
 
     def test_master_request_still_gets_the_original_send(self):
@@ -1253,14 +1270,17 @@ class TestStreamUsageForMeteredRequests(KeyFrontCase):
                 doc = {"model": "flash", "input": "x", "stream": True}
                 body = json.dumps(doc).encode()
                 drive(self.mw(), path, bearer(self.mint(name)), body=body)
-                self.assertEqual(self.app.body, body)
+                # forwarded as sent, except the client-lock marker every
+                # non-host (here: device-key) body carries
+                self.assertEqual(json.loads(self.app.body),
+                                 dict(doc, metadata={"ferry_domestic_only": True}))
 
     def test_master_bodies_are_untouched(self):
         for doc in ({"model": "flash", "prompt": "x", "stream": True},
                     {"model": "flash", "messages": [], "stream": 1}):
             with self.subTest(doc=doc):
                 body = json.dumps(doc).encode()
-                drive(self.mw(), "/v1/completions", bearer(MASTER), body=body)
+                drive(self.mw(), "/v1/completions", bearer(MASTER), body=body, client=HOST_PEER)
                 self.assertEqual(self.app.body, body)
 
 

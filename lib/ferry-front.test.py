@@ -1089,7 +1089,7 @@ class TestEventTap(unittest.TestCase):
             return {"type": "http.request", "body": body, "more_body": False}
 
         scope = {"type": "http", "path": "/v1/chat/completions",
-                 "client": ("192.168.0.9", 5000)}
+                 "client": ("127.0.0.1", 5000)}
         asyncio.run(mw(scope, receive, send))
         return app, sent, scope, reads
 
@@ -1882,7 +1882,7 @@ class FleetHarness(unittest.TestCase):
             app, public, fleets=FLEETS,
             state=self.state if state == "use" else state)
 
-    def drive_body(self, mw, path, raw, headers=None, client=("192.168.1.50", 5000)):
+    def drive_body(self, mw, path, raw, headers=None, client=("127.0.0.1", 5000)):
         """Send one request with `raw` as the body. Returns the sent messages."""
         scope = {"type": "http", "path": path, "method": "POST",
                  "client": client,
@@ -1908,8 +1908,9 @@ class TestFleetMiddleware(FleetHarness):
                 for selection in ("default", "sticky", "header"):
                     with self.subTest(fleet=fleet, path=path, selection=selection):
                         self.write_state({"default": fleet if selection == "default" else "domestic",
-                                          "clients": {"laptop": fleet} if selection == "sticky" else {}})
-                        headers = [(b"x-ferry-client", b"laptop")]
+                                          "clients": {"host": fleet} if selection == "sticky" else {}})
+                        # the host (loopback, headerless): only it may leave domestic
+                        headers = []
                         if selection == "header":
                             headers.append((b"x-ferry-fleet", fleet.encode()))
                         app = BodyApp()
@@ -1972,7 +1973,7 @@ class TestFleetMiddleware(FleetHarness):
         raw = json.dumps({"model": "heavy"}).encode()
         app = BodyApp()
         scope = {"type": "http", "path": "/v1/chat/completions", "method": "POST",
-                 "client": ("192.168.1.50", 5000), "headers": []}
+                 "client": ("127.0.0.1", 5000), "headers": []}
         msgs = [{"type": "http.request", "body": raw, "more_body": False}]
         sent = []
 
@@ -1988,28 +1989,27 @@ class TestFleetMiddleware(FleetHarness):
         self.assertIsNot(app.seen_receive, receive)
 
     def test_header_beats_sticky_and_default(self):
-        self.write_state({"default": "domestic", "clients": {"laptop": "domestic"}})
+        # Host only: a non-host caller naming international is a 403 (see
+        # lib/ferry-clientlock.test.py), so the precedence is a host property.
+        self.write_state({"default": "domestic", "clients": {"host": "domestic"}})
         raw = json.dumps({"model": "flash"}).encode()
         app = BodyApp()
         self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[
-            (b"x-ferry-fleet", b"international"),
-            (b"x-ferry-client", b"laptop")])
+            (b"x-ferry-fleet", b"international")])
         self.assertEqual(json.loads(app.body)["model"], "international.flash")
 
     def test_control_no_header_falls_to_sticky(self):
-        self.write_state({"default": "domestic", "clients": {"laptop": "international"}})
+        self.write_state({"default": "domestic", "clients": {"host": "international"}})
         raw = json.dumps({"model": "flash"}).encode()
         app = BodyApp()
-        self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[
-            (b"x-ferry-client", b"laptop")])
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[])
         self.assertEqual(json.loads(app.body)["model"], "international.flash")
 
     def test_control_no_sticky_falls_to_default(self):
         self.write_state({"default": "international", "clients": {}})
         raw = json.dumps({"model": "flash"}).encode()
         app = BodyApp()
-        self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[
-            (b"x-ferry-client", b"laptop")])
+        self.drive_body(self.mw(app), "/v1/chat/completions", raw, headers=[])
         self.assertEqual(json.loads(app.body)["model"], "international.flash")
 
     def test_an_empty_fleet_header_is_absent_not_an_error(self):
@@ -2153,7 +2153,7 @@ class TestFleetMiddleware(FleetHarness):
 
         asyncio.run(self.mw(app)({
             "type": "http", "path": "/v1/chat/completions", "method": "POST",
-            "client": ("192.168.1.50", 5000), "headers": []}, receive, send))
+            "client": ("127.0.0.1", 5000), "headers": []}, receive, send))
         self.assertEqual(json.loads(app.body)["model"], "domestic.heavy")
         self.assertEqual(app.more, [False])      # one chunk, not two
 
@@ -2643,7 +2643,7 @@ class TestFleetCatalogue(FleetHarness):
                            "data": [{"id": n, "object": "model", "owned_by": owner(n)}
                                     for n in names]}).encode()
 
-    def _list(self, headers=None, client=("192.168.1.50", 5000), state="use"):
+    def _list(self, headers=None, client=("127.0.0.1", 5000), state="use"):
         payload = self._payload("domestic.heavy", "domestic.medium", "domestic.flash", "domestic.super-flash",
                        "international.heavy", "international.medium", "international.flash",
                        "international.super-flash", "local-orch", "local-sub",
@@ -2695,9 +2695,11 @@ class TestFleetCatalogue(FleetHarness):
         self.assertNotEqual(dom, intl)
 
     def test_a_sticky_selection_picks_the_fleet(self):
-        self.write_state({"default": "domestic", "clients": {"laptop": "international"}})
-        _, sticky = self._list(headers=[(b"x-ferry-client", b"laptop")])
-        _, plain = self._list(headers=[(b"x-ferry-client", b"other")])
+        # The host's sticky selection (a non-host caller is locked to domestic).
+        self.write_state({"default": "domestic", "clients": {"host": "international"}})
+        _, sticky = self._list()
+        self.write_state({"default": "domestic", "clients": {}})
+        _, plain = self._list()
         self.assertNotEqual(sticky, plain)
         self.assertEqual(ids(sticky)[:4], ["heavy", "medium", "flash", "super-flash"])
 
@@ -2751,7 +2753,7 @@ class TestFleetCatalogue(FleetHarness):
 
 class TestFleetControlPlane(FleetHarness):
     def call(self, method, doc=None, headers=None,
-             client=("192.168.1.50", 5000), state="use"):
+             client=("127.0.0.1", 5000), state="use"):
         raw = b"" if doc is None else json.dumps(doc).encode()
         app = RecordingApp(b"{}")
         mw = self.mw(app, state=state)
@@ -2777,7 +2779,9 @@ class TestFleetControlPlane(FleetHarness):
         status, doc = self.call("GET", headers=[(b"x-ferry-client", b"laptop")])
         self.assertEqual(status, 200)
         self.assertEqual(doc["you"], "laptop")
-        self.assertEqual(doc["fleet"], "international")
+        # a non-host caller's effective fleet is the lock, whatever the file
+        # says; the file's own entry is still reported under `clients`
+        self.assertEqual(doc["fleet"], "domestic")
         self.assertEqual(doc["default"], "domestic")
         self.assertEqual(sorted(doc["fleets"]), ["domestic", "international"])
         self.assertEqual(doc["clients"], {"laptop": "international"})
@@ -2801,15 +2805,25 @@ class TestFleetControlPlane(FleetHarness):
         self.assertEqual(status, 200)
 
     def test_post_sets_only_the_callers_own_selection(self):
+        # The host (loopback, headerless) may pick international; its entry is
+        # keyed by its own identity and nobody else's.
         status, doc = self.call("POST", {"fleet": "international"},
-                                headers=[(b"x-ferry-client", b"laptop")])
+                                client=("127.0.0.1", 5000))
         self.assertEqual(status, 200)
         self.assertEqual(doc["fleet"], "international")
         self.assertEqual(doc["default"], "domestic")
         with open(self.state_path) as handle:
             self.assertEqual(json.load(handle),
                              {"default": "domestic",
-                              "clients": {"laptop": "international"}})
+                              "clients": {"host": "international"}})
+        # A client may pin domestic, under its own name.
+        status, doc = self.call("POST", {"fleet": "domestic"},
+                                headers=[(b"x-ferry-client", b"laptop")],
+                                client=("192.168.1.50", 5000))
+        self.assertEqual(status, 200)
+        with open(self.state_path) as handle:
+            self.assertEqual(json.load(handle)["clients"],
+                             {"host": "international", "laptop": "domestic"})
 
     def test_post_null_clears_the_selection(self):
         self.write_state({"default": "domestic", "clients": {"laptop": "international"}})
@@ -4274,7 +4288,8 @@ class TestControlPlaneAndInferenceCoverage(FleetHarness):
         mw = self.mw(app)
         with mock.patch.object(self.state, "selection_for", side_effect=Exception("weird fail")):
             with mock.patch("ferry_front._fleet_warn") as m_warn:
-                fleet = mw._catalogue_fleet({"headers": []})
+                fleet = mw._catalogue_fleet(
+                    {"headers": [], "client": ("127.0.0.1", 5000)})
                 self.assertIsNone(fleet)
                 m_warn.assert_called_once()
 

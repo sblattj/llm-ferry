@@ -143,6 +143,38 @@ def _fields(dep):
     return [(k, str(v)) for k, v in pairs if v is not None]
 
 
+def deployment_violation(params):
+    """Why a runtime deployment's litellm params hit the denylist, else None.
+
+    `params` is the litellm_params dict litellm hands a hook (model, api_base,
+    custom_llm_provider, plus model_info.base_model when present). Shares
+    DENY_RE with check(), so config-time and request-time use one denylist.
+    """
+    if not isinstance(params, dict):
+        return None
+    mi = params.get("model_info") if isinstance(params.get("model_info"), dict) else {}
+    pairs = [("model", params.get("model")),
+             ("api_base", params.get("api_base")),
+             ("custom_llm_provider", params.get("custom_llm_provider")),
+             ("base_model", params.get("base_model") or mi.get("base_model"))]
+    for field, value in pairs:
+        if value is None:
+            continue
+        m = DENY_RE.search(str(value))
+        if m:
+            return "token %r matches %s: %s" % (m.group(0), field, value)
+    return None
+
+
+def violation_report(path, problems):
+    """The refusal text shared by the CLI and the front door's startup check."""
+    lines = ["Error: the domestic fleet must use US models only; refusing to load %s:" % path]
+    lines.extend(problems)
+    lines.append("Fix the lane in %s, then re-run. The domestic fleet is US-only by policy; "
+                 "international is the place for these models." % path)
+    return "\n".join(lines)
+
+
 def check(config):
     """Return one message per violation (empty list when the config is clean)."""
     if not isinstance(config, dict):
@@ -181,11 +213,7 @@ def main(argv):
     problems = check(config)
     if not problems:
         return 0
-    print("Error: the domestic fleet must use US models only; refusing to load %s:" % path)
-    for p in problems:
-        print(p)
-    print("Fix the lane in %s, then re-run. The domestic fleet is US-only by policy; "
-          "international is the place for these models." % path)
+    print(violation_report(path, problems))
     return 1
 
 

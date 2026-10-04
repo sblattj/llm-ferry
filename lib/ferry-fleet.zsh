@@ -16,10 +16,13 @@ ferry fleet — read or switch which routing fleet bare lane names resolve to.
 Usage:
   ferry fleet ls                    List every fleet with its primaries; '*'
                                      marks the default, 'you' marks your own
-                                     resolved fleet.
+                                     resolved fleet. On a client, every fleet
+                                     but domestic is marked '(host only)'.
   ferry fleet show                  Show who you are, your resolved fleet, the
                                      host-wide default, and every client's pick.
-  ferry fleet use <fleet>           Select a fleet for yourself (sticky).
+  ferry fleet use <fleet>           Select a fleet for yourself (sticky). Only the
+                                     host may select a non-domestic fleet; a
+                                     client is locked to domestic and gets a 403.
   ferry fleet use <fleet> --default [Host only] Set the host-wide default fleet.
   ferry fleet use --clear           Clear your own selection (follow the default).
   ferry fleet --help                This message.
@@ -86,7 +89,7 @@ cmd_fleet() {
     route_config="$DEFAULT_ROUTE_CONFIG"
   fi
 
-  python3 - "$base" "$key" "$CLIENT_NAME" "$verb" "$fleet" "$flag" "$route_config" <<'PYEOF'
+  python3 - "$base" "$key" "$CLIENT_NAME" "$verb" "$fleet" "$flag" "$route_config" "$CLIENT_MODE" <<'PYEOF'
 import json
 import os
 import re
@@ -94,7 +97,7 @@ import sys
 import urllib.error
 import urllib.request
 
-base, key, name, verb, fleet, flag, route_config = sys.argv[1:8]
+base, key, name, verb, fleet, flag, route_config, client_mode = sys.argv[1:9]
 
 FLEET_PATH = "/v1/ferry/fleet"
 
@@ -135,6 +138,9 @@ def _request(method, payload=None):
                 msg = body
         except Exception:
             msg = body
+        if e.code == 403 and client_mode == "1":
+            msg += ("\nClients are locked to the domestic fleet on this host; "
+                    "ask the host operator.")
         _fail(msg)
     except urllib.error.URLError as e:
         _fail("cannot reach the front door at " + base + ": " + str(e.reason))
@@ -188,6 +194,8 @@ def cmd_ls():
             marks.append("*")
         if fname == doc.get("fleet"):
             marks.append("you")
+        if client_mode == "1" and fname != "domestic":
+            marks.append("(host only)")
         label = fname + ("  " + " ".join(marks) if marks else "")
         row = [label, _fmt(lanes.get("heavy")), _fmt(lanes.get("medium")), _fmt(lanes.get("flash")), _fmt(lanes.get("super-flash"))]
         if keys is not None:

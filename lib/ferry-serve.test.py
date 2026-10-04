@@ -893,6 +893,52 @@ class TestStatusTestCommand(unittest.TestCase):
             "prints returns content=null on a healthy lane")
 
 
+class TestStatusUnguardedFrontDoor(unittest.TestCase):
+    """`ferry status` on the host warns loudly when :$PORT is not ferry's front
+    door (argv lacks ferry_front.py): the domestic-fleet guard and the client
+    lock live there, so a bare `litellm --config` on the port has neither."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(FERRY) as f:
+            src = f.read()
+        m = re.search(r"^cmd_status\(\) \{\n.*?^\}$", src, re.S | re.M)
+        assert m, "cmd_status not found in the built ferry"
+        cls.func = m.group(0)
+
+    def status(self, holder_rc, holder_out=""):
+        # Stubs: only :8090 listens; the port-holder helper answers as told.
+        script = """
+CLIENT_MODE=0 PORT=8090 LOCAL_ORCH_PORT=0 LOCAL_SUB_PORT=0 LOCAL_SCHEMATRON_PORT=0
+SHARE_PORT=0 HF_PORT=0 PROXY_PORT=0 RELAY_PORT=0 VNC_PORT=0
+MDNS_NAME=h.local LAN_IP=1.2.3.4 C_RED= C_GREEN= C_YELLOW= C_RESET=
+_ferry_colors() { :; }
+lsof() { [[ "$*" == *"TCP:8090"* ]] && { [[ "$1" == -t ]] && echo 4242; return 0; }; return 1; }
+ps() { echo litellm; }
+curl() { return 1; }
+_ferry_port_holder() {
+  [[ "$1" == 8090 && "$2" == ferry_front.py ]] || return 1
+  echo '%s'
+  return %d
+}
+%s
+cmd_status
+""" % (holder_out, holder_rc, self.func)
+        r = subprocess.run(["zsh", "-c", script], capture_output=True, text=True, timeout=30)
+        return r.stdout + r.stderr
+
+    def test_bare_litellm_on_the_port_prints_the_warning(self):
+        out = self.status(2, "PID 4242: litellm --config /x/litellm.yaml --port 8090")
+        self.assertIn("WARNING: :8090 is served by litellm --config /x/litellm.yaml --port 8090, "
+                      "not ferry's front door", out)
+        self.assertIn("the domestic-fleet guard and client lock are NOT active. Run: ferry reload", out)
+
+    def test_ferry_front_door_prints_no_warning(self):
+        out = self.status(0)
+        self.assertIn("Port 8090 (endpoint) is", out)
+        self.assertNotIn("WARNING", out)
+
+
 class TestMasterKeyProbes(unittest.TestCase):
     """v1.22.0: the front door can sit behind general_settings.master_key.
 

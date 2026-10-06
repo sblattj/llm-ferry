@@ -627,8 +627,8 @@ class TestGoalPlugin(FerryOpencodeCase):
     # package.json declares build/prepack additionally dies in pacote's prepare
     # step inside the bun binary. The ref is still pinned because the spec
     # string IS opencode's cache key. Bump alongside GOAL_PLUGIN_REF.
-    REF = "v1.2.0"
-    VERSION = "1.2.0"
+    REF = "v1.3.0"
+    VERSION = "1.3.0"
     PKG = "opencode-goal-pro-max-complete-plugin"
     BASE = "github:sblattj/opencode-goal-pro-max-complete-plugin"
     TARBALL = (f"https://github.com/sblattj/opencode-goal-pro-max-complete-plugin"
@@ -954,7 +954,7 @@ class TestGoalPlugin(FerryOpencodeCase):
         self.run_ferry()
         self.assertEqual(self.read()["plugin"], [
             "opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/"
-            "opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.2.0.tar.gz"])
+            "opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.3.0.tar.gz"])
 
     def test_the_old_repos_dead_v0110_spec_is_migrated_to_the_new_one(self):
         """Case (c): every machine ferry v1.43.0 or earlier wired."""
@@ -1257,7 +1257,7 @@ root = os.path.join(
 os.makedirs(os.path.join(root, "dist"), exist_ok=True)
 with open(os.path.join(root, "package.json"), "w") as f:
     json.dump({"name": pkg,
-               "version": os.environ.get("FERRY_TEST_STUB_VERSION", "1.2.0")}, f)
+               "version": os.environ.get("FERRY_TEST_STUB_VERSION", "1.3.0")}, f)
 halves = ["goal-plugin.js", "goal-tui.js"]
 # A cache that installed the SERVER half and not the TUI half: the shape the
 # pre-install must report, and the one the TUI copy must refuse to make.
@@ -1349,7 +1349,7 @@ class TestGoalPluginPreInstall(GoalPluginStubCase):
 
     def test_a_successful_install_is_reported_with_the_cached_version(self):
         out = self.run_install()
-        self.assertIn("installed opencode-goal-pro-max-complete-plugin 1.2.0", out)
+        self.assertIn("installed opencode-goal-pro-max-complete-plugin 1.3.0", out)
         self.assertIn("ready for next opencode start", out)
         self.assertNotIn("WARNING", out)
 
@@ -1429,14 +1429,14 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
         """A managed copy already on disk, as a previous run would have left it."""
         os.makedirs(os.path.join(self.copy, "dist"), exist_ok=True)
         with open(os.path.join(self.copy, "package.json"), "w") as f:
-            json.dump({"name": pkg or self.PKG, "version": version or "1.2.0"}, f)
+            json.dump({"name": pkg or self.PKG, "version": version or "1.3.0"}, f)
         open(os.path.join(self.copy, "dist", "goal-tui.js"), "w").close()
         open(os.path.join(self.copy, "dist", "goal-plugin.js"), "w").close()
         if leftover:
             open(os.path.join(self.copy, leftover), "w").close()
         with open(os.path.join(self.copy, self.MARKER), "w") as f:
             f.write("%s\n%s\n%s\n" % (marker_spec or self.PLUGIN,
-                                      "v" + (version or "1.2.0"), pkg or self.PKG))
+                                      "v" + (version or "1.3.0"), pkg or self.PKG))
 
     def copy_version(self):
         with open(os.path.join(self.copy, "package.json")) as f:
@@ -1462,9 +1462,9 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
         with open(self.global_cfg) as f:
             self.assertEqual(json.load(f)["plugin"], [self.PLUGIN])
         self.assertTrue(os.path.isfile(os.path.join(self.copy, self.MARKER)))
-        self.assertEqual(self.copy_version(), "1.2.0")
+        self.assertEqual(self.copy_version(), "1.3.0")
         self.assertTrue(os.path.exists(os.path.join(self.copy, "dist", "goal-tui.js")))
-        self.assertIn("TUI plugin: %s (1.2.0) -> %s" % (self.copy, self.tui), out)
+        self.assertIn("TUI plugin: %s (1.3.0) -> %s" % (self.copy, self.tui), out)
 
     def test_the_marker_records_the_spec_the_copy_came_from(self):
         """A copy with no provenance cannot be refreshed on a ref bump, and
@@ -1524,7 +1524,7 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
         self.assertFalse(os.path.exists(os.path.join(bad, "ferry")))
         # Control: the pre-install still ran, so this is a TUI-copy refusal and
         # not a run that fell over before it got there.
-        self.assertIn("installed opencode-goal-pro-max-complete-plugin 1.2.0", out)
+        self.assertIn("installed opencode-goal-pro-max-complete-plugin 1.3.0", out)
 
     def test_a_cache_without_the_tui_bundle_is_reported_not_copied(self):
         out = self.run_install(config=self.global_cfg, no_tui=True)
@@ -1535,19 +1535,19 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
 
     # ── a ref bump ────────────────────────────────────────────────────────
     def test_a_stale_copy_is_replaced_wholesale_and_named(self):
-        self.seed_copy(version="0.9.0", leftover="gone-in-1.2.0.js")
+        self.seed_copy(version="0.9.0", leftover="gone-in-1.3.0.js")
         out = self.run_install(config=self.global_cfg)
-        self.assertIn("copy holds 0.9.0, expected 1.2.0", out)
+        self.assertIn("copy holds 0.9.0, expected 1.3.0", out)
         self.assertIn("refreshed after the install below", out)
-        self.assertEqual(self.copy_version(), "1.2.0")
+        self.assertEqual(self.copy_version(), "1.3.0")
         self.assertEqual(self.read_tui()["plugin"], [self.uri])
         # Wholesale, not merged: a file the old version shipped is gone.
-        self.assertFalse(os.path.exists(os.path.join(self.copy, "gone-in-1.2.0.js")))
+        self.assertFalse(os.path.exists(os.path.join(self.copy, "gone-in-1.3.0.js")))
 
     def test_no_install_with_a_stale_copy_says_how_to_fix_it(self):
         self.seed_copy(version="0.9.0")
         out = self.run_ferry("--no-install", config=self.global_cfg)
-        self.assertIn("copy holds 0.9.0, expected 1.2.0", out)
+        self.assertIn("copy holds 0.9.0, expected 1.3.0", out)
         self.assertIn("rerun without --no-install", out)
         self.assertEqual(self.copy_version(), "0.9.0")   # nothing refreshed it
 
@@ -1663,12 +1663,12 @@ class TestGoalPluginTuiCopy(GoalPluginStubCase):
 
     def test_an_old_repos_copy_is_refreshed_to_the_new_plugin(self):
         """Every host ferry v1.43.0 wired holds a 0.11.0 copy of the OLD
-        package. The version compare must refresh it to 1.2.0 of the new one."""
+        package. The version compare must refresh it to 1.3.0 of the new one."""
         self.seed_copy(version="0.11.0", marker_spec=self.OLD_PLUGIN,
                        pkg=TestGoalPlugin.OLD_PKG)
         out = self.run_install(config=self.global_cfg)
-        self.assertIn("copy holds 0.11.0, expected 1.2.0", out)
-        self.assertEqual(self.copy_version(), "1.2.0")
+        self.assertIn("copy holds 0.11.0, expected 1.3.0", out)
+        self.assertEqual(self.copy_version(), "1.3.0")
         with open(os.path.join(self.copy, "package.json")) as f:
             self.assertEqual(json.load(f)["name"], self.PKG)
         with open(os.path.join(self.copy, self.MARKER)) as f:
@@ -2061,7 +2061,7 @@ class TestGoalSkillInstall(FerryOpencodeCase):
         d = os.path.join(self.dir, "share", "opencode-goal-pro-max-complete-plugin")
         os.makedirs(os.path.join(d, "dist"), exist_ok=True)
         with open(os.path.join(d, "package.json"), "w") as f:
-            json.dump({"name": pkg_name, "version": "1.2.0"}, f)
+            json.dump({"name": pkg_name, "version": "1.3.0"}, f)
         with open(self.cfg, "w") as f:
             json.dump({"plugin": ["file://" + d]}, f)
 

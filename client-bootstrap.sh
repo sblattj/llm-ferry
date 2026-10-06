@@ -539,7 +539,7 @@ else
   # exactly what --profiles-only exists to leave alone.
   #
   # Keep this heredoc in sync with opencode/skills/using-the-goal-plugin/SKILL.md
-  # (itself a verbatim copy of skills/using-the-goal-plugin/SKILL.md at tag v1.2.0
+  # (itself a verbatim copy of skills/using-the-goal-plugin/SKILL.md at tag v1.3.0
   # of sblattj/opencode-goal-pro-max-complete-plugin, the pinned plugin release)
   # in the llm-ferry repo. lib/ferry-clientbootstrap.test.py asserts the file this
   # writes is byte-identical to that one.

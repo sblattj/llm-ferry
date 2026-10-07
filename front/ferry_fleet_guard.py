@@ -36,6 +36,24 @@ DENY_TOKENS = [
     "ernie", "baidu", "qianfan", "doubao", "volcengine", "volces", "bytedance",
     "hunyuan", "tencent", "stepfun", "iflytek", "xfyun", "sensenova", "sensetime",
     "internlm", "meituan", "longcat",
+    # Xiaomi. `mimo` must not run into a letter, so `mimosa` stays clean.
+    "xiaomi", r"mimo(?![a-z])",
+    # inclusionAI / Ant Group. Ling and Ring are English words, so a bare `ling`
+    # or `ring` is NOT a token: only a version digit or a size suffix after the
+    # hyphen counts, and the left boundary rejects `spring-2`, `string-1`,
+    # `bowling-3`, `sterling-pro` and `ceiling-lite`.
+    "inclusionai", "antgroup", "ant-group", "antling", "bailing",
+    r"(?:ling|ring)-(?:\d|lite|plus|flash|mini|max|pro|1t)",
+    # Other Chinese labs and China-hosted providers found by sweeping the
+    # OpenRouter catalogue (see lib/ferry-fleetguard.test.py).
+    "kuaishou", "kwaipilot", "kwai", r"kat-(?:coder|dev|v\d)",
+    "skywork", "kunlun", "tiangong",
+    "openbmb", "minicpm", "modelbest",
+    "thudm", "cogvlm", "cogview", "xverse", "huawei", "pangu", "baai", "infly",
+    "internvl", "360zhinao", "telechat", "xiaohongshu", "rednote",
+    r"dots-studio", r"dots-\d", r"dots\.llm",
+    "nex-agi", r"nex-n\d",
+    r"hy-mt", r"hy\d", "ui-tars",
 ]
 DENY_RE = re.compile(r"(?<![a-z0-9])(?:%s)" % "|".join(DENY_TOKENS), re.I)
 

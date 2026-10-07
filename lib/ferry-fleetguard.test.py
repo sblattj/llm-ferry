@@ -97,6 +97,56 @@ class TestDenylist(unittest.TestCase):
         self.assertTrue(guard.check(cfg([dep("domestic.heavy", "x/GLM-5")])))
 
 
+class TestDeploymentViolationGaps(unittest.TestCase):
+    """Chinese labs the first denylist missed (found by sweeping the OpenRouter catalogue)."""
+
+    def refused(self, model):
+        return guard.deployment_violation({"model": model}) is not None
+
+    def test_xiaomi_inclusionai_and_other_gaps_are_refused(self):
+        for model in (
+                "openrouter/xiaomi/mimo-v2.6-pro", "openrouter/xiaomi/mimo-v2.5",
+                "mimo-v2.6-flash", "openrouter/inclusionai/ling-3.0",
+                "openrouter/inclusionai/ring-3.0", "openrouter/inclusionai/ling-3.1-flash",
+                "antgroup/x", "ant-group/x", "antling/x", "bailing/x",
+                "openrouter/dots-studio/dots-3-note-preview:free",
+                "openrouter/nex-agi/nex-n2.5-pro", "openrouter/tencent/hy3",
+                "openrouter/tencent/hy-mt2-7b", "hy3-preview",
+                "openrouter/bytedance/ui-tars-1.5-7b", "kwaipilot/kat-coder-pro",
+                "kuaishou/x", "skywork/x", "kunlun/x", "openbmb/minicpm-v", "thudm/glm-4",
+                "xverse/x", "huawei/pangu-pro", "baai/bge-m3", "infly/inf-x",
+                "xiaohongshu/x", "rednote/x"):
+            self.assertTrue(self.refused(model), model)
+
+    def test_ling_and_ring_model_names_are_refused_only_when_versioned_or_sized(self):
+        for model in ("ling-3.0", "ring-3.0", "x/ling-1t", "x/Ring-2.5", "ling-lite",
+                      "ling-plus", "ling-flash", "ring-lite", "ring-flash", "ring-mini"):
+            self.assertTrue(self.refused(model), model)
+
+    def test_english_word_lookalikes_stay_clean(self):
+        for model in ("string-1", "spring-2", "bowling-3", "ceiling", "sterling-pro",
+                      "ceiling-lite", "x/boiling-2", "mimosa", "openrouter/x/ring",
+                      "x/ling", "x/shy3", "x/hytale"):
+            self.assertFalse(self.refused(model), model)
+
+    def test_us_models_stay_clean(self):
+        for model in ("openrouter/anthropic/claude-sonnet-5.5",
+                      "openrouter/openai/gpt-6.1-sol", "openrouter/x-ai/grok-4.7",
+                      "openrouter/google/gemini-3.8-flash",
+                      "openrouter/mistralai/mistral-large-4-0"):
+            self.assertFalse(self.refused(model), model)
+            self.assertEqual(
+                guard.check(cfg([dep("domestic.heavy", model)])), [], model)
+
+    def test_gaps_are_refused_by_check_on_a_domestic_lane(self):
+        for model in ("openrouter/xiaomi/mimo-v2.6-pro", "openrouter/inclusionai/ring-3.0"):
+            self.assertTrue(guard.check(cfg([dep("domestic.heavy", model)])), model)
+
+    def test_route_template_still_passes(self):
+        with open(TEMPLATE) as fh:
+            self.assertEqual(guard.check(yaml.safe_load(fh)), [])
+
+
 class TestReachability(unittest.TestCase):
     BAD = dep("international.heavy-glm", "openrouter/z-ai/glm-5.3")
 

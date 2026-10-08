@@ -1004,7 +1004,7 @@ class ClientCleanupTest(ClientHarness):
 # so a drift in either direction fails: the canonical spec and the verbatim
 # /goal command (lib/ferry-integrate.zsh's GOAL_PLUGIN / GOAL_COMMAND).
 GOAL_SPEC = ("opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/"
-             "opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.3.0.tar.gz")
+             "opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.4.0.tar.gz")
 # What every ferry up to v1.43.0 wrote, before the plugin's repo was renamed
 # (sblattj/OpenCode-goal-plugin is gone). Cleanup must still take it out.
 OLD_GOAL_SPEC = ("opencode-goal-plugin@https://github.com/sblattj/OpenCode-goal-plugin"
@@ -1024,7 +1024,7 @@ LOCAL_FORK = "/Users/someone/src/OpenCode-goal-plugin/index.js"
 # delete; its content is "<spec>\n<ref>\n<pkg>\n".
 GOAL_TUI_MARKER = ".ferry-goal-plugin"
 GOAL_PKG = "opencode-goal-pro-max-complete-plugin"
-GOAL_REF = "v1.3.0"
+GOAL_REF = "v1.4.0"
 # The managed copy's directory name did NOT follow the rename: it is still
 # <data>/ferry/opencode-goal-plugin, whatever package it holds.
 GOAL_TUI_DIRNAME = "opencode-goal-plugin"

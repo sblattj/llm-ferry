@@ -53,6 +53,12 @@ class StubHost(BaseHTTPRequestHandler):
             body = json.dumps({"data": [{"id": l} for l in LANES]}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+        elif self.path == "/opencode/skills/using-the-goal-plugin/SKILL.md" \
+                and not getattr(self.server, "hide_skill", False):
+            with open(GOAL_SKILL_SRC, "rb") as f:
+                body = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/markdown")
         elif self.path == "/ferry":
             with open(FERRY, "rb") as f:
                 body = f.read()
@@ -363,16 +369,41 @@ class ClientScopeTest(ClientHarness):
                          takeover(q.stdout))
         self.assertIn("skill was NOT installed", takeover(q.stdout))
 
-    def test_reset_says_once_that_it_cannot_ship_the_skill(self):
-        """A reset re-writes configs and never skill files — the client copy
-        rides in this bootstrap's heredoc and there is no checkout to copy from
-        — so the one thing an operator needs is that fact, once, not ferry's
-        per-target line three or four times."""
+    SKILL_DEST = (".config", "opencode", "skills", "using-the-goal-plugin", "SKILL.md")
+
+    def test_reset_refreshes_the_goal_skill_from_the_host_share(self):
+        """A reset in full scope fetches the current skill from the host share
+        (which serves its own directory) instead of telling the operator to
+        re-run bootstrap. Stale text goes in, the repo file comes out."""
         self.run_script(BOOTSTRAP)
+        dest = self.path(*self.SKILL_DEST)
+        with open(dest, "w") as f:
+            f.write("---\nname: using-the-goal-plugin\n---\nstale v1.3.0 goal_pause\n")
         out = self.run_script(RESET).stdout
+        with open(dest, "rb") as a, open(GOAL_SKILL_SRC, "rb") as b:
+            self.assertEqual(a.read(), b.read(), out)
+        self.assertEqual(out.count("Skill:   refreshed " + dest), 1, out)
         self.assertNotIn("no checkout", out)
-        self.assertEqual(out.count("using-the-goal-plugin is bootstrap-only"), 1, out)
-        self.assertIn("Re-run client-bootstrap.sh", out)
+        self.assertNotIn("bootstrap-only", out)
+
+    def test_reset_falls_back_when_the_host_does_not_serve_the_skill(self):
+        """An older host share 404s the skill path: the reset still succeeds,
+        the installed file is untouched, and the old advice is said once."""
+        self.run_script(BOOTSTRAP)
+        dest = self.path(*self.SKILL_DEST)
+        stale = "---\nname: using-the-goal-plugin\n---\nstale\n"
+        with open(dest, "w") as f:
+            f.write(stale)
+        self.server.hide_skill = True
+        self.addCleanup(setattr, self.server, "hide_skill", False)
+        p = self.run_script(RESET)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        with open(dest) as f:
+            self.assertEqual(f.read(), stale)
+        self.assertNotIn("refreshed", p.stdout)
+        self.assertNotIn("DONE WITH ERRORS", p.stdout)
+        self.assertEqual(p.stdout.count("Re-run client-bootstrap.sh"), 1, p.stdout)
+        self.assertEqual(p.stdout.count("could not fetch using-the-goal-plugin"), 1, p.stdout)
 
     # --- the default is unchanged ------------------------------------------
     def test_full_scope_is_still_the_default(self):

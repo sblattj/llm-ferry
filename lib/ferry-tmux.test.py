@@ -67,10 +67,11 @@ class TmuxPrintTest(TmuxTestBase):
     def test_print_one_entry_gives_the_exact_argv(self):
         self.write_state({"8101": entry("laptop")})
         argv = self.argv()
-        self.assertEqual(argv[:8], ["ssh", "-p", "8101", "-o", "HostKeyAlias=ferry-tmux-laptop",
-                                    "-t", "alice@127.0.0.1", argv[7]])
-        self.assertEqual(len(argv), 8)
-        remote = argv[7]
+        self.assertEqual(argv[:12], ["ssh", "-p", "8101", "-o", "HostKeyAlias=ferry-tmux-laptop",
+                                     "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4",
+                                     "-t", "alice@127.0.0.1", argv[11]])
+        self.assertEqual(len(argv), 12)
+        remote = argv[11]
         self.assertIn("/opt/homebrew/bin", remote)
         self.assertIn("exec tmux new-session -A -s ferry", remote)
         self.assertTrue(remote.endswith("-s ferry"))
@@ -193,7 +194,7 @@ class TmuxKeyAndUserSshdTest(TmuxTestBase):
         self.write_state({"8101": entry("laptop")})
         argv = self.argv()
         self.assertNotIn("-i", argv)
-        self.assertEqual(len(argv), 8)
+        self.assertEqual(len(argv), 12)
 
     def test_identity_flag_appears_with_the_key_file(self):
         key = self.make_key()

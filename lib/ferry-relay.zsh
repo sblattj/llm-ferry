@@ -199,6 +199,17 @@ def close_quietly(sock):
     except OSError:
         pass
 
+def keepalive(sock):
+    """TCP keepalive: probe after 60 s idle, every 15 s, give up after 4 misses."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPALIVE", 60),
+                       ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+        if hasattr(socket, opt):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), value)
+            except OSError:
+                pass
+
 def pump(src, dst):
     try:
         while True:
@@ -347,14 +358,7 @@ def handle(sock, addr):
         # shut, Wi-Fi dropped, a laptop carried out of the building — leaves a
         # bare TCP socket that never reports anything, and the host would keep a
         # port published for an absent machine indefinitely.
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        for opt, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPALIVE", 60),
-                           ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
-            if hasattr(socket, opt):
-                try:
-                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), value)
-                except OSError:
-                    pass
+        keepalive(sock)
         serve_registration(sock, addr, req)
         close_quietly(sock)
     elif op == "hostkey":
@@ -381,6 +385,11 @@ def handle(sock, addr):
             return
         sock.settimeout(None)
         pub.settimeout(None)
+        # The data channel crosses the network too. An idle ssh/tmux session
+        # sends nothing on it, and a firewall or VPN agent on the path (Zscaler's
+        # client connector, a NAT) drops a flow it has seen idle for a few
+        # minutes: the session dies though both ends are still up.
+        keepalive(sock)
         splice(pub, sock)
     else:
         close_quietly(sock)
@@ -529,6 +538,17 @@ def read_line(sock, limit=4096):
 def send_json(sock, obj):
     sock.sendall((json.dumps(obj) + "\n").encode())
 
+def keepalive(sock):
+    """Same settings as the relay half: probe after 60 s idle, every 15 s, 4 misses."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPALIVE", 60),
+                       ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+        if hasattr(socket, opt):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), value)
+            except OSError:
+                pass
+
 def pump(src, dst):
     try:
         while True:
@@ -576,6 +596,14 @@ def serve_one(cid):
         print(f"    could not open a data channel ({e})", flush=True)
         local.close()
         return
+    # create_connection's timeout STAYS on both sockets. Left there, the first
+    # recv() that waits longer (5 s locally, 10 s on the tunnel) raises, pump()
+    # ends and shuts the tunnel: an idle ssh/tmux session got "Connection closed
+    # by remote host" while both ends were fine. The relay half already clears
+    # its own. Then keep the flow alive through firewalls that drop idle ones.
+    local.settimeout(None)
+    data.settimeout(None)
+    keepalive(data)
     splice(local, data)
 
 try:
@@ -615,6 +643,7 @@ print(f"    Published. Visitors reach it at {resp.get('bind')}:{resp['public_por
       flush=True)
 
 ctrl.settimeout(None)
+keepalive(ctrl)
 try:
     while True:
         line = read_line(ctrl)

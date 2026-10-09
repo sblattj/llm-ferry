@@ -305,10 +305,29 @@ for oc_target in "${oc_targets[@]}"; do
 done
 
 # Said once, for the run as a whole (see FERRY_GOAL_SKILL_QUIET above). A reset
-# re-writes configs; the skill files ride in client-bootstrap.sh's heredocs and
-# a client has no checkout to copy them out of, so this is the one thing a
-# reset structurally cannot deliver.
-if [[ "$OC_MODE" != "none" ]]; then
+# re-writes configs AND, in full scope, refreshes the goal skill: a client has
+# no checkout to copy it from, but the host share serves its own directory, so
+# the current file is one curl away at /opencode/skills/using-the-goal-plugin/.
+# The fetch is validated before it replaces anything, and a miss (an older host
+# share that does not serve it, a 404, a proxy error page) never fails the reset:
+# it falls back to the old advice to re-run client-bootstrap.sh. In the narrower
+# scopes bootstrap never installed the skill, so there is nothing to refresh.
+if [[ "$OC_MODE" == "full" ]]; then
+  goal_skill_dest="$HOME/.config/opencode/skills/using-the-goal-plugin/SKILL.md"
+  tmp_skill="$(mktemp)"
+  if curl -fsSL -m 30 "http://$HOST_NAME:$SHARE_PORT/opencode/skills/using-the-goal-plugin/SKILL.md" -o "$tmp_skill" 2>/dev/null \
+       && [[ -s "$tmp_skill" ]] && head -n 5 "$tmp_skill" | grep -q '^name: using-the-goal-plugin'; then
+    mkdir -p "${goal_skill_dest:h}"
+    mv "$tmp_skill" "$goal_skill_dest"
+    chmod 644 "$goal_skill_dest"
+    echo "    Skill:   refreshed $goal_skill_dest"
+  else
+    rm -f "$tmp_skill"
+    echo "    Skill:   could not fetch using-the-goal-plugin from the host share (an older"
+    echo "             host?). Re-run client-bootstrap.sh in its default scope to refresh"
+    echo "             the client's copy."
+  fi
+elif [[ "$OC_MODE" != "none" ]]; then
   echo "    Skill:   using-the-goal-plugin is bootstrap-only, like the shell wrappers —"
   echo "             a reset writes configs, never skill files. Re-run client-bootstrap.sh"
   echo "             in its default scope to refresh the client's copy."

@@ -229,6 +229,23 @@ class RelayTest(unittest.TestCase):
         self.wait_for_port(self.public_port, "the published port")
         self.assertEqual(self.round_trip(), b"hello over the tunnel\n")
 
+    def test_an_idle_connection_survives_past_the_dial_timeouts(self):
+        """An idle ssh/tmux session through the tunnel was cut ("Connection closed
+        by remote host") after ~10 s of quiet: `ferry expose` dialled its local
+        service (timeout=5) and the relay (timeout=10) with create_connection,
+        which leaves that timeout ON the socket, so the first recv() that waited
+        longer raised and ended the splice. 12 s of silence must not end it."""
+        self.start_relay()
+        self.start_expose()
+        self.wait_for_port(self.public_port, "the published port")
+        with socket.create_connection(("127.0.0.1", self.public_port), timeout=10) as s:
+            s.settimeout(10)
+            s.sendall(b"before\n")
+            self.assertEqual(s.recv(64), b"before\n")
+            time.sleep(12)
+            s.sendall(b"after\n")
+            self.assertEqual(s.recv(64), b"after\n", "the tunnel closed while idle")
+
     def test_a_large_payload_survives_the_pump(self):
         self.start_relay()
         self.start_expose()

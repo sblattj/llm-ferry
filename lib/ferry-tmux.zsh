@@ -427,7 +427,12 @@ TMUX_PATH = ("$HOME/homebrew/bin:$HOME/.homebrew/bin:$HOME/.local/bin:/opt/homeb
 remote = (f'PATH="{TMUX_PATH}:$PATH"; command -v tmux >/dev/null 2>&1 || '
           f'{{ echo "ferry: tmux is not installed on this client (searched $PATH)" >&2; exit 127; }}; '
           f"exec tmux new-session -A -s {session}{dir_opt}")
-argv = ["ssh", "-p", str(port), "-o", f"HostKeyAlias={alias}"]
+# ServerAlive*: an idle session sends nothing, and a firewall or VPN agent on the
+# client's path (Zscaler's client connector, a NAT) drops a flow it sees idle. An
+# encrypted ping every 30 s keeps every hop busy; 4 misses (~2 min) ends a session
+# whose client really is gone instead of hanging it.
+argv = ["ssh", "-p", str(port), "-o", f"HostKeyAlias={alias}",
+        "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=4"]
 # The host's ferry key, when `ferry relay` has made one. No IdentitiesOnly: a system
 # sshd must still be offered the user's default keys.
 if os.path.exists(key_file):

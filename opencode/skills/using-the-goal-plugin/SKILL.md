@@ -37,8 +37,8 @@ The only stop reasons:
 |---|---|---|
 | `paused` | the user ran `/goal halt` (or its alias `/goal pause`) | nothing until they resume |
 | `blocked` | your concrete `[goal:blocked]` or `goal_block` was accepted | wait for the input you named |
-| `budget wrap-up requested` | 80% of token spend, of peak context, or of the clock - whichever arrives first | hand off: done, remaining, next action |
-| `max turns reached (n)`, `max duration reached (8h)`, `max tokens reached (N)`, `context window reached (N)` | hard limit hit | summarize state; the user must resume for a fresh window |
+| `token budget wrap-up requested`, `time budget wrap-up requested` | 80% of token spend or of the clock - whichever arrives first. Context fullness never triggers it | hand off: done, remaining, next action |
+| `max turns reached (n)`, `max duration reached (8h)`, `max tokens reached (N)` | hard limit hit | summarize state; the user must resume for a fresh window |
 | `terminal persistence failed` / `continuation claim persistence failed` | goal state could not be written durably | report it; the user fixes storage, then resumes |
 | `backgrounded` / `queued` | another goal has focus, or this one is later in an ordered sequence | work the focused goal only; queued goals auto-promote |
 
@@ -64,7 +64,7 @@ lists the offending flags instead of a goal; fix the line and re-send it.
 | `--max-minutes` | | positive int | wall-clock cap in minutes |
 | `--max-tokens` | | positive int | cumulative token SPEND cap |
 | `--budget` | | `<n>`, `<n>k`, `<n>m` | the same spend cap, friendlier units |
-| `--context-window` | | `<n>`, `<n>k`, `<n>m` | peak-context ceiling; overrides the model window the plugin reads from the host |
+| `--context-window` | | `<n>`, `<n>k`, `<n>m` | window size shown in the status (display only, never stops or nudges); overrides the model window the plugin reads from the host |
 | `--cooldown-ms` | | positive int | min delay between continuations |
 | `--no-progress-threshold` | | positive int | output tokens under which a turn looks stalled |
 | `--no-progress-turns` | | positive int | stalled turns before the stall is recorded (it does not pause the goal) |
@@ -216,28 +216,23 @@ keeps running, and it means your evidence was thin, not that you should re-asser
 | auto-continue turns | unlimited, rendered `∞` |
 | wall clock | 8 hours |
 | token spend budget | 100,000,000 cumulative |
-| context ceiling | the running model's own window, read from the host; none at all when the host cannot name one |
+| context window (display only) | the running model's own window, read from the host; unknown when the host cannot name one. Never stops or nudges the goal |
 | cooldown between continuations | 1500 ms |
 | stalled turns before a stall is recorded | 2 (whole turns under 50 output tokens, with no tool call, no thinking tokens, and no new text - a repeat or an empty turn); recorded, does not stop the goal |
 | tool-free turns before a stall is recorded | 10 (whole turns; `goal_*` calls do not count as tools); recorded, does not stop the goal |
-| wrap-up threshold | 80% of spend, of the context ceiling, or of the clock - the first to arrive |
-| warnings appear at | 10 minutes, 25,000 spend tokens, or 25,000 context tokens remaining (the 3-turn warning is silent unless `--max-turns` set a ceiling) |
+| wrap-up threshold | 80% of spend or of the clock - the first to arrive |
+| warnings appear at | 10 minutes or 25,000 spend tokens remaining (the 3-turn warning is silent unless `--max-turns` set a ceiling) |
 | rejected-format counter | counts rejected completion/blocker markers (a clean turn decrements it by one); it does not stop the goal |
 
 Two different token numbers, and they are not interchangeable. SPEND is the running bill - input,
 output, reasoning and cache read/write summed over every message the goal produced, including the
 tokens a subagent you delegated to burned. It only grows, a compaction does not reduce it, and it is
 what `tokens_remaining` in `<progress_budget>`, `Token spend:` in `/goal status`, and the token stat
-in the title and sidebar all count against the 100,000,000 budget. PEAK CONTEXT is the largest single
-message the goal has seen: it tracks how big the live context has grown, plateaus across cheap turns,
-and drops to 0 after a compaction. It is what `context_remaining` and `Peak context:` report, and it
-is measured against the model's own window rather than the budget. When the host cannot name a window
-both of those read `unlimited` / `∞` and no context brake exists - the clock and the spend budget are
-then the only hard limits.
+in the title and sidebar all count against the 100,000,000 budget. CONTEXT is the size of the live context (the latest message), and it drops after a compaction. It is display only: `Context:` in `/goal status` shows it against the model's window (and says where that window came from), but it never stops the goal, never triggers a wrap-up and never appears in `<progress_budget>`. Compaction handles a full window; do not wrap up or stop because context looks full.
 
 Turns are unlimited by default, so do not pace yourself against a turn count: the brakes that actually
-stop a healthy run are the 8-hour clock, the spend budget, the context ceiling, and the user's
-`/goal halt`. Stalls are recorded, not stops. Because the wrap-up PAUSES the goal, 80% is the ceiling you will really hit; the 100% stop
+stop a healthy run are the 8-hour clock, and the spend budget, plus the user's
+`/goal halt`. Stalls are recorded, not stops. Because the wrap-up PAUSES the goal, 80% of spend or clock is the ceiling you will really hit; the 100% stop
 reasons only fire when one turn jumps the whole way from under 80%.
 
 When `<budget_wrapup>` replaces the usual step line the window is nearly gone. It spells out the
@@ -282,7 +277,7 @@ stall/format counter reset to zero, while the goal id, objective, plan, and chec
 Answer from `/goal status` or `goal_status` data, never from memory of what you did. `/goal status`
 prints, in order: `Active goal:`, `State:`, `Completion audit:`, the objective size when a long handoff
 is retained, success criteria, constraints, mode, `Auto-continues sent:` used/`∞`, `Token spend:`
-used/max, `Peak context:` used/max (`∞` when no ceiling is known), the `API usage:` line (input, output,
+used/max, `Context:` used/max (`∞` when no window is known), the `API usage:` line (input, output,
 reasoning, cache read/write, cost), `Elapsed:` seconds plus elapsed/limit, `Last progress:`,
 `No-progress turns:`, `Recent checkpoint:`, `Last status:`, the plan render, and - when stopped -
 `Stopped:`, `Blocked reason:`, and a suggested action. `Token spend:` and the `API usage:` line are the
@@ -292,15 +287,14 @@ Durations render in whole seconds under a minute, then minutes, then hours with 
 truncated: `45s`, `45m`, `1.5h`, `8h`. So a default goal that has recorded a five-action plan shows
 `▶ ship it · 3/∞ · 2m/8h · 45k/100m · 0/5✓` - objective, turns, elapsed/clock, spend/budget, and
 verified/total plan actions. That last field appears only once a plan exists, and an ordered sequence
-inserts a leading `p/t` step field right after the objective. Peak context is never in the title.
+inserts a leading `p/t` step field right after the objective. Context is never in the title.
 
 The sidebar Goal panel shows the same state from session metadata: a state mark (active, paused,
 blocked, completed), the objective label, a stats line reading `1/∞ turns · 1m/8h · 147k/100m tokens`
-and gaining a fourth `147k/1m ctx` stat ONLY when a context ceiling is known, a `step p/t` line in an
+and gaining a fourth `147k/1m ctx` stat ONLY when a context window is known, a `step p/t` line in an
 ordered sequence, `<verified>/<total> actions verified` plus any blocked count, up to 12 lines for the
 actions that still need attention, with status mark and verdict, and notes for blocked, stopped,
-success criteria and constraints. Three stats instead of four means the goal is running with no
-context ceiling, not that the panel broke. An action shown as done WITHOUT a passing verdict is not
+success criteria and constraints. Three stats instead of four means the context window is unknown, not that the panel broke. An action shown as done WITHOUT a passing verdict is not
 verified - the usual reason a goal looks finished but will not complete.
 
 The Goal panel no longer repeats the plan: it prints the progress line plus only the actions that need

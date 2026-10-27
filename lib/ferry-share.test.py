@@ -317,6 +317,87 @@ class TestClientTelemetryLogPath(unittest.TestCase):
         self.assertIn("after the checkout vanished", body)
 
 
+class TestClientHqSend(unittest.TestCase):
+    """The client half: the real built `ferry msg` / `ferry log` against the real server.
+
+    A bare `curl -sS` used to print "Failed to connect ... Couldn't connect to
+    server" when the host's share server was down (2026-10-26: 8095 had been
+    dead for two weeks and a client's `ferry log` just failed), and exited 0
+    on a 500, so a lost message read as a sent one.
+    """
+
+    # Same live server as TestClientTelemetryLogPath, without re-running its tests.
+    setUp = TestClientTelemetryLogPath.setUp
+    _stop = TestClientTelemetryLogPath._stop
+    log_path = TestClientTelemetryLogPath.log_path
+
+    def client(self, share_port, host="127.0.0.1"):
+        conf = {"port": "8090", "share_port": str(share_port)}
+        if host is not None:
+            conf["host"] = host
+        os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+        with open(os.path.join(self.home, ".config", "ferry", "client.json"), "w") as f:
+            json.dump(conf, f)
+
+    def ferry(self, *args, stdin=""):
+        env = dict(os.environ, HOME=self.home, TMPDIR=self.home)
+        env.pop("OPENCODE_CONFIG", None)
+        p = subprocess.run(["zsh", FERRY, *args], env=env, input=stdin,
+                           capture_output=True, text=True, timeout=60)
+        return p.returncode, p.stdout + p.stderr
+
+    def logged(self):
+        with open(self.log_path) as f:
+            return f.read()
+
+    def test_log_reaches_a_live_share_server(self):
+        self.client(self.port)
+        rc, out = self.ferry("log", stdin="build failed at step 3\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Logged successfully at HQ!", out)
+        self.assertIn("build failed at step 3", self.logged())
+
+    def test_a_down_share_server_says_run_ferry_share(self):
+        dead = free_port()
+        self.client(dead)
+        for args, stdin in ((("log",), "lost line\n"), (("msg", "lost msg"), "")):
+            with self.subTest(cmd=args[0]):
+                rc, out = self.ferry(*args, stdin=stdin)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(f"http://127.0.0.1:{dead}/hq", out)
+                self.assertIn(f"nothing is listening on port {dead}", out)
+                self.assertIn("The message was NOT sent.", out)
+                self.assertIn("ferry share", out)
+                self.assertNotIn("Couldn't connect to server", out)
+
+    def test_a_500_is_a_failure_not_a_send(self):
+        # The handler's real 500 path: the telemetry file can't be opened.
+        self.client(self.port)
+        os.makedirs(self.log_path)
+        rc, out = self.ferry("log", stdin="will not land\n")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("answered HTTP 500", out)
+        self.assertIn("NOT saved", out)
+
+    def test_msg_sends_a_leading_at_sign_literally(self):
+        # `curl --data-binary "@x"` reads the file x; the text must go as typed.
+        secret = os.path.join(self.home, "not-for-hq.txt")
+        with open(secret, "w") as f:
+            f.write("FILE CONTENTS")
+        self.client(self.port)
+        rc, out = self.ferry("msg", "@" + secret, "please")
+        self.assertEqual(rc, 0, out)
+        body = self.logged()
+        self.assertIn("@" + secret + " please", body)
+        self.assertNotIn("FILE CONTENTS", body)
+
+    def test_a_profile_without_a_host_is_named(self):
+        self.client(self.port, host=None)
+        rc, out = self.ferry("log", stdin="x\n")
+        self.assertEqual(rc, 1, out)
+        self.assertIn('has no "host"', out)
+
+
 class TestOfferedPayloads(unittest.TestCase):
     """`ferry offer` naming and `/file/<name>` payload integrity.
 

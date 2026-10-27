@@ -158,7 +158,7 @@ ferry msg "note"                 # send a quick note to the host's log
 some-command 2>&1 | ferry log    # stream logs/errors back to the host
 ```
 
-That's it — every editor and CLI on the client now talks to one endpoint on the host. Narrower takeover scopes, catch-ups, and full removal (`client-reset.sh` / `client-cleanup.sh`): [Deep dives](docs/deep-dives.md#opencode-takeover-scopes); the host reads client telemetry back with `ferry inbox` ([attribution internals](docs/deep-dives.md#reading-what-the-clients-sent)).
+That's it — every editor and CLI on the client now talks to one endpoint on the host. Narrower takeover scopes, catch-ups, and full removal (`client-reset.sh` / `client-cleanup.sh`): [Deep dives](docs/deep-dives.md#opencode-takeover-scopes); the host reads client telemetry back with `ferry inbox` ([attribution internals](docs/deep-dives.md#reading-what-the-clients-sent)). If `ferry msg` or `ferry log` can't reach the host's share server, it says so and exits 1; run `ferry share` on the host.
 
 > If ferry replaced your key-sync ritual, [⭐ star the repo](https://github.com/sblattj/llm-ferry). It helps other people find it.
 

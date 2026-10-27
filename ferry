@@ -2452,7 +2452,9 @@ cmd_msg() {
   fi
   local text="$*"
   echo ">>> Streaming direct text telemetry to Host HQ..."
-  curl -sS -X POST --data-binary "$text" "http://$CLIENT_HOST:$CLIENT_SHARE_PORT/hq"
+  # Through stdin, not `--data-binary "$text"`: curl reads a body that starts
+  # with @ as a file name, so `ferry msg @notes.txt` sent the file's contents.
+  print -rn -- "$text" | _ferry_post_hq
 }
 
 cmd_log() {
@@ -2461,7 +2463,48 @@ cmd_log() {
     exit 1
   fi
   echo ">>> Streaming stdin log stream directly back to Host HQ..."
-  curl -sS -X POST --data-binary @- "http://$CLIENT_HOST:$CLIENT_SHARE_PORT/hq"
+  _ferry_post_hq
+}
+
+# POST stdin to the host's /hq and say plainly when it did not land. A bare
+# `curl -sS` printed "Failed to connect ... Couldn't connect to server" when the
+# host's share server was down (seen 2026-10-26: 8095 had been dead for two
+# weeks), and exited 0 on a 500, so a lost message looked like a sent one.
+_ferry_post_hq() {
+  local url="http://$CLIENT_HOST:$CLIENT_SHARE_PORT/hq"
+  if [[ -z "$CLIENT_HOST" ]]; then
+    echo "Error: ~/.config/ferry/client.json has no \"host\", so there is no Host HQ to send to."
+    exit 1
+  fi
+  local errf body rc=0 code
+  errf=$(mktemp "${TMPDIR:-/tmp}/ferry-hq.XXXXXX")
+  body=$(curl -sS --connect-timeout 10 -w '\n%{http_code}' -X POST --data-binary @- "$url" 2>"$errf") || rc=$?
+  local err; err=$(<"$errf"); rm -f "$errf"
+  code=${body##*$'\n'}; body=${body%$'\n'*}
+  if (( rc == 0 )) && [[ "$code" == 2* ]]; then
+    [[ -n "$body" ]] && print -r -- "$body"
+    return 0
+  fi
+  if (( rc == 0 )); then
+    echo "Error: the host's share server answered HTTP $code at $url; the message was NOT saved."
+    echo "    On the host, check the share log: \$TMPDIR/ferry-logs/share-$CLIENT_SHARE_PORT.log"
+    exit 1
+  fi
+  local why
+  case $rc in
+    7)  why="nothing is listening on port $CLIENT_SHARE_PORT" ;;
+    6)  why="can't resolve the host name '$CLIENT_HOST'" ;;
+    28) why="no answer within 10 s" ;;
+    *)  why="curl exit $rc: ${err#curl: }" ;;
+  esac
+  echo "Error: can't reach the host's share server at $url ($why). The message was NOT sent."
+  if (( rc == 7 )); then
+    echo "    The share server is probably down. On the host, run:  ferry share"
+    echo "    (\`ferry status\` on the host shows it as \"Port $CLIENT_SHARE_PORT (client share)\".)"
+  else
+    echo "    Check that this laptop can reach the host, and that the host is running:  ferry share"
+  fi
+  exit 1
 }
 
 

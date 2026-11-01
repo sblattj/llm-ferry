@@ -61,7 +61,7 @@ _ferry_install_opencode_guardrails() {
 # bootstrap's own report five lines later.
 #
 # Provenance: that file is a verbatim copy of skills/using-the-goal-plugin/SKILL.md
-# at tag v1.4.1 of sblattj/opencode-goal-pro-max-complete-plugin (the pinned
+# at tag v1.5.1 of sblattj/opencode-goal-pro-max-complete-plugin (the pinned
 # GOAL_PLUGIN_REF). Bumping the ref means re-copying it from the new tag, and
 # client-bootstrap.sh's GOALSKILL heredoc with it.
 #
@@ -788,11 +788,11 @@ OLD_GOAL_PLUGIN_PKG = "opencode-goal-plugin"
 # while the fork's HEAD was 0.9.1. The spec string IS the cache key, so a NEW
 # ref means a NEW directory and a guaranteed fresh install. That is why the ref
 # is pinned here and why cutting a plugin release means bumping GOAL_PLUGIN_REF.
-GOAL_PLUGIN_REF = "v1.4.1"
+GOAL_PLUGIN_REF = "v1.5.1"
 GOAL_PLUGIN_URL = (f"https://github.com/{GOAL_PLUGIN_REPO}"
                    f"/archive/refs/tags/{GOAL_PLUGIN_REF}.tar.gz")
 # Current spec, spelled out for grep:
-# opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.4.1.tar.gz
+# opencode-goal-pro-max-complete-plugin@https://github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.5.1.tar.gz
 GOAL_PLUGIN = f"{GOAL_PLUGIN_PKG}@{GOAL_PLUGIN_URL}"
 # Kept for MATCHING configs written by older ferries; never written any more.
 GOAL_PLUGIN_BASE = f"github:{GOAL_PLUGIN_REPO}"
@@ -1225,7 +1225,7 @@ def cache_dir_for(spec):
     NORMPATH IS LOAD-BEARING. opencode builds this with node's path.join, which
     COLLAPSES the `//` after `https:`; python's os.path.join does not. So the
     canonical spec lands at
-    `<packages>/opencode-goal-pro-max-complete-plugin@https:/github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.4.1.tar.gz`
+    `<packages>/opencode-goal-pro-max-complete-plugin@https:/github.com/sblattj/opencode-goal-pro-max-complete-plugin/archive/refs/tags/v1.5.1.tar.gz`
     with a SINGLE slash after `https:`, and a path built without normpath points
     at a directory that does not exist - which reads as "nothing to purge" and
     as "the plugin is not installed".
@@ -1243,7 +1243,7 @@ def purgeable(spec, path):
 
     (3) is deliberately not "the LEAF is the package name". A spec's slashes
     become directories, so the tarball form's leaf is a TAG
-    (`v1.4.1.tar.gz`) and its first component is `<pkg>@https:`,
+    (`v1.5.1.tar.gz`) and its first component is `<pkg>@https:`,
     while the pre-v1.30.1 `github:` form's leaf is `OpenCode-goal-plugin#v0.9.1`
     and its first component is `github:sblattj`. A rule anchored to either end
     alone refuses half the directories this exists to clean. `packages/foo`
@@ -1272,7 +1272,7 @@ def purge_cache(specs):
     NOT the whole `<pkg>@https:` subtree: every tarball spec of
     this package shares that first component, so wiping it while migrating a
     stale `...v1.0.0.tar.gz` entry would also delete an already-good
-    `...v1.4.1.tar.gz` install and leave an offline laptop with nothing. The
+    `...v1.5.1.tar.gz` install and leave an offline laptop with nothing. The
     exact per-spec directory is the minimal correct unit; empty scaffolding is
     pruned below.
     """
@@ -1383,6 +1383,16 @@ else:
     compaction = house
     limits = {"modalities": {"input": ["text", "image", "pdf"],
                              "output": ["text"]}}
+    # Cloud lanes carry a context limit so opencode's overflow check can fire:
+    # it never does when limit.context is 0, which is what a model with no
+    # limit resolves to (opencode session/overflow.ts:27). 208000 minus
+    # compaction.reserved 8000 gives a 200k compaction threshold. The ferry
+    # cloud lanes really have ~1M windows, so this is a policy number, not
+    # capacity. `output: 0` is required: opencode 1.19.0 rejects a limit
+    # without `output` as ConfigInvalidError, and 0 is what it already
+    # resolves to, so the output cap does not change.
+    cloud_limit = {"context": 208000, "input": 208000, "output": 0}
+    limits["limit"] = cloud_limit
 driver = force_model or driver
 # --small-model (and therefore --super) moves the whole fan-out together: the
 # band split is about which worker the driver PICKS, not about keeping two
@@ -1529,7 +1539,13 @@ declared_lanes = (driver, light, standard, explore, compaction, house)
 if not prefer_local and "medium" in served:
     declared_lanes += ("medium",)
 for lane in dict.fromkeys(declared_lanes):
-    spec = {} if lane == "medium" and not prefer_local else dict(limits)
+    if lane == "medium" and not prefer_local:
+        # No modalities (fleet variance, above), but it still gets the limit.
+        spec = {"limit": dict(cloud_limit)}
+    else:
+        spec = dict(limits)
+        if "limit" in spec:
+            spec["limit"] = dict(spec["limit"])
     prev_name = (prev_models.get(lane) or {}).get("name")
     if isinstance(prev_name, str) and prev_name:
         spec["name"] = prev_name

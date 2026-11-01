@@ -539,7 +539,7 @@ else
   # exactly what --profiles-only exists to leave alone.
   #
   # Keep this heredoc in sync with opencode/skills/using-the-goal-plugin/SKILL.md
-  # (itself a verbatim copy of skills/using-the-goal-plugin/SKILL.md at tag v1.4.1
+  # (itself a verbatim copy of skills/using-the-goal-plugin/SKILL.md at tag v1.5.1
   # of sblattj/opencode-goal-pro-max-complete-plugin, the pinned plugin release)
   # in the llm-ferry repo. lib/ferry-clientbootstrap.test.py asserts the file this
   # writes is byte-identical to that one.
@@ -602,7 +602,7 @@ be quoted. An unrecognized `--word` is not an error - it is swallowed into the o
 `--max-turn 20` silently does nothing. A KNOWN flag with a bad value is the opposite: it aborts the
 whole command and NO goal is created - a `--mode` that is not `normal`/`ordered`, a numeric flag that
 is not a strict positive integer, a `--max-turns` that is neither a positive integer nor an unlimited
-spelling, a flag whose value is missing, or an unparseable `--budget`/`--context-window`. The reply
+spelling, a flag whose value is missing, or an unparseable `--budget`/`--context-window`/`--compact-at`. The reply
 lists the offending flags instead of a goal; fix the line and re-send it.
 
 | Flag | Alias | Value | Effect |
@@ -613,6 +613,7 @@ lists the offending flags instead of a goal; fix the line and re-send it.
 | `--max-tokens` | | positive int | cumulative token SPEND cap |
 | `--budget` | | `<n>`, `<n>k`, `<n>m` | the same spend cap, friendlier units |
 | `--context-window` | | `<n>`, `<n>k`, `<n>m` | window size shown in the status (display only, never stops or nudges); overrides the model window the plugin reads from the host |
+| `--compact-at` | | `<n>`, `<n>k`, `<n>m`, or `0` | context size at which the plugin asks the host to compact (default 200k; `0` = off). Never pauses or stops the goal |
 | `--cooldown-ms` | | positive int | min delay between continuations |
 | `--no-progress-threshold` | | positive int | output tokens under which a turn looks stalled |
 | `--no-progress-turns` | | positive int | stalled turns before the stall is recorded (it does not pause the goal) |
@@ -765,6 +766,7 @@ keeps running, and it means your evidence was thin, not that you should re-asser
 | wall clock | 8 hours |
 | token spend budget | 100,000,000 cumulative |
 | context window (display only) | the running model's own window, read from the host; unknown when the host cannot name one. Never stops or nudges the goal |
+| forced compaction (`--compact-at`) | 200,000 tokens of context; `0` = off. Asks the host to compact, then the goal continues. Never stops the goal |
 | cooldown between continuations | 1500 ms |
 | stalled turns before a stall is recorded | 2 (whole turns under 50 output tokens, with no tool call, no thinking tokens, and no new text - a repeat or an empty turn); recorded, does not stop the goal |
 | tool-free turns before a stall is recorded | 10 (whole turns; `goal_*` calls do not count as tools); recorded, does not stop the goal |

@@ -1,4 +1,50 @@
 
+# _ferry_ensure_share_relay: bring the share server (:$SHARE_PORT) and the reverse
+# relay (:$RELAY_PORT) up if they are not, and leave them alone if they are. They
+# are plain background processes, so a host reboot drops both while `ferry up`
+# restores only the endpoint; clients then cannot `ferry update` or `ferry
+# expose-tmux`. Never restarts a listener that is already ferry's own (restarting
+# the relay drops every published client). Returns 0 iff both ferry listeners are
+# up on return, else 1. Never exits the shell. FERRY_SHARE_RELAY=0 skips it.
+_ferry_ensure_share_relay() {
+  if [[ "${FERRY_SHARE_RELAY:-1}" == "0" ]]; then
+    echo "    share server / relay ensure skipped (FERRY_SHARE_RELAY=0)"
+    return 0
+  fi
+  local overall=0 spec name port marker sub holder rc waited
+  for spec in "share server:${SHARE_PORT}:ferry-share-marker:share" "relay:${RELAY_PORT}:ferry-relay-marker:relay"; do
+    name="${spec%%:*}"; spec="${spec#*:}"
+    port="${spec%%:*}"; spec="${spec#*:}"
+    marker="${spec%%:*}"; sub="${spec#*:}"
+    rc=0; holder=$(_ferry_port_holder "$port" "$marker") || rc=$?
+    if (( rc == 0 )); then
+      echo "    $name already on :$port"
+      continue
+    elif (( rc == 2 )); then
+      echo "    WARNING: :$port is held by something that is not ferry's $name ($holder); not starting it."
+      overall=1
+      continue
+    fi
+    echo "    starting $name on :$port..."
+    # Output discarded on purpose: the relay banner prints its token.
+    "$FERRY_BIN_PATH" "$sub" >/dev/null 2>&1 || true
+    waited=0
+    while ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; do
+      (( waited >= 10 )) && break
+      sleep 1
+      waited=$(( waited + 1 ))
+    done
+    rc=0; holder=$(_ferry_port_holder "$port" "$marker") || rc=$?
+    if (( rc == 0 )); then
+      echo "    $name is on :$port"
+    else
+      echo "    WARNING: $name did not come up on :$port (see $LOG_DIR)"
+      overall=1
+    fi
+  done
+  return $overall
+}
+
 cmd_share() {
   if (( CLIENT_MODE )); then
     echo "Error: Command 'ferry share' is only available on the LLM-Ferry Host Mac."

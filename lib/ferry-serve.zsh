@@ -1034,6 +1034,16 @@ SCHEMFILTER_EOF
     echo "   Log: $schematron_log"
     echo "================================================================="
   fi
+
+  # The share server and the relay are separate background processes that a
+  # host reboot drops; restore them so a plain `ferry up` brings the whole host
+  # back. The schematron door is a companion that never touches :$PORT, so it
+  # skips this. A failure only warns: it must not change `ferry up`'s status.
+  if [[ "$LAUNCH_MODE" != "schematron" ]]; then
+    echo ">>> Ensuring the share server and relay are up..."
+    _ferry_ensure_share_relay || echo "    (share/relay not fully up; run 'ferry share' / 'ferry relay' by hand)"
+  fi
+  return 0
 }
 
 cmd_down() {

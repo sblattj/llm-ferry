@@ -95,5 +95,14 @@ cmd_update() {
   fi
 
   echo ">>> ferry update — $role mode"
-  eval "$cmd"
+  # pipe_fail: without it `curl ... | zsh` exits with zsh's status, and zsh
+  # happily runs the empty script curl produced when the host is unreachable,
+  # so a failed update reported success.
+  local rc=0
+  ( setopt pipe_fail; eval "$cmd" ) || rc=$?
+  if (( rc != 0 )) && [[ "$role" == "client" ]]; then
+    echo "Error: ferry update failed (rc=$rc): could not fetch client-reset.sh from $CLIENT_HOST:$CLIENT_SHARE_PORT." >&2
+    echo "       Host unreachable on $CLIENT_HOST:$CLIENT_SHARE_PORT; on the host check that \`ferry share\` is running (\`ferry status\`)." >&2
+  fi
+  return $rc
 }

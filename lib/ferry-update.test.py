@@ -21,8 +21,10 @@ a mocked test could get wrong while still passing.
 """
 import json
 import os
+import socket
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -127,6 +129,27 @@ class UpdateTest(unittest.TestCase):
             self.assertEqual(f.read(), "CANARY",
                              "--dry-run executed the real reset path")
 
+
+    def test_unreachable_host_fails_nonzero_and_names_port(self):
+        """A real (non-dry-run) client update against a closed port must fail.
+
+        Without pipe_fail, `curl ... | zsh` exits with zsh's status, and zsh runs
+        curl's empty output happily: exit 0 on an unreachable host.
+        """
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        self.make_client(host="127.0.0.1", share_port=port)
+        t0 = time.time()
+        p = subprocess.run([FERRY, "update", "--client"],
+                           env=dict(os.environ, HOME=self.home, TMPDIR=self.tmp),
+                           capture_output=True, text=True, timeout=60)
+        out = p.stdout + p.stderr
+        self.assertNotEqual(p.returncode, 0, out)
+        self.assertIn(str(port), out)
+        self.assertIn("ferry share", out)
+        self.assertLess(time.time() - t0, 30)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -304,8 +304,8 @@ uvx whosaid ...                              # uv/PyPI, huggingface_hub, git, cu
 
 The endpoint (`8090`), share server (`8095`) and relay (`8098`) are background processes, so a reboot drops them all. Three things bring them back:
 
-- `ferry up` (every mode except `--schematron`) also starts the share server and relay if they are down. It leaves running ones alone and warns if another process holds the port. `FERRY_SHARE_RELAY=0` skips this.
-- `ferry update --host` (`host-reset.sh`) starts the relay when its port is free (it never restarts a running relay, which would drop published clients), then installs the login autostart below. `FERRY_AUTOSTART=0` skips the install.
+- `ferry up` (every mode except `--schematron`) also starts the share server if it is down, and the relay too on hosts that have run `ferry relay` once (a host that never set one up gets no LAN listener on `8098`). It leaves running ones alone and warns if another process holds the port. `FERRY_SHARE_RELAY=0` skips this.
+- `ferry update --host` (`host-reset.sh`) starts the relay when its port is free and the host has run `ferry relay` once (it never restarts a running relay, which would drop published clients), then installs the login autostart below, even if its final verify step reported problems. `FERRY_AUTOSTART=0` skips the install.
 - The login autostart restores everything with no one at the keyboard. Install it once (or let `ferry update --host` do it):
 
 ```bash
@@ -314,7 +314,7 @@ ferry autostart status       # installed? loaded? plus the last lines of the boo
 ferry autostart uninstall    # unload and remove it
 ```
 
-At login the agent runs `ferry boot`, which waits (up to 60s) for the network, starts `ferry up` if nothing listens on `8090`, then makes sure the share server (`8095`) and relay (`8098`) are up. It only starts what is missing, so re-running it is harmless; `install` is idempotent too. Output goes to `~/.config/ferry/boot.log`. Host and macOS only; a client refuses to install it.
+At login the agent runs `ferry boot`, which waits (up to 60s) for the network, starts `ferry up` if nothing listens on `8090` (and checks `/health/liveliness` for up to 90s, so a boot that leaves the endpoint dead is reported as a failure; with no `~/.config/ferry/litellm.yaml` yet it asks you to run `ferry up` by hand once), then makes sure the share server (`8095`) is up, and the relay (`8098`) too if this host has run `ferry relay` once. It only starts what is missing, so re-running it is harmless; `install` is idempotent too. Output goes to `~/.config/ferry/boot.log`. Host and macOS only; a client refuses to install it, and `ferry boot` on a machine that has since become a client does nothing.
 
 ## Reverse expose: publish a client's port through the host
 

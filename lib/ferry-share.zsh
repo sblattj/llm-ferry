@@ -6,6 +6,8 @@
 # expose-tmux`. Never restarts a listener that is already ferry's own (restarting
 # the relay drops every published client). Returns 0 iff both ferry listeners are
 # up on return, else 1. Never exits the shell. FERRY_SHARE_RELAY=0 skips it.
+# The relay half runs only on hosts that chose a relay (RELAY_TOKEN_FILE exists,
+# created the first time `ferry relay` runs): starting it opens a LAN listener.
 _ferry_ensure_share_relay() {
   if [[ "${FERRY_SHARE_RELAY:-1}" == "0" ]]; then
     echo "    share server / relay ensure skipped (FERRY_SHARE_RELAY=0)"
@@ -16,6 +18,10 @@ _ferry_ensure_share_relay() {
     name="${spec%%:*}"; spec="${spec#*:}"
     port="${spec%%:*}"; spec="${spec#*:}"
     marker="${spec%%:*}"; sub="${spec#*:}"
+    if [[ "$sub" == "relay" && ! -f "$RELAY_TOKEN_FILE" ]]; then
+      echo "    relay not set up on this host (run 'ferry relay' once to enable it); skipping"
+      continue
+    fi
     rc=0; holder=$(_ferry_port_holder "$port" "$marker") || rc=$?
     if (( rc == 0 )); then
       echo "    $name already on :$port"

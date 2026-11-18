@@ -433,17 +433,23 @@ ok "share server is on :$SHARE_PORT"
 # Start it only when the port is free; leave ferry's own relay alone.
 echo ""
 relay_holder=$(lsof -t -nP -iTCP:"$RELAY_PORT" -sTCP:LISTEN 2>/dev/null | head -1) || true
-if [[ -z "$relay_holder" ]]; then
+if [[ ! -f "$HOME/.config/ferry/relay-token" ]]; then
+  say "    relay not set up on this host (run 'ferry relay' once to enable it); skipping"
+elif [[ -z "$relay_holder" ]]; then
   say ">>> Starting the reverse relay on :$RELAY_PORT..."
   # Output discarded: the relay banner prints its token.
   "$FERRY_BIN" relay >/dev/null 2>&1 || true
   waited=0
   while ! lsof -nP -iTCP:"$RELAY_PORT" -sTCP:LISTEN >/dev/null 2>&1; do
-    (( waited >= 10 )) && die "relay did not bind :$RELAY_PORT. Check ${TMPDIR:-/tmp}/ferry-logs/relay-$RELAY_PORT.log"
+    (( waited >= 10 )) && break
     sleep 1
     waited=$(( waited + 1 ))
   done
-  ok "relay is on :$RELAY_PORT"
+  if lsof -nP -iTCP:"$RELAY_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    ok "relay is on :$RELAY_PORT"
+  else
+    warn "relay did not bind :$RELAY_PORT (optional; continuing). Check ${TMPDIR:-/tmp}/ferry-logs/relay-$RELAY_PORT.log"
+  fi
 elif ps -p "$relay_holder" -o args= 2>/dev/null | grep -q "ferry-relay-marker"; then
   ok "relay already on :$RELAY_PORT (left running: restarting it would drop every published client)"
 else
@@ -750,6 +756,13 @@ for label, p in (("local-orch", orch_port), ("local-sub", sub_port)):
 sys.exit(1 if failed else 0)
 PYEOF
 
+# Once everything above is up (also after a soft verify failure): (re)install the login autostart, so the
+# RunAtLoad boot it fires finds the endpoint, share server and relay running.
+# Skip with FERRY_AUTOSTART=0; macOS only (launchd).
+if [[ "$(uname -s)" == "Darwin" && "${FERRY_AUTOSTART:-1}" != "0" ]]; then
+  "$FERRY_BIN" autostart install --quiet || say "warning: could not install the login autostart (ferry autostart install)"
+fi
+
 echo ""
 echo "================================================================="
 if [[ $RESET_FAILED -eq 1 ]]; then
@@ -765,10 +778,3 @@ if (( ! FULL )); then
 fi
 echo "Catch clients up:  curl -fsSL http://<host>:$SHARE_PORT/client-reset.sh | zsh"
 echo "================================================================="
-
-# Last, once everything above is up: (re)install the login autostart, so the
-# RunAtLoad boot it fires finds the endpoint, share server and relay running.
-# Skip with FERRY_AUTOSTART=0; macOS only (launchd).
-if [[ "$(uname -s)" == "Darwin" && "${FERRY_AUTOSTART:-1}" != "0" ]]; then
-  "$FERRY_BIN" autostart install --quiet || say "warning: could not install the login autostart (ferry autostart install)"
-fi

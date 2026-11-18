@@ -2253,6 +2253,8 @@ PYEOF
 # expose-tmux`. Never restarts a listener that is already ferry's own (restarting
 # the relay drops every published client). Returns 0 iff both ferry listeners are
 # up on return, else 1. Never exits the shell. FERRY_SHARE_RELAY=0 skips it.
+# The relay half runs only on hosts that chose a relay (RELAY_TOKEN_FILE exists,
+# created the first time `ferry relay` runs): starting it opens a LAN listener.
 _ferry_ensure_share_relay() {
   if [[ "${FERRY_SHARE_RELAY:-1}" == "0" ]]; then
     echo "    share server / relay ensure skipped (FERRY_SHARE_RELAY=0)"
@@ -2263,6 +2265,10 @@ _ferry_ensure_share_relay() {
     name="${spec%%:*}"; spec="${spec#*:}"
     port="${spec%%:*}"; spec="${spec#*:}"
     marker="${spec%%:*}"; sub="${spec#*:}"
+    if [[ "$sub" == "relay" && ! -f "$RELAY_TOKEN_FILE" ]]; then
+      echo "    relay not set up on this host (run 'ferry relay' once to enable it); skipping"
+      continue
+    fi
     rc=0; holder=$(_ferry_port_holder "$port" "$marker") || rc=$?
     if (( rc == 0 )); then
       echo "    $name already on :$port"
@@ -9581,10 +9587,15 @@ cmd_boot() {
 
   echo "=== ferry boot $(date '+%Y-%m-%d %H:%M:%S') ==="
 
+  if (( CLIENT_MODE )); then
+    echo "this machine is a client now; remove the agent with: ferry autostart uninstall"
+    return 0
+  fi
+
   if (( dry_run )); then
     echo "  [dry-run] 1. wait up to 60s for a non-loopback IPv4 address"
-    echo "  [dry-run] 2. if nothing listens on :$PORT, run: $FERRY_BIN_PATH up"
-    echo "  [dry-run] 3. ensure the share server (:$SHARE_PORT) and relay (:$RELAY_PORT) are up"
+    echo "  [dry-run] 2. if nothing listens on :$PORT, run: $FERRY_BIN_PATH up, then wait up to 90s for /health/liveliness"
+    echo "  [dry-run] 3. ensure the share server (:$SHARE_PORT) and, if set up, the relay (:$RELAY_PORT) are up"
     return 0
   fi
 
@@ -9603,9 +9614,25 @@ cmd_boot() {
 
   if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "    endpoint already up on :$PORT"
+  elif [[ ! -f "$DEFAULT_ROUTE_CONFIG" ]]; then
+    echo "    no route config yet; run ferry up by hand once"
+    rc=1
   else
     echo "    starting the endpoint (ferry up)"
     "$FERRY_BIN_PATH" up || { echo "    ferry up failed"; rc=1; }
+    if (( rc == 0 )); then
+      local waited=0
+      while ! curl -fsS -m 3 "http://127.0.0.1:$PORT/health/liveliness" >/dev/null 2>&1; do
+        if (( waited >= 90 )); then
+          echo "    endpoint did not come up; see $LOG_DIR/cloud-proxy-$PORT.log"
+          rc=1
+          break
+        fi
+        sleep 2
+        waited=$(( waited + 2 ))
+      done
+      (( rc == 0 )) && echo "    endpoint answering (${waited}s)"
+    fi
   fi
 
   if (( $+functions[_ferry_ensure_share_relay] )); then

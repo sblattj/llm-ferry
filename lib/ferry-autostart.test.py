@@ -11,8 +11,11 @@ temp dir (FERRY_LAUNCHAGENTS_DIR). Nothing here touches the real launchctl, and
 import os
 import plistlib
 import shutil
+import signal
+import socket
 import subprocess
 import tempfile
+import time
 import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -193,6 +196,73 @@ class AutostartTest(unittest.TestCase):
         self.assertIn("up", out)
         self.assertEqual(self.stub_calls(), [])
         self.assertFalse(os.path.exists(self.plist))
+
+class BootGuardsTest(unittest.TestCase):
+    """Real `ferry boot` (no --dry-run) in a sandbox HOME. Never reaches `ferry up`:
+    the client case returns first, the no-config case skips up. The live :8090 may
+    be listening here, so the second case accepts either branch."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(self.home, ".config", "ferry"))
+        self.ports = []
+
+    def boot(self, extra_env=None):
+        env = dict(os.environ, HOME=self.home, TMPDIR=self.tmp)
+        env.update(extra_env or {})
+        t0 = time.time()
+        p = subprocess.run([FERRY, "boot"], env=env, capture_output=True, text=True, timeout=120)
+        return p, time.time() - t0
+
+    def tearDown(self):
+        for port in self.ports:
+            r = subprocess.run(["lsof", "-t", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+                               capture_output=True, text=True)
+            for pid in [int(x) for x in r.stdout.split()]:
+                if pid != os.getpid():
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_client_mode_boot_is_a_fast_noop(self):
+        with open(os.path.join(self.home, ".config", "ferry", "client.json"), "w") as f:
+            f.write('{"host": "192.0.2.10", "port": 8090}')
+        p, dt = self.boot()
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("this machine is a client now; remove the agent with: ferry autostart uninstall", out)
+        self.assertNotIn("starting the endpoint", out)
+        self.assertNotIn("network up", out)
+        self.assertLess(dt, 5, f"client boot took {dt:.1f}s")
+
+    def test_no_route_config_does_not_run_up(self):
+        ports = []
+        for _ in range(2):
+            s = socket.socket()
+            s.bind(("127.0.0.1", 0))
+            ports.append(s.getsockname()[1])
+            s.close()
+        self.ports = ports
+        p, _ = self.boot({"FERRY_SHARE_PORT": str(ports[0]), "FERRY_RELAY_PORT": str(ports[1])})
+        out = p.stdout + p.stderr
+        self.assertNotIn("starting the endpoint (ferry up)", out, out)
+        self.assertNotIn("ferry up failed", out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "ferry", "litellm.yaml")))
+        self.assertIn("relay not set up on this host", out)
+        r = subprocess.run(["lsof", "-t", "-nP", f"-iTCP:{ports[1]}", "-sTCP:LISTEN"],
+                           capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "", "relay must stay down without a token")
+        if "endpoint already up" in out:
+            self.assertNotIn("no route config", out)
+            self.assertIn("boot ok", out, out)
+            self.assertEqual(p.returncode, 0, out)
+        else:
+            self.assertIn("no route config yet; run ferry up by hand once", out)
+            self.assertIn("boot finished with problems", out)
+            self.assertEqual(p.returncode, 1, out)
 
 
 if __name__ == "__main__":

@@ -114,6 +114,15 @@ class EnsureShareRelay(unittest.TestCase):
         self.assertTrue(listeners(self.share), "share server should still start")
         self.assertNotIn(TOKEN, out)
 
+    def test_no_token_file_skips_relay(self):
+        os.unlink(os.path.join(self.home, ".config", "ferry", "relay-token"))
+        rc, out = self.call()
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(listeners(self.share), "share half stays unconditional")
+        self.assertFalse(listeners(self.relay), "relay must stay down without a token file")
+        self.assertIn("relay not set up on this host (run 'ferry relay' once to enable it); skipping", out)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".config", "ferry", "relay-token")))
+
     def test_opt_out(self):
         rc, out = self.call({"FERRY_SHARE_RELAY": "0"})
         self.assertEqual(rc, 0, out)
@@ -141,10 +150,17 @@ class Callers(unittest.TestCase):
         self.assertIn('"$FERRY_BIN" relay >/dev/null 2>&1', blk)
         self.assertIn("ferry-relay-marker", blk)
         self.assertNotIn("pkill", blk, "relay must never be restarted by host-reset")
-        tail = s[s.index("HOST RESET COMPLETE"):]
-        self.assertIn('"${FERRY_AUTOSTART:-1}" != "0"', tail)
-        self.assertIn('"$FERRY_BIN" autostart install --quiet ||', tail)
-        self.assertIn("warning: could not install the login autostart", tail)
+        self.assertIn('"$HOME/.config/ferry/relay-token"', blk)
+        self.assertIn("relay not set up on this host", blk)
+        self.assertNotIn("die ", blk.split("relay_holder=")[1], "relay is optional: no die")
+        self.assertIn("warn \"relay did not bind", blk)
+        step7 = s.index("--- 7. Verify")
+        failed = s.index("if [[ $RESET_FAILED -eq 1 ]]")
+        inst = s.index('"$FERRY_BIN" autostart install --quiet ||')
+        self.assertTrue(step7 < inst < failed, "autostart install must sit between step 7 and the RESET_FAILED exit")
+        self.assertIn('"${FERRY_AUTOSTART:-1}" != "0"', s[step7:failed])
+        self.assertIn("warning: could not install the login autostart", s[step7:failed])
+        self.assertEqual(s.count("autostart install --quiet"), 1)
 
 
 if __name__ == "__main__":

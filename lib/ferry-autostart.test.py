@@ -91,6 +91,73 @@ class AutostartTest(unittest.TestCase):
         self.run_ferry("autostart", "install")  # print still rc 1 => not loaded
         self.assertTrue(any(c.startswith("bootstrap") for c in self.stub_calls()))
 
+    def run_ferry_env(self, extra, *args, expect_rc=0):
+        env = dict(os.environ, HOME=self.home, TMPDIR=self.tmp,
+                   FERRY_LAUNCHAGENTS_DIR=self.agents, FERRY_LAUNCHCTL=self.stub)
+        for k in ("FERRY_SHARE_PORT", "FERRY_RELAY_PORT", "FERRY_LOCAL", "FERRY_SHARE_RELAY"):
+            env.pop(k, None)
+        env.update(extra)
+        p = subprocess.run([FERRY, *args], env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, expect_rc,
+                         f"rc={p.returncode}\nstdout={p.stdout}\nstderr={p.stderr}")
+        return p.stdout + p.stderr
+
+    def load_plist(self):
+        with open(self.plist, "rb") as f:
+            return plistlib.load(f)
+
+    def test_plist_carries_ferry_env_only_when_set(self):
+        self.run_ferry_env({"FERRY_RELAY_PORT": "18098", "FERRY_LOCAL": ""}, "autostart", "install")
+        e = self.load_plist()["EnvironmentVariables"]
+        self.assertEqual(e.get("FERRY_RELAY_PORT"), "18098")
+        self.assertNotIn("FERRY_SHARE_PORT", e)
+        self.assertNotIn("FERRY_LOCAL", e)  # empty is skipped
+        self.assertEqual(e.get("TMPDIR"), self.tmp)
+        os.remove(self.plist)
+        self.run_ferry_env({}, "autostart", "install")
+        self.assertNotIn("FERRY_RELAY_PORT", self.load_plist()["EnvironmentVariables"])
+
+    def test_plist_path_is_canonical_not_the_shell_path(self):
+        canon = ":".join([os.path.join(self.home, ".local/bin"), "/opt/homebrew/bin", "/opt/homebrew/sbin",
+                          "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+        self.run_ferry_env({"PATH": "/tmp/venv-xyz/bin:" + os.environ["PATH"]}, "autostart", "install")
+        p = self.load_plist()["EnvironmentVariables"]["PATH"]
+        self.assertTrue(p.startswith(canon), p)
+        self.assertNotIn("/tmp/venv-xyz", p)
+        with open(self.plist, "rb") as fh:
+            first = fh.read()
+        os.remove(self.plist)
+        self.run_ferry_env({"PATH": "/tmp/venv-abc/bin:" + os.environ["PATH"]}, "autostart", "install")
+        with open(self.plist, "rb") as fh:
+            self.assertEqual(first, fh.read())
+
+    def test_install_refuses_stable_link_without_cmd_boot(self):
+        bindir = os.path.join(self.home, ".local", "bin")
+        os.makedirs(bindir)
+        old = os.path.join(self.tmp, "old-ferry")
+        with open(old, "w") as f:
+            f.write("#!/bin/sh\necho old\n")
+        os.chmod(old, 0o755)
+        os.symlink(old, os.path.join(bindir, "ferry"))
+        out = self.run_ferry("autostart", "install", expect_rc=1)
+        self.assertIn("ferry update --host", out)
+        self.assertFalse(os.path.exists(self.plist))
+        self.assertEqual(self.stub_calls(), [])
+
+    def test_bootstrap_retries_transient_failure(self):
+        cnt = os.path.join(self.tmp, "bootstrap-count")
+        with open(self.stub, "w") as f:
+            f.write('#!/bin/sh\n'
+                    'echo "$@" >> "%s"\n'
+                    'if [ "$1" = print ]; then exit 1; fi\n'
+                    'if [ "$1" = bootstrap ]; then\n'
+                    '  n=$(cat "%s" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "%s"\n'
+                    '  if [ $n -le 2 ]; then exit 5; fi\n'
+                    'fi\n'
+                    'exit 0\n' % (self.log, cnt, cnt))
+        self.run_ferry("autostart", "install")
+        self.assertEqual(len([c for c in self.stub_calls() if c.startswith("bootstrap")]), 3)
+
     def test_uninstall_removes_plist(self):
         self.run_ferry("autostart", "install")
         self.assertTrue(os.path.exists(self.plist))

@@ -39,11 +39,49 @@ _ferry_autostart_ferry_path() {
   fi
 }
 
+# Stable PATH for the job: canonical dirs first (deterministic bytes, never a
+# temporary venv from the installing shell), then the dirs of python3, litellm
+# and uv when they resolve elsewhere. Deduped, order kept.
+_ferry_autostart_job_path() {
+  local -a dirs=("$HOME/.local/bin" /opt/homebrew/bin /opt/homebrew/sbin /usr/local/bin /usr/bin /bin /usr/sbin /sbin)
+  local tool bin d
+  for tool in python3 litellm uv; do
+    bin="$(command -v "$tool" 2>/dev/null)" || bin=""
+    [[ -n "$bin" && "$bin" == /* ]] || continue
+    d="${bin:h}"
+    (( ${dirs[(Ie)$d]} )) || dirs+=("$d")
+  done
+  print -r -- "${(j.:.)dirs}"
+}
+
+# Refuse a ferry without cmd_boot (stale stable link); warn on a linked worktree.
+_ferry_autostart_check_ferry() {
+  local f real dir gd gc
+  f="$(_ferry_autostart_ferry_path)"
+  real="${f:A}"
+  if [[ ! -f "$real" ]] || ! grep -q 'cmd_boot()' "$real" 2>/dev/null; then
+    echo "ferry autostart: $f ($real) has no 'boot' command; the stable link points at an older ferry. Run 'ferry update --host' first." >&2
+    return 1
+  fi
+  dir="${real:h}"
+  gd="$(git -C "$dir" rev-parse --git-dir 2>/dev/null)" || gd=""
+  gc="$(git -C "$dir" rev-parse --git-common-dir 2>/dev/null)" || gc=""
+  if [[ -n "$gd" && -n "$gc" && "${gd:A}" != "${gc:A}" ]]; then
+    echo "warning: autostart points at a git worktree ($real); it breaks if that worktree is removed" >&2
+  fi
+  return 0
+}
+
 # Print the plist XML for this machine to stdout.
 _ferry_autostart_render_plist() {
-  python3 - "$FERRY_AUTOSTART_LABEL" "$(_ferry_autostart_ferry_path)" "$PATH" "$HOME" "$(_ferry_autostart_log_path)" <<'PY'
-import plistlib, sys
+  python3 - "$FERRY_AUTOSTART_LABEL" "$(_ferry_autostart_ferry_path)" "$(_ferry_autostart_job_path)" "$HOME" "$(_ferry_autostart_log_path)" <<'PY'
+import os, plistlib, sys
 label, ferry, path, home, log = sys.argv[1:6]
+env = {"PATH": path, "HOME": home}
+# launchd does not see the installing shell's env: carry the host's settings.
+for k in ("FERRY_SHARE_PORT", "FERRY_RELAY_PORT", "FERRY_LOCAL", "FERRY_SHARE_RELAY", "TMPDIR"):
+    if os.environ.get(k):
+        env[k] = os.environ[k]
 d = {
     "Label": label,
     "ProgramArguments": [ferry, "boot"],
@@ -51,7 +89,7 @@ d = {
     "KeepAlive": False,
     "AbandonProcessGroup": True,
     "ProcessType": "Interactive",
-    "EnvironmentVariables": {"PATH": path, "HOME": home},
+    "EnvironmentVariables": env,
     "StandardOutPath": log,
     "StandardErrorPath": log,
 }
@@ -93,6 +131,7 @@ _ferry_autostart_install() {
   plist="$(_ferry_autostart_plist_path)"
   uid="$(id -u)"
   dom="gui/$uid"
+  _ferry_autostart_check_ferry || return 1
   xml="$(_ferry_autostart_render_plist)" || rc=$?
   if (( rc != 0 )) || [[ -z "$xml" ]]; then
     echo "ferry autostart: could not generate the plist (python3 missing?)" >&2
@@ -118,8 +157,15 @@ _ferry_autostart_install() {
   fi
   mv -f "$tmp" "$plist" || { rm -f "$tmp"; return 1; }
   "$lc" bootout "$dom/$FERRY_AUTOSTART_LABEL" >/dev/null 2>&1 || true
-  rc=0
-  "$lc" bootstrap "$dom" "$plist" >/dev/null 2>&1 || rc=$?
+  # bootout is async: a bootstrap right after it can fail transiently (rc 5).
+  local attempt=1
+  while (( attempt <= 3 )); do
+    rc=0
+    "$lc" bootstrap "$dom" "$plist" >/dev/null 2>&1 || rc=$?
+    (( rc == 0 )) && break
+    (( attempt < 3 )) && sleep 1
+    attempt=$(( attempt + 1 ))
+  done
   if (( rc != 0 )); then
     echo "ferry autostart: plist written to $plist but 'launchctl bootstrap' failed (rc=$rc); it will load at next login." >&2
     return 1

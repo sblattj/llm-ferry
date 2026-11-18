@@ -1359,7 +1359,10 @@ cmd_status() {
   # published through it. A port opened on this machine on someone else's behalf
   # must be visible here, or nobody can answer "what is this host serving?".
   _rc=0; _holder=$(_ferry_port_holder "$RELAY_PORT" ferry-relay-marker) || _rc=$?
-  if (( _rc == 2 )); then
+  local _relay_rc=$_rc
+  if (( _rc == 1 )); then
+    echo ">>> Port $RELAY_PORT (reverse relay) is ${C_RED}OFFLINE${C_RESET}"
+  elif (( _rc == 2 )); then
     echo ">>> Port $RELAY_PORT (reverse relay) is ${C_YELLOW}held by another process, not ferry's${C_RESET}: $_holder"
     echo "    'ferry relay' cannot start until it is freed."
   elif (( _rc == 0 )); then
@@ -1412,8 +1415,13 @@ PYEOF
   fi
 
   # tmux-over-ssh: one hint per client that published its sshd with expose-tmux.
-  # Reads the state file alone (a stale file is the relay's to clean up).
-  if [[ -f "$RELAY_STATE_FILE" ]]; then
+  # Listed only while the relay is up: after a reboot the state file outlives
+  # the relay, and its entries would read as live clients.
+  if (( _relay_rc != 0 )) && [[ -f "$RELAY_STATE_FILE" ]]; then
+    if grep -q '"tmux"' "$RELAY_STATE_FILE" 2>/dev/null; then
+      echo "    tmux client list skipped: $RELAY_STATE_FILE is stale (relay is down, start it with: ferry relay)"
+    fi
+  elif [[ -f "$RELAY_STATE_FILE" ]]; then
     python3 - "$RELAY_STATE_FILE" <<'PYEOF' || true
 import json, sys
 try:

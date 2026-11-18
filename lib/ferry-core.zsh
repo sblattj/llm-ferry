@@ -118,10 +118,10 @@ detect_mdns_name() {
 # there and fans out to the cloud lanes plus the two MLX backends below, which
 # listen on their own ports and are NOT meant to be addressed directly by clients.
 PORT="8090"               # litellm front door — the single LAN endpoint
-SHARE_PORT="8095"
+SHARE_PORT="${FERRY_SHARE_PORT:-8095}"
 HF_PORT="8096"
 PROXY_PORT="8097"
-RELAY_PORT="8098"         # reverse-expose control port — clients dial IN to publish OUT
+RELAY_PORT="${FERRY_RELAY_PORT:-8098}"         # reverse-expose control port — clients dial IN to publish OUT
 LOCAL_ORCH_PORT="8092"    # MLX backend for the `local-orch` lane
 LOCAL_SUB_PORT="8093"     # MLX backend for the `local-sub` lane
 # Dedicated door for the schematron extraction lane (`ferry up --schematron`):

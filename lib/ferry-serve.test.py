@@ -654,7 +654,7 @@ class TestLocalSchematronLane(unittest.TestCase):
     # ---- the --schematron door ------------------------------------------
     def _door_block(self):
         m = re.search(r'elif \[\[ "\$LAUNCH_MODE" == "schematron" \]\]; then(.*?)'
-                      r'\n  fi\n\}', self.src, re.S)
+                      r'\n  fi\n(?:\}|\n  # The share server and the relay)', self.src, re.S)
         self.assertIsNotNone(m, "the schematron door branch is missing")
         return m.group(1)
 

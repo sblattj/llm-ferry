@@ -89,6 +89,11 @@ Commands:
   relay              [Host] Accept reverse-expose registrations so a client can
                        publish one of ITS local ports through this host
                        ferry relay [--port P] [--bind ADDR] [--token] [--foreground]
+  autostart          [Host] Survive a reboot: install a launchd LaunchAgent that runs
+                       'ferry boot' at login (endpoint, share server, relay)
+                       ferry autostart install [--quiet] [--dry-run] | uninstall | status
+  boot               [Host] What the LaunchAgent runs: start whatever is not listening
+                       ferry boot [--dry-run]
   expose <port>      [Client] Publish 127.0.0.1:<port> from the host, dialling only
                        outbound — for a laptop that cannot accept inbound at all
                        ferry expose <port> [--as PUBLIC] [--host H] [--token T]

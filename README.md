@@ -66,6 +66,7 @@ It goes further than serving inference: it can **ferry whole models and files** 
 - [Ports](#ports)
 - [Ferrying models & files across the LAN](#ferrying-models--files-across-the-lan)
 - [Route a client's downloads through the host](#route-a-clients-downloads-through-the-host)
+- [Survive a reboot (host autostart)](#survive-a-reboot-host-autostart)
 - [Reverse expose: publish a client's port through the host](#reverse-expose-publish-a-clients-port-through-the-host)
 - [Remote access (Tailscale)](#remote-access-tailscale)
 - [Local models — operating notes](#local-models--operating-notes)
@@ -299,6 +300,18 @@ uvx whosaid ...                              # uv/PyPI, huggingface_hub, git, cu
 
 `ferry env` stays `eval`-able (`--write` persists into `~/.zshrc`); HTTPS goes via `CONNECT` tunneling with backpressure, so a CDN pushing a multi-GB model cannot outrun a slower LAN client.
 
+## Survive a reboot (host autostart)
+
+Nothing restarts a host's endpoint, share server or relay after a reboot on its own. Install the LaunchAgent once:
+
+```bash
+ferry autostart install      # writes ~/Library/LaunchAgents/com.llm-ferry.host.plist and loads it
+ferry autostart status       # installed? loaded? plus the last lines of the boot log
+ferry autostart uninstall    # unload and remove it
+```
+
+At login the agent runs `ferry boot`, which waits (up to 60s) for the network, starts `ferry up` if nothing listens on `8090`, then makes sure the share server (`8095`) and relay (`8098`) are up. It only starts what is missing, so re-running it is harmless; `install` is idempotent too. Output goes to `~/.config/ferry/boot.log`. Host and macOS only; a client refuses to install it.
+
 ## Reverse expose: publish a client's port through the host
 
 Every other feature pushes **host → client**. This is the missing direction: a locked-down laptop that can only make **outbound** connections dials the host, and the host does the listening.
@@ -383,6 +396,7 @@ Everything runs on your own hardware and network. The front door answers only re
 | `status` | both | Host: per-lane listeners, memory, and served lane names. Client: connection health + the host's lanes |
 | `update [--full] [--host\|--client] [--dry-run]` | both | Catch this machine up (host rebuilds and re-links, client re-pulls). `--full` also reloads the GPU lanes |
 | `dash [--open] [--port P] [--ferry URL]` | host | Live route-proxy dashboard on `8091` (`--grafana` → full Grafana/VictoriaMetrics stack; also standalone `ferry-dash`) |
+| `autostart install\|uninstall\|status` / `boot` | host | Survive a reboot: a launchd LaunchAgent runs `ferry boot` at login to bring the endpoint, share server and relay back (macOS) |
 | `share` | host | Serve the client bootstrap + ferry transfer routes over the LAN (`8095`) |
 | `auth-claude login\|status\|refresh\|logout` | host | Manage the Claude Pro/Max subscription OAuth credential |
 | `msg <text>` / `log` / `inbox` | client / host | Send a note or pipe stdin to the host's log; read it back dated and attributed |

@@ -94,6 +94,8 @@ case "$COMMAND" in
   fleet)         cmd_fleet "$@" ;;
   keys)          cmd_keys "$@" ;;
   update)        cmd_update "$@" ;;
+  autostart)     cmd_autostart "$@" ;;
+  boot)          cmd_boot "$@" ;;
   migrate)       cmd_migrate "$@" ;;
   dash)          cmd_dash "$@" ;;
   --help|-h)     usage ;;

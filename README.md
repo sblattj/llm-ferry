@@ -302,7 +302,11 @@ uvx whosaid ...                              # uv/PyPI, huggingface_hub, git, cu
 
 ## Survive a reboot (host autostart)
 
-Nothing restarts a host's endpoint, share server or relay after a reboot on its own. Install the LaunchAgent once:
+The endpoint (`8090`), share server (`8095`) and relay (`8098`) are background processes, so a reboot drops them all. Three things bring them back:
+
+- `ferry up` (every mode except `--schematron`) also starts the share server and relay if they are down. It leaves running ones alone and warns if another process holds the port. `FERRY_SHARE_RELAY=0` skips this.
+- `ferry update --host` (`host-reset.sh`) starts the relay when its port is free (it never restarts a running relay, which would drop published clients), then installs the login autostart below. `FERRY_AUTOSTART=0` skips the install.
+- The login autostart restores everything with no one at the keyboard. Install it once (or let `ferry update --host` do it):
 
 ```bash
 ferry autostart install      # writes ~/Library/LaunchAgents/com.llm-ferry.host.plist and loads it

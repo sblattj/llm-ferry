@@ -632,6 +632,8 @@ class TestDevicePathAllowlist(KeyFrontCase):
                              ("/v1/models", "GET"), ("/models", "GET"),
                              ("/v1/models/flash", "GET"),
                              ("/v1/responses/compact", "POST"),
+                             ("/v1beta/models/flash:generateContent", "POST"),
+                             ("/v1beta/models/flash:streamGenerateContent", "POST"),
                              ("/health/liveliness", "GET"), ("/health/liveness", "GET")):
             with self.subTest(path=path):
                 scope, sent, _ = drive(self.mw(), path, bearer(token), method=method)
@@ -748,21 +750,31 @@ class TestDevicePathAllowlist(KeyFrontCase):
                 self.assert_route_refused(token, path, "GET", scope_type="websocket")
 
     def test_unmetered_routes_refuse_device_keys(self):
-        # Round 6: Gemini-native generate and every websocket skip _key_admit
+        # Round 6: Gemini countTokens and every websocket skip _key_admit
         # (no lane check, RPM, budget or metering), so a device key there
-        # would bypass its limits. Refused until metering exists.
+        # would bypass its limits. Refused until metering exists. Gemini
+        # generate and streamGenerateContent ARE metered (TestGeminiNative).
         token = self.mint()
-        for action in ("generateContent", "streamGenerateContent", "countTokens"):
-            with self.subTest(action=action):
-                self.assert_route_refused(token, "/v1beta/models/flash:" + action, "POST")
-        for path in ("/v1/realtime", "/realtime", "/v1/responses", "/responses"):
+        for path in ("/v1beta/models/flash:countTokens", "/models/flash:countTokens",
+                     "/v1beta/models/flash:embedContent",
+                     "/v1beta/models/flash:batchGenerateContent",
+                     "/v1beta/models/flash", "/v1beta/models",
+                     "/v1beta/models/flash:generateContent/x",
+                     "/v1beta/models/a:b:generateContent",
+                     "/v1/models/flash:generateContent",
+                     "/v1beta/interactions"):
+            with self.subTest(path=path):
+                self.assert_route_refused(token, path, "POST")
+        for path in ("/v1/realtime", "/realtime", "/v1/responses", "/responses",
+                     "/v1beta/models/flash:streamGenerateContent"):
             with self.subTest(websocket=path):
                 self.assert_route_refused(token, path, "GET", scope_type="websocket")
         self.assertEqual(self.app.calls, 0)
 
     def test_limited_key_cannot_bypass_limits_on_gemini_native(self):
         # The Task 10 probe: lanes=[heavy], rpm=1, model flash. Chat was
-        # 403/403/403 and generateContent was 200/200/200.
+        # 403/403/403 and generateContent was 200/200/200. Now the lane check
+        # reads the lane from the PATH, so this is a lane refusal.
         _, token = K.add("probe", lanes=["heavy"], rpm=1)
         body = json.dumps({"model": "flash", "messages": []}).encode()
         statuses = [reply(drive(self.mw(), "/v1beta/models/flash:generateContent",
@@ -780,14 +792,23 @@ class TestDevicePathAllowlist(KeyFrontCase):
                 self.assertIs(self.app.send, send)
                 self.assertEqual(scope["ferry.key"], "master")
 
-    def test_gemini_query_key_is_refused_and_stripped(self):
-        # The ?key= stripping stays: a refused key is never logged.
+    def test_gemini_query_key_is_admitted_and_stripped(self):
+        # Gemini SDKs may send the key as ?key=. It is stripped from the
+        # logged query string either way; admitted, the master rides in
+        # x-litellm-api-key. A refused ?key= (countTokens) is stripped too.
         token = self.mint()
-        scope, sent, _ = drive(self.mw(), "/v1beta/models/flash:generateContent", (),
+        scope, sent, _ = drive(self.mw(), "/v1beta/models/flash:streamGenerateContent", (),
+                               query=("alt=sse&key=" + token).encode())
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(scope["query_string"], b"alt=sse")
+        self.assertEqual(self.app.scope["query_string"], b"alt=sse")
+        self.assertEqual(self.app.headers()[b"x-litellm-api-key"], MASTER.encode())
+        self.assertEqual(self.app.calls, 1)
+        scope, sent, _ = drive(self.mw(), "/v1beta/models/flash:countTokens", (),
                                query=("alt=sse&key=" + token).encode())
         self.assertEqual(reply(sent)[0], 403)
         self.assertEqual(scope["query_string"], b"alt=sse")
-        self.assertEqual(self.app.calls, 0)
+        self.assertEqual(self.app.calls, 1)
 
     def test_fleet_route_is_admitted(self):
         token = self.mint()
@@ -1295,6 +1316,367 @@ class TestAnthropicLaneRefusal(KeyFrontCase):
         self.assertEqual(doc["error"]["type"], "permission_error")
         self.assertIn("heavy", doc["error"]["message"])
         self.assertEqual(self.app.calls, 0)
+
+
+GEMINI_GEN = "/v1beta/models/%s:generateContent"
+GEMINI_STREAM = "/v1beta/models/%s:streamGenerateContent"
+GEMINI_BODY = json.dumps({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}).encode()
+
+
+def gemini_json(prompt=7, candidates=5, **extra):
+    usage = dict({"promptTokenCount": prompt, "candidatesTokenCount": candidates,
+                  "totalTokenCount": prompt + candidates}, **extra)
+    return json.dumps({"candidates": [{"content": {"role": "model",
+                                                   "parts": [{"text": "ok"}]}}],
+                       "usageMetadata": usage}).encode()
+
+
+class SseUpstream(Upstream):
+    """litellm's raw Gemini SSE (`_litellm_raw_sse_stream`): data frames, no [DONE]."""
+
+    def __init__(self, frames, headers=()):
+        super().__init__()
+        self.frames = frames
+        self.extra_headers = list(headers)
+
+    async def __call__(self, scope, receive, send):
+        self.calls += 1
+        self.scope = scope
+        buf = b""
+        while True:
+            msg = await receive()
+            buf += msg.get("body", b"")
+            if not msg.get("more_body"):
+                break
+        self.body = buf
+        await send({"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"text/event-stream")] + self.extra_headers})
+        for frame in self.frames:
+            await send({"type": "http.response.body",
+                        "body": b"data: " + json.dumps(frame).encode() + b"\n\n",
+                        "more_body": True})
+        await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+
+class TestGeminiNative(KeyFrontCase):
+    """Issue #3: device keys on POST /v1beta/models/<lane>:(stream)generateContent
+    get chat's enforcement: path lane check (fleet-resolved), RPM and budget
+    before upstream, usageMetadata charged, events and header stripping."""
+
+    def usage(self):
+        return U.Usage(self.db)
+
+    def gen(self, token, lane="flash", path=GEMINI_GEN, body=GEMINI_BODY, mw=None, **kw):
+        return drive(mw or self.mw(), path % lane, [("x-goog-api-key", token)],
+                     body=body, **kw)
+
+    def fleet_mw(self):
+        state_path = os.path.join(self.dir, "fleets.json")
+        with open(state_path, "w") as fh:
+            json.dump({"default": "domestic", "clients": {}}, fh)
+        return self.mw(FF.FleetState(state_path, FLEETS), FLEETS)
+
+    def test_both_routes_admit_a_device_key(self):
+        token = self.mint()
+        for path in (GEMINI_GEN, GEMINI_STREAM):
+            with self.subTest(path=path):
+                self.app.payload = gemini_json()
+                scope, sent, _ = self.gen(token, path=path, query=b"alt=sse")
+                self.assertEqual(reply(sent)[0], 200)
+                self.assertEqual(scope["ferry.key"], "laptop")
+                self.assertEqual(self.app.headers()[b"x-goog-api-key"], MASTER.encode())
+                self.assertEqual(self.app.scope["query_string"], b"alt=sse")
+        self.assertEqual(self.app.calls, 2)
+
+    def test_a_lane_outside_the_key_is_403_from_the_path(self):
+        token = self.mint(lanes=["heavy"])
+        status, _, doc = reply(self.gen(token, "flash")[1])
+        self.assertEqual(status, 403)
+        self.assertEqual(doc["error"]["code"], "model_not_allowed")
+        self.assertIn("flash", doc["error"]["message"])
+        self.assertEqual(self.app.calls, 0)
+        self.assertEqual(reply(self.gen(token, "heavy")[1])[0], 200)
+        # An alias in the path counts like it does in a body.
+        self.assertEqual(reply(self.gen(token, "orch")[1])[0], 200)
+
+    def test_a_body_model_cannot_smuggle_another_lane(self):
+        # litellm serves the PATH model (common_request_processing: the
+        # endpoint's `model` beats data["model"]), so the check must too: a
+        # body naming an allowed lane does not admit a refused path lane.
+        token = self.mint(lanes=["heavy"])
+        body = json.dumps({"model": "heavy", "contents": []}).encode()
+        self.assertEqual(reply(self.gen(token, "flash", body=body)[1])[0], 403)
+        self.assertEqual(self.app.calls, 0)
+        # The other way round: an allowed path lane with a body naming another
+        # lane is admitted, and the body model is pinned to the path lane.
+        body = json.dumps({"model": "flash", "contents": []}).encode()
+        self.assertEqual(reply(self.gen(token, "heavy", body=body)[1])[0], 200)
+        self.assertEqual(json.loads(self.app.body)["model"], "heavy")
+        self.assertEqual(self.app.scope["path"], GEMINI_GEN % "heavy")
+
+    def test_unparseable_body_still_checks_the_path_lane(self):
+        token = self.mint(lanes=["flash"])
+        self.assertEqual(reply(self.gen(token, "heavy", body=b"{not json")[1])[0], 403)
+        self.assertEqual(self.app.calls, 0)
+
+    def test_fleet_resolution_rewrites_the_path_and_the_check_sees_it(self):
+        mw = self.fleet_mw()
+        token = self.mint("dom", lanes=["domestic.flash"])
+        scope, sent, _ = self.gen(token, "flash", path=GEMINI_STREAM, mw=mw, query=b"alt=sse")
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.scope["path"], GEMINI_STREAM % "domestic.flash")
+        self.assertEqual(self.app.scope["query_string"], b"alt=sse")
+        self.assertTrue(json.loads(self.app.body)["metadata"]["ferry_domestic_only"])
+        # A key limited to the international lane is refused: bare flash
+        # resolves to domestic.flash, and the qualified name is host-only.
+        token = self.mint("intl", lanes=["international.flash"])
+        calls = self.app.calls
+        self.assertEqual(reply(self.gen(token, "flash", mw=mw)[1])[0], 403)
+        self.assertEqual(reply(self.gen(token, "international.flash", mw=mw)[1])[0], 403)
+        self.assertEqual(self.app.calls, calls)
+
+    def test_raw_path_follows_the_rewrite(self):
+        mw = self.fleet_mw()
+        token = self.mint()
+        scope = {"type": "http", "path": GEMINI_GEN % "flash",
+                 "raw_path": (GEMINI_GEN % "flash").encode(), "method": "POST",
+                 "client": ("100.64.0.9", 1), "query_string": b"",
+                 "headers": [(b"x-goog-api-key", token.encode())]}
+
+        async def receive():
+            return {"type": "http.request", "body": GEMINI_BODY, "more_body": False}
+
+        async def send(message):
+            pass
+
+        asyncio.run(mw(scope, receive, send))
+        self.assertEqual(self.app.scope["raw_path"], (GEMINI_GEN % "domestic.flash").encode())
+
+    def test_master_on_gemini_is_fleet_resolved_too(self):
+        mw = self.fleet_mw()
+        _, sent, _ = drive(mw, GEMINI_GEN % "heavy", [("x-goog-api-key", MASTER)],
+                           body=GEMINI_BODY, client=HOST_PEER)
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.app.scope["path"], GEMINI_GEN % "domestic.heavy")
+        self.assertEqual(self.app.body, GEMINI_BODY)
+
+    def test_rpm_exhaustion_is_429_before_upstream(self):
+        token = self.mint(rpm=1)
+        self.app.payload = gemini_json()
+        self.assertEqual(reply(self.gen(token)[1])[0], 200)
+        status, headers, doc = reply(self.gen(token, path=GEMINI_STREAM)[1])
+        self.assertEqual(status, 429)
+        self.assertIn(b"retry-after", headers)
+        self.assertEqual(doc["error"]["code"], "rate_limit_exceeded")
+        self.assertEqual(self.app.calls, 1)
+
+    def test_budget_exhaustion_is_429_before_upstream(self):
+        token = self.mint(budget_tokens=10)
+        self.app.payload = gemini_json()            # charges 12
+        self.assertEqual(reply(self.gen(token)[1])[0], 200)
+        status, _, doc = reply(self.gen(token)[1])
+        self.assertEqual(status, 429)
+        self.assertEqual(doc["error"]["code"], "insufficient_quota")
+        self.assertEqual(self.app.calls, 1)
+
+    def test_json_usage_metadata_is_charged(self):
+        self.app.payload = gemini_json(7, 5)
+        self.gen(self.mint())
+        self.assertEqual(self.usage().month_tokens("laptop"), 12)
+        self.assertEqual(self.usage().minute_requests("laptop"), 1)
+
+    def test_thoughts_are_output_beside_candidates(self):
+        # Gemini API: totalTokenCount = prompt + tool-use prompt + thoughts +
+        # candidates, so thoughts are NOT inside candidatesTokenCount.
+        self.app.payload = json.dumps({"usageMetadata": {
+            "promptTokenCount": 7, "candidatesTokenCount": 5, "thoughtsTokenCount": 3,
+            "toolUsePromptTokenCount": 2, "totalTokenCount": 17}}).encode()
+        self.gen(self.mint())
+        self.assertEqual(self.usage().month_tokens("laptop"), 17)
+
+    def test_thoughts_already_inside_candidates_are_not_double_counted(self):
+        # A total that already balances without thoughts means candidates
+        # included them: charge the total, not total + thoughts.
+        self.app.payload = json.dumps({"usageMetadata": {
+            "promptTokenCount": 7, "candidatesTokenCount": 5, "thoughtsTokenCount": 3,
+            "totalTokenCount": 12}}).encode()
+        self.gen(self.mint())
+        self.assertEqual(self.usage().month_tokens("laptop"), 12)
+
+    def test_sse_usage_metadata_is_charged_once_last_value_wins(self):
+        # Native Gemini repeats CUMULATIVE usage on every chunk: the last one
+        # is the charge, never the sum.
+        self.app = SseUpstream([
+            {"candidates": [{"content": {"parts": [{"text": "o"}]}}],
+             "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 1,
+                               "totalTokenCount": 8}},
+            {"candidates": [{"content": {"parts": [{"text": "k"}]}, "finishReason": "STOP"}],
+             "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 5,
+                               "totalTokenCount": 12}}])
+        _, sent, _ = self.gen(self.mint(), path=GEMINI_STREAM, query=b"alt=sse")
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.usage().month_tokens("laptop"), 12)
+
+    def test_adapter_stream_usage_is_charged_through_the_door_tap_off(self):
+        # litellm's adapter path: the usage chunk reaches only the hooked
+        # translate (mid-request, inside the proxy), while the wire carries
+        # the adapter's 0/0/0 finish frame. Tap off: metering alone must hold.
+        class Handler:
+            @staticmethod
+            def _prepare_completion_kwargs(stream=False):
+                return {"stream": stream}
+
+        class Adapter:
+            def translate_streaming_completion_to_generate_content(self, response, wrapper):
+                return None
+
+        self.assertTrue(FF.install_gemini_stream_usage_hook(Handler, Adapter))
+        placeholder = {"candidates": [{"content": {"parts": [{"text": "ok"}]},
+                                       "finishReason": "STOP"}],
+                       "usageMetadata": {"promptTokenCount": 0, "candidatesTokenCount": 0,
+                                         "totalTokenCount": 0}}
+
+        class AdapterUpstream(SseUpstream):
+            async def __call__(self, scope, receive, send):
+                chunk = type("Chunk", (), {})()
+                chunk.usage = {"prompt_tokens": 9, "completion_tokens": 4}
+                Adapter().translate_streaming_completion_to_generate_content(chunk, None)
+                await super().__call__(scope, receive, send)
+
+        self.app = AdapterUpstream([placeholder])
+        with mock.patch.dict(os.environ, {"FERRY_EVENTS": "0"}):
+            self.assertFalse(FF.tap_enabled())
+            _, sent, _ = self.gen(self.mint(), path=GEMINI_STREAM, query=b"alt=sse")
+        self.assertEqual(reply(sent)[0], 200)
+        self.assertEqual(self.usage().month_tokens("laptop"), 13)
+
+    def test_a_refused_gemini_request_is_not_charged(self):
+        token = self.mint(rpm=1)
+        self.app.payload = gemini_json()
+        self.gen(token)
+        self.gen(token)
+        self.assertEqual(self.usage().month_tokens("laptop"), 12)
+        self.assertEqual(self.usage().minute_requests("laptop"), 1)
+
+    def test_count_tokens_stays_refused(self):
+        token = self.mint()
+        _, sent, _ = self.gen(token, path="/v1beta/models/%s:countTokens")
+        status, _, doc = reply(sent)
+        self.assertEqual(status, 403)
+        self.assertEqual(doc["error"]["code"], "route_not_allowed")
+        self.assertEqual(self.app.calls, 0)
+        self.assertEqual(self.usage().minute_requests("laptop"), 0)
+
+    def test_gemini_paths_are_inference_paths(self):
+        for path in (GEMINI_GEN % "flash", GEMINI_STREAM % "domestic.heavy"):
+            self.assertTrue(FF.is_inference_path(path), path)
+        for path in ("/v1beta/models/flash:countTokens", "/v1beta/models",
+                     "/v1beta/models/flash", "/v1beta/models/a/b:generateContent",
+                     "/v1beta/models/:generateContent", "/v1beta/interactions"):
+            self.assertFalse(FF.is_inference_path(path), path)
+        self.assertEqual(FF.gemini_lane(GEMINI_STREAM % "flash"), "flash")
+        self.assertIsNone(FF.gemini_lane("/v1beta/models/flash:countTokens"))
+
+    def test_identity_headers_are_stripped_off_host(self):
+        self.app = SseUpstream(
+            [{"usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1}}],
+            headers=[(b"x-litellm-model-name", b"provider/real-model"),
+                     (b"llm_provider-server", b"vendor"),
+                     (b"llm_provider-x-ratelimit-remaining", b"9")])
+        with mock.patch.dict(os.environ, {"FERRY_STRIP_HEADERS": "1"}):
+            _, sent, _ = self.gen(self.mint(), path=GEMINI_STREAM)
+        _, headers, _ = reply(sent)
+        self.assertNotIn(b"x-litellm-model-name", headers)
+        self.assertNotIn(b"llm_provider-server", headers)
+        self.assertIn(b"llm_provider-x-ratelimit-remaining", headers)
+
+    def test_event_record_is_emitted_with_the_key(self):
+        tap = mock.Mock()
+        tap.record_from_headers.return_value = {}
+        self.app.payload = gemini_json(7, 5)
+        with mock.patch.dict(os.environ, {"FERRY_EVENTS": "1"}), \
+                mock.patch.object(FF, "_tap", return_value=tap):
+            self.gen(self.mint())
+        rec = tap.offer.call_args[0][0]
+        self.assertEqual(rec["key"], "laptop")
+        self.assertEqual((rec["input_tokens"], rec["output_tokens"]), (7, 5))
+
+
+class TestGeminiAdapterStreamUsage(unittest.TestCase):
+    """litellm's completion adapter (1.99) never asked for stream usage and
+    wrote a 0/0/0 usageMetadata on its finish frame. The hook asks for
+    include_usage and observes the trailing usage chunk (which the adapter
+    drops) on the request's collector. The real-litellm proof is in
+    lib/ferry-front-routes.test.py; these pin the hook's own contract."""
+
+    def fakes(self):
+        class Handler:
+            @staticmethod
+            def _prepare_completion_kwargs(stream=False):
+                return {"model": "m", "stream": stream}
+
+        class Adapter:
+            def translate_streaming_completion_to_generate_content(self, response, wrapper):
+                return None
+
+        return Handler, Adapter
+
+    def test_stream_kwargs_ask_for_usage_and_non_stream_do_not(self):
+        Handler, Adapter = self.fakes()
+        self.assertTrue(FF.install_gemini_stream_usage_hook(Handler, Adapter))
+        self.assertTrue(FF.install_gemini_stream_usage_hook(Handler, Adapter))  # idempotent
+        self.assertEqual(Handler._prepare_completion_kwargs(stream=True)["stream_options"],
+                         {"include_usage": True})
+        self.assertNotIn("stream_options", Handler._prepare_completion_kwargs(stream=False))
+
+    def test_trailing_usage_chunk_is_observed_and_placeholder_skipped(self):
+        Handler, Adapter = self.fakes()
+        self.assertTrue(FF.install_gemini_stream_usage_hook(Handler, Adapter))
+        metrics = FF._metrics_module()
+        collector = FF._gemini_metrics_class(metrics)()
+        collector.start_response([(b"content-type", b"text/event-stream")], 200)
+        token = metrics.CURRENT_METRICS.set(collector)
+        try:
+            chunk = type("Chunk", (), {})()
+            chunk.usage = {"prompt_tokens": 9, "completion_tokens": 4}
+            self.assertIsNone(Adapter().translate_streaming_completion_to_generate_content(chunk, None))
+        finally:
+            metrics.CURRENT_METRICS.reset(token)
+        # The adapter's 0/0/0 finish frame, fed after, must not zero the charge.
+        placeholder = {"candidates": [{"content": {"parts": [{"text": "x"}]}}],
+                       "usageMetadata": {"promptTokenCount": 0, "candidatesTokenCount": 0,
+                                         "totalTokenCount": 0}}
+        collector.feed(b"data: " + json.dumps(placeholder).encode() + b"\n\n")
+        observed = collector.finish()
+        self.assertEqual((observed["input_tokens"], observed["output_tokens"]), (9, 4))
+
+    def test_usage_outside_a_gemini_request_is_ignored(self):
+        Handler, Adapter = self.fakes()
+        FF.install_gemini_stream_usage_hook(Handler, Adapter)
+        metrics = FF._metrics_module()
+        collector = metrics.RequestMetrics()
+        token = metrics.CURRENT_METRICS.set(collector)
+        try:
+            chunk = type("Chunk", (), {})()
+            chunk.usage = {"prompt_tokens": 9, "completion_tokens": 4}
+            Adapter().translate_streaming_completion_to_generate_content(chunk, None)
+        finally:
+            metrics.CURRENT_METRICS.reset(token)
+        collector.start_response([(b"content-type", b"application/json")], 200)
+        self.assertEqual(collector.finish()["input_tokens"], None)
+
+    def test_no_hook_usage_keeps_the_wire_value(self):
+        metrics = FF._metrics_module()
+        collector = FF._gemini_metrics_class(metrics)()
+        collector.start_response([(b"content-type", b"application/json")], 200)
+        collector.feed(gemini_json(3, 2))
+        observed = collector.finish()
+        self.assertEqual((observed["input_tokens"], observed["output_tokens"]), (3, 2))
+
+    def test_missing_class_is_reported_not_raised(self):
+        with mock.patch("sys.stderr"):
+            self.assertFalse(FF.install_gemini_stream_usage_hook(
+                type("Missing", (), {}), type("Missing2", (), {})))
 
 
 if __name__ == "__main__":

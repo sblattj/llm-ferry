@@ -16,6 +16,7 @@ Forensic internals moved out of the [README](../README.md) so it stays scannable
 - [The cline takeover internals](#the-cline-takeover-internals)
 - [Codex wiring](#codex-wiring)
 - [Prime Agent wiring](#prime-agent-wiring)
+- [Agentic coding CLI wiring](#agentic-coding-cli-wiring)
 - [Fleets — configuration detail](#fleets--configuration-detail)
 - [Event tap, schema repair & attribution](#event-tap-schema-repair--attribution)
 - [Encrypted drop — crypto detail](#encrypted-drop--crypto-detail)
@@ -334,7 +335,7 @@ Then, in a terminal wider than 120 columns, `ctrl+p` → **Plugins** lists an *E
 
 ## The cline takeover internals
 
-**Cline is wired through its files, not VS Code settings.** As of v4.1.21 the Cline extension (`saoudrizwan.claude-dev`) keeps *all* provider config in plain JSON under `~/.cline/` — `data/globalState.json` for extension state, `data/secrets.json` (mode 0600) for credentials, and `data/settings/providers.json` as the SDK-shared mirror. There is no settings import/export (that is Roo Code) and no `cline.*` VS Code settings; the only environment variables relocate the data directory (`CLINE_DATA_DIR` and friends), which `ferry cline --data-dir` follows. That file-backed surface is exactly why ferry can wire Cline the way it wires opencode: `ferry cline` merges ferry's keys into all three files around everything Cline already wrote, snapshots each to `<file>.<UTCtimestamp>.ferry.bak` before the first modify of a run (pruned to the last 10), and records `~/.config/ferry/cline.json` so reset and cleanup can find their way back.
+**Cline is wired through its files, not VS Code settings.** As of v4.1.21 the Cline extension (`saoudrizwan.claude-dev`) keeps *all* provider config in plain JSON under `~/.cline/` — `data/globalState.json` for extension state, `data/secrets.json` (mode 0600) for credentials, and `data/settings/providers.json` as the SDK-shared mirror. There is no settings import/export (that is Roo Code) and no `cline.*` VS Code settings; the only environment variables relocate the data directory: `CLINE_DIR` names the root (files under `<root>/data/`) and `CLINE_DATA_DIR` names the data directory itself (npm `cline` 3.0.67, `@cline/shared` `dist/storage/index.js`). `ferry cline` follows both the same way, and `--data-dir DIR` names the root. Before v1.52.0 ferry wrote `$CLINE_DATA_DIR/data/...`, one level deeper than the CLI reads. That file-backed surface is exactly why ferry can wire Cline the way it wires opencode: `ferry cline` merges ferry's keys into all three files around everything Cline already wrote, snapshots each to `<file>.<UTCtimestamp>.ferry.bak` before the first modify of a run (pruned to the last 10), and records `~/.config/ferry/cline.json` so reset and cleanup can find their way back.
 
 **The provider id duality is the #1 trap.** The same setting is spelled two ways in Cline's own stores: extension state (`globalState.json`) uses `"openai"` for what the UI calls OpenAI Compatible, while `providers.json` uses `"openai-compatible"`. Write only one spelling and the other store still points wherever it pointed before. `ferry cline` writes both, every time.
 
@@ -369,6 +370,35 @@ Then, in a terminal wider than 120 columns, `ctrl+p` → **Plugins** lists an *E
 **Never touched:** the rest of `~/.prime` (sessions, login) and `settings.json` (ferry does not set a default provider; it prints `prime-agent --provider ferry --model heavy` instead). Cleanup restores the newest `.ferry.bak` snapshot and deletes the rest, then runs a guarded text-surgical strip of `providers.ferry` (only while its `baseUrl` is the recorded ferry host, or, with no record, while it carries the `X-Ferry-Client` header); `models.json` itself is never deleted.
 
 **Verified end to end against prime-agent 0.9.8.** `ferry prime` on a host, then `prime-agent --provider ferry --model heavy -p ...`, answered a plain prompt and completed a tool-using task (a Python call that wrote a file); `--model flash` answered too, and every request reached the front door as `POST /v1/chat/completions` with a 200. Still unknown: whether a running prime-agent daemon re-reads `models.json` without a restart, so restart it after re-running `ferry prime`.
+
+## Agentic coding CLI wiring
+
+**One registry, one helper, fourteen modules.** `lib/ferry-agents.zsh` holds `FERRY_AGENT_CLIENTS` (command name and binary per client), `ferry agents`, and the shared machinery every `lib/ferry-<client>.zsh` calls: `_agent_main` parses the common flags (`--host --port --key --model --keep --unwire --dry-run`), `_agent_resolve` reads `client.json`, picks the device or master key and asks the host which lanes it serves (an unreachable host is a warning, and the `--model` lane is kept whole), and the `FERRY_AGENT_PY` preamble gives each module's embedded Python the same few verbs: `wrapper()` writes a ferry-managed `~/.local/bin/<client>-ferry`, `write_owned()` writes a ferry-owned config, `json_member_set()` adds one member to a file of yours, and `save_record()` writes `~/.config/ferry/<client>.json`. The key goes once into `~/.config/ferry/agents.key` (0600), and wrappers read it at run time, so it is never in argv, never in a wrapper and never in a client config.
+
+**Unwire is driven by the record, not by guesses.** The record lists every created file with its sha256 and every member added to a user file. `--unwire` deletes a created file only while its hash still matches (a wrapper you edited stays, with a note), removes only the members ferry added, and refuses to replace a file at a wrapper path that ferry did not write. `client-cleanup.sh` calls `ferry <client> --unwire` for every client with a record and has a Python fallback for when the `ferry` CLI is already gone.
+
+**Least-invasive door per client.** The research for each client was read from its own source and is cited `file:LINE` in the header of its module; the door each one got:
+
+| Client | Door | Research |
+|---|---|---|
+| Pi | one `ferry` provider inserted as text into `models.json` (Pi has no flag for another file; `PI_CODING_AGENT_DIR` relocates everything), key via an `apiKey: "!cat <keyfile>"` command | `lib/ferry-pi.zsh` |
+| oh-my-pi | its own `models.yml` is YAML and has no override flag, so a ferry-owned extension calls `registerProvider("ferry", ...)` and the wrapper loads it with `-e` | `lib/ferry-omp.zsh` |
+| Gemini CLI | env only: `GOOGLE_GEMINI_BASE_URL`, `GEMINI_API_KEY`, `GEMINI_CLI_CUSTOM_HEADERS`, plus a ferry-owned system settings file that selects API-key auth | `lib/ferry-gemini.zsh` |
+| Qwen Code | `QWEN_CODE_SYSTEM_SETTINGS_PATH` to a ferry-owned settings file listing every lane with `customHeaders` | `lib/ferry-qwen.zsh` |
+| OpenHands | `OPENHANDS_PERSISTENCE_DIR` to a ferry-owned dir and `--override-with-envs`; headers only come from the settings file | `lib/ferry-openhands.zsh` |
+| Open Interpreter | the current Rust `interpreter` is a Codex fork, so `-c model_providers.ferry...` overrides with `wire_api="chat"` and `env_key` | `lib/ferry-interpreter.zsh` |
+| Goose | `GOOSE_PROVIDER=openai`, `OPENAI_BASE_URL`, `OPENAI_CUSTOM_HEADERS` | `lib/ferry-goose.zsh` |
+| Aider | `--openai-api-base`, `--model openai/<lane>`, and ferry-owned `--model-settings-file` / `--model-metadata-file` carrying `extra_headers` | `lib/ferry-aider.zsh` |
+| Codewhale | `CODEWHALE_CONFIG_PATH` to a ferry-owned `config.toml` (`allow_insecure_http` for LAN HTTP) | `lib/ferry-codewhale.zsh` |
+| Reasonix | `REASONIX_HOME` to a ferry-owned home with `config.toml` and a 0600 `.env` | `lib/ferry-reasonix.zsh` |
+| Crush | `CRUSH_GLOBAL_DATA` to a ferry-owned dir with `crush.json` | `lib/ferry-crush.zsh` |
+| Kilo Code | `KILO_CONFIG` to a ferry-owned `kilo.json`; `--global` also merges a provider into `~/.config/kilo/kilo.json` | `lib/ferry-kilo.zsh` |
+| Kimi Code CLI | `KIMI_CODE_HOME` to a ferry-owned home (the Python `kimi-cli` is archived and only prints a notice) | `lib/ferry-kimi.zsh` |
+| GitHub Copilot CLI | BYOK env `COPILOT_PROVIDER_BASE_URL` / `_API_KEY` / `_HEADERS` / `COPILOT_MODEL`; the client ships as a binary, so the citations are its help text and changelog | `lib/ferry-copilot.zsh` |
+
+**Bootstrap default differs from Cline and Codex.** Those two are wired even before they are installed. The agent CLIs are wired only when their binary is on `PATH` at bootstrap time (or with `--with-<client>`), so a bootstrap does not drop fourteen wrappers for tools you do not use. `client-reset.sh` re-applies a client only when `client.json` says `<client>_mode: full`.
+
+**Testing.** `lib/ferry-agents.test.py` pins the registry contract (every client answers `ferry <client> --help`, the bootstrap's copy of the list equals the CLI's, reset and cleanup read `ferry agents --list`) and the helper (key file mode, idempotent re-wire, unwire restoring a user file byte for byte, dry run). Each `lib/ferry-<client>.test.py` wires into a throwaway `$HOME`, then runs the real client binary through its wrapper against a stub endpoint and asserts the request path, the bearer and `X-Ferry-Client`. A client binary not on `PATH` is found through `FERRY_E2E_BIN_<CLIENT>`, else that e2e test skips.
 
 ## Fleets — configuration detail
 

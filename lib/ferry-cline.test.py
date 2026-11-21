@@ -132,7 +132,7 @@ class ClineHarness(unittest.TestCase):
         for k in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
                   "OPENCODE_CONFIG", "OPENCODE_TUI_CONFIG",
                   "CLIENT_MASTER_KEY", "FERRY_MASTER_KEY",
-                  "FERRY_FLEET", "CLINE_DATA_DIR"):
+                  "FERRY_FLEET", "CLINE_DATA_DIR", "CLINE_DIR"):
             e.pop(k, None)
         if extra:
             e.update(extra)
@@ -525,16 +525,30 @@ class FleetHeaderTest(ClineHarness):
 
 
 class DataDirTest(ClineHarness):
-    """--data-dir relocates the whole write; CLINE_DATA_DIR is the default
-    default and the flag wins over it."""
+    """--data-dir relocates the whole write; the flag wins over the env.
 
-    def test_cline_data_dir_env_locates_the_default_target(self):
+    Layouts follow the Cline CLI's own resolver (npm cline 3.0.67,
+    @cline/shared storage: CLINE_DIR is the root that holds data/,
+    CLINE_DATA_DIR is the data dir itself)."""
+
+    def test_cline_data_dir_env_is_the_data_dir_itself(self):
         envdir = os.path.join(self.home, "envdata")
         self.run_cline(pass_data_dir=False, env_extra={"CLINE_DATA_DIR": envdir})
         self.assertTrue(
-            os.path.exists(os.path.join(envdir, "data", "globalState.json")),
-            "CLINE_DATA_DIR was not honoured as the default data dir")
+            os.path.exists(os.path.join(envdir, "globalState.json")),
+            "CLINE_DATA_DIR was not used as the data dir itself")
+        self.assertTrue(
+            os.path.exists(os.path.join(envdir, "settings", "providers.json")))
+        self.assertFalse(os.path.exists(os.path.join(envdir, "data")),
+                         "wrote CLINE_DATA_DIR/data, a dir the CLI never reads")
         self.assertFalse(os.path.exists(os.path.join(self.data, "data")))
+
+    def test_cline_dir_env_is_the_root(self):
+        rootdir = os.path.join(self.home, "rootdir")
+        self.run_cline(pass_data_dir=False, env_extra={"CLINE_DIR": rootdir})
+        self.assertTrue(
+            os.path.exists(os.path.join(rootdir, "data", "globalState.json")),
+            "CLINE_DIR was not honoured as the Cline root")
 
     def test_the_data_dir_flag_wins_over_the_env(self):
         flagdir = os.path.join(self.home, "flagdata")
@@ -543,7 +557,103 @@ class DataDirTest(ClineHarness):
         self.assertTrue(
             os.path.exists(os.path.join(flagdir, "data", "globalState.json")),
             "--data-dir lost to CLINE_DATA_DIR")
-        self.assertFalse(os.path.exists(os.path.join(envdir, "data")))
+        self.assertFalse(os.path.exists(os.path.join(envdir, "globalState.json")))
+
+
+class _ChatStub(BaseHTTPRequestHandler):
+    """Catalogue plus a canned OpenAI chat/completions reply (stream and not).
+    Every request is recorded on the server: path, auth, X-Ferry-Client."""
+
+    def _rec(self):
+        self.server.seen.append({
+            "method": self.command, "path": self.path,
+            "auth": self.headers.get("Authorization"),
+            "client": self.headers.get("X-Ferry-Client"),
+        })
+
+    def do_GET(self):  # noqa: N802
+        self._rec()
+        body = json.dumps({"object": "list",
+                           "data": [{"id": m, "object": "model"} for m in CATALOGUE]}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):  # noqa: N802
+        self._rec()
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+        if b'"stream":true' in raw.replace(b" ", b""):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for d in ({"id": "c1", "object": "chat.completion.chunk", "model": "heavy",
+                       "choices": [{"index": 0, "delta": {"role": "assistant",
+                                                          "content": "PONG"},
+                                    "finish_reason": None}]},
+                      {"id": "c1", "object": "chat.completion.chunk", "model": "heavy",
+                       "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                       "usage": usage}):
+                self.wfile.write(("data: %s\n\n" % json.dumps(d)).encode())
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
+        body = json.dumps({"id": "c1", "object": "chat.completion", "model": "heavy",
+                           "choices": [{"index": 0, "finish_reason": "stop",
+                                        "message": {"role": "assistant", "content": "PONG"}}],
+                           "usage": usage}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+@unittest.skipUnless(shutil.which("cline"), "the cline CLI (npm `cline`) is not on PATH")
+class ClineCliE2ETest(ClineHarness):
+    """The `cline` CLI shares ~/.cline with the VS Code extension. Cline CLI
+    3.0.67 (@cline/shared resolveProviderSettingsPath) reads
+    <~/.cline/data>/settings/providers.json, the file `ferry cline` writes, and
+    needs no -P/-k/-m flag: lastUsedProvider 'openai-compatible' selects it.
+    This runs the real binary one-shot against a stub: zero tokens."""
+
+    def test_cline_cli_one_shot_uses_the_ferry_wired_provider(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _ChatStub)
+        srv.seen = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        # Wire into the throwaway HOME's default ~/.cline (no --data-dir): the
+        # path a plain `cline` invocation reads.
+        self.run_cline("--key", "test-key", port=srv.server_address[1],
+                       pass_data_dir=False)
+        self.assertTrue(os.path.exists(os.path.join(
+            self.home, ".cline", "data", "settings", "providers.json")))
+        srv.seen.clear()                     # drop ferry's own lane-check GET
+        cwd = os.path.join(self.home, "work")
+        os.makedirs(cwd)
+        # The CLI daemonizes a background hub (cwd = our throwaway dir); reap it.
+        self.addCleanup(subprocess.run,
+                        ["pkill", "-f", f"cline-hub-daemon --cwd .*{os.path.basename(self.home)}"],
+                        capture_output=True)
+        p = subprocess.run(
+            ["cline", "--json", "-t", "90", "reply with PONG"],
+            capture_output=True, text=True, cwd=cwd, timeout=150,
+            env=self.env({"CLINE_NO_AUTO_UPDATE": "1", "CLINE_NO_INTERACTIVE": "1"}),
+        )
+        self.assertEqual(p.returncode, 0, f"cline failed:\n{p.stdout}\n{p.stderr}")
+        self.assertIn("PONG", p.stdout)
+        posts = [r for r in srv.seen if r["method"] == "POST"]
+        self.assertTrue(posts, f"cline never called the stub: {srv.seen}")
+        for r in posts:
+            self.assertEqual(r["path"], "/v1/chat/completions")
+            self.assertEqual(r["auth"], "Bearer test-key")
+            self.assertTrue(r["client"], "X-Ferry-Client missing on the cline request")
+        self.assertIn('"provider":"openai-compatible"', p.stdout.replace(" ", ""))
 
 
 class ScriptContractTest(unittest.TestCase):

@@ -483,6 +483,16 @@ Commands:
   prime              [Dual] Point Prime Agent at this ferry host: adds a 'ferry'
                        provider to its models.json (openai-completions lanes)
                         ferry prime [--host H] [--port P] [--key K] [--model LANE] [--agent-dir DIR] [--keep N]
+  agents             [Dual] List the agentic coding CLIs ferry can wire (issue #3)
+                       and which are installed / wired on this machine
+                        ferry agents [--list | --installed]
+  pi | omp | gemini | qwen | openhands | interpreter | goose | aider |
+  codewhale | reasonix | crush | kilo | kimi | copilot
+                     [Dual] Wire that CLI to this ferry host without touching
+                       its own config: a <client>-ferry wrapper (or one 'ferry'
+                       provider entry), key in ~/.config/ferry/agents.key (0600)
+                        ferry <client> [--host H] [--port P] [--key K] [--model LANE]
+                        ferry <client> --unwire [--dry-run]
   fleet              [Dual] Read or switch which fleet (routing set) bare lane
                        names resolve to
                         ferry fleet ls | show | use <fleet> [--default] | use --clear
@@ -7745,7 +7755,8 @@ Usage:
                   master_key when set, else 'local' (never empty: Cline only
                   sends Authorization when a key exists).
   --model LANE    Lane id for BOTH the act and plan modes (default heavy).
-  --data-dir DIR  Cline data dir (default $CLINE_DATA_DIR, else ~/.cline).
+  --data-dir DIR  Cline root dir, files go in DIR/data (default $CLINE_DIR,
+                  else ~/.cline; $CLINE_DATA_DIR names the data dir itself).
   --keep N        Snapshots to keep per config file (default 10).
 EOF
         return 0 ;;
@@ -7809,9 +7820,19 @@ except Exception:
   local cl_name="${CLIENT_NAME:-}"
 
   cl_model="${cl_model:-heavy}"
-  # CLINE_DATA_DIR only relocates Cline's files (the one knob Cline honors),
-  # so it is the default default; an explicit --data-dir always wins.
-  cl_data="${cl_data:-${CLINE_DATA_DIR:-$HOME/.cline}}"
+  # Two layouts, matching the Cline CLI's own resolver (npm cline 3.0.67,
+  # @cline/shared dist/storage/index.js: l() = $CLINE_DIR else ~/.cline, and
+  # p() = $CLINE_DATA_DIR else l()/data): --data-dir DIR and $CLINE_DIR name
+  # the ROOT (files land in DIR/data/...), while $CLINE_DATA_DIR names the data
+  # dir ITSELF (files land in $CLINE_DATA_DIR/...). An explicit flag wins.
+  local cl_inner=""
+  if [[ -n "$cl_data" ]]; then
+    cl_inner="$cl_data/data"
+  elif [[ -n "${CLINE_DATA_DIR:-}" ]]; then
+    cl_inner="$CLINE_DATA_DIR"; cl_data="${CLINE_DATA_DIR:h}"
+  else
+    cl_data="${CLINE_DIR:-$HOME/.cline}"; cl_inner="$cl_data/data"
+  fi
 
   # Lane check against the host catalogue — never fatal. A ferry-down host
   # still gets wired, just unchecked (Cline has to work with ferry down, the
@@ -7868,13 +7889,14 @@ PYEOF
   # The three Cline files (merge — every unknown key survives) plus ferry's
   # own record. Any failure here fails the command; the marketplace hint below
   # only prints on the success path.
-  python3 - "$cl_host" "$cl_port" "$cl_key" "$cl_model" "$cl_name" "$cl_data" "$cl_keep" "${FERRY_FLEET:-}" "$HOME/.config/ferry/cline.json" <<'PYEOF'
+  python3 - "$cl_host" "$cl_port" "$cl_key" "$cl_model" "$cl_name" "$cl_data" "$cl_keep" "${FERRY_FLEET:-}" "$HOME/.config/ferry/cline.json" "$cl_inner" <<'PYEOF'
 import datetime, json, os, re, shutil, stat, sys
 
 host, port, key, model, name, data_dir, keep = sys.argv[1:8]
 fleet = sys.argv[8]
 record = os.path.abspath(os.path.expanduser(sys.argv[9]))
 data_dir = os.path.abspath(os.path.expanduser(data_dir))
+inner = os.path.abspath(os.path.expanduser(sys.argv[10]))
 keep = int(keep)
 base = f"http://{host}:{port}/v1"
 now = datetime.datetime.now(datetime.timezone.utc)
@@ -7947,9 +7969,9 @@ if key.lower().startswith("fk-"):
         settings = entry.get("settings")
         return settings.get("apiKey") if isinstance(settings, dict) else None
     for p, getter in (
-        (os.path.join(data_dir, "data", "secrets.json"),
+        (os.path.join(inner, "secrets.json"),
          lambda d: d.get("openAiApiKey")),
-        (os.path.join(data_dir, "data", "settings", "providers.json"),
+        (os.path.join(inner, "settings", "providers.json"),
          _old_provider_key),
         (record, lambda d: d.get("master_key")),
     ):
@@ -7962,7 +7984,7 @@ if key.lower().startswith("fk-"):
 # --- globalState.json: the file that actually flips Cline's selection. ---
 # "openai" here is Cline's extension-state id for "OpenAI Compatible" — NOT
 # OpenAI the service, and not providers.json's "openai-compatible" either.
-gs_path = os.path.join(data_dir, "data", "globalState.json")
+gs_path = os.path.join(inner, "globalState.json")
 os.makedirs(os.path.dirname(gs_path), exist_ok=True)
 snap = snapshot(gs_path)
 if snap:
@@ -7980,7 +8002,7 @@ gs.update({
 dump(gs_path, gs)
 
 # --- secrets.json: plain JSON, mode 0600 (Cline's own convention). ---
-sec_path = os.path.join(data_dir, "data", "secrets.json")
+sec_path = os.path.join(inner, "secrets.json")
 snap = snapshot(sec_path)
 if snap:
     print(f"    Snapshot:       {snap}")
@@ -7993,7 +8015,7 @@ if mode & 0o177:            # group/other bits set = looser than 0600
 
 # --- settings/providers.json: the SDK-shared mirror. Its id for the same ---
 # --- provider is "openai-compatible"; other provider entries survive.     ---
-pv_path = os.path.join(data_dir, "data", "settings", "providers.json")
+pv_path = os.path.join(inner, "settings", "providers.json")
 os.makedirs(os.path.dirname(pv_path), exist_ok=True)
 snap = snapshot(pv_path)
 if snap:
@@ -8966,6 +8988,2550 @@ PYEOF
   fi
   return $pr_rc
 }
+# ferry agents: the shared wiring contract for the agentic coding CLIs that
+# issue #3 adds (pi, gemini, aider, goose, ...).
+#
+# opencode / claude / cline / codex / prime each grew their own resolve, lane
+# check, snapshot and cleanup code. Fourteen more clients cannot each carry a
+# hand-written copy of all that through client-bootstrap.sh, client-reset.sh
+# and client-cleanup.sh, so this module owns the parts that are the same for
+# every client and the client scripts loop over one registry:
+#
+#   FERRY_AGENT_CLIENTS  name:binary pairs. `ferry agents --list` prints the
+#                        names; the client scripts read that, never a hand list.
+#   _agent_main          the common CLI of every `ferry <client>`: --host,
+#                        --port, --key, --model, --unwire, --dry-run, --help.
+#                        Resolves the endpoint exactly the way `ferry cline`
+#                        does (flag, else client.json, else 127.0.0.1:8090 on
+#                        the host), checks the lane against GET /v1/models and
+#                        then calls the module's own _<client>_wire.
+#   _agent_python        runs a module's Python with FERRY_AGENT_PY (snapshot,
+#                        load/dump, owned-file writes, the record) preloaded.
+#   ~/.config/ferry/<client>.json
+#                        the record of what was wired: host, port, lane and the
+#                        exact files ferry CREATED (with their sha256) or EDITED
+#                        (with the member it owns). `ferry <client> --unwire`
+#                        undoes exactly that and nothing else: a created file
+#                        the user has since changed is kept, an edited file only
+#                        loses ferry's own member.
+#   ~/.config/ferry/agents.key
+#                        the bearer, mode 0600, read at RUN time by the
+#                        `<client>-ferry` wrappers, so the key never sits in
+#                        argv, in a shell rc file or in a world-readable config.
+#
+# The key resolves like cline's: --key, else client.json's api_key (device key)
+# or master_key, else the legacy 'local' placeholder (several clients refuse an
+# empty key outright).
+
+# Registry. Order is the issue's order; the binary is what "installed" means.
+FERRY_AGENT_CLIENTS=(
+  pi:pi
+  gemini:gemini
+  openhands:openhands
+  interpreter:interpreter
+  goose:goose
+  aider:aider
+  codewhale:codewhale
+  reasonix:reasonix
+  omp:omp
+  crush:crush
+  qwen:qwen
+  kilo:kilo
+  kimi:kimi
+  copilot:copilot
+)
+
+_agents_help() {
+  cat <<'EOF'
+ferry agents: the agentic coding CLIs ferry can wire (issue #3).
+
+Usage:
+  ferry agents               table: client, binary, installed?, wired?
+  ferry agents --list        client names, one per line
+  ferry agents --installed   client names whose binary is on PATH
+
+Wire one with `ferry <client>`, undo it with `ferry <client> --unwire`.
+EOF
+}
+
+cmd_agents() {
+  # `ferry agents`          a table: client, binary, installed, wired
+  # `ferry agents --list`   the client names, one per line (for the scripts)
+  # `ferry agents --installed`  only the clients whose binary is on PATH
+  local mode="table" e n b
+  case "${1:-}" in
+    --list) mode="list" ;;
+    --installed) mode="installed" ;;
+    "") ;;
+    --help|-h) _agents_help; return 0 ;;
+    *) echo "Unknown option for 'ferry agents': $1"; exit 1 ;;
+  esac
+  for e in "${FERRY_AGENT_CLIENTS[@]}"; do
+    n="${e%%:*}"; b="${e#*:}"
+    case "$mode" in
+      list) print -r -- "$n" ;;
+      installed) command -v "$b" >/dev/null 2>&1 && print -r -- "$n" ;;
+      table)
+        printf "  %-12s %-12s %-10s %s\n" "$n" "$b" \
+          "$(command -v "$b" >/dev/null 2>&1 && echo installed || print -r -- -)" \
+          "$([[ -f $HOME/.config/ferry/$n.json ]] && echo wired || print -r -- -)" ;;
+    esac
+  done
+  return 0
+}
+
+# Help for one client: the module's own text, then the flags every client
+# shares. Also registered as _ferry_<client>_usage, because the dispatcher's
+# central --help guard (lib/ferry-main.zsh _ferry_help_for) answers --help
+# before cmd_<client> ever runs.
+_agent_help() {
+  local client="$1"
+  if (( $+functions[_${client}_help] )); then
+    "_${client}_help"
+  else
+    echo "ferry ${client} - wire ${client} to the ferry endpoint."
+  fi
+  cat <<EOF
+
+Common flags (every 'ferry <client>'):
+  --host H      Endpoint host. Default: ~/.config/ferry/client.json, else
+                127.0.0.1 on the host machine.
+  --port P      Endpoint port (default 8090).
+  --key K       Bearer to send. Default: client.json api_key / master_key,
+                else 'local'. Stored in ~/.config/ferry/agents.key (0600).
+  --model LANE  Default lane (default heavy; falls back to a served lane).
+  --keep N      Snapshots to keep per edited file (default 10).
+  --unwire      Undo what 'ferry ${client}' wrote (record-driven; files you
+                changed since are kept). --dry-run shows it without acting.
+EOF
+}
+
+_ferry_agents_usage() { _agents_help; }
+() {
+  local e
+  for e in "${FERRY_AGENT_CLIENTS[@]}"; do
+    functions[_ferry_${e%%:*}_usage]="_agent_help ${e%%:*}"
+  done
+}
+
+_agent_binary() {   # <client> -> its binary name
+  local e
+  for e in "${FERRY_AGENT_CLIENTS[@]}"; do
+    [[ "${e%%:*}" == "$1" ]] && { print -r -- "${e#*:}"; return 0; }
+  done
+  return 1
+}
+
+# _agent_main <client> "$@"
+#   Parses the common flags, then either unwires (generic, record-driven, plus
+#   the module's optional _<client>_unwire hook for edited files) or resolves
+#   the endpoint and calls _<client>_wire. The module's help text comes from
+#   _<client>_help; extra module flags are collected in AG_EXTRA.
+#   Globals set for the wire function:
+#     AG_CLIENT AG_HOST AG_PORT AG_BASE (http://h:p/v1) AG_ROOT (http://h:p)
+#     AG_KEY AG_NAME AG_FLEET AG_LANE AG_LANES (served lane ids, space-sep)
+#     AG_RECORD (~/.config/ferry/<client>.json) AG_KEYFILE AG_DRY AG_KEEP
+_agent_main() {
+  local client="$1"; shift
+  AG_CLIENT="$client"; AG_HOST=""; AG_PORT=""; AG_KEY=""; AG_LANE=""
+  AG_DRY=0; AG_KEEP=10; AG_EXTRA=()
+  local unwire=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --host)    AG_HOST="$2"; shift 2 ;;
+      --port)    AG_PORT="$2"; shift 2 ;;
+      --key)     AG_KEY="$2"; shift 2 ;;
+      --model)   AG_LANE="$2"; shift 2 ;;
+      --keep)    AG_KEEP="$2"; shift 2 ;;
+      --unwire)  unwire=1; shift ;;
+      --dry-run) AG_DRY=1; shift ;;
+      --help|-h) _agent_help "$client"; return 0 ;;
+      *) AG_EXTRA+=("$1"); shift ;;
+    esac
+  done
+
+  AG_RECORD="$HOME/.config/ferry/${client}.json"
+  AG_KEYFILE="$HOME/.config/ferry/agents.key"
+
+  if (( unwire )); then
+    _agent_unwire "$client"
+    return $?
+  fi
+
+  _agent_resolve || return 1
+
+  # Clients the module can only pre-seed say so; a missing binary is a note.
+  local bin
+  bin=$(_agent_binary "$client") || bin="$client"
+  if ! command -v "$bin" >/dev/null 2>&1; then
+    echo "    NOTE: '$bin' is not on PATH yet. The wiring is written anyway, so"
+    echo "    installing it later is enough."
+  fi
+
+  "_${client}_wire" || return 1
+  _agent_set_mode "$client" full
+  return 0
+}
+
+_agent_resolve() {
+  # Host / port / key from client.json, read fresh (the scripts call this
+  # outside a normal CLI boot), same precedence as cmd_cline.
+  local prof ph pp pk
+  prof=$(python3 -c "import json, os, sys
+try:
+    d = json.load(open(os.path.expanduser(sys.argv[1])))
+    print(d.get('host') or '-', d.get('port') or '-', d.get('api_key') or d.get('master_key') or '-')
+except Exception:
+    print('- - -')" "$HOME/.config/ferry/client.json" 2>/dev/null) || prof="- - -"
+  read -r ph pp pk <<< "$prof"
+  [[ "$ph" == "-" ]] && ph=""; [[ "$pp" == "-" ]] && pp=""; [[ "$pk" == "-" ]] && pk=""
+  if [[ -z "$AG_HOST" ]]; then
+    AG_HOST="$ph"
+    if [[ -z "$AG_HOST" ]]; then
+      if (( ${CLIENT_MODE:-0} )) && [[ -f "$HOME/.config/ferry/client.json" ]]; then
+        echo "Error: ~/.config/ferry/client.json has no 'host'. Re-run the client"
+        echo "bootstrap, or pass --host <mdns-or-ip> explicitly."
+        return 1
+      fi
+      AG_HOST="127.0.0.1"
+    fi
+  fi
+  AG_PORT="${AG_PORT:-${pp:-8090}}"
+  AG_KEY="${AG_KEY:-${pk:-${CLIENT_MASTER_KEY:-}}}"
+  [[ -z "$AG_KEY" ]] && AG_KEY="local"
+  AG_NAME="${CLIENT_NAME:-host}"
+  AG_FLEET="${FERRY_FLEET:-}"
+  AG_ROOT="http://${AG_HOST}:${AG_PORT}"
+  AG_BASE="${AG_ROOT}/v1"
+  AG_LANE="${AG_LANE:-heavy}"
+
+  # Lane check, never fatal (a ferry-down host still gets wired). Line 1 of
+  # the output is the lane to use, line 2 the served catalogue.
+  local out
+  out=$(python3 - "$AG_BASE" "$AG_KEY" "$AG_LANE" <<'PYEOF'
+import json, sys, urllib.request
+base, key, model = sys.argv[1:4]
+served = []
+try:
+    req = urllib.request.Request(f"{base}/models")
+    req.add_header("Authorization", "Bearer %s" % key)
+    with urllib.request.urlopen(req, timeout=4) as r:
+        served = [m.get("id") for m in json.load(r).get("data", []) if m.get("id")]
+except Exception as e:
+    print(f"    WARNING: could not verify the lane catalogue at {base}/models",
+          file=sys.stderr)
+    print(f"    ({e}); wiring lane '{model}' unchecked.", file=sys.stderr)
+if served and model not in served:
+    new = "heavy" if "heavy" in served else served[0]
+    print(f"    WARNING: the host does not serve lane '{model}'; falling back",
+          file=sys.stderr)
+    print(f"    to lane '{new}'.", file=sys.stderr)
+    model = new
+print(model)
+print(" ".join(served))
+PYEOF
+) || out=""
+  # (@f) keeps empty lines, so a one-element result stays an array (a bare
+  # (f) on "heavy\n" collapses to a scalar and [1] would take its first CHAR).
+  local -a ag_out; ag_out=("${(@f)out}")
+  AG_LANE="${ag_out[1]:-$AG_LANE}"
+  AG_LANES="${ag_out[2]:-}"
+  [[ -z "$AG_LANES" ]] && AG_LANES="$AG_LANE"
+
+  # The shared bearer file. 'local' is still written: wrappers always find a
+  # value, and 'local' is no secret.
+  mkdir -p "$HOME/.config/ferry"
+  ( umask 077; print -rn -- "$AG_KEY" > "$AG_KEYFILE" )
+  chmod 600 "$AG_KEYFILE"
+  return 0
+}
+
+_agent_set_mode() {   # <client> <full|none>: keep client.json's <client>_mode
+  # true to what is wired, so client-reset.sh re-applies a client the user
+  # wired by hand and stops re-applying one they unwired. Host machines have
+  # no client.json and nothing to record.
+  local cj="$HOME/.config/ferry/client.json"
+  [[ -f "$cj" ]] || return 0
+  python3 - "$cj" "$1" "$2" <<'PYEOF' || true
+import json, os, sys
+path, client, mode = sys.argv[1:4]
+try:
+    with open(path) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(0)
+if d.get(f"{client}_mode") == mode:
+    sys.exit(0)
+d[f"{client}_mode"] = mode
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+os.chmod(tmp, os.stat(path).st_mode & 0o777)
+os.replace(tmp, path)
+PYEOF
+}
+
+# Python preloaded into every module's write step. Modules call:
+#   snapshot(path)                 -> copy to <path>.<UTC>.ferry.bak, prune
+#   load_json(path) / dump_json(path, obj, mode=None)
+#   write_owned(path, text, mode)  -> create a ferry-owned file; refuses to
+#                                     replace a file ferry did not create
+#   wrapper(path, exports, argv0, argv_prefix=())
+#                                  -> a ~/.local/bin/<client>-ferry script
+#   note_created(path) / note_edited(path, kind, **owner)
+#   save_record(extra={})          -> ~/.config/ferry/<client>.json
+# with CLIENT, HOST, PORT, BASE, ROOT, KEYFILE, NAME, FLEET, LANE, LANES,
+# HEADERS ({"X-Ferry-Client": ..., "X-Ferry-Fleet": ...}), HOME, DRY.
+FERRY_AGENT_PY='
+import datetime, hashlib, json, os, re, shutil, stat, sys
+_E = os.environ
+CLIENT = _E["AG_CLIENT"]; HOST = _E["AG_HOST"]; PORT = _E["AG_PORT"]
+BASE = _E["AG_BASE"]; ROOT = _E["AG_ROOT"]; KEYFILE = _E["AG_KEYFILE"]
+NAME = _E.get("AG_NAME", "host"); FLEET = _E.get("AG_FLEET", "")
+LANE = _E["AG_LANE"]; LANES = [l for l in _E.get("AG_LANES", "").split() if l] or [LANE]
+RECORD = _E["AG_RECORD"]; KEEP = int(_E.get("AG_KEEP", "10") or 10)
+HOME = os.path.expanduser("~")
+HEADERS = {"X-Ferry-Client": NAME}
+if FLEET:
+    HEADERS["X-Ferry-Fleet"] = FLEET
+MARKER = f"ferry-managed: {CLIENT}"
+_TS = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+_SNAP_RE = r"\.\d{8}T\d{6}Z(-\d+)?\.ferry\.bak$"
+_created, _edited = [], []
+
+def snapshot(path):
+    if not os.path.exists(path):
+        return None
+    d = os.path.dirname(path) or "."
+    stem = os.path.basename(path)
+    snap = os.path.join(d, f"{stem}.{_TS}.ferry.bak")
+    n = 1
+    while os.path.exists(snap):
+        snap = os.path.join(d, f"{stem}.{_TS}-{n}.ferry.bak"); n += 1
+    shutil.copy2(path, snap)
+    if KEEP > 0:
+        pat = re.compile("^" + re.escape(stem) + _SNAP_RE)
+        for old in sorted(f for f in os.listdir(d) if pat.match(f))[:-KEEP]:
+            os.remove(os.path.join(d, old))
+    print(f"    Snapshot:       {snap}")
+    return snap
+
+def load_json(path):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return None          # unparseable: the caller must not overwrite it
+
+def dump_json(path, obj, mode=None):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".ferry-tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f, indent=2)
+        f.write("\n")
+    if mode is not None:
+        os.chmod(tmp, mode)
+    elif os.path.exists(path):
+        os.chmod(tmp, stat.S_IMODE(os.stat(path).st_mode))
+    os.replace(tmp, path)
+
+def _sha(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+def _prior_created():
+    try:
+        with open(RECORD) as f:
+            return {c["path"] for c in json.load(f).get("created", [])}
+    except Exception:
+        return set()
+
+def write_owned(path, text, mode=0o644):
+    """Create (or refresh) a file ferry owns outright. A file at that path
+    that ferry did not create (no marker, not in the last record) is never
+    replaced: that is the user config this whole design leaves alone."""
+    path = os.path.abspath(path)
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                cur = f.read()
+        except Exception:
+            cur = ""
+        if MARKER not in cur and path not in _prior_created():
+            raise SystemExit(f"    ERROR: {path} exists and is not ferry-managed; "
+                             "leaving it alone. Move it aside and re-run.")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".ferry-tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    note_created(path)
+    return path
+
+def wrapper(path, exports, argv0, argv_prefix=(), pre=""):
+    """A zsh wrapper that exports the client env (values may reference
+    $FERRY_KEY, read from the 0600 key file at run time) and execs argv0."""
+    import shlex
+    lines = ["#!/usr/bin/env zsh", f"# {MARKER}",
+             f"# Generated by `ferry {CLIENT}`; `ferry {CLIENT} --unwire` removes it.",
+             f"FERRY_KEY=\"$(cat {shlex.quote(KEYFILE)} 2>/dev/null)\"",
+             ": \"${FERRY_KEY:=local}\""]
+    if pre:
+        lines.append(pre.rstrip("\n"))
+    for k, v in exports.items():
+        lines.append(f"export {k}={v}")
+    pre_args = " ".join(shlex.quote(a) for a in argv_prefix)
+    lines.append(f"exec {shlex.quote(argv0)} {pre_args} \"$@\"".replace("  ", " "))
+    return write_owned(path, "\n".join(lines) + "\n", 0o755)
+
+def note_created(path):
+    path = os.path.abspath(path)
+    _created[:] = [c for c in _created if c["path"] != path]
+    _created.append({"path": path, "sha256": _sha(path)})
+
+def note_edited(path, kind, **owner):
+    path = os.path.abspath(path)
+    _edited[:] = [e for e in _edited if e["path"] != path]
+    _edited.append(dict(path=path, kind=kind, **owner))
+
+def save_record(extra=None):
+    rec = {"client": CLIENT, "host": HOST, "port": PORT, "base": BASE,
+           "model": LANE, "created": _created, "edited": _edited}
+    rec.update(extra or {})
+    os.makedirs(os.path.dirname(RECORD), exist_ok=True)
+    if os.path.exists(RECORD):
+        shutil.copy2(RECORD, f"{RECORD}.{_TS}.bak")
+    dump_json(RECORD, rec, 0o600)
+    print(f"    Config written: {RECORD}")
+
+def json_member_set(path, keys, value):
+    """Set obj[k1][k2]...=value in a plain-JSON file, keeping every other key.
+    Records the member as ferry-owned so --unwire removes only it."""
+    d = load_json(path)
+    if d is None:
+        raise SystemExit(f"    ERROR: {path} is not valid JSON; leaving it alone.")
+    snapshot(path)
+    cur = d
+    for k in keys[:-1]:
+        if not isinstance(cur.get(k), dict):
+            cur[k] = {}
+        cur = cur[k]
+    cur[keys[-1]] = value
+    dump_json(path, d)
+    note_edited(path, "json-member", keys=list(keys), base=BASE)
+'
+
+# _agent_python [args...] <<'PYEOF' ... PYEOF
+#   Runs the heredoc with FERRY_AGENT_PY preloaded; args land in sys.argv[1:].
+_agent_python() {
+  local body
+  body="$(cat)"
+  AG_CLIENT="$AG_CLIENT" AG_HOST="$AG_HOST" AG_PORT="$AG_PORT" \
+  AG_BASE="$AG_BASE" AG_ROOT="$AG_ROOT" AG_KEYFILE="$AG_KEYFILE" \
+  AG_NAME="$AG_NAME" AG_FLEET="$AG_FLEET" AG_LANE="$AG_LANE" \
+  AG_LANES="$AG_LANES" AG_RECORD="$AG_RECORD" AG_KEEP="$AG_KEEP" \
+    python3 -c "${FERRY_AGENT_PY}"$'\n'"${body}" "$@"
+}
+
+# Generic, record-driven unwire. Created files go only if their sha256 still
+# matches the record (else they are the user's now and stay, with a note).
+# Edited files: kind "json-member" is stripped here; any other kind is handed
+# to the module's _<client>_unwire <path> <edit-json> hook when it defines one.
+# The record goes last, and client.json's <client>_mode flips to none.
+_agent_unwire() {
+  local client="$1"
+  local rec="$HOME/.config/ferry/${client}.json"
+  if [[ ! -f "$rec" ]]; then
+    echo ">>> ${client}: nothing wired by ferry (no $rec), skipping."
+    return 0
+  fi
+  echo ">>> Unwiring ${client} (from $rec)..."
+  local plan rc=0
+  plan=$(python3 - "$rec" "$AG_DRY" <<'PYEOF'
+import hashlib, json, os, sys
+rec_path, dry = sys.argv[1], sys.argv[2] == "1"
+rec = json.load(open(rec_path))
+for c in rec.get("created", []):
+    p = c["path"]
+    if not os.path.exists(p):
+        continue
+    with open(p, "rb") as f:
+        same = hashlib.sha256(f.read()).hexdigest() == c.get("sha256")
+    if not same:
+        print(f"    Kept {p}: changed since ferry wrote it.", file=sys.stderr)
+    elif dry:
+        print(f"    [dry-run] would remove {p}", file=sys.stderr)
+    else:
+        os.remove(p)
+        print(f"    Removed {p}", file=sys.stderr)
+for e in rec.get("edited", []):
+    p = e["path"]
+    if not os.path.exists(p):
+        continue
+    if e.get("kind") != "json-member":
+        print("HOOK\t" + json.dumps(e))
+        continue
+    try:
+        d = json.load(open(p))
+    except Exception:
+        print(f"    Kept {p}: no longer valid JSON; remove ferry's entry by hand.",
+              file=sys.stderr)
+        continue
+    keys, cur, chain = e["keys"], d, []
+    for k in keys[:-1]:
+        if not isinstance(cur, dict) or k not in cur:
+            cur = None
+            break
+        chain.append((cur, k)); cur = cur[k]
+    if not isinstance(cur, dict) or keys[-1] not in cur:
+        continue
+    if dry:
+        print(f"    [dry-run] would remove {'.'.join(keys)} from {p}", file=sys.stderr)
+        continue
+    del cur[keys[-1]]
+    for parent, k in reversed(chain):      # drop containers ferry emptied
+        if parent[k] == {}:
+            del parent[k]
+        else:
+            break
+    with open(p + ".ferry-tmp", "w") as f:
+        json.dump(d, f, indent=2); f.write("\n")
+    os.chmod(p + ".ferry-tmp", os.stat(p).st_mode & 0o777)
+    os.replace(p + ".ferry-tmp", p)
+    print(f"    Removed {'.'.join(keys)} from {p}", file=sys.stderr)
+PYEOF
+) || rc=$?
+  local line
+  for line in "${(@f)plan}"; do
+    [[ "$line" == HOOK$'\t'* ]] || continue
+    if (( $+functions[_${client}_unwire] )); then
+      "_${client}_unwire" "${line#HOOK$'\t'}" || rc=1
+    else
+      echo "    Kept an edit ferry cannot undo generically: ${line#HOOK$'\t'}"
+    fi
+  done
+  if (( AG_DRY )); then
+    echo "    [dry-run] would remove $rec"
+    return $rc
+  fi
+  rm -f "$rec"
+  echo "    Removed $rec"
+  _agent_set_mode "$client" none
+  return $rc
+}
+# ferry pi - point Pi (earendil-works/pi, binary `pi`) at the ferry endpoint.
+#
+# Research (source read from a fresh clone, earendil-works/pi @ 780bf31 which
+# is coding-agent 1.6.0; the INSTALLED pi is 0.85.1 and its bundled
+# docs/models.md says the same for every fact below, so the file format is
+# stable across both). Paths are packages/coding-agent/... unless noted.
+#
+# (1) Where custom providers live. <agent dir>/models.json, agent dir =
+#     $PI_CODING_AGENT_DIR else ~/.pi/agent (src/config.ts:610 ENV_AGENT_DIR,
+#     src/config.ts:630-636 getAgentDir, src/config.ts:644-645 getModelsPath;
+#     loaded by src/core/model-runtime.ts:220-222). The file is
+#     {"providers": {"<id>": {...}}} (src/core/model-config.ts:131 schema).
+#     Custom OpenAI base URL: provider `baseUrl` with `api: "openai-completions"`
+#     (src/core/model-config.ts:90-93 baseUrl, :101-107 api); the OpenAI SDK is
+#     built with baseURL = model.baseUrl (../ai/src/api/openai-completions.ts:
+#     778-784) so the .../v1 root is the right value and the SDK appends
+#     /chat/completions. Anthropic base URL: the same provider entry with
+#     `api: "anthropic-messages"`; ferry serves /v1/messages too, but chat/
+#     completions is the preferred dialect, so that is what is wired.
+# (2) Key. Provider `apiKey` is a literal, "$NAME" / "${NAME}" env
+#     interpolation, or "!command" whose trimmed stdout is the key
+#     (src/core/model-config.ts:95-100; src/core/resolve-config-value.ts, the
+#     `!` branch of parseConfigValueReference, executeCommandUncached
+#     "stdout.trim()", and the "$$" / "$!" escapes in parseConfigValueTemplate).
+#     ferry uses "!cat '<~/.config/ferry/agents.key>'": the key never sits in
+#     models.json, and it works for a plain `pi --provider ferry` as well as
+#     through the pi-ferry wrapper. (A "$FERRY_KEY" form would send an unset
+#     variable as no key at all in a plain pi.)
+# (3) Custom headers. Provider `headers` map, values resolve like apiKey
+#     (src/core/model-config.ts:37-39 HeadersSchema, :108 headers;
+#     src/core/resolve-config-value.ts:271-282 resolveHeadersOrThrow). ferry
+#     sends X-Ferry-Client (and X-Ferry-Fleet when set), with "$" escaped as
+#     "$$" and a leading "!" as "$!" so a host name can never be executed.
+# (4) API spoken. openai-completions (POST {baseUrl}/chat/completions). The
+#     provider also pins the plain dialect through `compat`
+#     (supportsStore false, supportsDeveloperRole false, maxTokensField
+#     max_tokens; src/core/pi-ai-schemas.ts ProviderCompatSchema, documented in
+#     docs/models.md "OpenAI Compatibility") because a LiteLLM-fronted local
+#     lane may reject the generic OpenAI defaults. `authHeader: true` adds
+#     Authorization: Bearer <key> (src/core/provider-composer.ts:379-391).
+# (5) Least invasive wiring. Pi has NO flag or env var that points at a
+#     different models.json alone: PI_CODING_AGENT_DIR relocates the whole
+#     agent dir (auth.json, settings.json, sessions, skills), which would
+#     orphan the user's own login and settings; there is no extension or
+#     --models-file flag either (src/cli/args.ts only has --provider/--model/
+#     --api-key, :115-119). So design rule 1b applies: ONE named `ferry`
+#     provider is added next to the user's own providers, and nothing that
+#     selects the default provider is touched (settings.json is never read).
+#     Plain `pi` keeps its provider; `pi-ferry` is `pi --provider ferry
+#     --model <lane>` and a `/model` pick of ferry/<lane> works in plain pi.
+#
+# The file is JSONC for pi, but only `//` line comments and trailing commas
+# (src/utils/json.ts:2-5 stripJsonComments; a /* */ block comment is NOT
+# tolerated by pi, so it is not tolerated here either). The edit is
+# TEXT-surgical: the ferry member is inserted as the FIRST member of
+# "providers" (with its own trailing comma), so not one byte of the user's file
+# moves, and the literal inserted text is recorded so `ferry pi --unwire`
+# removes exactly that text and gives the seeded file back byte for byte. A file
+# that cannot be parsed or edited safely, or a user-owned `ferry` provider
+# ferry did not write, is left untouched (snippet printed, exit 1).
+#
+# Files: ~/.local/bin/pi-ferry (wrapper), the edit of <agent dir>/models.json
+# (created when absent), ~/.config/ferry/pi.json (record) and
+# ~/.config/ferry/agents.key (0600, shared).
+
+cmd_pi() { _agent_main pi "$@"; }
+
+_pi_help() {
+  cat <<'EOF'
+ferry pi - point Pi (earendil-works/pi) at the ferry endpoint.
+
+Usage:
+  ferry pi [--agent-dir DIR] [common flags]
+
+  Adds ONE 'ferry' provider (openai-completions, every served lane listed)
+  to Pi's models.json and writes the wrapper ~/.local/bin/pi-ferry, which
+  runs `pi --provider ferry --model <lane>`. The key is never written to
+  models.json: the provider reads ~/.config/ferry/agents.key (0600) through
+  an apiKey "!cat ..." command. Your other providers, comments and
+  formatting stay byte for byte; the default provider of plain `pi` is not
+  changed. X-Ferry-Client / X-Ferry-Fleet are sent as provider headers.
+  --agent-dir DIR  Pi agent dir (default $PI_CODING_AGENT_DIR, else ~/.pi/agent).
+
+Then:  pi-ferry            (or: pi --provider ferry --model heavy)
+EOF
+}
+
+_pi_wire() {
+  local pi_dir="" a
+  local -a extra=("${AG_EXTRA[@]}")
+  while (( ${#extra[@]} )); do
+    a="${extra[1]}"
+    case "$a" in
+      --agent-dir) pi_dir="${extra[2]:-}"; extra=("${extra[@]:2}") ;;
+      *) echo "Unknown option for 'ferry pi': $a"; return 1 ;;
+    esac
+  done
+  pi_dir="${pi_dir:-${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}}"
+  _agent_python "$pi_dir" <<'PYEOF'
+import shlex, sys
+
+agent_dir = os.path.abspath(os.path.expanduser(sys.argv[1]))
+models_path = os.path.join(agent_dir, "models.json")
+
+
+def cfg_escape(v):
+    """A literal header value for pi's value resolver: "$" -> "$$", a leading
+    "!" -> "$!" (so a host name can never be run as a command)."""
+    v = v.replace("$", "$$")
+    return "$!" + v[1:] if v.startswith("!") else v
+
+
+lanes = [LANE] + [l for l in LANES if l != LANE]
+provider = {
+    "name": "ferry",
+    "baseUrl": BASE,
+    "apiKey": "!cat " + shlex.quote(KEYFILE),
+    "api": "openai-completions",
+    "authHeader": True,
+    "headers": {k: cfg_escape(v) for k, v in HEADERS.items()},
+    "compat": {
+        "supportsStore": False,
+        "supportsDeveloperRole": False,
+        "maxTokensField": "max_tokens",
+    },
+    "models": [{"id": l, "name": f"ferry {l}"} for l in lanes],
+}
+
+
+# ---------------------------------------------------------------- JSONC ----
+class Bad(Exception):
+    pass
+
+
+WS = " \t\r\n﻿"
+
+
+def skip_ws(t, i):
+    n = len(t)
+    while i < n:
+        if t[i] in WS:
+            i += 1
+        elif t.startswith("//", i):
+            j = t.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif t.startswith("/*", i):
+            raise Bad("a /* */ comment (pi does not accept those either)")
+        else:
+            break
+    return i
+
+
+def end_string(t, i):
+    j = i + 1
+    while j < len(t):
+        if t[j] == "\\":
+            j += 2
+        elif t[j] == '"':
+            return j + 1
+        else:
+            j += 1
+    raise Bad("unterminated string")
+
+
+SCALAR = re.compile(r"-?\d[\d.eE+\-]*|true|false|null")
+
+
+def parse_value(t, i):
+    i = skip_ws(t, i)
+    if i >= len(t):
+        raise Bad("unexpected end of file")
+    c = t[i]
+    if c == "{":
+        return parse_object(t, i)[0]
+    if c == "[":
+        i += 1
+        while True:
+            i = skip_ws(t, i)
+            if i >= len(t):
+                raise Bad("unterminated array")
+            if t[i] == "]":
+                return i + 1
+            i = skip_ws(t, parse_value(t, i))
+            if i < len(t) and t[i] == ",":
+                i += 1
+            elif i < len(t) and t[i] != "]":
+                raise Bad("expected , or ] in array")
+    if c == '"':
+        return end_string(t, i)
+    m = SCALAR.match(t, i)
+    if not m:
+        raise Bad(f"unexpected character {c!r}")
+    return m.end()
+
+
+def parse_object(t, i):
+    """(index past the closing brace, [(key, value_start, value_end)])."""
+    members = []
+    i += 1
+    while True:
+        i = skip_ws(t, i)
+        if i >= len(t):
+            raise Bad("unterminated object")
+        if t[i] == "}":
+            return i + 1, members
+        if t[i] != '"':
+            raise Bad("expected a string key")
+        ke = end_string(t, i)
+        k = json.loads(t[i:ke])
+        i = skip_ws(t, ke)
+        if i >= len(t) or t[i] != ":":
+            raise Bad("expected ':' after a key")
+        vs = skip_ws(t, i + 1)
+        ve = parse_value(t, vs)
+        members.append((k, vs, ve))
+        i = skip_ws(t, ve)
+        if i < len(t) and t[i] == ",":
+            i += 1
+        elif i < len(t) and t[i] != "}":
+            raise Bad("expected , or } in object")
+
+
+def strip_jsonc(t):
+    """Comments and trailing commas removed: a strict-JSON twin of t."""
+    out, i, n = [], 0, len(t)
+    while i < n:
+        c = t[i]
+        if c == '"':
+            j = end_string(t, i)
+            out.append(t[i:j])
+            i = j
+        elif c == "/" or c in WS:
+            j = skip_ws(t, i)
+            if j > i:
+                out.append(" ")
+                i = j
+            else:
+                out.append(c)
+                i += 1
+        elif c == ",":
+            j = skip_ws(t, i + 1)
+            if not (j < n and t[j] in "}]"):
+                out.append(c)
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def loads(t):
+    try:
+        return json.loads(strip_jsonc(t))
+    except (ValueError, IndexError) as e:
+        raise Bad(str(e))
+
+
+def block(indent, key, val):
+    pad = " " * indent
+    body = json.dumps(val, indent=2).replace("\n", "\n" + pad)
+    return f"{pad}{json.dumps(key)}: {body}"
+
+
+def first_member_text(t, obj_start, indent, key, val):
+    """The exact text to insert right after the `{` of the object at obj_start
+    so that `key` becomes its first member. Existing bytes never move."""
+    _, members = parse_object(t, obj_start)
+    member = block(indent, key, val)
+    if members:
+        return "\n" + member + ","
+    return "\n" + member + "\n" + " " * (indent - 2)
+
+
+# ----------------------------------------------------------------- state ----
+def prior_edit():
+    try:
+        with open(RECORD) as f:
+            for e in json.load(f).get("edited", []):
+                if e.get("path") == os.path.abspath(models_path) \
+                        and e.get("kind") == "pi-models-jsonc":
+                    return e
+    except Exception:
+        pass
+    return None
+
+
+def fail(msg, snippet_indent=4):
+    print(f"    ERROR: {models_path} was NOT modified: {msg}.", file=sys.stderr)
+    print('    Add this provider under "providers" by hand:', file=sys.stderr)
+    print(block(snippet_indent, "ferry", provider), file=sys.stderr)
+    sys.exit(1)
+
+
+existing = None
+if os.path.exists(models_path):
+    with open(models_path, encoding="utf-8") as f:
+        existing = f.read()
+
+prior = prior_edit()
+created = bool(prior and prior.get("created")) or existing is None
+blank = prior.get("blank") if prior else None
+if existing is not None and not existing.strip() and not (prior and prior.get("inserted")):
+    blank = existing                      # a user's empty file: restore it on unwire
+if existing is None or (not existing.strip() and blank is not None):
+    base = "{}\n"
+else:
+    base = existing
+
+try:
+    old = loads(base)
+    if not isinstance(old, dict):
+        raise Bad("top level is not a JSON object")
+    start = skip_ws(base, 0)
+    if base[start] != "{":
+        raise Bad("top level is not a JSON object")
+    old_inserted = prior.get("inserted") if prior else None
+    if old_inserted and old_inserted in base:
+        # Re-wire: refresh our own text in place, same shape, same spot.
+        tail = "," if old_inserted.endswith(",") else old_inserted[old_inserted.rfind("\n"):]
+        top = bool(prior.get("top"))
+        member = (block(2, "providers", {"ferry": provider}) if top
+                  else block(4, "ferry", provider))
+        new_inserted = "\n" + member + tail
+        new_text = base.replace(old_inserted, new_inserted, 1)
+    else:
+        prov = next((m for m in parse_object(base, start)[1] if m[0] == "providers"), None)
+        if prov is None:
+            new_inserted = first_member_text(base, start, 2, "providers", {"ferry": provider})
+            pos = start + 1
+            top = True
+        else:
+            if not isinstance(old.get("providers"), dict):
+                raise Bad('"providers" is not an object')
+            if "ferry" in old["providers"]:
+                raise Bad('a "ferry" provider that ferry did not write is already there')
+            new_inserted = first_member_text(base, prov[1], 4, "ferry", provider)
+            pos = prov[1] + 1
+            top = False
+        new_text = base[:pos] + new_inserted + base[pos:]
+    want = json.loads(json.dumps(old))
+    want.setdefault("providers", {})["ferry"] = provider
+    if loads(new_text) != want:
+        raise Bad("the edit did not round-trip")
+except (Bad, IndexError) as e:
+    fail(str(e))
+
+os.makedirs(agent_dir, exist_ok=True)
+changed = new_text != existing
+if existing is not None and changed and existing.strip():
+    snapshot(models_path)
+if changed:
+    fd = os.open(models_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(new_text)
+
+wrapper(os.path.join(HOME, ".local", "bin", "pi-ferry"), {}, "pi",
+        ["--provider", "ferry", "--model", LANE])
+note_edited(models_path, "pi-models-jsonc", inserted=new_inserted,
+            created=created, blank=blank, top=top)
+save_record({"agent_dir": agent_dir, "provider": "ferry", "lanes": lanes})
+print(f"    Wired pi        -> {BASE} (openai-completions; lanes: {', '.join(lanes)})")
+print(f"    File edited:    {models_path}" + ("" if changed else " (unchanged)"))
+print(f"    Run:            pi-ferry   (pi --provider ferry --model {LANE})")
+PYEOF
+}
+
+# Remove ONLY ferry's inserted text from models.json. Called by the generic
+# unwire with the edit record (json) as $1; it runs under --dry-run too.
+_pi_unwire() {
+  python3 - "$1" "${AG_DRY:-0}" <<'PYEOF'
+import json, os, sys
+e = json.loads(sys.argv[1]); dry = sys.argv[2] == "1"
+path, ins = e["path"], e.get("inserted") or ""
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+if not ins or ins not in text:
+    print(f"    Kept {path}: ferry's provider text is no longer there verbatim;"
+          " remove the \"ferry\" provider by hand.", file=sys.stderr)
+    sys.exit(0)
+new = text.replace(ins, "", 1)
+gone = new.strip() == "{}" and (e.get("created") or e.get("blank") is not None)
+if dry:
+    print(f"    [dry-run] would remove the ferry provider from {path}"
+          + (" (and the file)" if gone and e.get("created") else ""), file=sys.stderr)
+    sys.exit(0)
+if gone and e.get("created"):
+    os.remove(path)
+    print(f"    Removed {path} (ferry created it)", file=sys.stderr)
+else:
+    out = e["blank"] if gone else new
+    mode = os.stat(path).st_mode & 0o777
+    with open(path + ".ferry-tmp", "w", encoding="utf-8") as f:
+        f.write(out)
+    os.chmod(path + ".ferry-tmp", mode)
+    os.replace(path + ".ferry-tmp", path)
+    print(f"    Removed the ferry provider from {path}", file=sys.stderr)
+PYEOF
+}
+# ferry omp - point oh-my-pi (can1357/oh-my-pi, binary `omp`, a Pi fork) at the
+# ferry endpoint.
+#
+# Research (source read from a fresh clone, can1357/oh-my-pi @ 2843591; the
+# installed omp is 17.2.15). Paths are packages/coding-agent/... unless noted.
+#
+# Does omp share Pi's models.json wiring? NO. Same idea, different file and
+# format, so ferry does not reuse the prime/pi text-surgery:
+#   - omp reads <agent dir>/models.yml, else models.yaml, and YAML is the only
+#     format it parses there (src/config/config-file.ts:156-176 ConfigFile ctor
+#     picks the .yaml fallback and the .json migration path; :233-240
+#     #parseContent runs YAML.parse for .yml/.yaml). A models.json is only a
+#     ONE-TIME migration source, converted when no YAML file exists
+#     (src/config/config-file.ts:30-57 migrateJsonToYml: `if
+#     (fs.existsSync(ymlPath)) return`), so a `ferry` entry in models.json is
+#     ignored once a models.yml exists. Pi's "$NAME" apiKey form also differs:
+#     omp treats a bare env-var NAME as the variable and anything else, "$NAME"
+#     included, as a literal (src/config/resolve-config-value.ts:104-108,
+#     `$envExact(v) || v`). Default location: path.join(getAgentDir(),
+#     "models.yml") (src/config/model-registry.ts:783), getAgentDir() =
+#     $PI_CODING_AGENT_DIR else ~/.omp/agent (../utils/src/dirs.ts:361-367; omp
+#     reads the same PI_CODING_AGENT_DIR variable Pi does).
+#
+# (1) Provider config + base URLs. Two places: models.yml
+#     `providers.<id>.baseUrl` + `api: openai-completions` (docs/models.md
+#     "Provider-level fields"), or an extension's pi.registerProvider(name,
+#     {baseUrl, apiKey, api, headers, authHeader, models})
+#     (src/extensibility/extensions/types.ts:2284-2328 ProviderConfig,
+#     :2331-2362 ProviderModelConfig; docs/extensions.md "Provider
+#     registration"). An Anthropic base URL would be `api:
+#     "anthropic-messages"`; the OpenAI chat dialect is preferred here.
+# (2) Key. registerProvider's apiKey is "API key or environment variable name"
+#     (types.ts:2288-2294); it is installed as the provider's runtime key
+#     (src/config/model-registry.ts:4440-4449, whose comment says it is
+#     typically an env-var name). ferry sets apiKey: "FERRY_KEY" and the
+#     omp-ferry wrapper exports FERRY_KEY from ~/.config/ferry/agents.key
+#     (0600) at run time, so the key is never in argv nor in any config file.
+# (3) Headers. ProviderConfig.headers (types.ts:2299-2300) and per-model
+#     headers; ferry sends X-Ferry-Client and X-Ferry-Fleet (when set).
+# (4) API. openai-completions, POST {baseUrl}/chat/completions; every served
+#     lane is registered as a model. Per-model `compat` pins the plain dialect
+#     (supportsStore false, supportsDeveloperRole false, maxTokensField
+#     max_tokens; types.ts:2360-2361) because a LiteLLM-fronted local lane may
+#     reject OpenAI's newer defaults.
+# (5) Least invasive wiring (design rule 1a, NO edit of any user file). omp
+#     has no flag to point at another models.yml (PI_CODING_AGENT_DIR and
+#     --profile relocate the whole agent dir: credentials DB, settings,
+#     sessions), but it loads `-e <file>` extensions on top of normal
+#     discovery (docs/cli-reference.md:160 `--extension <path>, -e <path>`;
+#     :164 "--no-extensions ... explicit -e paths still work"). So ferry
+#     writes ONE ferry-owned extension, ~/.config/ferry/omp/ferry-provider.ts,
+#     that registers a `ferry` provider, plus the wrapper ~/.local/bin/omp-ferry
+#     = `omp -e <that file> --model ferry/<lane>`. The user's models.yml,
+#     settings and logins are never read or written, plain `omp` is unchanged,
+#     and `ferry omp --unwire` removes the two files ferry created.
+#     Limitation: the provider exists only under omp-ferry (or `omp -e <file>`),
+#     not in a plain `omp` /model list.
+#
+# Files: ~/.local/bin/omp-ferry (wrapper), ~/.config/ferry/omp/ferry-provider.ts
+# (extension), ~/.config/ferry/omp.json (record), ~/.config/ferry/agents.key
+# (0600, shared).
+
+cmd_omp() { _agent_main omp "$@"; }
+
+_omp_help() {
+  cat <<'EOF'
+ferry omp - point oh-my-pi (omp, a Pi fork) at the ferry endpoint.
+
+Usage:
+  ferry omp [common flags]
+
+  Writes ~/.config/ferry/omp/ferry-provider.ts (an omp extension that
+  registers a 'ferry' provider: openai-completions, every served lane as a
+  model, X-Ferry-Client / X-Ferry-Fleet headers) and the wrapper
+  ~/.local/bin/omp-ferry, which runs `omp -e <that file> --model
+  ferry/<lane>` with FERRY_KEY read from ~/.config/ferry/agents.key (0600) at
+  run time. Nothing of yours is edited: models.yml, settings and logins are
+  untouched and plain `omp` behaves as before. (omp uses models.yml, not Pi's
+  models.json, and has no flag to point at another one; -e is the clean door.)
+  Limitation: the ferry provider exists under omp-ferry only.
+
+Then:  omp-ferry     (or: omp -e ~/.config/ferry/omp/ferry-provider.ts --model ferry/heavy)
+EOF
+}
+
+_omp_wire() {
+  if (( ${#AG_EXTRA[@]} )); then
+    echo "Unknown option for 'ferry omp': ${AG_EXTRA[1]}"
+    return 1
+  fi
+  _agent_python <<'PYEOF'
+lanes = [LANE] + [l for l in LANES if l != LANE]
+ext_path = os.path.join(HOME, ".config", "ferry", "omp", "ferry-provider.ts")
+compat = {"supportsStore": False, "supportsDeveloperRole": False,
+          "maxTokensField": "max_tokens"}
+models = [{"id": l, "name": f"ferry {l}", "reasoning": False, "input": ["text"],
+           "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+           "contextWindow": 128000, "maxTokens": 16384, "compat": compat}
+          for l in lanes]
+cfg = {"baseUrl": BASE, "apiKey": "FERRY_KEY", "api": "openai-completions",
+       "authHeader": True, "headers": HEADERS, "models": models}
+body = json.dumps(cfg, indent=2).replace("\n", "\n  ")   # JSON literals are valid TypeScript
+ts = (f"// {MARKER}\n"
+      "// Generated by `ferry omp`; `ferry omp --unwire` removes it. It holds no key:\n"
+      "// apiKey names the FERRY_KEY variable the omp-ferry wrapper exports from\n"
+      "// ~/.config/ferry/agents.key at run time.\n"
+      "export default function ferryProvider(pi: any) {\n"
+      f"  pi.registerProvider(\"ferry\", {body});\n"
+      "}\n")
+write_owned(ext_path, ts, 0o644)
+wrapper(os.path.join(HOME, ".local", "bin", "omp-ferry"),
+        {"FERRY_KEY": '"$FERRY_KEY"'}, "omp",
+        ["-e", ext_path, "--model", f"ferry/{LANE}"])
+save_record({"extension": ext_path, "provider": "ferry", "lanes": lanes})
+print(f"    Wired omp       -> {BASE} (openai-completions; lanes: {', '.join(lanes)})")
+print(f"    Extension:      {ext_path}")
+print(f"    Run:            omp-ferry   (omp -e {ext_path} --model ferry/{LANE})")
+PYEOF
+}
+# ferry gemini - point Gemini CLI at the ferry endpoint, through a wrapper.
+#
+# Research, answered from the client's source (google-gemini/gemini-cli, tag
+# v0.56.0 = b6e23a7dc29e; the same facts were observed against the installed
+# 0.56.0 binary with a stub server):
+#   (1) Provider config / base URL. Gemini CLI has no provider list: it speaks
+#       ONE API, Gemini-native. The endpoint comes from the env var
+#       GOOGLE_GEMINI_BASE_URL (packages/core/src/core/contentGenerator.ts:352,
+#       validated at :354); there is no OpenAI or Anthropic base URL at all.
+#   (2) Key. GEMINI_API_KEY (contentGenerator.ts:175, :201). The Google SDK
+#       sends it as `x-goog-api-key` (header name from :277). The front door
+#       reads that header (front/ferry_front.py CREDENTIAL_HEADERS, ~:1473).
+#       GEMINI_API_KEY_AUTH_MECHANISM=bearer would send Authorization instead
+#       (:277-:288) but is not needed.
+#   (3) Custom headers. YES: GEMINI_CLI_CUSTOM_HEADERS, "Name: value" pairs
+#       separated by commas (contentGenerator.ts:241, parsed by
+#       packages/core/src/utils/customHeaderUtils.ts:10-38, merged at :272-:274).
+#       So X-Ferry-Client / X-Ferry-Fleet are sent.
+#   (4) API. Gemini-native: POST {base}/v1beta/models/<model>:streamGenerateContent
+#       (observed: /v1beta/models/heavy:streamGenerateContent?alt=sse).
+#   (5) Least invasive wiring: the `gemini-ferry` wrapper, env only, plus ONE
+#       ferry-owned settings file ~/.config/ferry/gemini-settings.json that the
+#       wrapper points GEMINI_CLI_SYSTEM_SETTINGS_PATH at
+#       (packages/core/src/config/storage.ts:185, settings.ts:105). The user's
+#       ~/.gemini is never read-written by ferry and plain `gemini` is untouched.
+#
+# Three source facts shape the wiring:
+#   - GOOGLE_GEMINI_BASE_URL alone selects auth type "gateway"
+#     (contentGenerator.ts:87-88), but the CLI's own validateAuthMethod
+#     (packages/cli/src/config/auth.ts:73) rejects it ("Invalid auth method
+#     selected."; observed on 0.56.0). So the settings file selects
+#     security.auth.selectedType = "gemini-api-key" (contentGenerator.ts:65),
+#     which still honours GOOGLE_GEMINI_BASE_URL (:352) and, being a SYSTEM
+#     settings file, beats whatever login the user's own settings.json holds.
+#   - The model name goes to the wire verbatim (observed /models/heavy:...)
+#     EXCEPT four aliases the CLI rewrites to Google model ids before sending:
+#     auto, pro, flash, flash-lite (packages/core/src/config/models.ts:110-113,
+#     resolveModel switch ~:262-:300). So lane `heavy` / `medium` reach litellm,
+#     but a ferry lane literally named `flash` is turned into a Google id and
+#     cannot be selected from this client. Reported as a gap, not worked around.
+#   - Device keys: since v1.52.0 the front door admits a device key on
+#     POST /v1beta/models/<lane>:generateContent and :streamGenerateContent
+#     with the lane limit, RPM, budget and metering of chat/completions
+#     (front/ferry_front.py GEMINI_GENERATE_RE, DEVICE_KEY_PATTERN_ROUTES).
+#     A host older than v1.52.0 still refuses them, so with an `fk-` key the
+#     wire step prints a one-line note saying so.
+# Headless runs in an untrusted directory need GEMINI_CLI_TRUST_WORKSPACE=true
+# or --skip-trust (a Gemini CLI rule, not ferry's); the wrapper does not set it.
+
+_gemini_help() {
+  cat <<'EOF'
+ferry gemini - point Gemini CLI at the ferry endpoint via a `gemini-ferry` wrapper.
+
+Usage:
+  ferry gemini [--host H] [--port P] [--key K] [--model LANE] [--unwire]
+
+  Writes ~/.local/bin/gemini-ferry and ~/.config/ferry/gemini-settings.json
+  (ferry's own; ~/.gemini is never touched, plain `gemini` is unchanged).
+  gemini-ferry sets GOOGLE_GEMINI_BASE_URL, GEMINI_API_KEY (read at run time
+  from ~/.config/ferry/agents.key), GEMINI_MODEL=<lane> and
+  GEMINI_CLI_CUSTOM_HEADERS (X-Ferry-Client, X-Ferry-Fleet), then runs `gemini`.
+
+Limits:
+  - Gemini CLI only speaks the Gemini-native API (/v1beta/...). A device key
+    (fk-...) works there only on a host running ferry v1.52.0 or later.
+  - The CLI rewrites the model names auto, pro, flash and flash-lite to Google
+    ids, so those lane names cannot be reached; heavy / medium pass through.
+EOF
+}
+
+_gemini_wire() {
+  local key
+  key=$(<"$AG_KEYFILE") 2>/dev/null || key=""
+  if [[ "$key" == fk-* ]]; then
+    echo "    Note: the key is a device key (fk-...). The host must run ferry v1.52.0 or"
+    echo "    later, which admits device keys on the Gemini-native routes (/v1beta)."
+  fi
+  _agent_python <<'PYEOF'
+import json, os, shlex
+settings = os.path.join(HOME, ".config", "ferry", "gemini-settings.json")
+# gemini-api-key, not "gateway": gateway fails the CLI's own auth validation.
+write_owned(settings, json.dumps(
+    {"security": {"auth": {"selectedType": "gemini-api-key"}}}, indent=2) + "\n", 0o644)
+hdr =",".join(f"{k}: {v}" for k, v in HEADERS.items())
+pre = (
+    "unset GOOGLE_GENAI_USE_GCA GOOGLE_GENAI_USE_VERTEXAI"
+)
+exports = {
+    "GOOGLE_GEMINI_BASE_URL": shlex.quote(ROOT),
+    "GEMINI_API_KEY": '"$FERRY_KEY"',
+    "GEMINI_MODEL": shlex.quote(LANE),
+    "GEMINI_CLI_SYSTEM_SETTINGS_PATH": shlex.quote(settings),
+    "GEMINI_CLI_CUSTOM_HEADERS":
+        '"${GEMINI_CLI_CUSTOM_HEADERS:+$GEMINI_CLI_CUSTOM_HEADERS,}"' + shlex.quote(hdr),
+}
+w = wrapper(os.path.join(HOME, ".local", "bin", "gemini-ferry"), exports, "gemini", pre=pre)
+print(f"    Wrapper:        {w}")
+print(f"    Settings:       {settings}")
+print(f"    Lane:           {LANE}  (endpoint {ROOT}, Gemini-native /v1beta)")
+save_record({"settings": settings})
+PYEOF
+}
+
+cmd_gemini() { _agent_main gemini "$@"; }
+# ferry qwen - point Qwen Code at the ferry endpoint, through a wrapper.
+#
+# Research, answered from the client's source (QwenLM/qwen-code, tag v0.27.3 =
+# ddeba2fd3436, the version the e2e installs; checked against the stub too):
+#   (1) Provider config / base URL. Qwen Code (a Gemini CLI fork) keeps
+#       providers in settings.json under `modelProviders.<authType>[]`, each
+#       entry {id, name, envKey, baseUrl, generationConfig}
+#       (packages/cli/src/config/settingsSchema.ts:404, docs/users/configuration/
+#       model-providers.md:7). OpenAI-compatible is auth type `openai`; env-only
+#       setups use OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL
+#       (packages/core/src/models/constants.ts:90-91,
+#       packages/cli/src/config/auth.ts:25, availableModels.ts:48). No Anthropic
+#       wiring is needed: the openai type is the least-friction route to ferry.
+#   (2) Key. Never stored in settings: the runtime reads process.env[envKey]
+#       (docs model-providers.md:7); for `openai` the default envKey is
+#       OPENAI_API_KEY (auth.ts:25). The wrapper exports it from the 0600 key
+#       file at run time.
+#   (3) Custom headers. YES, but only per model entry: `generationConfig.
+#       customHeaders` (docs model-providers.md:291-293; applied at
+#       packages/core/src/core/openaiContentGenerator/provider/default.ts:109-115).
+#       The env-only route has no header knob, which is why ferry writes a
+#       settings file instead of relying on OPENAI_BASE_URL alone.
+#   (4) API. OpenAI chat/completions by default (pipeline.ts:566,610 call
+#       client.chat.completions.create); `wireApi: "responses"` is optional and
+#       not used. Observed POST /v1/chat/completions, Authorization: Bearer,
+#       X-Ferry-Client from customHeaders.
+#   (5) Least invasive wiring: the `qwen-ferry` wrapper plus ONE ferry-owned
+#       settings file ~/.config/ferry/qwen-settings.json that the wrapper points
+#       QWEN_CODE_SYSTEM_SETTINGS_PATH at (packages/cli/src/config/
+#       storage-paths-lite.ts:176). System settings outrank the user's
+#       ~/.qwen/settings.json, so the file forces the `openai` auth type and the
+#       ferry lane for THIS wrapper only; ~/.qwen and plain `qwen` are never
+#       touched. (QWEN_HOME, packages/core/src/config/storage.ts:194, would
+#       relocate the whole login/history dir: more invasive, not used.)
+#
+# "May Qwen share Gemini CLI's wiring?" No, only the shape (wrapper + owned
+# system-settings file). Gemini CLI speaks the Gemini-native API through
+# GOOGLE_GEMINI_BASE_URL and takes headers from GEMINI_CLI_CUSTOM_HEADERS
+# (ferry-gemini.zsh); Qwen Code is the OpenAI-compatible chat/completions path
+# with headers in modelProviders[].generationConfig.customHeaders, uses
+# QWEN_CODE_SYSTEM_SETTINGS_PATH, and so works with device keys (fk-), which
+# the Gemini-native route does not.
+
+_qwen_help() {
+  cat <<'EOF'
+ferry qwen - point Qwen Code at the ferry endpoint via a `qwen-ferry` wrapper.
+
+Usage:
+  ferry qwen [--host H] [--port P] [--key K] [--model LANE] [--unwire]
+
+  Writes ~/.local/bin/qwen-ferry and ~/.config/ferry/qwen-settings.json
+  (ferry's own; ~/.qwen is never touched, plain `qwen` is unchanged).
+  qwen-ferry reads the key at run time from ~/.config/ferry/agents.key, sets
+  OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL and
+  QWEN_CODE_SYSTEM_SETTINGS_PATH, then runs `qwen`. Every lane the host serves
+  is listed for /model; the default is --model (heavy). Requests go to
+  <endpoint>/v1/chat/completions with X-Ferry-Client / X-Ferry-Fleet headers.
+EOF
+}
+
+_qwen_wire() {
+  _agent_python <<'PYEOF'
+import json, os, shlex
+settings = os.path.join(HOME, ".config", "ferry", "qwen-settings.json")
+models = [{"id": l, "name": f"ferry {l}", "envKey": "OPENAI_API_KEY",
+           "baseUrl": BASE, "generationConfig": {"customHeaders": dict(HEADERS)}}
+          for l in LANES]
+doc = {"security": {"auth": {"selectedType": "openai"}},
+       "model": {"name": LANE},
+       "modelProviders": {"openai": models}}
+write_owned(settings, json.dumps(doc, indent=2) + "\n", 0o644)
+exports = {
+    "OPENAI_API_KEY": '"$FERRY_KEY"',
+    "OPENAI_BASE_URL": shlex.quote(BASE),
+    "OPENAI_MODEL": shlex.quote(LANE),
+    "QWEN_CODE_SYSTEM_SETTINGS_PATH": shlex.quote(settings),
+}
+w = wrapper(os.path.join(HOME, ".local", "bin", "qwen-ferry"), exports, "qwen")
+print(f"    Wrapper:        {w}")
+print(f"    Settings:       {settings}")
+print(f"    Lane:           {LANE}  (endpoint {BASE}, chat/completions)")
+save_record({"settings": settings})
+PYEOF
+}
+
+cmd_qwen() { _agent_main qwen "$@"; }
+# ferry openhands: wire the OpenHands CLI (`openhands`) to ferry (issue #3).
+#
+# Research, answered from the source (OpenHands/OpenHands-CLI @ 283c6ac, CLI
+# 1.16.0; the PyPI `openhands` 1.16.0 I ran the e2e on pins openhands-sdk
+# 1.21.0, so SDK lines below cite that wheel, openhands/sdk/llm/):
+#
+# (1) Provider config. There is no provider list. The CLI holds ONE agent in
+#     <persistence dir>/agent_settings.json (openhands_cli/locations.py:51,
+#     stores/agent_store.py:263-285), the persistence dir being ~/.openhands
+#     unless OPENHANDS_PERSISTENCE_DIR is set (locations.py:5-12). Its LLM
+#     goes through LiteLLM: model "openai/<id>" plus llm.base_url is a custom
+#     OpenAI-compatible endpoint (sdk llm.py:180 base_url, llm.py:973
+#     api_base=self.base_url). The Anthropic base URL is the same field with a
+#     "anthropic/<id>" model; ferry uses the OpenAI side.
+# (2) Key. Stored as a literal in agent_settings.json by default
+#     (agent_store.py:474-476 dumps with expose_secrets). The CLI can instead
+#     take it from the environment, but ONLY with the flag
+#     --override-with-envs (argparsers/util.py:34-42): LLM_API_KEY, LLM_BASE_URL
+#     and LLM_MODEL (agent_store.py:133-135) then override the stored agent
+#     (agent_store.py:197-225, 241-254, 353-358) and are never persisted
+#     (agent_store.py:184-186). Without the flag the variables are ignored with
+#     a warning (agent_store.py:156-178).
+# (3) Custom headers. Yes, but only as a settings field: LLM.extra_headers
+#     (sdk llm.py:287-290) is forwarded on every chat and responses call
+#     (sdk options/chat_options.py:31-33, responses_options.py:30-32). There
+#     is no env var or flag for it, so X-Ferry-Client / X-Ferry-Fleet need an
+#     agent_settings.json.
+# (4) API spoken: OpenAI chat/completions for an "openai/<lane>" model. The SDK
+#     switches to /v1/responses only for model names on its Responses list
+#     (sdk llm.py:1366-1370, utils/model_features.py:201); lane ids are not on
+#     it. Observed e2e: POST /v1/chat/completions, non-streaming. The request
+#     body also carries prompt_cache_key and reasoning_effort, which the front
+#     door must tolerate (it did against the stub; not checked against the
+#     live gateway, by rule).
+# (5) Least invasive wiring: a ferry-OWNED persistence dir,
+#     ~/.config/ferry/openhands/, holding one agent_settings.json that has the
+#     lane model, the base URL and the X-Ferry headers but NO api_key. The
+#     `openhands-ferry` wrapper exports OPENHANDS_PERSISTENCE_DIR at that dir,
+#     LLM_API_KEY="$FERRY_KEY" (read from the 0600 key file at run time),
+#     LLM_BASE_URL, LLM_MODEL=openai/<lane>, and runs
+#     `openhands --override-with-envs "$@"`. The user's ~/.openhands and the
+#     plain `openhands` command are never touched. Trade-off, stated plainly:
+#     because the persistence dir moves, `openhands-ferry` has its own
+#     conversation history, mcp.json and CLI settings (the CLI keeps all of
+#     them under that one directory, locations.py:15-47, 54). Pick another
+#     lane for one run with FERRY_LANE=flash openhands-ferry.
+#     Headless one-shot (used by the e2e): `openhands-ferry --headless -t
+#     "<task>"` (entrypoint.py:104-108).
+#
+# The ferry-owned settings file is JSON (no comment room for the managed
+# marker), so write_owned() trusts the record instead: a file at that path
+# that ferry did not record is never replaced.
+
+_openhands_help() {
+  cat <<'EOF2'
+ferry openhands - wire the OpenHands CLI to ferry (issue #3)
+
+Writes (nothing of yours is edited):
+  ~/.local/bin/openhands-ferry         wrapper: sets OPENHANDS_PERSISTENCE_DIR,
+                                       LLM_API_KEY (read from the 0600 key file
+                                       at run time), LLM_BASE_URL, LLM_MODEL and
+                                       runs `openhands --override-with-envs`
+  ~/.config/ferry/openhands/agent_settings.json
+                                       ferry's own agent: lane model, base URL,
+                                       X-Ferry-Client / X-Ferry-Fleet headers,
+                                       no key
+
+Use:  openhands-ferry                  # TUI on the ferry lane
+      openhands-ferry --headless -t "fix the failing test"
+      FERRY_LANE=flash openhands-ferry # another lane for one run
+Your own `openhands` and ~/.openhands are untouched. Limitation: openhands-ferry
+keeps its own history, MCP list and settings (OpenHands stores them all under
+one directory). Custom headers can only come from the settings file, so the
+settings file is what carries X-Ferry-Client.
+EOF2
+}
+
+_openhands_wire() {
+  local pdir="$HOME/.config/ferry/openhands"
+  _agent_python "$pdir" <<'PYEOF'
+import json, os, shlex, sys
+pdir = sys.argv[1]
+settings = os.path.join(pdir, "agent_settings.json")
+agent = {"llm": {"model": f"openai/{LANE}", "base_url": BASE,
+                 "extra_headers": HEADERS, "usage_id": "agent"}}
+write_owned(settings, json.dumps(agent, indent=2) + "\n", 0o600)
+print(f"    Agent settings: {settings}")
+wrapper(os.path.join(HOME, ".local", "bin", "openhands-ferry"),
+        {"OPENHANDS_PERSISTENCE_DIR": shlex.quote(pdir),
+         "LLM_API_KEY": '"$FERRY_KEY"',
+         "LLM_BASE_URL": shlex.quote(BASE),
+         "LLM_MODEL": "\"openai/${FERRY_LANE:-" + LANE + "}\""},
+        "openhands", ["--override-with-envs"])
+print(f"    Wrapper:        {os.path.join(HOME, '.local', 'bin', 'openhands-ferry')}")
+print(f"    Lane: {LANE}  Endpoint: {BASE}")
+print("    Run `openhands-ferry`; your own `openhands` and ~/.openhands are untouched.")
+save_record()
+PYEOF
+}
+
+cmd_openhands() { _agent_main openhands "$@"; }
+# ferry interpreter - point Open Interpreter at the ferry endpoint by lane name.
+#
+# WHICH "Open Interpreter": openinterpreter/openinterpreter was rewritten. The
+# old Python/LiteLLM package (PyPI `open-interpreter` 0.4.x, flags --api_base /
+# --api_key) is no longer what the project ships. Current main is a Rust FORK
+# OF OPENAI CODEX ("Open Interpreter is a fork of OpenAI's Codex",
+# README.md "Harness Emulation") installed by `curl -fsSL
+# https://www.openinterpreter.com/install | sh` (README.md "Installation") as
+# the binaries `interpreter` and `i` (codex-package.json in the release asset
+# open-interpreter-package-<target>.tar.gz: variant open-interpreter,
+# entrypoint bin/interpreter). This module wires THAT. The legacy 0.4.x Python
+# CLI also installs a binary called `interpreter`; it has no `-c` override and
+# is not supported here (run `interpreter --version`: 0.0.x is the new one).
+#
+# Research, pinned to openinterpreter/openinterpreter@bb3f575 (release
+# rust-v0.0.61, 2026-11-11), codex-rs/ paths:
+#  (1) Provider config + base URL. Config lives in $INTERPRETER_HOME (default
+#      ~/.openinterpreter; CODEX_HOME is deliberately ignored, so it never
+#      shares ~/.codex): utils/home-dir/src/lib.rs:6 and :12. Providers are
+#      the `model_providers` map of config.toml (config/src/config_toml.rs:323)
+#      selected by `model_provider` (config_toml.rs:163); an entry's `base_url`
+#      is model-provider-info/src/lib.rs:158. OpenAI-compatible base URL: yes,
+#      that field. Anthropic base URL: yes too, `wire_api = "messages"`
+#      (lib.rs:111 enum WireApi: responses | chat | messages, deserialised
+#      at lib.rs:140), which ferry serves at /v1/messages.
+#  (2) Key: `env_key` names an env var holding the bearer (lib.rs:163). Other
+#      options are a literal `experimental_bearer_token` (discouraged, lib.rs
+#      :169) and a command (`auth`). ferry uses env_key, so the key is never
+#      in argv or a config file.
+#  (3) Custom headers: `http_headers` (static, lib.rs:185) and
+#      `env_http_headers` (header -> env var, lib.rs:190). Both used below.
+#  (4) API: all three wire_api values exist. Chat Completions is POSTed to
+#      <base_url>/chat/completions (chat-wire-compat/src/client.rs:135,
+#      streaming at :177). ferry uses wire_api="chat" (lib.rs:115) because the
+#      project targets low-cost non-OpenAI models, the path ferry's lanes
+#      serve natively; Responses (the default, lib.rs:111) would also work.
+#      The CLI flag form is `--chat-completions` (exec/src/lib.rs:578).
+#  (5) Least invasive wiring: every setting rides on `-c key=value` config
+#      overrides (cli/src/main.rs:137, the root flag is forwarded to the exec
+#      subcommand too), exactly how `ferry codex` does it. NO file in
+#      ~/.openinterpreter is read or written, the user's plain `interpreter`
+#      and its login are untouched, and the only file ferry creates is the
+#      wrapper ~/.local/bin/interpreter-ferry. The key travels in the
+#      FERRY_INTERPRETER_KEY env var, read at run time from the 0600
+#      ~/.config/ferry/agents.key. Limitation: lane names are not in the
+#      client's model catalogue, so the client may print a non-fatal "model
+#      metadata not found" notice; the request is still sent.
+#
+# User args come LAST, so `interpreter-ferry -c model=\"medium\"` or `exec ...`
+# overrides ferry's default lane.
+
+_interpreter_help() {
+  cat <<'EOF'
+ferry interpreter - wire Open Interpreter (Rust, Codex-based `interpreter`) to ferry.
+
+Usage:
+  ferry interpreter [--host H] [--port P] [--key K] [--model LANE]
+  ferry interpreter --unwire [--dry-run]
+
+Writes one wrapper, ~/.local/bin/interpreter-ferry. It runs `interpreter`
+with `-c` overrides: a `ferry` model provider (Chat Completions at
+<base>/v1/chat/completions), the lane as the model, the bearer in the
+FERRY_INTERPRETER_KEY env var read from ~/.config/ferry/agents.key (0600),
+and X-Ferry-Client (and X-Ferry-Fleet when set) as request headers.
+~/.openinterpreter and your plain `interpreter` are never touched.
+
+  interpreter-ferry                       interactive, default lane
+  interpreter-ferry exec "do a thing"     one-shot, non-interactive
+  interpreter-ferry -c model='"flash"'    another lane
+
+Only the current Rust release (`interpreter --version` 0.0.x) is supported,
+not the legacy Python package open-interpreter 0.4.x.
+EOF
+}
+
+_interpreter_wire() {
+  _agent_python <<'PYEOF'
+import json, os
+
+def toml_str(s):
+    return json.dumps(s)          # a JSON string is a valid TOML basic string
+
+hdrs = "{" + ",".join("%s=%s" % (toml_str(k), toml_str(v))
+                      for k, v in HEADERS.items()) + "}"
+cfg = [
+    ("model_provider", toml_str("ferry")),
+    ("model_providers.ferry.name", toml_str("Ferry")),
+    ("model_providers.ferry.base_url", toml_str(BASE)),
+    ("model_providers.ferry.env_key", toml_str("FERRY_INTERPRETER_KEY")),
+    ("model_providers.ferry.wire_api", toml_str("chat")),
+    ("model_providers.ferry.http_headers", hdrs),
+]
+if "X-Ferry-Fleet" not in HEADERS:
+    # Fleet set at run time still reaches ferry (the header is dropped when
+    # FERRY_FLEET is unset or empty, model-provider-info/src/lib.rs:190).
+    cfg.append(("model_providers.ferry.env_http_headers",
+                "{" + toml_str("X-Ferry-Fleet") + "=" + toml_str("FERRY_FLEET") + "}"))
+cfg.append(("model", toml_str(LANE)))
+
+argv_prefix = []
+for k, v in cfg:
+    argv_prefix += ["-c", "%s=%s" % (k, v)]
+
+wrapper(os.path.join(HOME, ".local", "bin", "interpreter-ferry"),
+        {"FERRY_INTERPRETER_KEY": '"$FERRY_KEY"'},
+        "interpreter", argv_prefix)
+print(f"    Wrapper:        {HOME}/.local/bin/interpreter-ferry  (lane {LANE})")
+print("    Served lanes:   " + " ".join(LANES))
+print("    ~/.openinterpreter and plain `interpreter` are untouched.")
+save_record({"wire_api": "chat", "lanes": LANES})
+PYEOF
+}
+
+cmd_interpreter() { _agent_main interpreter "$@"; }
+# ferry goose: run Goose (aaif-goose/goose, formerly block/goose) on a ferry lane.
+#
+# Wiring: a wrapper only. `~/.local/bin/goose-ferry` exports Goose's own env
+# vars and execs the real `goose`; NO Goose config file is read, written or
+# snapshotted, so ~/.config/goose/config.yaml, the user's providers and their
+# keyring entries are untouched, and plain `goose` keeps its own provider.
+# `ferry goose --unwire` removes the wrapper and the record, nothing else.
+#
+# Research, all read from source at tag v1.49.0 (commit 71fc4be1ed72, the
+# same version as the installed /opt/homebrew/bin/goose, `goose --version`
+# prints 1.49.0). Paths are relative to crates/:
+#  (1) Provider config: the `openai` provider (goose/src/providers/
+#      openai_def.rs:63 from_env) resolves its endpoint from OPENAI_HOST
+#      (env, wins, :275 resolve_base_url) else OPENAI_BASE_URL (env or
+#      config.yaml) else OPENAI_HOST in config.yaml, default
+#      https://api.openai.com (:296). OPENAI_BASE_URL is split into host +
+#      path (goose-providers/src/openai.rs:129 parse_openai_base_url): a
+#      trailing /v1 is stripped from the host and selects the base path
+#      `v1/chat/completions` (openai_def.rs:90-93); OPENAI_BASE_PATH is read
+#      from env only in that case (openai_def.rs:99), so a persisted
+#      config.yaml OPENAI_BASE_PATH cannot shadow it. The wrapper therefore
+#      sets OPENAI_BASE_URL=<ferry>/v1 and UNSETS OPENAI_HOST and
+#      OPENAI_BASE_PATH (an exported OPENAI_HOST would outrank it).
+#      GOOSE_PROVIDER / GOOSE_MODEL pick provider and model
+#      (goose/src/config/base.rs:755 get_param upper-cases the key and checks
+#      the environment before config.yaml). Goose also supports declarative
+#      custom providers (goose/src/config/declarative_providers.rs, JSON in
+#      the config dir) but those are files under ~/.config/goose that ferry
+#      would have to own; the env route needs none, so it is not used.
+#      Anthropic: goose has an `anthropic` provider with ANTHROPIC_HOST, but
+#      ferry uses chat/completions here (rule: prefer OpenAI).
+#  (2) Key: OPENAI_API_KEY from the environment. Config::get_secrets
+#      (goose/src/config/base.rs:887) takes EVERY secret from the environment
+#      when the primary one (OPENAI_API_KEY) is set in env, so with the wrapper
+#      the system keyring (base.rs:31 KEYRING_SERVICE "goose") is not read for
+#      this provider. The wrapper exports it from $FERRY_KEY, read at run time
+#      from the 0600 ~/.config/ferry/agents.key; the key is in no file and no
+#      argv. The wrapper does NOT set GOOSE_DISABLE_KEYRING, because that would
+#      move the user's OTHER providers' secrets to a file (base.rs:206, :388
+#      secret_storage). The e2e test sets GOOSE_DISABLE_KEYRING=1 itself so it
+#      never touches a real keychain.
+#  (3) Custom headers: yes. OPENAI_CUSTOM_HEADERS, a comma list of
+#      `Name=Value` (goose-providers/src/openai.rs:983 parse_custom_headers),
+#      read as a secondary secret (openai_def.rs:108-113) and applied to every
+#      request (openai_def.rs:153 with_headers). The wrapper sends X-Ferry-Client and,
+#      when FERRY_FLEET was set at wire time, X-Ferry-Fleet. A comma or `=`
+#      inside a value would break that format, so such characters are
+#      replaced by `_`.
+#  (4) API: OpenAI chat/completions, streaming (supports_streaming defaults
+#      true, openai.rs:201; POST <host>/v1/chat/completions, openai.rs:838
+#      and 851 stream_openai_compat). Responses API is used only for known
+#      responses model names or a base path containing `responses`
+#      (openai.rs:416 should_use_responses_api); lane ids like `heavy` are
+#      neither. The model catalogue is GET <host>/v1/models (openai.rs:560
+#      fetch_models_from_api), which ferry serves as the lane catalogue.
+#  (5) Least invasive: env only, in a wrapper (this file). Goose picks its
+#      config dir via GOOSE_PATH_ROOT, else etcetera XDG/HOME
+#      (goose/src/config/paths.rs:8,22-36), so HOME= redirects it in tests.
+#      Telemetry: GOOSE_TELEMETRY_OFF=1 disables posthog (posthog.rs:23); the
+#      e2e sets it, the wrapper leaves the user's choice alone.
+#
+# Lanes: Goose takes ONE model per run. The wrapper defaults GOOSE_MODEL to
+# the wired lane; `FERRY_MODEL=flash goose-ferry ...` (or `--model flash` on
+# `goose run`/`session`) picks another lane from the catalogue.
+
+cmd_goose() { _agent_main goose "$@"; }
+
+_goose_help() {
+  cat <<'EOF'
+ferry goose - run Goose (aaif-goose/goose) on a ferry lane.
+
+Usage:
+  ferry goose [--host H] [--port P] [--key K] [--model LANE]
+
+  Writes ~/.local/bin/goose-ferry, a wrapper that exports GOOSE_PROVIDER=openai,
+  GOOSE_MODEL=<lane>, OPENAI_BASE_URL=<ferry>/v1, OPENAI_API_KEY (read from the
+  0600 ~/.config/ferry/agents.key at run time) and OPENAI_CUSTOM_HEADERS
+  (X-Ferry-Client, X-Ferry-Fleet when set), then execs goose. No Goose config
+  file is touched: plain `goose` keeps its own provider and keyring.
+
+  goose-ferry run -t "..." --no-session     one headless run on the ferry lane
+  goose-ferry                               interactive session on the ferry lane
+  FERRY_MODEL=flash goose-ferry ...         another lane for one run
+
+  Limitation: one model per run; `goose configure` inside goose-ferry still
+  edits the user's own config.yaml.
+EOF
+}
+
+_goose_wire() {
+  _agent_python <<'PYEOF'
+import shlex
+
+def _clean(v):                 # OPENAI_CUSTOM_HEADERS is "A=B,C=D"
+    return re.sub(r"[,=\s]", "_", v)
+
+hdr = ",".join(f"{k}={_clean(v)}" for k, v in HEADERS.items())
+wrapper(os.path.join(HOME, ".local", "bin", "goose-ferry"),
+        {"GOOSE_PROVIDER": "openai",
+         "GOOSE_MODEL": '"${FERRY_MODEL:-%s}"' % LANE,
+         "OPENAI_BASE_URL": shlex.quote(BASE),
+         "OPENAI_API_KEY": '"$FERRY_KEY"',
+         "OPENAI_CUSTOM_HEADERS": shlex.quote(hdr)},
+        "goose",
+        pre="unset OPENAI_HOST OPENAI_BASE_PATH")
+save_record({"lanes": LANES})
+PYEOF
+}
+# ferry aider: point Aider (Aider-AI/aider, PyPI `aider-chat`) at the ferry
+# endpoint through an `aider-ferry` wrapper. Nothing of the user's is edited.
+#
+# Research (Aider-AI/aider @ 5dc9490, __init__.py:3 says 0.86.3.dev; cloned
+# --depth 1 into a scratch dir, every fact below read from that tree):
+#
+# (1) Provider config / base URL. Aider talks to models through LiteLLM and
+#     has no provider table: the model name carries the provider. The OpenAI
+#     compatible base URL is `--openai-api-base` (aider/args.py:77), which
+#     aider/main.py:620-621 copies into os.environ["OPENAI_API_BASE"] (the
+#     variable LiteLLM reads). A model named `openai/<id>` goes to that base
+#     with the model id `<id>` (provider = first path piece,
+#     aider/models.py:717-719). There is no Anthropic-base path we need: the
+#     OpenAI one reaches every lane. Per-model knobs live in a YAML list
+#     (`--model-settings-file`, aider/args.py:121; loaded by
+#     aider/models.py:1085 register_models into ModelSettings, :135-157) and
+#     context/cost metadata in a JSON5 file (`--model-metadata-file`,
+#     aider/args.py:127; aider/models.py:1112 register_litellm_models, parsed
+#     with json5 so a leading // comment is legal, :1122).
+# (2) Key. `--openai-api-key` (aider/args.py:69, main.py:615-616) or the env
+#     var OPENAI_API_KEY (aider/models.py:725, fast_validate_environment). A
+#     key on argv would show in `ps`, so the wrapper exports OPENAI_API_KEY
+#     from $FERRY_KEY (the 0600 agents.key) at run time and passes only the
+#     base on argv.
+# (3) Custom headers. Yes, and only through model settings: a settings entry
+#     named exactly `aider/extra_params` is deep-merged into EVERY model's
+#     extra_params (aider/models.py:344-346 finds it, :405-422 merges), and
+#     extra_params is splatted into litellm.completion(**kwargs)
+#     (aider/models.py:1010-1011, :1036), where `extra_headers` is LiteLLM's
+#     own kwarg. So X-Ferry-Client (and X-Ferry-Fleet) ride on every request
+#     whatever lane `--model` picks.
+# (4) API spoken. OpenAI chat/completions via litellm.completion, streaming by
+#     default (`--stream`, aider/args.py:323), so POST {base}/chat/completions.
+# (5) Least invasive wiring, and why the wrapper passes flags, not env only:
+#     * ferry-owned files under ~/.config/ferry/aider/ (model-settings.yml,
+#       model-metadata.json) handed over with --model-settings-file and
+#       --model-metadata-file. Aider searches home, git root, cwd and then the
+#       command-line file, and the LAST one wins per model name
+#       (aider/main.py:305-332 generate_search_path_list, reversed-unique; the
+#       list is loaded in order), so ferry's entries override a same-named user
+#       entry but the user's ~/.aider.model.settings.yml and repo files are
+#       never read-modified or replaced.
+#     * the base goes on argv, not only in OPENAI_API_BASE: a user's .env
+#       loads with override=True (aider/main.py:361-381, called at :501) and
+#       would beat the environment, while `--openai-api-base` is applied after
+#       the dotenv load (main.py:620). The user's ~/.aider.conf.yml is never
+#       edited; command line beats env beats config in configargparse.
+#     * the metadata file is not decoration: without an entry for the model,
+#       aider fetches LiteLLM's price table from the network
+#       (aider/models.py:203-218 _update_cache, get_model_from_cached_json_db
+#       :223-232 short-circuits on local_model_metadata) and warns "unknown
+#       context window". A local entry per lane keeps startup offline.
+#     The plain `aider` command is untouched. Limitations: a key the user put
+#     in .env, ~/.aider.conf.yml (`openai-api-key`) or `--openai-api-key`
+#     beats the exported env var (main.py:615-616 runs after dotenv); the
+#     wrapper cannot put the key on argv without exposing it. Lane context
+#     size is a flat 128000 estimate (ferry's catalogue does not carry one).
+#
+# Wire: ~/.local/bin/aider-ferry, ~/.config/ferry/aider/model-settings.yml,
+# ~/.config/ferry/aider/model-metadata.json, ~/.config/ferry/aider.json.
+# `ferry aider --unwire` removes exactly those (generic, record-driven).
+
+_aider_help() {
+  cat <<'EOF'
+ferry aider - point Aider (aider-chat) at the ferry endpoint.
+
+Usage:
+  ferry aider [--host H] [--port P] [--key K] [--model LANE] [--keep N]
+  ferry aider --unwire [--dry-run]
+
+  Writes the `aider-ferry` wrapper (~/.local/bin/aider-ferry) plus two
+  ferry-owned files, ~/.config/ferry/aider/model-settings.yml and
+  model-metadata.json, which the wrapper passes by flag. Your own
+  ~/.aider.conf.yml, ~/.aider.model.settings.yml and repo files are not
+  touched, and plain `aider` keeps using whatever it used before.
+
+  aider-ferry runs `aider --openai-api-base <ferry>/v1 --model openai/<lane>`
+  with OPENAI_API_KEY read from the 0600 key file at run time (never argv).
+  X-Ferry-Client / X-Ferry-Fleet go out as extra_headers on every request.
+  Pass your own --model to pick another lane (use the openai/<lane> form).
+
+  Limitation: an openai key set in .env or ~/.aider.conf.yml beats the
+  exported key; remove it there, or use plain `aider` for that account.
+EOF
+}
+
+_aider_wire() {
+  _agent_python <<'PYEOF'
+import os, json
+cfg = os.path.join(HOME, ".config", "ferry", "aider")
+settings = os.path.join(cfg, "model-settings.yml")
+meta = os.path.join(cfg, "model-metadata.json")
+
+# YAML list for --model-settings-file. json.dumps strings are valid YAML
+# double-quoted scalars, so a header value can hold any character.
+q = json.dumps
+y = [f"# {MARKER}", "# Written by `ferry aider`; `ferry aider --unwire` removes it.",
+     "- name: aider/extra_params", "  extra_params:", "    extra_headers:"]
+for k, v in HEADERS.items():
+    y.append(f"      {q(k)}: {q(v)}")
+for lane in LANES:
+    y += [f"- name: {q('openai/' + lane)}", "  edit_format: diff"]
+write_owned(settings, "\n".join(y) + "\n", 0o644)
+
+# JSON5 for --model-metadata-file (json5.loads accepts the // marker line).
+m = {}
+for lane in LANES:
+    m["openai/" + lane] = {
+        "max_tokens": 8192, "max_input_tokens": 128000, "max_output_tokens": 8192,
+        "input_cost_per_token": 0, "output_cost_per_token": 0,
+        "litellm_provider": "openai", "mode": "chat"}
+write_owned(meta, f"// {MARKER}\n" + json.dumps(m, indent=2) + "\n", 0o644)
+
+wrapper(os.path.join(HOME, ".local", "bin", "aider-ferry"),
+        {"OPENAI_API_KEY": '"$FERRY_KEY"'}, "aider",
+        ["--openai-api-base", BASE, "--model", "openai/" + LANE,
+         "--model-settings-file", settings, "--model-metadata-file", meta])
+print(f"    Wrapper:        {os.path.join(HOME, '.local', 'bin', 'aider-ferry')}  (lane {LANE})")
+save_record()
+PYEOF
+}
+
+cmd_aider() { _agent_main aider "$@"; }
+# ferry codewhale: point Codewhale (Hmbown/Codewhale, formerly deepseek-tui;
+# Rust) at the ferry endpoint through a `codewhale-ferry` wrapper and ONE
+# ferry-owned config file. The user's ~/.codewhale/config.toml, keyring and
+# login are never read, edited or replaced, so plain `codewhale` is untouched.
+#
+# Research (Hmbown/Codewhale @ 555322f = tag v0.10.2 + 0, cloned --depth 1
+# into a scratch dir; every fact below read from that tree and, where noted,
+# confirmed by running the v0.10.2 darwin-arm64 release binary against a stub):
+#
+# (0) Binary name. The release asset is `codewhale-macos-arm64` (plus
+#     `codewhale-tui-macos-arm64`, the TUI it dispatches to, which must sit next
+#     to it); installed on PATH it is `codewhale` (`codewhale --help` prints
+#     "Usage: codewhale ..."; a `deepseek` alias is not shipped in v0.10.2).
+#     The registry's `codewhale:codewhale` is therefore right.
+#
+# (1) Provider config. TOML, default ~/.codewhale/config.toml (docs/
+#     CONFIGURATION.md:341-343). The path is overridable: `--config FILE` or
+#     env CODEWHALE_CONFIG_PATH, which must be ABSOLUTE
+#     (docs/CONFIGURATION.md:349, crates/paths/src/lib.rs:160); `--config`
+#     wins over the env. A custom OpenAI-compatible provider is a user-named
+#     table: `provider = "<name>"` plus `[providers.<name>] kind =
+#     "openai-compatible"`, `base_url`, `api_key_env`, `model`
+#     (docs/CONFIGURATION.md:681). The generic built-in `openai` provider
+#     also takes OPENAI_BASE_URL (crates/config/src/env_overrides.rs:198) but its
+#     key env is only a FALLBACK after saved config and keyring credentials
+#     (docs/CONFIGURATION.md:1469-1470), so a user's saved openai key would
+#     beat the ferry key; a custom table with api_key_env has no such rival.
+#     Anthropic: the `wire = "anthropic"` custom dialect exists
+#     (docs/CONFIGURATION.md:691-692), but ferry uses OpenAI chat below.
+#
+# (2) Key. `api_key_env = "FERRY_KEY"` names an env var the key is read from
+#     (docs/CONFIGURATION.md:699; crates/tui/src/lib.rs:5031 reads
+#     entry.api_key_env). The wrapper exports FERRY_KEY from the 0600
+#     ~/.config/ferry/agents.key at run time: the key is in no config file and
+#     never in argv. Verified live: the stub saw `Authorization: Bearer <key>`.
+#
+# (3) Custom headers. Yes: `http_headers = { "Name" = "value" }` at top level or
+#     in a provider table (docs/CONFIGURATION.md:778; field
+#     crates/config/src/provider_toml.rs:150; merge crates/config/src/
+#     config_resolve.rs:1049). Authorization and Content-Type stay
+#     client-managed. ferry sends X-Ferry-Client (and X-Ferry-Fleet when set)
+#     there. Verified live: the stub saw x-ferry-client.
+#
+# (4) API. A custom table sends Chat Completions by default (docs/
+#     CONFIGURATION.md:691), POST {base_url}/chat/completions, streaming.
+#     Verified live: POST /v1/chat/completions with "stream":true.
+#
+# (5) Least invasive wiring (chosen). Ferry-owned config
+#     ~/.config/ferry/codewhale/config.toml (provider "ferry", model = the
+#     lane) + wrapper ~/.local/bin/codewhale-ferry exporting
+#     CODEWHALE_CONFIG_PATH and FERRY_KEY. The ferry table sets
+#     `allow_insecure_http = true` (crates/config/src/provider_toml.rs:148;
+#     consumed crates/engine/src/client.rs:1145) because a LAN ferry is
+#     plain http and Codewhale refuses non-loopback http otherwise; consent is
+#     scoped to this one table, not the shell. No TOML surgery on the user's
+#     file, so there is no _codewhale_unwire hook: --unwire just removes the
+#     two files ferry created.
+#     Limits: (a) the wrapper runs on ferry's config ALONE, so the user's own
+#     approval/sandbox/skills settings in ~/.codewhale/config.toml do not apply
+#     under `codewhale-ferry` (state such as sessions still lives under
+#     CODEWHALE_HOME); (b) the table carries one default model, the other
+#     lanes are `codewhale-ferry --model <lane>`; (c) the wrapper unsets
+#     CODEWHALE_/DEEPSEEK_ PROVIDER, MODEL, BASE_URL and HTTP_HEADERS
+#     (crates/config/src/env_overrides.rs:141, :186, :195, :278) so a shell export cannot divert the route.
+#     Codewhale's own usage telemetry (on by default, see its first-run
+#     notice) is its business and is left as the user configured it.
+
+cmd_codewhale() { _agent_main codewhale "$@"; }
+
+_codewhale_help() {
+  cat <<'EOF'
+ferry codewhale - point Codewhale (Hmbown/Codewhale, binary `codewhale`) at ferry.
+
+Usage:
+  ferry codewhale [--host H] [--port P] [--key K] [--model LANE]
+  ferry codewhale --unwire [--dry-run]
+
+Writes a ferry-owned config (~/.config/ferry/codewhale/config.toml, custom
+OpenAI-compatible provider "ferry", chat completions) and a wrapper
+~/.local/bin/codewhale-ferry that points CODEWHALE_CONFIG_PATH at it and reads
+the key from ~/.config/ferry/agents.key at run time. Your ~/.codewhale config,
+keys and plain `codewhale` are left alone. Run `codewhale-ferry`; other lanes:
+`codewhale-ferry --model <lane>`. Limit: the wrapper uses ferry's config only,
+so your own ~/.codewhale/config.toml settings do not apply to it.
+Headers: X-Ferry-Client (and X-Ferry-Fleet) are sent via http_headers.
+EOF
+}
+
+_codewhale_wire() {
+  _agent_python <<'PYEOF'
+import os, json, shlex
+cfg = os.path.join(HOME, ".config", "ferry", "codewhale", "config.toml")
+q = json.dumps      # a JSON string is a valid TOML basic string
+hdr = ", ".join(f"{q(k)} = {q(v)}" for k, v in HEADERS.items())
+toml = "\n".join([
+    f"# {MARKER}",
+    "# Written by `ferry codewhale`; `ferry codewhale --unwire` removes it.",
+    "# The key is NOT here: api_key_env is read from the environment at run time.",
+    'provider = "ferry"',
+    f"default_text_model = {q(LANE)}",
+    "",
+    "[providers.ferry]",
+    'kind = "openai-compatible"',
+    f"base_url = {q(BASE)}",
+    'api_key_env = "FERRY_KEY"',
+    f"model = {q(LANE)}",
+    "allow_insecure_http = true",
+    f"http_headers = {{ {hdr} }}",
+    "",
+])
+write_owned(cfg, toml, 0o600)
+
+pre = "unset CODEWHALE_PROVIDER DEEPSEEK_PROVIDER CODEWHALE_MODEL DEEPSEEK_MODEL DEEPSEEK_DEFAULT_TEXT_MODEL " \
+      "CODEWHALE_BASE_URL DEEPSEEK_BASE_URL CODEWHALE_HTTP_HEADERS DEEPSEEK_HTTP_HEADERS"
+wp = os.path.join(HOME, ".local", "bin", "codewhale-ferry")
+wrapper(wp, {"CODEWHALE_CONFIG_PATH": shlex.quote(cfg), "FERRY_KEY": '"$FERRY_KEY"'},
+        "codewhale", pre=pre)
+print(f"    Wrapper:        {wp}  (lane {LANE})")
+save_record()
+PYEOF
+}
+# ferry reasonix - point Reasonix (esengine/DeepSeek-Reasonix, a Go coding agent
+# for the terminal) at the ferry endpoint.
+#
+# Wiring: a ferry-owned REASONIX_HOME plus a `reasonix-ferry` wrapper. Plain
+# `reasonix` is never touched: ~/.reasonix (config.toml, .env, sessions, skills,
+# hooks) and every project reasonix.toml stay byte for byte as the user left
+# them, and ferry never opens them, so no snapshot is needed.
+#
+# What it is: the repo has two lines (README.md:93-109). 2.x (branch `studio`,
+# a Go module, `go.mod`) is what the research below read; the final release is
+# v2.61.0 (README.md:7, "no longer maintained as of 2026-11-12"). 1.x is the
+# npm package `reasonix` (README.md:125-129: `npm i -g reasonix`, or
+# `brew install esengine/reasonix/reasonix`), a thin launcher that pulls a
+# prebuilt native binary (npm/reasonix/package.json optionalDependencies
+# @reasonix/cli-<os>-<arch>). 2.x ships as release archives
+# `reasonix-<os>-<arch>.tar.gz` on github.com/esengine/DeepSeek-Reasonix
+# releases (README.md:155-156). Both lines install a binary named `reasonix`
+# (npm/reasonix/package.json "bin": {"reasonix": ...}; cmd/reasonix), which
+# matches the registry entry reasonix:reasonix in lib/ferry-agents.zsh.
+#
+# Research (clone: github.com/esengine/DeepSeek-Reasonix @ cd20bb50, branch
+# studio, 2026-11-11; the e2e runs the v2.61.0 darwin-arm64 release binary):
+#
+# (1) Where provider config lives; base URLs.
+#   <Reasonix home>/config.toml, where the home is $REASONIX_HOME, else
+#   ~/.reasonix on macOS/Linux (docs/CONFIG_PATHS.md:6-19;
+#   internal/contract/config/paths.go:33 userConfigPath = Home()/config.toml;
+#   storage_roots.go:67 and :127 read REASONIX_HOME). Precedence is flag >
+#   ./reasonix.toml > <home>/config.toml (reasonix.example.toml:2). With
+#   REASONIX_HOME set "the runtime is fully self-contained" (docs/
+#   CONFIG_PATHS.md:21-24), which is exactly the isolation ferry wants.
+#   A provider is `[[providers]]` with name, kind, base_url, models, default,
+#   api_key_env, headers (internal/contract/config/provider_entry.go:29-46;
+#   reasonix.example.toml:94-103). kind = "openai" is the OpenAI-compatible
+#   /chat/completions client (internal/model/openai/openai.go:1) and its URL is
+#   base_url + "/chat/completions" (internal/model/openai/chaturl.go:25), so
+#   ferry's base (http://host:port/v1) is used as is. kind = "anthropic" speaks
+#   /v1/messages (internal/model/anthropic/anthropic.go:2) and takes a root
+#   base_url without /v1 (anthropic.go:76-85); ferry uses the OpenAI kind.
+#   There is NO command-line flag to point at another config file; the home
+#   directory is the override, so ferry owns a whole home.
+#   `default_model = "ferry"` selects the provider (reasonix.example.toml:8);
+#   a project reasonix.toml cannot override default_model
+#   (internal/contract/config/config.go:221 IgnoredProjectDefaultModel).
+#
+# (2) Key. Only through the NAMED env var in the provider's api_key_env, and
+#   only as stored in <home>/.env: "loaded provider entries still resolve only
+#   from Reasonix's global .env" (config.go:1566-1570; credentials.go:557-581
+#   resolveCredentialForRootGlobalFirst reads storedCredentialValue(.env) and
+#   nothing else; paths.go:389-402 UserCredentialsPath = Home()/.env). The
+#   process environment is NOT consulted at run time. So a literal key has to
+#   sit in a file: ferry keeps it in <ferry home>/.env, mode 0600, and the
+#   wrapper rewrites it from the 0600 ~/.config/ferry/agents.key on every
+#   launch, so a rotated key is picked up and nothing carries it in argv or in
+#   a world-readable file. config.toml holds only api_key_env = "FERRY_API_KEY"
+#   (reasonix.example.toml:4-5: "Never put API key values here").
+#   REASONIX_CREDENTIALS_STORE=file keeps it off the OS keyring
+#   (credentials.go:136-138).
+#
+# (3) Custom headers: yes. `headers = { "X-Ferry-Client" = "..." }` on the
+#   provider (provider_entry.go:46) is applied to every streamed chat POST
+#   (internal/model/openai/chat_headers.go:19 applyCustomHeaders) and to the
+#   model-list GET (internal/model/openai/fetch_models.go:124). Only
+#   authorization, content-type, accept and host are refused
+#   (openai.go:401-408 reservedCustomHeader). ferry sends X-Ferry-Client (and
+#   X-Ferry-Fleet when set).
+#
+# (4) API: OpenAI chat/completions, streamed (Accept: text/event-stream,
+#   chat_headers.go:18). Auth is `Authorization: Bearer <key>` (openai.go:
+#   365-375 applyAPIKeyHeader; only a MiMo host uses `api-key`).
+#
+# (5) Least invasive wiring: the wrapper exports REASONIX_HOME (ferry's own dir
+#   ~/.config/ferry/reasonix/home) and REASONIX_CREDENTIALS_STORE=file and
+#   execs `reasonix`. The ferry home holds config.toml (one `ferry` provider
+#   listing every served lane as a model, default = LANE) and .env.
+#   Limits, stated plainly: (a) the ferry home is self-contained, so
+#   `reasonix-ferry` has its own sessions, skills, slash commands and hooks
+#   (docs/CONFIG_PATHS.md:35-47 lists what lives in the home); plain
+#   `reasonix` keeps yours. (b) A project reasonix.toml that declares its own
+#   providers still loads. (c) Reasonix is unmaintained since 2026-11-12.
+
+_reasonix_help() {
+  cat <<'EOF'
+ferry reasonix - point Reasonix (esengine/DeepSeek-Reasonix) at the ferry endpoint.
+
+Usage:
+  ferry reasonix [--host H] [--port P] [--key K] [--model LANE] [--keep N]
+
+  Writes a ferry-owned Reasonix home (~/.config/ferry/reasonix/home: config.toml
+  with a 'ferry' OpenAI-compatible provider listing every lane as a model and
+  the X-Ferry-Client header, plus a 0600 .env for the key) and the
+  `reasonix-ferry` wrapper (~/.local/bin/reasonix-ferry), which sets
+  REASONIX_HOME to that dir and refreshes the key from ~/.config/ferry/agents.key
+  at run time. Plain `reasonix` and ~/.reasonix are never edited.
+  Run `reasonix-ferry` (or `reasonix-ferry run -p "prompt"`).
+  Limit: the ferry home is separate, so reasonix-ferry has its own sessions,
+  skills and hooks. Reasonix itself is unmaintained since 2026-11-12.
+EOF
+}
+
+_reasonix_wire() {
+  _agent_python <<'PYEOF'
+import json, os, shlex
+
+RHOME = os.path.join(HOME, ".config", "ferry", "reasonix", "home")
+CFG = os.path.join(RHOME, "config.toml")
+ENV = os.path.join(RHOME, ".env")
+WRAP = os.path.join(HOME, ".local", "bin", "reasonix-ferry")
+
+def q(s):                       # TOML basic string (JSON escapes are a subset)
+    return json.dumps(str(s))
+
+hdrs = ", ".join(f"{q(k)} = {q(v)}" for k, v in HEADERS.items())
+toml = "\n".join([
+    f"# {MARKER}",
+    "# Written by `ferry reasonix`; `ferry reasonix --unwire` removes it.",
+    "# The key lives in the 0600 .env next to this file, never here.",
+    "",
+    'default_model = "ferry"',
+    "",
+    "[[providers]]",
+    'name        = "ferry"',
+    'kind        = "openai"',
+    f"base_url    = {q(BASE)}",
+    "models      = [" + ", ".join(q(l) for l in LANES) + "]",
+    f"default     = {q(LANE)}",
+    'api_key_env = "FERRY_API_KEY"',
+    f"headers     = {{ {hdrs} }}",
+    "",
+])
+
+# Wrapper first: it refuses (and exits) before anything else is written when
+# a user file sits at the wrapper path.
+pre = "\n".join([
+    f"_ferry_rhome={shlex.quote(RHOME)}",
+    'mkdir -p "$_ferry_rhome"',
+    '( umask 077; print -r -- "FERRY_API_KEY=$FERRY_KEY" > "$_ferry_rhome/.env" )',
+    'chmod 600 "$_ferry_rhome/.env"',
+])
+wrapper(WRAP, {"REASONIX_HOME": shlex.quote(RHOME),
+               "REASONIX_CREDENTIALS_STORE": "file"},
+        "reasonix", pre=pre)
+
+write_owned(CFG, toml, 0o644)
+
+# .env: ferry-created, 0600, key only. Tracked as an "edited" kind so the
+# unwire hook removes it whatever key it holds by then (the wrapper rewrites
+# it), then drops the home dir if nothing else is in it.
+key = open(KEYFILE).read().strip() if os.path.exists(KEYFILE) else "local"
+if os.path.exists(ENV) and "FERRY_API_KEY" not in open(ENV).read():
+    raise SystemExit(f"    ERROR: {ENV} exists and is not ferry's; leaving it alone.")
+os.makedirs(RHOME, exist_ok=True)
+fd = os.open(ENV + ".ferry-tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(f"FERRY_API_KEY={key}\n")
+os.chmod(ENV + ".ferry-tmp", 0o600)
+os.replace(ENV + ".ferry-tmp", ENV)
+note_edited(ENV, "reasonix-env", home=RHOME)
+
+print(f"    Reasonix home:  {RHOME}")
+print(f"    Wrapper:        {WRAP}")
+print(f"    Provider:       ferry -> {BASE} (lane {LANE})")
+print("    Run `reasonix-ferry`; plain `reasonix` is untouched.")
+save_record()
+PYEOF
+}
+
+# --unwire hook for the .env ferry created. Receives the edit as JSON:
+# {"path": ".../.env", "kind": "reasonix-env", "home": "<ferry home>"}.
+_reasonix_unwire() {
+  local edit="$1"
+  python3 - "$edit" "$AG_DRY" <<'PYEOF'
+import json, os, sys
+e = json.loads(sys.argv[1])
+dry = sys.argv[2] == "1"
+p, home = e["path"], e.get("home", "")
+if dry:
+    print(f"    [dry-run] would remove {p}", file=sys.stderr)
+    sys.exit(0)
+try:
+    os.remove(p)
+    print(f"    Removed {p}", file=sys.stderr)
+except FileNotFoundError:
+    pass
+# The home goes only when nothing else is in it (a session the user made
+# under reasonix-ferry keeps it, with a note).
+try:
+    os.rmdir(home)
+    print(f"    Removed {home}", file=sys.stderr)
+except OSError:
+    if home and os.path.isdir(home):
+        print(f"    Kept {home}: reasonix-ferry created sessions or files in it.",
+              file=sys.stderr)
+PYEOF
+}
+
+cmd_reasonix() { _agent_main reasonix "$@"; }
+# ferry crush - point Crush (charmbracelet/crush, Go) at the ferry endpoint.
+#
+# Wiring: a ferry-owned config DIRECTORY plus a `crush-ferry` wrapper. Plain
+# `crush` is never touched: ~/.config/crush/crush.json, ~/.local/share/crush/
+# crush.json and every project crush.json stay byte for byte as the user left
+# them, and no snapshot is needed because ferry never opens them.
+#
+# Research (clone: github.com/charmbracelet/crush @ db7c905f, main on
+# 2026-11-20; the e2e runs the v0.102.0 release binary, same loader):
+#
+# (1) Where provider config lives; base URLs.
+#   internal/config/load.go:1064 (lookupConfigs) loads, low to high priority:
+#     systemConfigPath, GlobalConfig(), crushrc sibling, GlobalConfigData(),
+#     then project .crushrc / crushrc / .crush.json / crush.json found from
+#     cwd up to the git root; later wins on conflict (load.go:1068-1096).
+#   GlobalConfig() = $CRUSH_GLOBAL_CONFIG/crush.json, else $XDG_CONFIG_HOME
+#     (else ~/.config)/crush/crush.json (load.go:1360, internal/home/home.go:50).
+#   GlobalConfigData() = $CRUSH_GLOBAL_DATA/crush.json, else
+#     $XDG_DATA_HOME/crush/crush.json, else ~/.local/share/crush/crush.json
+#     (load.go:1407). It is "machine-owned" state Crush itself rewrites when
+#     you pick a model, and it merges AFTER the user's global file.
+#   CRUSH_GLOBAL_CONFIG would REPLACE the user's global file (their providers
+#     would vanish), so ferry points CRUSH_GLOBAL_DATA instead: the user's
+#     global config still loads, ferry's file merges over it.
+#   A `providers.<id>` entry has `type`, `base_url`, `api_key`, `extra_headers`,
+#     `models` (internal/config/config.go:99-151). `type: openai-compat` is
+#     normalised to the chat-completions endpoint (load.go:46, 632-634); an
+#     `anthropic` type would use /v1/messages. Both are OpenAI/Anthropic base
+#     URL style (base_url includes /v1). ferry uses openai-compat.
+#
+# (2) Key. `api_key` goes through the shell-style resolver (internal/config/
+#   resolve.go:74: $VAR, ${VAR}, $(cmd)), resolved at load (load.go:646). ferry
+#   writes api_key "$CRUSH_FERRY_KEY"; the wrapper exports that from the 0600
+#   ~/.config/ferry/agents.key at run time, so no key is in argv or in the
+#   config file.
+#
+# (3) Custom headers: `extra_headers` (config.go:120), values resolved the same
+#   way and sent on every request (load.go:669-678; internal/agent/
+#   coordinator.go:1554). ferry sends X-Ferry-Client (and X-Ferry-Fleet).
+#
+# (4) API: OpenAI chat/completions for type openai-compat (POST {base_url}/
+#   chat/completions, streamed). Crush also GETs {base_url}/models to discover
+#   models (config.go:148 discover_models, default on); ferry serves that as
+#   the lane catalogue and lists every lane explicitly as well.
+#
+# (5) Default model. models.large / models.small select {provider, model}
+#   (config.go:857, load.go:984-990). ferry's data file sets both to the ferry
+#   lane, else Crush falls back to the first known provider with a key in env.
+#   `options.disable_provider_auto_update` keeps the wrapper from fetching the
+#   catwalk catalogue over the net (config.go:471). Limit: a project
+#   .crush.json that sets models.* overrides this (project files merge last),
+#   and with CRUSH_CLIENT_SERVER=1 a server already started by plain `crush`
+#   keeps its own env (internal/cmd/root.go:280).
+
+_crush_help() {
+  cat <<'EOF'
+ferry crush - point Crush (charmbracelet/crush) at the ferry endpoint.
+
+Usage:
+  ferry crush [--host H] [--port P] [--key K] [--model LANE] [--keep N]
+
+  Writes a ferry-owned Crush config dir (~/.config/ferry/crush/crush.json: a
+  'ferry' provider with every lane as a model, X-Ferry-Client header, default
+  model = LANE) and the `crush-ferry` wrapper (~/.local/bin/crush-ferry). The
+  wrapper points Crush at that dir with CRUSH_GLOBAL_DATA and passes the key as
+  $CRUSH_FERRY_KEY at run time. Plain `crush` and your own crush.json files are
+  never edited. Run `crush-ferry` (or `crush-ferry run "prompt"`).
+  Limit: a project .crush.json that sets models.* overrides the default lane.
+EOF
+}
+
+_crush_wire() {
+  _agent_python <<'PYEOF'
+import json, os, shlex
+
+DDIR = os.path.join(HOME, ".config", "ferry", "crush")
+CFG = os.path.join(DDIR, "crush.json")
+WRAP = os.path.join(HOME, ".local", "bin", "crush-ferry")
+
+models = [{"id": l, "name": f"ferry {l}", "context_window": 200000,
+           "default_max_tokens": 16384} for l in LANES]
+provider = {"name": "ferry", "type": "openai-compat", "base_url": BASE,
+            "api_key": "$CRUSH_FERRY_KEY", "extra_headers": dict(HEADERS),
+            "models": models}
+
+cur = load_json(CFG)
+if cur is None:
+    raise SystemExit(f"    ERROR: {CFG} is not valid JSON; leaving it alone.")
+if cur and cur.get("_ferry") != MARKER:
+    raise SystemExit(f"    ERROR: {CFG} exists and is not ferry-managed; "
+                     "leaving it alone. Move it aside and re-run.")
+cur["_ferry"] = MARKER
+cur.setdefault("providers", {})["ferry"] = provider
+sel = {"provider": "ferry", "model": LANE}
+mods = cur.setdefault("models", {})
+for slot in ("large", "small"):
+    old = mods.get(slot) or {}
+    # keep the tuning Crush saved for a ferry selection, never another provider's
+    mods[slot] = {**(old if old.get("provider") == "ferry" else {}), **sel}
+cur.setdefault("options", {})["disable_provider_auto_update"] = True
+dump_json(CFG, cur, 0o600)
+note_edited(CFG, "crush-data", dir=DDIR)
+
+wrapper(WRAP,
+        {"CRUSH_GLOBAL_DATA": shlex.quote(DDIR),
+         "CRUSH_FERRY_KEY": '"$FERRY_KEY"'},
+        "crush")
+print(f"    Crush config:   {CFG}")
+print(f"    Wrapper:        {WRAP}  (run `crush-ferry`; plain `crush` is untouched)")
+save_record()
+PYEOF
+}
+
+# Hook for the generic unwire: the data file is shared with Crush itself (it
+# rewrites it when the user picks a model), so remove only ferry's members and
+# delete the file/dir only when nothing else is left in it.
+_crush_unwire() {
+  python3 - "$1" "${AG_DRY:-0}" <<'PYEOF'
+import json, os, sys
+e = json.loads(sys.argv[1]); dry = sys.argv[2] == "1"
+p = e["path"]
+try:
+    d = json.load(open(p))
+except Exception:
+    print(f"    Kept {p}: no longer valid JSON; remove ferry's entry by hand.")
+    sys.exit(0)
+if dry:
+    print(f"    [dry-run] would remove ferry's members from {p}")
+    sys.exit(0)
+d.pop("_ferry", None)
+(d.get("providers") or {}).pop("ferry", None)
+for sect in ("models", "recent_models"):
+    m = d.get(sect)
+    if isinstance(m, dict):
+        for k in list(m):
+            v = m[k]
+            if isinstance(v, dict) and v.get("provider") == "ferry":
+                del m[k]
+            elif isinstance(v, list):
+                m[k] = [x for x in v if not (isinstance(x, dict) and x.get("provider") == "ferry")]
+                if not m[k]:
+                    del m[k]
+opts = d.get("options")
+if isinstance(opts, dict):
+    opts.pop("disable_provider_auto_update", None)
+for k in ("providers", "models", "recent_models", "options"):
+    if k in d and d[k] == {}:
+        del d[k]
+if d == {}:
+    os.remove(p)
+    try:
+        os.rmdir(os.path.dirname(p))
+    except OSError:
+        pass
+    print(f"    Removed {p}")
+else:
+    with open(p + ".ferry-tmp", "w") as f:
+        json.dump(d, f, indent=2); f.write("\n")
+    os.chmod(p + ".ferry-tmp", os.stat(p).st_mode & 0o777)
+    os.replace(p + ".ferry-tmp", p)
+    print(f"    Removed ferry's members from {p} (other keys kept)")
+PYEOF
+}
+
+cmd_crush() { _agent_main crush "$@"; }
+# ferry kilo: run Kilo Code (Kilo-Org/kilocode) on a ferry lane.
+#
+# Wiring: a wrapper plus ONE ferry-owned config file. `~/.local/bin/kilo-ferry`
+# exports KILO_CONFIG=~/.config/ferry/kilo/kilo.json and FERRY_KEY, then execs
+# the real `kilo`. Kilo layers KILO_CONFIG over the user's own config, so the
+# user's ~/.config/kilo/*, their logins (auth.json) and their default provider
+# are not touched, and plain `kilo` never sees the ferry provider.
+# `ferry kilo --unwire` removes the wrapper, the owned config and the record.
+#
+# Optional `--global` (extension users, see the VS Code note below): ALSO adds
+# one named `ferry` provider member to ~/.config/kilo/kilo.json (snapshotted,
+# plain-JSON member edit, `--unwire` removes only that member). It adds a
+# provider only; it never sets `model`, so the user's default does not move.
+#
+# Research, read from source at Kilo-Org/kilocode@b2947d7e56c5 (main, the CLI
+# package is @kilocode/cli 7.8.28, binaries `kilo` and `kilocode`, both the
+# same file: npm package.json "bin"; the registry's kilo:kilo is correct).
+# Kilo's CLI is an opencode fork, so the provider shape is opencode's. Paths
+# are relative to packages/:
+#  (1) Provider config: opencode-style `provider.<id>` in kilo.json / kilo.jsonc
+#      (also config.json, opencode.json[c], read from Global.Path.config =
+#      $XDG_CONFIG_HOME or ~/.config, + "kilo": core/src/global.ts:12,24 and
+#      opencode/src/config/config.ts:462-480). Entries merge into the provider
+#      table at opencode/src/provider/provider.ts:1548-1556 and :1744-1755.
+#      Custom OpenAI base URL: `npm: "@ai-sdk/openai-compatible"` (loaded by
+#      provider.ts:145) with `options.baseURL`; the SDK appends
+#      /chat/completions. Anthropic base URL: `npm: "@ai-sdk/anthropic"` with
+#      options.baseURL works the same way; ferry uses chat/completions (rule:
+#      prefer OpenAI). Config path override: KILO_CONFIG (an explicit file,
+#      core/src/flag/flag.ts:45, loaded after the global files at
+#      opencode/src/config/config.ts:766-781, trusted for {env:}/{file:}),
+#      KILO_CONFIG_DIR (flag.ts:140, a whole extra dir, config.ts:818), and
+#      KILO_CONFIG_CONTENT (inline JSON, flag.ts:46, config.ts:901). The
+#      wrapper uses KILO_CONFIG. The file is JSONC (opencode/src/config/
+#      parse.ts:8 allows comments + trailing commas), so it carries the
+#      `// ferry-managed: kilo` marker the helper needs.
+#  (2) Key: `options.apiKey` in the provider entry (provider.ts:1886 passes the
+#      options through to the SDK). Config text supports `{env:NAME}` and
+#      `{file:path}` substitution (opencode/src/config/variable.ts:50-100, the
+#      secret-name blocklist at kilocode/config/variable.ts:21-30 does not list
+#      FERRY_KEY). The owned config says `{env:FERRY_KEY}`, which the wrapper
+#      fills from the 0600 agents.key at run time: the key is in no file and no
+#      argv. The --global entry uses `{file:~/.config/ferry/agents.key}` (the
+#      extension has no wrapper to export an env var).
+#  (3) Custom headers: yes, `options.headers` (config schema
+#      opencode/src/provider/provider.ts:1138 Record<string,string>, carried
+#      into the SDK options by :1886-1890). Sent: X-Ferry-Client and, when
+#      FERRY_FLEET was set at wire time, X-Ferry-Fleet.
+#  (4) API: OpenAI chat/completions (streaming) through @ai-sdk/openai-compatible.
+#      Kilo's own default provider is the Kilo Gateway (`kilo` provider,
+#      provider.ts:535); it is simply not selected: the owned config sets
+#      model "ferry/<lane>" and small_model likewise.
+#  (5) Least invasive: wrapper + KILO_CONFIG (this file). Data (auth.json,
+#      sessions, db) lives under $XDG_DATA_HOME/kilo (core/src/global.ts:22),
+#      so HOME/XDG redirects it in tests.
+#
+# VS Code extension (packages/kilo-vscode): NOT file-less. It has no
+# SecretStorage use (grep of `secrets` over src/ finds nothing outside tests and
+# the vendored autocomplete code) and it spawns the very same CLI backend,
+# `kilo serve --port 0` (src/services/cli-backend/server-manager.ts:129) with
+# process.env, so it reads the same ~/.config/kilo config and auth.json as the
+# CLI. A VS Code launched from a shell with KILO_CONFIG exported would pick the
+# owned file up, but a dock/Spotlight launch will not, so for the extension use
+# `ferry kilo --global`: it adds the `ferry` provider to the user's global
+# config, where the extension finds it and offers ferry/<lane> in its model
+# picker. Selecting a model in the extension stays the user's choice.
+
+_kilo_help() {
+  cat <<'EOF'
+ferry kilo - run Kilo Code (the `kilo` CLI, Kilo-Org/kilocode) on a ferry lane.
+
+Writes ~/.local/bin/kilo-ferry and ~/.config/ferry/kilo/kilo.json. The wrapper
+sets KILO_CONFIG to that file and FERRY_KEY from ~/.config/ferry/agents.key
+(0600) and runs `kilo`, so your own Kilo config, logins and plain `kilo` are
+not touched. Every lane the host serves is listed as ferry/<lane>; the default
+is ferry/<--model lane> (heavy). X-Ferry-Client (and X-Ferry-Fleet when
+FERRY_FLEET is set at wire time) are sent as provider headers.
+
+  kilo-ferry run "hello"        non-interactive
+  kilo-ferry                    interactive
+
+Kilo flags:
+  --global      ALSO add one `ferry` provider to ~/.config/kilo/kilo.json so the
+                VS Code extension (which has no wrapper) can use it. Adds the
+                provider only; your default model does not change. Needs plain
+                JSON (kilo.json); a kilo.jsonc is left alone and reported.
+EOF
+}
+
+_kilo_wire() {
+  local globalcfg=0 a
+  for a in "${AG_EXTRA[@]}"; do
+    case "$a" in
+      --global) globalcfg=1 ;;
+      *) echo "Unknown option for 'ferry kilo': $a"; return 1 ;;
+    esac
+  done
+  _agent_python "$globalcfg" <<'PYEOF'
+import json, os, sys
+want_global = sys.argv[1] == "1"
+cfgdir = os.path.join(HOME, ".config", "ferry", "kilo")
+owned = os.path.join(cfgdir, "kilo.json")
+wrap = os.path.join(HOME, ".local", "bin", "kilo-ferry")
+
+def provider(key):
+    return {
+        "npm": "@ai-sdk/openai-compatible",
+        "name": f"Ferry ({HOST})",
+        "options": {"baseURL": BASE, "apiKey": key, "headers": dict(HEADERS)},
+        "models": {l: {"name": l, "limit": {"context": 128000, "output": 16000}}
+                   for l in LANES},
+    }
+
+cfg = {
+    "$schema": "https://app.kilo.ai/config.json",
+    "provider": {"ferry": provider("{env:FERRY_KEY}")},
+    "model": f"ferry/{LANE}",
+    "small_model": f"ferry/{LANE}",
+}
+write_owned(owned, f"// {MARKER}\n// Generated by `ferry kilo`; `ferry kilo --unwire` removes it.\n"
+            + json.dumps(cfg, indent=2) + "\n", 0o644)
+wrapper(wrap, {"KILO_CONFIG": json.dumps(owned), "FERRY_KEY": '"$FERRY_KEY"'},
+        "kilo")
+print(f"    Wrapper:        {wrap}")
+print(f"    Kilo config:    {owned} (via KILO_CONFIG)")
+print(f"    Default model:  ferry/{LANE}  (lanes: {', '.join(LANES)})")
+
+if want_global:
+    g = os.path.join(HOME, ".config", "kilo", "kilo.json")
+    if os.path.exists(os.path.join(HOME, ".config", "kilo", "kilo.jsonc")):
+        print("    NOTE: ~/.config/kilo/kilo.jsonc exists; ferry will not edit a JSONC")
+        print("    file. Add the provider by hand or use kilo-ferry.")
+    else:
+        json_member_set(g, ["provider", "ferry"],
+                        provider("{file:" + KEYFILE + "}"))
+        print(f"    Global config:  provider.ferry added to {g}")
+save_record({"wrapper": wrap, "config": owned, "global": want_global})
+PYEOF
+}
+cmd_kilo() { _agent_main kilo "$@"; }
+# ferry kimi: wire Kimi Code CLI (`kimi`) to the ferry front door (issue #3).
+#
+# WHICH "kimi": the issue names MoonshotAI/kimi-cli (Python, PyPI `kimi-cli`).
+# That project is archived: its last release (1.52.0) short-circuits every entry
+# point to a one-line "no longer maintained" notice (and a bare `kimi` downloads
+# and runs an installer script from the CDN), so nothing can be wired to it:
+#   MoonshotAI/kimi-cli@9ab1286 src/kimi_cli/__main__.py:23 (gate call),
+#   :28 (_deprecation_gate), src/kimi_cli/deprecation.py:1 (module docstring),
+#   pyproject.toml:4 (description "[Archived] Legacy Python Kimi CLI").
+# Its successor, MoonshotAI/kimi-code (TypeScript, npm @moonshot-ai/kimi-code,
+# binary `kimi`, also `curl https://code.kimi.com/kimi-code/install.sh | bash`),
+# is what a user has on PATH as `kimi` today, so this module wires THAT one.
+# Source cites below are MoonshotAI/kimi-code@83e4dde (HEAD, CLI 2.7.2 line);
+# the e2e in ferry-kimi.test.py ran on npm @moonshot-ai/kimi-code 2.6.2.
+#
+# Research checklist (issue #3):
+#  (1) Provider config / base URL. TOML at $KIMI_CODE_HOME/config.toml, default
+#      ~/.kimi-code (apps/kimi-code/src/utils/paths.ts:26 getDataDir: env
+#      KIMI_CODE_HOME, else homedir()/.kimi-code; constant name at
+#      apps/kimi-code/src/constant/app.ts:26; docs/en/configuration/
+#      config-files.md:5, :9). `[providers.<name>]` has type / base_url /
+#      api_key / api_key_env / custom_headers (schema, camelCased in code:
+#      packages/agent-core-v2/src/app/kosongConfig/configSection.ts:50;
+#      docs/en/configuration/config-files.md:127); `[models."<alias>"]`
+#      points at a provider (docs config-files.md:147). Types: kimi,
+#      anthropic, openai (Chat Completions), openai_responses, bedrock,
+#      google-genai, vertexai (docs/en/configuration/providers.md:9). The
+#      `openai` type calls client.chat.completions with baseURL and
+#      defaultHeaders from the provider (packages/core/src/llm/builtin/
+#      protocol/openai/index.ts:48, :49, :69, :75). ferry uses type "openai":
+#      lane ids go out as the `model` of POST <base>/chat/completions.
+#  (2) Key. `api_key_env = "<VAR>"` names an environment variable that is
+#      re-read on every request and is mutually exclusive with api_key (docs
+#      config-files.md:129; read from process.env at
+#      packages/agent-core-v2/src/app/auth/authService.ts:729). Plain
+#      KIMI_API_KEY / OPENAI_API_KEY in the shell are NOT read (docs
+#      env-vars.md:5, :9). So the wrapper exports FERRY_KIMI_API_KEY from the
+#      0600 key file and the config only names that variable: no key on disk
+#      in the config, none in argv.
+#  (3) Custom headers. Yes: `[providers.<name>.custom_headers]` goes on every
+#      request (configSection.ts:53, protocol/openai/index.ts:49). ferry puts
+#      X-Ferry-Client (and X-Ferry-Fleet when set) there.
+#  (4) API. OpenAI Chat Completions, streaming only (the e2e stub saw
+#      stream=true, 24 tools, POST /v1/chat/completions).
+#  (5) Least invasive wiring: `kimi-ferry`, a wrapper that sets
+#      KIMI_CODE_HOME=~/.config/ferry/kimi/home (a ferry-owned data dir whose
+#      config.toml lists every served lane) and execs `kimi`. The user's own
+#      ~/.kimi-code (login, config, sessions) is never opened or edited and the
+#      plain `kimi` command is unchanged. No flag can point at another config
+#      file (apps/kimi-code/src/cli/commands.ts has only -m/-p style options),
+#      so the data-dir env var is the only relocation hook.
+#      Why not the env-only route (KIMI_MODEL_NAME / KIMI_MODEL_API_KEY /
+#      KIMI_MODEL_BASE_URL, docs env-vars.md:115): it defines a single
+#      model, so no lane list and no /model switching between lanes.
+#
+# Limitations, all from the data-dir swap: `kimi-ferry` starts with an empty
+# profile, so it does not see the user's own MCP servers, skills, plugins,
+# sessions or Kimi login; sessions made by `kimi-ferry` live under
+# ~/.config/ferry/kimi/home and `--unwire` leaves that data (only ferry's
+# config.toml and the wrapper are removed). A Python kimi-cli older than 1.52
+# on PATH ignores KIMI_CODE_HOME and would run against the user's own account.
+# The wrapper unsets KIMI_MODEL_NAME / _API_KEY / _PROVIDER_TYPE / _BASE_URL
+# and KIMI_CODE_BASE_URL first: they outrank default_model (env-vars.md:117) and
+# would route around ferry. Telemetry is off in the owned config.
+
+_kimi_help() {
+  cat <<'EOF'
+ferry kimi - wire Kimi Code CLI (npm @moonshot-ai/kimi-code, binary `kimi`) to ferry.
+
+  Run `kimi-ferry` instead of `kimi`. It uses a ferry-owned data dir
+  (~/.config/ferry/kimi/home) with one provider "ferry" (OpenAI Chat
+  Completions) and one model alias per served lane (ferry/<lane>); the default
+  is the lane you pass with --model (default heavy). The key is read at run
+  time from ~/.config/ferry/agents.key through an env var, never put in the
+  config. X-Ferry-Client / X-Ferry-Fleet go out as provider custom_headers.
+
+  Your own ~/.kimi-code and the plain `kimi` command are not touched. Limits:
+  kimi-ferry starts with its own empty profile (no MCP servers, skills,
+  plugins, sessions or Kimi login from your ~/.kimi-code), and --unwire keeps
+  the sessions stored under ~/.config/ferry/kimi/home. The old Python kimi-cli
+  (PyPI kimi-cli) is archived and cannot be wired.
+EOF
+}
+
+_kimi_wire() {
+  _agent_python <<'PYEOF'
+import json, shlex
+
+home_dir = os.path.join(HOME, ".config", "ferry", "kimi", "home")
+bin_dir = os.path.join(HOME, ".local", "bin")
+
+def q(s):                       # TOML basic string (JSON escapes are valid)
+    return json.dumps(s, ensure_ascii=False)
+
+lines = [
+    f"# {MARKER}",
+    "# Generated by `ferry kimi`; `ferry kimi --unwire` removes it. Kimi Code reads",
+    "# this as $KIMI_CODE_HOME/config.toml when started through `kimi-ferry`.",
+    f"default_model = {q('ferry/' + LANE)}",
+    "telemetry = false",
+    "",
+    "[providers.ferry]",
+    'type = "openai"',
+    f"base_url = {q(BASE)}",
+    'api_key_env = "FERRY_KIMI_API_KEY"',
+    "",
+    "[providers.ferry.custom_headers]",
+]
+for k, v in HEADERS.items():
+    lines.append(f"{q(k)} = {q(v)}")
+for lane in LANES:
+    lines += ["",
+              f"[models.{q('ferry/' + lane)}]",
+              'provider = "ferry"',
+              f"model = {q(lane)}",
+              "max_context_size = 200000",
+              'capabilities = ["tool_use"]']
+write_owned(os.path.join(home_dir, "config.toml"), "\n".join(lines) + "\n", 0o644)
+
+# Env that outranks default_model / the provider must not leak in from the
+# user's shell: the KIMI_MODEL_* family and the managed base URL.
+pre = "unset KIMI_MODEL_NAME KIMI_MODEL_API_KEY KIMI_MODEL_PROVIDER_TYPE KIMI_MODEL_BASE_URL KIMI_CODE_BASE_URL"
+wrapper(os.path.join(bin_dir, "kimi-ferry"),
+        {"KIMI_CODE_HOME": shlex.quote(home_dir),
+         "FERRY_KIMI_API_KEY": '"$FERRY_KEY"',
+         "KIMI_DISABLE_TELEMETRY": "1"},
+        "kimi", pre=pre)
+print(f"    Wrapper:        {os.path.join(bin_dir, 'kimi-ferry')}")
+print(f"    Default model:  ferry/{LANE} (lanes: {' '.join(LANES)})")
+print("    Run `kimi-ferry`; plain `kimi` and ~/.kimi-code are untouched.")
+save_record()
+PYEOF
+}
+
+cmd_kimi() { _agent_main kimi "$@"; }
+# ferry copilot: point GitHub Copilot CLI (`copilot`, npm @github/copilot)
+# at the ferry endpoint through a `copilot-ferry` wrapper. No config file of
+# the user's is edited and no GitHub login is read or changed.
+#
+# Research. The issue asks "check whether it accepts a custom endpoint at all":
+# YES, through its BYOK ("bring your own key") mode. github/copilot-cli holds
+# only docs and a changelog; the shipped code is the npm package, whose
+# platform package (@github/copilot-darwin-arm64) is one 163 MB Mach-O
+# executable. Its JS is not greppable (no COPILOT_PROVIDER_* string is found by
+# `grep -a -b`, so there are no byte offsets to cite), so every fact below is
+# read from the client's own shipped help text and the upstream changelog, and
+# was then confirmed by running the real client against a stub. Pinned:
+# copilot 1.0.94 (buildMetadata.gitCommit fdeb5949944; `copilot --version`),
+# `copilot help environment` and `copilot help providers` of that build, and
+# github/copilot-cli changelog.md (fetched 2026-11-20, top entry 1.0.114).
+#
+# (1) Provider config / base URL. Env-driven: COPILOT_PROVIDER_BASE_URL
+#     "activates BYOK mode ... GitHub authentication is not required" (help
+#     providers; help environment). COPILOT_PROVIDER_TYPE is "openai"
+#     (default), "azure" or "anthropic", so an Anthropic base is possible too,
+#     but ferry's OpenAI chat/completions door reaches every lane, so ferry
+#     uses type openai. A saved providers.json is also read (changelog.md:462,
+#     1.0.109: COPILOT_PROVIDER_* "take precedence over a saved providers.json,
+#     unless COPILOT_PROVIDERS_CONFIG names the file"; :399 1.0.110), which is
+#     why the env route never has to touch it.
+# (2) Key. COPILOT_PROVIDER_API_KEY (or ..._API_KEY_COMMAND, or
+#     COPILOT_PROVIDER_BEARER_TOKEN; help environment). The wrapper exports
+#     COPILOT_PROVIDER_API_KEY from $FERRY_KEY (the 0600 agents.key) at run
+#     time: it lives in the process environment, never argv or a file. The
+#     stub saw `authorization: Bearer <key>`. Any bearer / key-command the user
+#     exported is unset first (changelog.md:461: precedence differs per type).
+# (3) Custom headers. Yes: COPILOT_PROVIDER_HEADERS, newline-separated
+#     "Name: Value" pairs, "sent only to the BYOK provider endpoint (not to
+#     GitHub Copilot services)" (help environment). X-Ferry-Client and
+#     X-Ferry-Fleet go there; the stub saw `x-ferry-client`.
+# (4) API spoken. COPILOT_PROVIDER_WIRE_API "completions" (default) or
+#     "responses"; ferry sets completions explicitly. Observed:
+#     POST {base}/chat/completions, streamed (OpenAI JS SDK 5.20.1).
+# (5) Least invasive wiring: wrapper only, ~/.local/bin/copilot-ferry. The
+#     plain `copilot` command, ~/.copilot (config.json, providers.json,
+#     sessions) and the GitHub login are untouched. The model comes from
+#     COPILOT_MODEL (a model is required for BYOK, help providers); `--model`
+#     overrides it (changelog.md:459, 1.0.109), so any lane id works.
+#     Limitations: copilot's built-in model picker is GitHub's list, so lane
+#     switching is `copilot-ferry --model <lane>`; ferry's lane id is also
+#     the "well-known model id", which copilot does not recognise, so it falls
+#     back to safe defaults for tool support and token limits (help providers).
+#
+# Wire: ~/.local/bin/copilot-ferry and ~/.config/ferry/copilot.json.
+# `ferry copilot --unwire` removes exactly those (generic, record-driven).
+
+cmd_copilot() { _agent_main copilot "$@"; }
+
+_copilot_help() {
+  cat <<'EOF2'
+ferry copilot - point GitHub Copilot CLI at the ferry endpoint (BYOK).
+
+Usage:
+  ferry copilot [--host H] [--port P] [--key K] [--model LANE] [--keep N]
+  ferry copilot --unwire [--dry-run]
+
+  Writes the `copilot-ferry` wrapper (~/.local/bin/copilot-ferry). It sets
+  COPILOT_PROVIDER_BASE_URL=<ferry>/v1 (type openai, wire API completions),
+  COPILOT_PROVIDER_API_KEY from the 0600 key file at run time (never argv),
+  COPILOT_PROVIDER_HEADERS (X-Ferry-Client / X-Ferry-Fleet) and
+  COPILOT_MODEL=<lane>, then execs `copilot`. No GitHub login is needed in
+  that mode. Your ~/.copilot config and plain `copilot` are not touched.
+
+  Pick another lane with `copilot-ferry --model <lane>`.
+  Limitation: copilot's own /model list is GitHub's; lanes are chosen by
+  --model. Needs a copilot new enough to have BYOK (see `copilot help providers`).
+EOF2
+}
+
+_copilot_wire() {
+  _agent_python <<'PYEOF'
+import os
+def dq(s):   # bash/zsh $'...' quoting
+    return "$'" + s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+headers = "\n".join(f"{k}: {v}" for k, v in HEADERS.items())
+pre = ("unset COPILOT_PROVIDER_BEARER_TOKEN COPILOT_PROVIDER_API_KEY_COMMAND "
+       "COPILOT_PROVIDER_TRANSPORT COPILOT_PROVIDER_MODEL_ID "
+       "COPILOT_PROVIDER_WIRE_MODEL COPILOT_PROVIDERS_CONFIG COPILOT_OFFLINE")
+w = os.path.join(HOME, ".local", "bin", "copilot-ferry")
+import shlex
+wrapper(w, {
+    "COPILOT_PROVIDER_TYPE": "openai",
+    "COPILOT_PROVIDER_BASE_URL": shlex.quote(BASE),
+    "COPILOT_PROVIDER_WIRE_API": "completions",
+    "COPILOT_PROVIDER_API_KEY": '"$FERRY_KEY"',
+    "COPILOT_PROVIDER_HEADERS": dq(headers),
+    "COPILOT_MODEL": shlex.quote(LANE),
+}, "copilot", pre=pre)
+print(f"    Wrapper:        {w}  (lane {LANE}; lanes: {' '.join(LANES)})")
+save_record()
+PYEOF
+}
 # ferry fleet — read or switch which FLEET (routing set) a caller resolves
 # bare lane names against. Talks to the front door's control plane at
 # /v1/ferry/fleet (front/ferry_front.py): GET returns the fleet document,
@@ -9901,6 +12467,21 @@ case "$COMMAND" in
   cline)         cmd_cline "$@" ;;
   codex)         cmd_codex "$@" ;;
   prime)         cmd_prime "$@" ;;
+  agents)        cmd_agents "$@" ;;
+  pi)            cmd_pi "$@" ;;
+  gemini)        cmd_gemini "$@" ;;
+  openhands)     cmd_openhands "$@" ;;
+  interpreter)   cmd_interpreter "$@" ;;
+  goose)         cmd_goose "$@" ;;
+  aider)         cmd_aider "$@" ;;
+  codewhale)     cmd_codewhale "$@" ;;
+  reasonix)      cmd_reasonix "$@" ;;
+  omp)           cmd_omp "$@" ;;
+  crush)         cmd_crush "$@" ;;
+  qwen)          cmd_qwen "$@" ;;
+  kilo)          cmd_kilo "$@" ;;
+  kimi)          cmd_kimi "$@" ;;
+  copilot)       cmd_copilot "$@" ;;
   fleet)         cmd_fleet "$@" ;;
   keys)          cmd_keys "$@" ;;
   update)        cmd_update "$@" ;;

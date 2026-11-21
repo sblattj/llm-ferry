@@ -1023,8 +1023,16 @@ class TestEventTap(unittest.TestCase):
     def test_every_inference_shape_is_tapped(self):
         for path in ("/v1/chat/completions", "/chat/completions",
                      "/v1/messages", "/v1/responses", "/v1/embeddings",
-                     "/v1/chat/completions?stream=true"):
+                     "/v1/chat/completions?stream=true",
+                     "/v1beta/models/flash:generateContent",
+                     "/v1beta/models/flash:streamGenerateContent"):
             self.assertTrue(FF.is_inference_path(path), path)
+
+    def test_only_gemini_generate_is_tapped_on_v1beta(self):
+        for path in ("/v1beta/models/flash:countTokens", "/v1beta/models",
+                     "/v1beta/models/flash", "/models/flash:generateContent",
+                     "/v1beta/models/a/b:generateContent", "/v1beta/interactions"):
+            self.assertFalse(FF.is_inference_path(path), path)
 
     def test_a_health_request_writes_no_event(self):
         os.environ["FERRY_EVENTS"] = "on"

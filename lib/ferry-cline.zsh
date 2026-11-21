@@ -54,7 +54,8 @@ Usage:
                   master_key when set, else 'local' (never empty: Cline only
                   sends Authorization when a key exists).
   --model LANE    Lane id for BOTH the act and plan modes (default heavy).
-  --data-dir DIR  Cline data dir (default $CLINE_DATA_DIR, else ~/.cline).
+  --data-dir DIR  Cline root dir, files go in DIR/data (default $CLINE_DIR,
+                  else ~/.cline; $CLINE_DATA_DIR names the data dir itself).
   --keep N        Snapshots to keep per config file (default 10).
 EOF
         return 0 ;;
@@ -118,9 +119,19 @@ except Exception:
   local cl_name="${CLIENT_NAME:-}"
 
   cl_model="${cl_model:-heavy}"
-  # CLINE_DATA_DIR only relocates Cline's files (the one knob Cline honors),
-  # so it is the default default; an explicit --data-dir always wins.
-  cl_data="${cl_data:-${CLINE_DATA_DIR:-$HOME/.cline}}"
+  # Two layouts, matching the Cline CLI's own resolver (npm cline 3.0.67,
+  # @cline/shared dist/storage/index.js: l() = $CLINE_DIR else ~/.cline, and
+  # p() = $CLINE_DATA_DIR else l()/data): --data-dir DIR and $CLINE_DIR name
+  # the ROOT (files land in DIR/data/...), while $CLINE_DATA_DIR names the data
+  # dir ITSELF (files land in $CLINE_DATA_DIR/...). An explicit flag wins.
+  local cl_inner=""
+  if [[ -n "$cl_data" ]]; then
+    cl_inner="$cl_data/data"
+  elif [[ -n "${CLINE_DATA_DIR:-}" ]]; then
+    cl_inner="$CLINE_DATA_DIR"; cl_data="${CLINE_DATA_DIR:h}"
+  else
+    cl_data="${CLINE_DIR:-$HOME/.cline}"; cl_inner="$cl_data/data"
+  fi
 
   # Lane check against the host catalogue — never fatal. A ferry-down host
   # still gets wired, just unchecked (Cline has to work with ferry down, the
@@ -177,13 +188,14 @@ PYEOF
   # The three Cline files (merge — every unknown key survives) plus ferry's
   # own record. Any failure here fails the command; the marketplace hint below
   # only prints on the success path.
-  python3 - "$cl_host" "$cl_port" "$cl_key" "$cl_model" "$cl_name" "$cl_data" "$cl_keep" "${FERRY_FLEET:-}" "$HOME/.config/ferry/cline.json" <<'PYEOF'
+  python3 - "$cl_host" "$cl_port" "$cl_key" "$cl_model" "$cl_name" "$cl_data" "$cl_keep" "${FERRY_FLEET:-}" "$HOME/.config/ferry/cline.json" "$cl_inner" <<'PYEOF'
 import datetime, json, os, re, shutil, stat, sys
 
 host, port, key, model, name, data_dir, keep = sys.argv[1:8]
 fleet = sys.argv[8]
 record = os.path.abspath(os.path.expanduser(sys.argv[9]))
 data_dir = os.path.abspath(os.path.expanduser(data_dir))
+inner = os.path.abspath(os.path.expanduser(sys.argv[10]))
 keep = int(keep)
 base = f"http://{host}:{port}/v1"
 now = datetime.datetime.now(datetime.timezone.utc)
@@ -256,9 +268,9 @@ if key.lower().startswith("fk-"):
         settings = entry.get("settings")
         return settings.get("apiKey") if isinstance(settings, dict) else None
     for p, getter in (
-        (os.path.join(data_dir, "data", "secrets.json"),
+        (os.path.join(inner, "secrets.json"),
          lambda d: d.get("openAiApiKey")),
-        (os.path.join(data_dir, "data", "settings", "providers.json"),
+        (os.path.join(inner, "settings", "providers.json"),
          _old_provider_key),
         (record, lambda d: d.get("master_key")),
     ):
@@ -271,7 +283,7 @@ if key.lower().startswith("fk-"):
 # --- globalState.json: the file that actually flips Cline's selection. ---
 # "openai" here is Cline's extension-state id for "OpenAI Compatible" — NOT
 # OpenAI the service, and not providers.json's "openai-compatible" either.
-gs_path = os.path.join(data_dir, "data", "globalState.json")
+gs_path = os.path.join(inner, "globalState.json")
 os.makedirs(os.path.dirname(gs_path), exist_ok=True)
 snap = snapshot(gs_path)
 if snap:
@@ -289,7 +301,7 @@ gs.update({
 dump(gs_path, gs)
 
 # --- secrets.json: plain JSON, mode 0600 (Cline's own convention). ---
-sec_path = os.path.join(data_dir, "data", "secrets.json")
+sec_path = os.path.join(inner, "secrets.json")
 snap = snapshot(sec_path)
 if snap:
     print(f"    Snapshot:       {snap}")
@@ -302,7 +314,7 @@ if mode & 0o177:            # group/other bits set = looser than 0600
 
 # --- settings/providers.json: the SDK-shared mirror. Its id for the same ---
 # --- provider is "openai-compatible"; other provider entries survive.     ---
-pv_path = os.path.join(data_dir, "data", "settings", "providers.json")
+pv_path = os.path.join(inner, "settings", "providers.json")
 os.makedirs(os.path.dirname(pv_path), exist_ok=True)
 snap = snapshot(pv_path)
 if snap:

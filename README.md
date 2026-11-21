@@ -57,6 +57,7 @@ It goes further than serving inference: it can **ferry whole models and files** 
 - [Why not just…?](#why-not-just)
 - [Features](#features)
 - [Quickstart](#quickstart)
+- [Agentic coding CLIs](#agentic-coding-clis)
 - [Recent releases](#recent-releases)
 - [The stack — eight lanes on one endpoint](#the-stack--eight-lanes-on-one-endpoint)
 - [Fleets](#fleets)
@@ -113,6 +114,7 @@ Ollama and LM Studio are excellent local runtimes; a raw LiteLLM proxy is a grea
 - 🌐 **One endpoint, every device** — OpenAI-compatible (`/v1/chat/completions`, `/v1/models`); Anthropic `/v1/messages` too, so **Claude Code runs on the ferry backend** (`claude-ferry` wrappers). [[The stack →]](#the-stack--eight-lanes-on-one-endpoint)
 - 🧩 **Cline (VS Code) wired too** — `ferry cline` (or a plain bootstrap) points the Cline extension at the ferry endpoint by lane name, writing its file-backed provider config with snapshots first. [[Release →]](docs/releases/v1.40.0.md)
 - 🤖 **Codex CLI and Prime Agent wired too** — `ferry codex` installs `codex-ferry` (heavy) / `codex-ferry-flash` wrappers (Codex's `/goal` works through them); `ferry prime` adds a `ferry` provider to Prime Agent's `models.json`. [[Release →]](docs/releases/v1.41.0.md)
+- 🛠️ **Every popular agentic coding CLI wired too**: `ferry <client>` for Pi, oh-my-pi, Gemini CLI, Qwen Code, OpenHands, Open Interpreter, Goose, Aider, Codewhale, Reasonix, Crush, Kilo Code, Kimi Code and GitHub Copilot CLI: a `<client>-ferry` wrapper on your lanes, your own config left alone, `--unwire` to undo. The bootstrap wires the ones already installed. [[→]](#agentic-coding-clis)
 - 🔑 **Keys stay on the host** — provider keys never leave the host; each client holds one ferry key — its own revocable [device key](#device-keys), or the shared master key on older setups. [[Privacy →]](#privacy)
 - ⚡ **Local GPU + cloud, same endpoint** — Apple MLX inference on the Mac, or a cloud proxy, or both in one route config. [[Local GPU lanes →]](#the-local-gpu-lanes)
 - 🧠 **Named lanes with explicit fallback hops** — clients pick a role (`heavy`, `flash`, …); you swap the backends without editing a single client. [[The stack →]](#the-stack--eight-lanes-on-one-endpoint)
@@ -151,7 +153,7 @@ ferry share                          # print the one-liner clients run (LAN shar
 curl -fsSL http://your-mac.local:8095/client-bootstrap.sh | zsh
 ```
 
-The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint, and adds `opencode-cloud` / `opencode-local` / `opencode-super` shell shortcuts — and, when `claude` is installed, `claude-ferry` / `claude-ferry-local` / `claude-ferry-super`. Cline in VS Code is auto-wired the same way (`ferry cline`'s takeover; skip with `--no-cline`, and close VS Code for the run). The Codex CLI gets `codex-ferry` / `codex-ferry-flash` wrappers in `~/.zshrc` (`--no-codex` skips; installed even before Codex is — `npm i -g @openai/codex`), and Prime Agent gets a `ferry` provider in its `models.json` (`--no-prime` skips; installed even before prime-agent is). Bare `opencode`, `claude` and `codex` are deliberately untouched. Then check in:
+The bootstrapper is non-interactive when the host is reachable: it installs the `ferry` CLI to `~/.local/bin`, writes `~/.config/ferry/client.json`, wires opencode to the host endpoint, and adds `opencode-cloud` / `opencode-local` / `opencode-super` shell shortcuts — and, when `claude` is installed, `claude-ferry` / `claude-ferry-local` / `claude-ferry-super`. Cline in VS Code is auto-wired the same way (`ferry cline`'s takeover; skip with `--no-cline`, and close VS Code for the run). The Codex CLI gets `codex-ferry` / `codex-ferry-flash` wrappers in `~/.zshrc` (`--no-codex` skips; installed even before Codex is — `npm i -g @openai/codex`), and Prime Agent gets a `ferry` provider in its `models.json` (`--no-prime` skips; installed even before prime-agent is). Every [agentic coding CLI](#agentic-coding-clis) ferry knows (`ferry agents`) that is already installed gets its `<client>-ferry` wrapper too (`--no-<client>` skips one, `--no-agents` all, `--with-<client>` wires one before it is installed). Bare `opencode`, `claude` and `codex` are deliberately untouched. Then check in:
 
 ```bash
 ferry status                     # connection health + the lanes the host serves
@@ -163,8 +165,43 @@ That's it — every editor and CLI on the client now talks to one endpoint on th
 
 > If ferry replaced your key-sync ritual, [⭐ star the repo](https://github.com/sblattj/llm-ferry). It helps other people find it.
 
+## Agentic coding CLIs
+
+`ferry <client>` points one more coding CLI at the ferry endpoint (`http://HOST:8090/v1`) with this client's device key (or the master key) and the `X-Ferry-Client` / `X-Ferry-Fleet` headers, on the `heavy` lane unless you pass `--model <lane>`. Each one installs a `<client>-ferry` wrapper in `~/.local/bin` and leaves the plain command, your config and your logins alone, so you choose per run.
+
+```bash
+ferry agents               # every client ferry knows, and which are installed here
+ferry gemini               # wire one (same flags for all: --host --port --key --model)
+gemini-ferry -p "hello"    # run it on ferry; plain `gemini` is unchanged
+ferry gemini --unwire      # undo exactly what ferry wrote (--dry-run to preview)
+```
+
+- **The key stays out of argv and out of your config.** It lives in `~/.config/ferry/agents.key` (0600) and each wrapper reads it at run time.
+- **What was written is recorded.** `~/.config/ferry/<client>.json` lists every file ferry created (with its hash) and every key it added to a file of yours. `--unwire` removes only those, keeps a file you changed since, and sets `<client>_mode` to `none` in `client.json`.
+- **Bootstrap, reset and cleanup drive the same list.** The bootstrap wires each client that is already installed (`--with-<client>` wires one that is not yet, `--no-<client>` / `--no-agents` skip). `client-reset.sh` re-applies the ones whose mode is `full`, and `client-cleanup.sh` unwires them all.
+
+| Client | Command → wrapper | What ferry writes | Limitation |
+|---|---|---|---|
+| [Pi](https://github.com/earendil-works/pi) | `ferry pi` → `pi-ferry` | One `ferry` provider inserted into `~/.pi/agent/models.json` (text-surgical, comments kept) | Edits your `models.json`; refuses `/* */` comments |
+| [oh-my-pi](https://github.com/can1357/oh-my-pi) | `ferry omp` → `omp-ferry` | A ferry-owned extension `~/.config/ferry/omp/ferry-provider.ts` loaded with `-e` | The provider exists under `omp-ferry` only |
+| [Gemini CLI](https://github.com/google-gemini/gemini-cli) | `ferry gemini` → `gemini-ferry` | `~/.config/ferry/gemini-settings.json` (system settings, API-key auth) | Gemini-native API only (`/v1beta`; device keys need a v1.52.0 host); the CLI rewrites the lane aliases `auto`, `pro`, `flash`, `flash-lite` |
+| [Qwen Code](https://github.com/QwenLM/qwen-code) | `ferry qwen` → `qwen-ferry` | `~/.config/ferry/qwen-settings.json` via `QWEN_CODE_SYSTEM_SETTINGS_PATH` | none known |
+| [OpenHands CLI](https://github.com/OpenHands/OpenHands-CLI) | `ferry openhands` → `openhands-ferry` | `~/.config/ferry/openhands/` as `OPENHANDS_PERSISTENCE_DIR` | Own history, MCP list and settings, apart from plain `openhands` |
+| [Open Interpreter](https://github.com/openinterpreter/openinterpreter) | `ferry interpreter` → `interpreter-ferry` | Nothing but the wrapper (`-c` overrides) | The Rust `interpreter` (0.0.x); the legacy Python 0.4 one is not wired |
+| [Goose](https://github.com/aaif-goose/goose) | `ferry goose` → `goose-ferry` | Nothing but the wrapper (env only) | Pick another lane with `FERRY_MODEL=<lane>` |
+| [Aider](https://github.com/Aider-AI/aider) | `ferry aider` → `aider-ferry` | `~/.config/ferry/aider/model-settings.yml`, `model-metadata.json` | An `openai-api-key` in a `.env` or `.aider.conf.yml` beats the wrapper's key |
+| [Codewhale](https://github.com/Hmbown/Codewhale) | `ferry codewhale` → `codewhale-ferry` | `~/.config/ferry/codewhale/config.toml` via `CODEWHALE_CONFIG_PATH` | Your own `~/.codewhale/config.toml` settings do not apply under the wrapper |
+| [Reasonix](https://github.com/esengine/DeepSeek-Reasonix) | `ferry reasonix` → `reasonix-ferry` | A ferry-owned `REASONIX_HOME` (`config.toml`, 0600 `.env`) | Own sessions, skills and hooks; upstream unmaintained since 2026-11-12 |
+| [Crush](https://github.com/charmbracelet/crush) | `ferry crush` → `crush-ferry` | `~/.config/ferry/crush/crush.json` via `CRUSH_GLOBAL_DATA` | A project `.crush.json` that sets `models.*` overrides the lane |
+| [Kilo Code](https://github.com/Kilo-Org/kilocode) | `ferry kilo` → `kilo-ferry` | `~/.config/ferry/kilo/kilo.json` via `KILO_CONFIG` (`--global` also adds a `ferry` provider to `~/.config/kilo/kilo.json`) | The fleet header is fixed at wire time |
+| [Kimi Code CLI](https://www.npmjs.com/package/@moonshot-ai/kimi-code) | `ferry kimi` → `kimi-ferry` | A ferry-owned `KIMI_CODE_HOME` | Starts with an empty profile; the archived Python `kimi-cli` is not wired |
+| [GitHub Copilot CLI](https://github.com/github/copilot-cli) | `ferry copilot` → `copilot-ferry` | Nothing but the wrapper (BYOK env, no GitHub login needed) | none known |
+
+Cline CLI shares `~/.cline` with the VS Code extension, so the existing `ferry cline` covers it (it now honors `CLINE_DIR` and `CLINE_DATA_DIR` the way the CLI does). Every client above was run through its wrapper against a stub endpoint in a throwaway `$HOME` (`lib/ferry-<client>.test.py`); the stub saw `POST /v1/chat/completions` (Gemini: `/v1beta/models/<lane>:streamGenerateContent`) with the key and `X-Ferry-Client`. How each client reads its provider config, with source citations: [Deep dives](docs/deep-dives.md#agentic-coding-cli-wiring).
+
 ## Recent releases
 
+- **[v1.52.0: every agentic coding CLI](docs/releases/v1.52.0.md)**: `ferry <client>` for 14 more coding CLIs (Pi, Gemini CLI, Aider, Goose, Crush, Copilot CLI, ...), each proven end to end against the real binary; `ferry agents` lists them; bootstrap, reset and cleanup drive the same registry.
 - **[v1.39.0 — per-device keys](docs/releases/v1.39.0.md)** — every client gets its own revocable key at bootstrap, with optional lane, requests-per-minute and monthly token limits; `ferry keys` manages them and the dash shows who spent what.
 - **[v1.38.0 — safe help, clean pipes, named offers](docs/releases/v1.38.0.md)** — `--help` never runs a subcommand, colour only on a terminal, `ferry offer --as NAME` with `.app` signatures intact, and releases cut automatically on tag push.
 - **[v1.37.0 — Claude subscription lanes](docs/releases/v1.37.0.md)** — `ferry auth-claude login` serves `claude-*` traffic from a Claude Pro/Max subscription over OAuth, with metered fallback hops. [Full history →](docs/releases)
@@ -379,7 +416,7 @@ Every client can hold **its own key** instead of the shared master key, so you c
   ```
 
   Names are lower-cased to `[a-z0-9-]`; `master` and `host` are reserved.
-- **Client routes only.** A device key works on inference (`/v1/chat/completions`, `/v1/completions`, `/v1/messages` and its `count_tokens`, `POST /v1/responses` and its `compact`, `/v1/embeddings`), the model lists, `/v1/ferry/fleet` and the health probe. Any other route answers 403 `route_not_allowed`. That covers litellm's admin API and UI, audio, images, files and batches. It also covers stored responses (GET/DELETE `/v1/responses/<id>`, its `input_items` and `cancel`), which no ferry client polls and which would re-meter a stored response's usage. Device keys do not work on the Gemini-native (`/v1beta/models/…:generateContent`) or websocket routes (realtime, the responses socket), which get 403 or a 1008 close, because the front cannot limit or meter them yet: use the master key there. The master key is unaffected and still reaches everything.
+- **Client routes only.** A device key works on inference (`/v1/chat/completions`, `/v1/completions`, `/v1/messages` and its `count_tokens`, `POST /v1/responses` and its `compact`, `/v1/embeddings`), the model lists, `/v1/ferry/fleet` and the health probe. Any other route answers 403 `route_not_allowed`. That covers litellm's admin API and UI, audio, images, files and batches. It also covers stored responses (GET/DELETE `/v1/responses/<id>`, its `input_items` and `cancel`), which no ferry client polls and which would re-meter a stored response's usage. Since v1.52.0 a device key also works on the Gemini-native generate routes (`POST /v1beta/models/<lane>:generateContent` and `:streamGenerateContent`), with the lane taken from the path and the same limits and metering. Other `/v1beta` routes (`countTokens` included) and the websocket routes (realtime, the responses socket) still refuse device keys with 403 or a 1008 close, because the front cannot limit or meter them yet: use the master key there. The master key is unaffected and still reaches everything.
 - **Limits are optional.** `--lanes` accepts bare lanes (`flash`, which means any fleet's flash) or fleet lanes (`international.flash`); `orch` counts as `heavy`, `light` as `flash` and `super-light` as `super-flash`. A disallowed lane is a 403. `--rpm` caps one key's requests per minute across all front-door workers (429 with `Retry-After`). `--budget-tokens` caps **input + output tokens per calendar month (UTC)**, answered 429 `insufficient_quota` once spent. Tokens are charged once per request when its response completes (streams included, even if the client disconnects), so every request already in flight when the budget runs out may still finish: the overshoot can be more than one request. Limits and metering apply on every route a device key can reach that serves a model: the OpenAI- and Anthropic-style inference routes above. There are no USD budgets in v1.
 - **Credentials.** A device key is accepted from any credential header litellm reads or from `?key=`; a `?key=` device key is removed from the URL before forwarding, so it never reaches the access log, and sending two different credentials alongside an `fk-` key is a 401.
 - **Fleet identity.** A device key's name is its fleet identity, so a migrated client's sticky fleet is stored under that name. If it falls back to the default after migrating, re-select it with `ferry fleet use <fleet>` (a client can only select `domestic`).
@@ -418,6 +455,8 @@ Everything runs on your own hardware and network. The front door answers only re
 | `cline [--host H] [--port P] [--key KEY] [--model M] [--data-dir D] [--keep N]` | dual | Point Cline (VS Code) at the ferry endpoint: writes the `~/.cline` provider files (snapshot first, merged, `heavy` lane by default), records `~/.config/ferry/cline.json` for reset/cleanup |
 | `codex [--host H] [--port P] [--key KEY] [--wrappers]` | dual | Install the `codex-ferry` (heavy) / `codex-ferry-flash` wrappers pointing the OpenAI Codex CLI at the ferry endpoint with `-c` overrides (`~/.codex` and `CODEX_HOME` never touched; key via env, not argv); records `~/.config/ferry/codex.json`. Codex 0.158+ only speaks `wire_api="responses"`, so the lane must serve `/v1/responses`; `/goal` works through the wrappers. Also writes `~/.config/ferry/codex-catalog.json` (tiers `heavy`/`medium`/`light`/`super-light`) because Codex validates `spawn_agent` model names client-side against its catalog; the wrappers run at high reasoning effort |
 | `prime [--host H] [--port P] [--key KEY] [--model LANE] [--agent-dir DIR] [--keep N]` | dual | Add a `ferry` provider (OpenAI-compatible, every served lane as a model) to Prime Agent's `models.json` — text-surgical, comments and other providers kept, snapshot first; records `~/.config/ferry/prime.json`. Then `prime-agent --provider ferry --model heavy`. Verified end to end against prime-agent 0.9.8 (plain prompt, tool calls, `heavy` and `flash`) |
+| `agents [--list\|--installed]` | dual | List the [agentic coding CLIs](#agentic-coding-clis) ferry can wire and which are installed |
+| `pi` / `omp` / `gemini` / `qwen` / `openhands` / `interpreter` / `goose` / `aider` / `codewhale` / `reasonix` / `crush` / `kilo` / `kimi` / `copilot` `[--host H] [--port P] [--key KEY] [--model LANE] [--unwire] [--dry-run]` | dual | Wire that coding CLI to the ferry endpoint through a `<client>-ferry` wrapper, your config untouched; `--unwire` undoes it ([table](#agentic-coding-clis)) |
 | `migrate [--dry-run] [--full] [--dir D]` | client | Promote this client into a host of its own ([how](docs/deep-dives.md#promoting-a-client-into-a-host)) |
 
 `ferry --help` prints the built-in usage banner.
@@ -441,7 +480,7 @@ Issues and PRs are welcome — [open an issue](https://github.com/sblattj/llm-fe
 
 ## Development
 
-`ferry` is assembled from 20 per-domain modules in [`lib/`](lib/). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules, regenerate, and commit both (`build.zsh --check` flags drift; don't hand-edit `ferry`):
+`ferry` is assembled from 40 per-domain modules in [`lib/`](lib/). The shipped `ferry` is a **generated** single file — clients fetch it as one script over the LAN — so edit the modules, regenerate, and commit both (`build.zsh --check` flags drift; don't hand-edit `ferry`):
 
 ```bash
 ./build.zsh --check    # regenerate ./ferry from lib/ferry-*.zsh; fail on drift

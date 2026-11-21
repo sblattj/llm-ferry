@@ -45,6 +45,7 @@ if not HAVE_LITELLM:
 
 import asyncio  # noqa: E402
 import itertools  # noqa: E402
+import json  # noqa: E402
 import re  # noqa: E402
 import shutil  # noqa: E402
 import tempfile  # noqa: E402
@@ -80,6 +81,9 @@ CLIENT_ENDPOINTS = {
     "responses_api": [("POST", "/v1/responses"), ("POST", "/responses")],
     "compact_response": [("POST", "/v1/responses/compact")],
     "health_liveliness": [("GET", "/health/liveliness"), ("GET", "/health/liveness")],
+    # Gemini-native generate (issue #3): metered like chat, lane from the path.
+    "google_generate_content": [("POST", "/v1beta/models/flash:generateContent")],
+    "google_stream_generate_content": [("POST", "/v1beta/models/flash:streamGenerateContent")],
 }
 # Stored-response endpoints: no ferry client polls them, and a GET would
 # re-meter the stored response's usage on every poll. Refused for device keys
@@ -91,11 +95,9 @@ STORED_RESPONSE_ENDPOINTS = {
     "cancel_response": [("POST", "/v1/responses/resp_1/cancel")],
 }
 # Client-shaped endpoints a device key must NOT reach yet: the front cannot
-# limit or meter them (Gemini-native is not an inference path to the front;
-# websockets never reach _key_admit). The master still reaches them.
+# limit or meter them (Gemini countTokens is not an inference path to the
+# front; websockets never reach _key_admit). The master still reaches them.
 UNMETERED_ENDPOINTS = {
-    "google_generate_content": [("POST", "/v1beta/models/flash:generateContent")],
-    "google_stream_generate_content": [("POST", "/v1beta/models/flash:streamGenerateContent")],
     "google_count_tokens": [("POST", "/v1beta/models/flash:countTokens")],
     "realtime_websocket_endpoint": [("WEBSOCKET", "/v1/realtime"), ("WEBSOCKET", "/realtime")],
     "responses_websocket_endpoint": [("WEBSOCKET", "/v1/responses"), ("WEBSOCKET", "/responses")],
@@ -313,6 +315,67 @@ class TestDeviceKeyRoutesAgainstLitellm(unittest.TestCase):
             with self.subTest(method=method):
                 self.assertIsNone(_resolve(self.app, method, path))
                 self.assertTrue(FF.device_key_route_allowed(method, path))
+
+
+@unittest.skipUnless(HAVE_LITELLM, "SKIPPED LOUDLY: litellm is not importable, so the "
+                     "Gemini adapter usage check did NOT run")
+class TestGeminiAdapterReportsUsage(unittest.TestCase):
+    """A device key's budget on Gemini-native generate is charged from the
+    `usageMetadata` litellm writes. Every non-Gemini deployment answers this
+    route through litellm's completion adapter, which (1.99) never asks for
+    stream usage, so its stream carried 0/0/0. The front's hook makes the
+    adapter ask; this pins that against the REAL adapter (offline: the
+    completion itself is litellm's own mock_response)."""
+
+    def run_adapter(self, stream):
+        import litellm
+        from litellm import google_genai as G
+        real = litellm.acompletion
+        seen = {}
+
+        async def mocked(**kw):
+            seen.update(kw)
+            kw.pop("mock_response", None)
+            return await real(mock_response="a few words from the mock", **kw)
+
+        async def go():
+            metrics = FF._metrics_module()
+            collector = FF._gemini_metrics_class(metrics)()
+            token = metrics.CURRENT_METRICS.set(collector)
+            try:
+                args = dict(model="openai/gpt-4o-mini",
+                            contents=[{"role": "user", "parts": [{"text": "hello"}]}])
+                if stream:
+                    out = await G.agenerate_content_stream(**args)
+                    collector.start_response([(b"content-type", b"text/event-stream")], 200)
+                    async for chunk in out:
+                        collector.feed(chunk if isinstance(chunk, bytes) else chunk.encode())
+                else:
+                    out = await G.agenerate_content(**args)
+                    collector.start_response([(b"content-type", b"application/json")], 200)
+                    doc = out if isinstance(out, dict) else out.model_dump()
+                    collector.feed(json.dumps(doc).encode())
+            finally:
+                metrics.CURRENT_METRICS.reset(token)
+            return collector.finish()
+
+        litellm.acompletion = mocked
+        try:
+            return asyncio.run(go()), seen
+        finally:
+            litellm.acompletion = real
+
+    def test_json_usage_reaches_the_meter(self):
+        observed, _ = self.run_adapter(stream=False)
+        self.assertGreater(observed["input_tokens"] or 0, 0)
+        self.assertGreater(observed["output_tokens"] or 0, 0)
+
+    def test_stream_usage_reaches_the_meter(self):
+        self.assertTrue(FF.install_gemini_stream_usage_hook())
+        observed, seen = self.run_adapter(stream=True)
+        self.assertEqual(seen.get("stream_options"), {"include_usage": True})
+        self.assertGreater(observed["input_tokens"] or 0, 0)
+        self.assertGreater(observed["output_tokens"] or 0, 0)
 
 
 def _litellm_version():

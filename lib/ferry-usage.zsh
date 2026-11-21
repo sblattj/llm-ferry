@@ -125,6 +125,16 @@ Commands:
   prime              [Dual] Point Prime Agent at this ferry host: adds a 'ferry'
                        provider to its models.json (openai-completions lanes)
                         ferry prime [--host H] [--port P] [--key K] [--model LANE] [--agent-dir DIR] [--keep N]
+  agents             [Dual] List the agentic coding CLIs ferry can wire (issue #3)
+                       and which are installed / wired on this machine
+                        ferry agents [--list | --installed]
+  pi | omp | gemini | qwen | openhands | interpreter | goose | aider |
+  codewhale | reasonix | crush | kilo | kimi | copilot
+                     [Dual] Wire that CLI to this ferry host without touching
+                       its own config: a <client>-ferry wrapper (or one 'ferry'
+                       provider entry), key in ~/.config/ferry/agents.key (0600)
+                        ferry <client> [--host H] [--port P] [--key K] [--model LANE]
+                        ferry <client> --unwire [--dry-run]
   fleet              [Dual] Read or switch which fleet (routing set) bare lane
                        names resolve to
                         ferry fleet ls | show | use <fleet> [--default] | use --clear

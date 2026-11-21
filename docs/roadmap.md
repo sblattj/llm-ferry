@@ -39,11 +39,11 @@ Still open from 06:
 - [ ] The device-key route allowlist (`device_key_route_allowed`) may need
       widening if a client uses a route outside it — watch the front log for
       `route_not_allowed`.
-- [ ] Meter Gemini-native + realtime for device keys, then allow them.
-      Gemini-native generate (`/v1beta/models/…:generateContent`) and the
-      websocket routes (realtime, the responses socket) refuse device keys
-      today because `_key_admit` runs only on `INFERENCE_PATH_PREFIXES` over
-      HTTP; the master key still reaches them.
+- [x] Meter Gemini-native generate for device keys, then allow it (v1.52.0:
+      `POST /v1beta/models/<lane>:generateContent` / `:streamGenerateContent`).
+- [ ] Meter realtime for device keys, then allow them. The websocket routes
+      (realtime, the responses socket) and the other `/v1beta` routes refuse
+      device keys today; the master key still reaches them.
 - [ ] **34 Ollama-native API** (`/api/tags`, `/api/chat`). Many tools speak
       only Ollama; also answers the "ollama converging from below" threat.
 - [ ] **01 Session affinity.** Pin a conversation to one deployment — matters

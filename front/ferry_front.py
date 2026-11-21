@@ -66,12 +66,30 @@ INFERENCE_PATH_PREFIXES = (
     "/v1/responses", "/responses",
     "/v1/embeddings", "/embeddings",
 )
+# Gemini-native generate: the lane is the PATH segment, not a body key.
+# litellm 1.99 serves /v1beta/models/{model_name:path}:generateContent and
+# passes model_name as the endpoint's `model`, which beats data["model"]
+# (proxy/google_endpoints/endpoints.py, common_request_processing.py), so the
+# path is the one place the front may read, check and rewrite the lane. One
+# segment with no ':' (a whole-path fullmatch): `a/b` and `x:countTokens`
+# style lanes are not lanes. countTokens and every other /v1beta route stay
+# out: they are neither metered nor admitted for device keys.
+GEMINI_GENERATE_RE = re.compile(
+    r"/v1beta/models/(?P<lane>[^/:]+):(?P<action>generateContent|streamGenerateContent)")
+
+
+def gemini_lane(path):
+    """The lane named by a Gemini-native generate path, or None."""
+    match = GEMINI_GENERATE_RE.fullmatch(path or "")
+    return match.group("lane") if match else None
 
 
 def is_inference_path(path: str) -> bool:
     """Whether this path is a served model call worth an event."""
     if not path or path in MODEL_LIST_PATHS:
         return False
+    if gemini_lane(path) is not None:
+        return True
     return any(path.startswith(p) for p in INFERENCE_PATH_PREFIXES)
 
 
@@ -599,6 +617,175 @@ def install_reasoning_usage_hook(adapter=None):
         return True
     except Exception:
         print("ferry: optional reasoning usage hook unavailable", file=sys.stderr)
+        return False
+
+
+# ── Gemini-native usage ─────────────────────────────────────────────────────
+# Gemini-native generate reports `usageMetadata`, not OpenAI `usage`, so the
+# shared collector (lib/ferry_metrics.py) sees no tokens there. The subclass
+# below maps it, for both the JSON body and each SSE frame. Semantics (Gemini
+# API reference, UsageMetadata): totalTokenCount = prompt + tool-use prompt +
+# thoughts + candidates, so thoughtsTokenCount is NOT inside
+# candidatesTokenCount: output = candidates + thoughts, input = prompt +
+# tool-use prompt. Should a provider fold thoughts into candidates (the total
+# balances without them), thoughts are not added twice. Native streams repeat
+# CUMULATIVE usage on every frame, so the last frame wins (the collector
+# overwrites, never sums).
+#
+# litellm's completion adapter (every non-Gemini deployment behind this route)
+# streamed 0/0/0 usageMetadata: GenerateContentToCompletionHandler never sets
+# stream_options, the proxy only injects include_usage for route_type
+# "acompletion" (common_request_processing._stream_usage_tracking_updates),
+# and without it CustomStreamWrapper keeps usage off the returned chunks, so
+# the adapter's finish chunk maps no usage. install_gemini_stream_usage_hook
+# makes the adapter ask for include_usage (the same thing the front already
+# forces on metered chat streams). The usage then arrives on a chunk AFTER the
+# finish chunk, which the adapter's translate drops (no parts, no finish
+# reason), so the hook also hands that chunk's usage straight to the request's
+# collector. The adapter's 0/0/0 placeholder frame is not a usage report and
+# the collector skips it, so frame order cannot zero the charge. Proved
+# against litellm 1.99 in lib/ferry-front-routes.test.py.
+_GEMINI_METRICS: dict = {}
+
+
+def _gemini_count(usage: dict, key: str):
+    value = usage.get(key)
+    if isinstance(value, (int, float)) and not isinstance(value, bool) \
+            and 0 <= value < float("inf"):
+        return value
+    return None
+
+
+def gemini_usage(usage):
+    """OpenAI-shaped usage from a Gemini `usageMetadata` dict, or None."""
+    if not isinstance(usage, dict):
+        return None
+    prompt = _gemini_count(usage, "promptTokenCount")
+    tool = _gemini_count(usage, "toolUsePromptTokenCount")
+    cand = _gemini_count(usage, "candidatesTokenCount")
+    thoughts = _gemini_count(usage, "thoughtsTokenCount")
+    total = _gemini_count(usage, "totalTokenCount")
+    cached = _gemini_count(usage, "cachedContentTokenCount")
+    out = {}
+    if prompt is not None or tool is not None:
+        out["prompt_tokens"] = (prompt or 0) + (tool or 0)
+    if cand is not None or thoughts is not None:
+        inside = bool(thoughts) and cand is not None and total is not None \
+            and total == (prompt or 0) + (tool or 0) + cand
+        out["completion_tokens"] = (cand or 0) + (0 if inside else (thoughts or 0))
+    if thoughts:
+        out["completion_tokens_details"] = {"reasoning_tokens": thoughts}
+    if cached is not None:
+        out["prompt_tokens_details"] = {"cached_tokens": cached}
+    return out or None
+
+
+def _gemini_placeholder(meta) -> bool:
+    """litellm's adapter writes {prompt,candidates,total}=0 when it has no
+    usage; a real response always counts its prompt."""
+    return isinstance(meta, dict) and all(
+        _gemini_count(meta, key) == 0 for key in
+        ("promptTokenCount", "candidatesTokenCount", "totalTokenCount"))
+
+
+def _gemini_metrics_class(module):
+    """RequestMetrics plus usageMetadata and Gemini candidate text, cached."""
+    base = module.RequestMetrics
+    cls = _GEMINI_METRICS.get(base)
+    if cls is not None:
+        return cls
+
+    class GeminiRequestMetrics(base):
+        def _document(self, doc):
+            if isinstance(doc, list):
+                # streamGenerateContent without alt=sse: a JSON array.
+                for item in doc:
+                    self._document(item)
+                return
+            super()._document(doc)
+            if not isinstance(doc, dict):
+                return
+            usage = gemini_usage(doc.get("usageMetadata"))
+            if usage and not _gemini_placeholder(doc.get("usageMetadata")):
+                self.observe_openai_usage(usage)
+            candidates = doc.get("candidates")
+            for cand in candidates if isinstance(candidates, list) else ():
+                content = cand.get("content") if isinstance(cand, dict) else None
+                parts = content.get("parts") if isinstance(content, dict) else None
+                for part in parts if isinstance(parts, list) else ():
+                    if isinstance(part, dict) and not part.get("thought"):
+                        self._text(part.get("text"))
+
+    _GEMINI_METRICS[base] = GeminiRequestMetrics
+    return GeminiRequestMetrics
+
+
+def _wrap_once(owner, name, make, static=False):
+    original = owner.__dict__[name]
+    func = original.__func__ if isinstance(original, staticmethod) else original
+    if getattr(func, "_ferry_gemini_hook", False):
+        return
+    wrapped = make(func)
+    wrapped._ferry_gemini_hook = True
+    setattr(owner, name, staticmethod(wrapped) if static else wrapped)
+
+
+def install_gemini_stream_usage_hook(handler=None, adapter=None):
+    """Meter litellm's Gemini completion adapter streams.
+
+    1. GenerateContentToCompletionHandler._prepare_completion_kwargs (a
+       staticmethod): a streaming call carries stream_options.include_usage.
+    2. GoogleGenAIAdapter.translate_streaming_completion_to_generate_content:
+       a chunk carrying usage is observed on the request's Gemini collector
+       (CURRENT_METRICS); the wire is left as litellm makes it.
+    Metering, not observability: installed whether or not the tap is on.
+    Idempotent; a missing class is reported, never raised."""
+    try:
+        if handler is None:
+            from litellm.google_genai.adapters.handler import (
+                GenerateContentToCompletionHandler as handler)
+        if adapter is None:
+            from litellm.google_genai.adapters.transformation import (
+                GoogleGenAIAdapter as adapter)
+        handler.__dict__["_prepare_completion_kwargs"]
+        adapter.__dict__["translate_streaming_completion_to_generate_content"]
+
+        def make_prepare(func):
+            def prepare(*args, **kwargs):
+                out = func(*args, **kwargs)
+                try:
+                    if isinstance(out, dict) and out.get("stream") is True:
+                        options = out.get("stream_options")
+                        options = dict(options) if isinstance(options, dict) else {}
+                        options["include_usage"] = True
+                        out["stream_options"] = options
+                except Exception:
+                    pass
+                return out
+            return prepare
+
+        def make_translate(func):
+            def translate(self, response, *args, **kwargs):
+                try:
+                    usage = getattr(response, "usage", None)
+                    if usage is None:
+                        hidden = getattr(response, "_hidden_params", None)
+                        usage = hidden.get("usage") if isinstance(hidden, dict) else None
+                    if usage is not None:
+                        collector = _metrics_module().CURRENT_METRICS.get(None)
+                        if isinstance(collector, tuple(_GEMINI_METRICS.values())):
+                            collector.observe_openai_usage(usage)
+                except Exception:
+                    pass
+                return func(self, response, *args, **kwargs)
+            return translate
+
+        _wrap_once(handler, "_prepare_completion_kwargs", make_prepare, static=True)
+        _wrap_once(adapter, "translate_streaming_completion_to_generate_content",
+                   make_translate)
+        return True
+    except Exception:
+        print("ferry: Gemini stream usage hook unavailable", file=sys.stderr)
         return False
 
 
@@ -1362,11 +1549,17 @@ ANTHROPIC_PATHS = ("/v1/messages", "/messages")
 # route table; update both together.
 #
 # A route is also admitted only if the front can LIMIT and METER it there:
-# Gemini-native generate (/v1beta/models/…:generateContent) is not an
-# is_inference_path, and websockets (realtime, the responses socket) never
-# reach _key_admit, so a key there would skip its lane check, RPM, budget
-# and metering. They stay refused for device keys (the master still reaches
-# them) until metering is added for them.
+# lane check (incl. fleet resolution), RPM, monthly token budget, token
+# accounting and events. Gemini-native generate (POST
+# /v1beta/models/<lane>:generateContent and :streamGenerateContent,
+# GEMINI_GENERATE_RE) meets that: it is an is_inference_path, _fleet_rewrite
+# reads the lane from the PATH (litellm serves the path model, not a body
+# `model`), resolves it to `<fleet>.<lane>` and rewrites the path, _key_admit
+# runs before upstream, and the Gemini collector (_gemini_metrics_class)
+# charges `usageMetadata` from the JSON or SSE body. countTokens, every other
+# /v1beta route and the bare /models/<x>:… forms are not metered and stay
+# refused, as do websockets (realtime, the responses socket), which never
+# reach _key_admit. The master still reaches all of them.
 KEY_ROUTE_REFUSED = "device keys may not call this route"
 WEBSOCKET_METHOD = "WEBSOCKET"   # the method slot for a websocket upgrade
 DEVICE_KEY_EXACT_ROUTES = {
@@ -1388,6 +1581,7 @@ DEVICE_KEY_EXACT_ROUTES = {
 _SEGMENT = r"[^/]+"
 DEVICE_KEY_PATTERN_ROUTES = {
     "GET": (re.compile(r"/v1/models/" + _SEGMENT),),
+    "POST": (GEMINI_GENERATE_RE,),
 }
 
 
@@ -1815,6 +2009,21 @@ def _header_map(scope) -> dict:
     return out
 
 
+def _rewrite_gemini_path(scope, model: str) -> None:
+    """Point a Gemini-native generate request at `model` (a fleet lane).
+
+    `path` and `raw_path` move together: Starlette routes on `path`, and a
+    stale `raw_path` would disagree with it in anything that reads the raw
+    form. The query string (alt=sse) is a separate scope key and untouched."""
+    match = GEMINI_GENERATE_RE.fullmatch(scope.get("path", ""))
+    if match is None:
+        return
+    new = "/v1beta/models/%s:%s" % (model, match.group("action"))
+    scope["path"] = new
+    if "raw_path" in scope:
+        scope["raw_path"] = urllib.parse.quote(new, safe="/:").encode()
+
+
 def _set_content_length(scope, length: int) -> None:
     """Replace content-length in a live ASGI scope after a body rewrite.
 
@@ -2073,7 +2282,10 @@ class LaneCatalogueFilter:
             started_at = time.monotonic()
             try:
                 module = _metrics_module()
-                collector = module.RequestMetrics(started_at=started_at, clock=time.monotonic)
+                metrics_cls = (_gemini_metrics_class(module)
+                               if gemini_lane(scope.get("path", "")) is not None
+                               else module.RequestMetrics)
+                collector = metrics_cls(started_at=started_at, clock=time.monotonic)
                 token = module.CURRENT_METRICS.set(collector)
             except Exception as err:
                 collector = None
@@ -2238,6 +2450,12 @@ class LaneCatalogueFilter:
                 except Exception:
                     doc = None
         requested = doc.get("model") if isinstance(doc, dict) else None
+        gemini = gemini_lane(scope.get("path", ""))
+        if gemini is not None:
+            # litellm serves the PATH model on Gemini-native generate, so the
+            # lane check reads the path, never a body `model` (which could
+            # name an allowed lane while the path names another).
+            requested = gemini
         if isinstance(doc, dict) and tap_enabled():
             # The record still NAMES what was found — now with `fixed` per
             # entry — so a lane that hangs for one client stays traceable to
@@ -2254,7 +2472,37 @@ class LaneCatalogueFilter:
             # reach a Chinese deployment, even through a non-fleet model name.
             mark_domestic_only(doc)
             changed = True
-        if (self.state is not None and isinstance(doc, dict)
+        path_model = None
+        if gemini is not None:
+            # Same precedence and failure modes as the body-model branch
+            # below, applied to the path lane; the resolved `<fleet>.<lane>`
+            # is written back into the PATH, which is what litellm routes on.
+            path_model = gemini
+            if self.state is not None:
+                header_fleet = headers.get(FLEET_HEADER, b"").decode(
+                    "utf-8", "replace").strip()
+                try:
+                    resolved = resolve_model(
+                        gemini, header_fleet, caller_identity(scope, headers),
+                        self.state, locked=locked)
+                except ResolveError as err:
+                    await self._reply(send, 403 if isinstance(err, FleetLockError)
+                                      else 400, {"error": {
+                        "message": str(err.args[0]), "type": "ferry_fleet"}})
+                    return None
+                except Exception as err:
+                    _fleet_warn(err)
+                    resolved = None
+                if resolved:
+                    path_model = resolved
+            if path_model != gemini:
+                _rewrite_gemini_path(scope, path_model)
+            if isinstance(doc, dict) and "model" in doc and doc["model"] != path_model:
+                # Ignored by litellm 1.99 (the path wins), pinned anyway so a
+                # future precedence change cannot serve an unchecked lane.
+                doc["model"] = path_model
+                changed = True
+        if (self.state is not None and gemini is None and isinstance(doc, dict)
                 and isinstance(doc.get("model"), str)):
             header_fleet = headers.get(FLEET_HEADER, b"").decode(
                 "utf-8", "replace").strip()
@@ -2310,7 +2558,10 @@ class LaneCatalogueFilter:
                 pass
         entry = scope.get(KEY_ENTRY_SCOPE)
         if entry is not None:
-            resolved = doc.get("model") if isinstance(doc, dict) else None
+            if gemini is not None:
+                resolved = path_model
+            else:
+                resolved = doc.get("model") if isinstance(doc, dict) else None
             if not await self._key_admit(scope, send, entry, requested, resolved):
                 return None
         metered = entry is not None and isinstance(doc, dict)
@@ -3166,6 +3417,7 @@ def build_app(litellm_app=None):
     install_claude_oauth_hook()
     install_zai_tool_compat()
     install_fleet_policy_hook()
+    install_gemini_stream_usage_hook()
     if tap_enabled():
         install_reasoning_usage_hook()
 

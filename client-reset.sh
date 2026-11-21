@@ -420,6 +420,34 @@ if [[ "$PRIME_MODE" != "none" ]]; then
   fi
 fi
 
+# --- 7. Re-apply the agentic coding CLIs (issue #3) ------------------------------
+# One loop over the registry the freshly pulled CLI reports (`ferry agents
+# --list`): every client whose "<client>_mode" in client.json is "full" is
+# re-wired with the saved host/port/key. Absent or "none" stays unwired, the
+# same never-widen rule as every mode above (a client the user wired by hand
+# later is "full", because `ferry <client>` records that itself).
+AGENTS_APPLIED=(); AGENTS_FAILED=()
+agent_list=(${(f)"$(env -u OPENCODE_CONFIG "$FERRY_BIN" agents --list 2>/dev/null)"})
+for _ac in "${agent_list[@]}"; do
+  [[ -n "$_ac" ]] || continue
+  _am=$(python3 -c "import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2] + '_mode') or 'none')
+except Exception:
+    print('none')" "$CLIENT_JSON" "$_ac" 2>/dev/null) || _am="none"
+  [[ "$_am" == "full" ]] || continue
+  echo ""
+  echo ">>> Re-applying the $_ac wiring..."
+  if env -u OPENCODE_CONFIG "$FERRY_BIN" "$_ac" \
+        --host "$HOST_NAME" --port "$HOST_PORT" "${key_args[@]}"; then
+    AGENTS_APPLIED+=("$_ac")
+  else
+    AGENTS_FAILED+=("$_ac")
+    echo "    WARNING: 'ferry $_ac' failed; its wiring may be stale. Re-run"
+    echo "    'ferry $_ac' by hand once fixed."
+  fi
+done
+
 echo ""
 echo "================================================================="
 if [[ $RESET_FAILED -eq 1 ]]; then
@@ -452,5 +480,12 @@ fi
 if [[ $PRIME_APPLIED -eq 1 ]]; then
   echo "Prime Agent wiring re-applied: 'ferry' provider in its models.json"
   echo "(prime_mode scope from client.json)."
+fi
+if (( ${#AGENTS_APPLIED} )); then
+  echo "Agentic coding CLIs re-applied: ${AGENTS_APPLIED[*]} (<client>_mode scope"
+  echo "from client.json; see 'ferry agents')."
+fi
+if (( ${#AGENTS_FAILED} )); then
+  echo "WARNING: agent wiring failed for: ${AGENTS_FAILED[*]}"
 fi
 echo "================================================================="

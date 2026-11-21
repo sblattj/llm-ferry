@@ -1514,8 +1514,9 @@ class ScriptContractTest(unittest.TestCase):
         self.assertIn('key_args=(--key "$saved_key")', reset)
         # Every ferry re-apply call rides the array — opencode's per-config
         # loop, the claude wrappers, the cline pre-seed (v1.40.0), and the
-        # codex + prime steps (v1.41.0); empty when no key was stored.
-        self.assertEqual(reset.count('"${key_args[@]}"'), 5)
+        # codex + prime steps (v1.41.0), and the agentic coding CLI loop
+        # (v1.52.0); empty when no key was stored.
+        self.assertEqual(reset.count('"${key_args[@]}"'), 6)
         self.assertIn("c.get('api_key') or c.get('master_key'", reset)
 
     def test_client_to_host_never_promotes_a_device_key_to_master(self):

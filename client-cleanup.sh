@@ -80,6 +80,55 @@ else
 fi
 echo ""
 
+# --- 1c. Unwire the agentic coding CLIs (issue #3) ---------------------------
+# Runs BEFORE the ferry CLI goes (section 2) and before ~/.config/ferry goes
+# (section 3): every `ferry <client>` left a record in ~/.config/ferry/
+# <client>.json naming the files it created (with their sha256) and the one
+# member it added to each config it edited. `ferry <client> --unwire` undoes
+# exactly that: a created file the user changed since is kept, an edited file
+# only loses ferry's own entry, the user's config and login are never touched.
+# No CLI left to ask (a half-removed install)? The same record-driven removal
+# of created files runs inline, and edited files are listed for a hand fix.
+echo ">>> Unwiring the agentic coding CLIs (ferry agents)..."
+AGENT_DRY=(); [[ $DRY_RUN -eq 1 ]] && AGENT_DRY=(--dry-run)
+if [[ -x "$HOME/.local/bin/ferry" ]]; then
+  agent_list=(${(f)"$(env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" agents --list 2>/dev/null)"})
+  for _ac in "${agent_list[@]}"; do
+    [[ -n "$_ac" && -f "$HOME/.config/ferry/$_ac.json" ]] || continue
+    env -u OPENCODE_CONFIG "$HOME/.local/bin/ferry" "$_ac" --unwire "${AGENT_DRY[@]}" \
+      || echo "    WARNING: 'ferry $_ac --unwire' failed; see above."
+  done
+else
+  python3 - "$HOME/.config/ferry" "$DRY_RUN" <<'PYEOF' || true
+import glob, hashlib, json, os, sys
+cfg, dry = sys.argv[1], sys.argv[2] == "1"
+for rec_path in sorted(glob.glob(os.path.join(cfg, "*.json"))):
+    try:
+        rec = json.load(open(rec_path))
+    except Exception:
+        continue
+    if not isinstance(rec, dict) or "created" not in rec or "client" not in rec:
+        continue
+    for c in rec.get("created", []):
+        p = c.get("path", "")
+        if not os.path.isfile(p):
+            continue
+        with open(p, "rb") as f:
+            same = hashlib.sha256(f.read()).hexdigest() == c.get("sha256")
+        if not same:
+            print(f"    Kept {p}: changed since ferry wrote it.")
+        elif dry:
+            print(f"    [dry-run] would remove {p}")
+        else:
+            os.remove(p)
+            print(f"    Removed {p}")
+    for e in rec.get("edited", []):
+        print(f"    By hand: remove ferry's entry {e.get('keys') or e.get('kind')} "
+              f"from {e.get('path')} (no ferry CLI left to do it).")
+PYEOF
+fi
+echo ""
+
 # --- 2. Remove the ferry CLI ------------------------------------------------
 FERRY_BIN="$HOME/.local/bin/ferry"
 echo ">>> Removing the 'ferry' CLI..."
@@ -610,7 +659,7 @@ echo ""
 #     base URL must still point at the host:port captured in section 2b, the
 #     API key must equal the recorded master_key or "local", and
 #     lastUsedProvider goes only while it still names openai-compatible.
-CLINE_DATA="$HOME/.cline/data"
+CLINE_DATA="${CLINE_DATA_DIR:-${CLINE_DIR:-$HOME/.cline}/data}"
 # The base the guards compare against; empty when section 2b found no record
 # at all, which is the "cannot prove ownership" case, not a URL of ":".
 CLINE_BASE=""
@@ -688,7 +737,7 @@ PYEOF
 }
 
 if [[ -d "$CLINE_DATA" ]]; then
-  echo ">>> Unwiring the Cline (VS Code) provider files under $HOME/.cline ..."
+  echo ">>> Unwiring the Cline (VS Code) provider files under $CLINE_DATA ..."
   for spec in \
     "$CLINE_DATA/globalState.json|globalstate" \
     "$CLINE_DATA/secrets.json|secrets" \
@@ -732,7 +781,7 @@ if [[ -d "$CLINE_DATA" ]]; then
     unwire_cline_file "$c_path" "$c_kind" "$CLINE_BASE" "$CLINE_KEY"
   done
 else
-  echo ">>> Cline (VS Code): $HOME/.cline not present — skipping."
+  echo ">>> Cline (VS Code): $CLINE_DATA not present, skipping."
 fi
 echo ""
 
@@ -1025,5 +1074,7 @@ echo "  - ~/.codex itself (Codex config/login/history are not ferry's; only the"
 echo "    codex-ferry wrapper block was stripped from ~/.zshrc)"
 echo "  - ~/.prime itself and Prime Agent's models.json (only providers.ferry was"
 echo "    unwired; your other providers stay)"
+echo "  - every agentic coding CLI's own config and login (pi, gemini, aider, ...;"
+echo "    only the <client>-ferry wrappers and ferry's own provider entries went)"
 echo "Open a NEW terminal so the stripped wrappers/aliases unload."
 echo "================================================================="

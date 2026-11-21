@@ -82,6 +82,12 @@ NO_CLAUDE=0
 NO_CLINE=0
 NO_CODEX=0
 NO_PRIME=0
+# The agentic coding CLIs of issue #3 (`ferry agents --list` is the source of
+# truth once the CLI is installed; this copy only exists so the flags parse
+# before it is). lib/ferry-agents.test.py pins the two lists equal.
+AGENT_CLIENTS=(pi gemini openhands interpreter goose aider codewhale reasonix omp crush qwen kilo kimi copilot)
+typeset -A AGENT_PICK   # <client> -> no | with (absent = wire when installed)
+NO_AGENTS=0
 # The shared master key (v1.22.0): optional. Env first; an explicit --key wins.
 MASTER_KEY="${FERRY_MASTER_KEY:-}"
 
@@ -105,6 +111,12 @@ usage() {
   echo "         by default they are installed even when codex isn't installed yet)"
   echo "       --no-prime   (skip the Prime Agent models.json provider; by default"
   echo "         ~/.prime/agent is pre-seeded even when prime-agent isn't installed yet)"
+  echo "       --no-<client> | --with-<client>   for each agentic coding CLI in"
+  echo "         'ferry agents': ${AGENT_CLIENTS[*]}"
+  echo "         (by default each one is wired ONLY when its binary is on PATH;"
+  echo "         --with-<client> wires it anyway, --no-<client> skips it;"
+  echo "         --no-agents skips all of them). Recorded as <client>_mode."
+  echo "         i.e. ${AGENT_CLIENTS[@]/#/--no-}"
   echo "       -h | --help"
 }
 
@@ -119,6 +131,14 @@ while [[ $# -gt 0 ]]; do
     --no-cline)        NO_CLINE=1; shift ;;
     --no-codex)        NO_CODEX=1; shift ;;
     --no-prime)        NO_PRIME=1; shift ;;
+    --no-agents)       NO_AGENTS=1; shift ;;
+    --no-*|--with-*)
+      _ac="${1#--no-}"; _ac="${_ac#--with-}"
+      if (( ! ${AGENT_CLIENTS[(Ie)$_ac]} )); then
+        echo "Unknown flag: $1"; echo "Agent clients: ${AGENT_CLIENTS[*]}"; exit 1
+      fi
+      [[ "$1" == --no-* ]] && AGENT_PICK[$_ac]=no || AGENT_PICK[$_ac]=with
+      shift ;;
     --key)
       if [[ $# -lt 2 || -z "$2" ]]; then
         echo "Error: --key needs a value"; exit 1
@@ -127,7 +147,7 @@ while [[ $# -gt 0 ]]; do
     --key=*)
       MASTER_KEY="${1#--key=}"; shift ;;
     -h|--help)         usage; exit 0 ;;
-    *) echo "Unknown flag: $1"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --key KEY, --with-guardrails, --no-guardrails, --no-claude, --no-cline, --no-codex, --no-prime, --help"; exit 1 ;;
+    *) echo "Unknown flag: $1"; echo "Want: --profiles-only, --no-opencode, --full-opencode, --key KEY, --with-guardrails, --no-guardrails, --no-claude, --no-cline, --no-codex, --no-prime, --no-agents, --no-<client>, --with-<client>, --help"; exit 1 ;;
   esac
 done
 
@@ -1348,6 +1368,48 @@ if [[ $PRIME_FAILED -eq 1 ]]; then
   echo "    models, or re-run this script / client-reset.sh."
 fi
 
+# 4f. The agentic coding CLIs (issue #3). One loop over the registry the
+# installed CLI reports (`ferry agents --list`): each client is wired when its
+# binary is on PATH (`ferry agents --installed`) or --with-<client> was given,
+# and skipped for --no-<client> / --no-agents. A successful `ferry <client>`
+# records "<client>_mode": "full" in client.json itself; every client NOT
+# wired gets "none" here, so client-reset.sh never widens.
+echo ""
+AGENTS_WIRED=(); AGENTS_FAILED=(); AGENTS_NONE=()
+FERRY_CLI="$HOME/.local/bin/ferry"
+agent_list=(${(f)"$(env -u OPENCODE_CONFIG "$FERRY_CLI" agents --list 2>/dev/null)"})
+agent_installed=(${(f)"$(env -u OPENCODE_CONFIG "$FERRY_CLI" agents --installed 2>/dev/null)"})
+for _ac in "${agent_list[@]}"; do
+  [[ -n "$_ac" ]] || continue
+  if (( NO_AGENTS )) || [[ "${AGENT_PICK[$_ac]:-}" == "no" ]]; then
+    AGENTS_NONE+=("$_ac"); continue
+  fi
+  if [[ "${AGENT_PICK[$_ac]:-}" != "with" ]] && (( ! ${agent_installed[(Ie)$_ac]} )); then
+    AGENTS_NONE+=("$_ac"); continue
+  fi
+  echo ">>> Wiring $_ac to the host..."
+  if env -u OPENCODE_CONFIG "$FERRY_CLI" "$_ac" --host "$HOST_NAME" --port "$HOST_PORT"; then
+    AGENTS_WIRED+=("$_ac")
+  else
+    AGENTS_FAILED+=("$_ac"); AGENTS_NONE+=("$_ac")
+  fi
+done
+if (( ${#AGENTS_NONE} )); then
+  python3 - "$HOME/.config/ferry/client.json" "${AGENTS_NONE[@]}" <<'PYEOF' || true
+import json, os, sys
+path, names = sys.argv[1], sys.argv[2:]
+with open(path) as f:
+    d = json.load(f)
+for n in names:
+    d[f"{n}_mode"] = "none"
+with open(path + ".tmp", "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+os.chmod(path + ".tmp", 0o600)
+os.replace(path + ".tmp", path)
+PYEOF
+fi
+
 # 5. Wrap up
 echo "================================================================="
 echo ">>> SUCCESS! Client setup is complete."
@@ -1465,4 +1527,16 @@ case "$PRIME_MODE" in
     echo ">>> PRIME AGENT WAS NOT CONFIGURED (--no-prime)."
     ;;
 esac
+echo ""
+if (( ${#AGENTS_WIRED} )); then
+  echo ">>> AGENTIC CODING CLIs ON THE FERRY BACKEND: ${AGENTS_WIRED[*]}"
+  echo "    Run each through its wrapper, e.g. '${AGENTS_WIRED[1]}-ferry' (details:"
+  echo "    ferry <client> --help). 'ferry agents' shows what is wired."
+fi
+if (( ${#AGENTS_FAILED} )); then
+  echo "    WARNING: wiring FAILED for: ${AGENTS_FAILED[*]} (see above; re-run"
+  echo "    'ferry <client>' by hand once fixed)."
+fi
+echo "    Not wired (not installed, or skipped): ${AGENTS_NONE[*]:-none}."
+echo "    Install one later, then run 'ferry <client>' to wire it."
 echo ""
